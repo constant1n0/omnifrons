@@ -54,10 +54,10 @@ Validated anchor mapping:
 - **Core** occupies the flake's center cell and bears the **active model's mark** in its brand color; the brand color also drives the SKILLS ring and the skill rhombi. Prototypes use monograms as stand-ins for the marks.
 - **Skills** sit on the center cell's boundary vertices (S/3) — the core's immediate surface.
 - **Domains** occupy the six level-1 cell centers (2S/3) — a natural cap of six per view level, free slots rendered as dashed anchors. Domain colors are assigned in **color-wheel order** around the ring (yellow → orange → red → violet → blue → green), so adjacent territories are natural wheel neighbors and cross-territory bond gradients blend rather than clash.
-- **Memory is territorial**: each domain's topics render as its level-2 sub-cells, keeping **five topics per territory** — the outward level-2 anchor (8S/9) belongs to the domain's routine, never to memory. Notes and dust fill the deeper levels.
-- **Routines** anchor at 8S/9; **applications** light the flake's outer edge cells at ≈S. The bands stay disjoint by construction: memory ≤ ~0.8S, routines 0.889S, applications S.
+- **Memory is territorial**: each domain's topics render as its level-2 sub-cells, keeping **five topics per territory** — the outward anchor chain belongs to the domain's routine, never to memory. Notes and dust fill the deeper levels.
+- **Routines** anchor on the outward level-2→3 chain at 26S/27; **applications** sit just beyond the flake's outer edge (≈1.05S) — external capability living literally outside the knowledge boundary. The bands stay disjoint with clear air: memory ≤ ~0.8S, routines 0.963S, applications 1.05S.
 - Connection lines still terminate on **vertices**, never centers, per the registered vertex rule.
-- **Concentric zone guide rings** (skills S/3, domains 2S/3, routines 8S/9, applications S) stay visible over the flake; memory deliberately has no ring — it is territorial.
+- **Concentric zone guide rings** (skills S/3, domains 2S/3, routines 26S/27, applications ≈1.05S) stay visible over the flake; memory deliberately has no ring — it is territorial.
 - **Whisper budget**: the flake mesh renders as background texture (opacity fading by level), and cross-domain relations are an **invisible attraction** — no permanent strokes. A relation materializes as a single gradient hairline only while its topic (or domain) is hovered or dragged, with opacity encoding strength, and while auto-arrange is pulling; at rest, relation strength lives purely in proximity. The whisper budget is global — multiplying elements divides their per-element presence.
 
 Interaction, validated in the study:
