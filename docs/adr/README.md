@@ -111,6 +111,7 @@ An exception never changes a failed test into a pass. It records bounded accepte
 | [ADR-0001: Open-source license](0001-open-source-license.md) | Accepted | Apache-2.0 for original Omnifrons work. | Owner approved and canonical license committed; ongoing review applies when dependencies, assets, binaries, or contribution workflows are added. |
 | [ADR-0002: Desktop technology stack](0002-desktop-technology-stack.md) | Proposed | Proposes Tauri 2 with framework-independent Rust core and React/TypeScript renderer. | Reproducible cross-platform verification plan, security review, and confirmed Rust ownership. |
 | [ADR-0003: Local Markdown and tiered assets](0003-local-markdown-and-tiered-assets.md) | Accepted | Keeps Markdown always local and separates optional heavy-asset storage. | Owner decision recorded; implementation diagnostics and provider conformance remain required. |
+| [ADR-0004: Fully open platform with custom integrated apps](0004-open-platform-and-custom-apps.md) | Accepted | Publishes the entire general product as free software; monetization through per-client custom apps above the platform. | Owner decision recorded; legal advice on service terms required before first reliant engagement. |
 
 ## Planned governance artifact
 
