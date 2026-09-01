@@ -218,11 +218,11 @@ Automated switching between Engram Git Sync and Engram Cloud is unsupported unti
 | Plane | Authority | Purpose |
 | --- | --- | --- |
 | Knowledge | Obsidian-compatible Markdown vault | Canonical long-form notes and human navigation |
-| Operational memory | Engram | Curated observations and pointers, not full-vault duplication |
+| Operational memory | [Engram](https://github.com/Gentleman-Programming/engram) | Curated observations and pointers, not full-vault duplication |
 | Delivery/specification | OpenSpec | Normative requirements, design, tasks, verification, and change lifecycle |
 | Projection | Orb | Read/status projection only |
 
-`obsidian-skills` supplies format/tool procedures; Omnifrons owns its knowledge protocol. Engram-to-Obsidian output is isolated generated content and never overwrites canonical human notes.
+[`obsidian-skills`](https://github.com/kepano/obsidian-skills) supplies format and tool procedures, while the vault organization follows [Karpathy's LLM-Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Omnifrons owns the knowledge lifecycle and write policy. Engram-to-Obsidian output is isolated generated content and never overwrites canonical human notes.
 
 ### Local Markdown and tiered heavy assets
 
