@@ -221,6 +221,8 @@ The dashboard is a **launcher of views**, not a single page. The initial set is 
 
 Navigation between dashboards is launcher-style tab routing (the tabbed-panel surface). Home shows **summaries and badges**; detail lives in the dedicated dashboard — the summary always precedes the detail.
 
+The adapter feed behind the dashboards is **headless-consumable by design**: the same typed data serves the desktop shell, a terminal/SSH client, and any future mobile surface. Dashboards are one consumer of the feed, never the only one. Where a source exposes no event stream, its adapter synthesizes typed events from polling over monotonic identifiers, delivered through signed, replay-protected, idempotent ingestion.
+
 **Home's proposed default layout** — a proposal, never an imposition (see Gadget system): center — the idle orb, its CTA, and an arc rail of quick-action buttons with badges; left column — Today (large dot-matrix clock, day's calendar, time zones) and micro-app quick links; right column — inbox digest, skills deck (headless runs with in-place progress and result reports), and the routines summary table (fired / next / queued); bottom strip — usage and spend (subscription quota bars, metered token counters) beside the status line (active model, honest handoff state, scope/trust chip, sync stamp).
 
 ### Gadget system
@@ -252,6 +254,15 @@ Omnifrons-native (no prior-art equivalent):
 - **Sessions monitor:** every running harness execution — foreground session, headless runs, cloud routines — with harness identity and state.
 - **Generations gallery:** log of AI-generated media fed by agent connectors.
 - **Scope/trust indicator:** the active harness's scope mode (`sandbox-enforced`, `harness-enforced`, `advisory`) permanently visible.
+
+Fleet health semantics, binding for the sessions and routines gadgets:
+
+- A stored "status" field can lie: it may reflect the last run that *terminated*, not one that terminated *well*. Health verdicts derive from the **run ledger**, using the last conclusive run and excluding operator cancellations.
+- **Deliberate silence is healthy.** An executor configured to skip empty ticks, or deliberately dormant, is not broken; the vocabulary distinguishes broken states (failed last run, silent past its own interval, quota-exhausted) from healthy-quiet states (waiting, dormant, never-started). An old error on a sleeping executor is a fossil — wake it before repairing it.
+- Usage gadgets model **shared quota pools** as first-class, not only per-executor spend: a per-executor cap cannot protect an account-wide pool, and an adapter reporting zero cost reads as *unverified*, never as free.
+- **Approval effects are identity-bound**: an approve/reject mutates as the correct actor, and every disposition is bounded — work left undisposed can re-wake its executor indefinitely, so the queue never leaves an item open as a side effect.
+- Sync health models **multiple control-plane instances** (with replication state) where they exist — never assumes a single authority per plane.
+- **Alerting never depends on a dashboard being open**: critical events also reach humans through out-of-band channels; dashboards subscribe to that stream rather than replacing it.
 
 ## Dashboard usage and spend widgets
 
