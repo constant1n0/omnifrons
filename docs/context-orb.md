@@ -34,7 +34,7 @@ The Orb has two visual representations, fixed by the project's motion studies:
 
 **Idle orb (dashboard center).** A particle globe: a cloud of 1–2 px colored dots, clustered by domain color, inside a faint geodesic wireframe sphere with scattered star specks. Idle motion is slow rotation (~1 revolution per ≥8 s) plus per-particle twinkle — there is no measurable scale or position "breathing". At the sphere's heart orbits a **cube of sub-cubes** rotating about its own space diagonal, so its silhouette remains hexagonal: a hexagon is a cube seen along that diagonal, which makes the idle orb the 3-D lift of the hexaflake graph — the cube that is conceptually a sphere (the squaring of the circle). A dot-matrix CTA beneath the globe invites opening the full view.
 
-**Interactive graph view (takeover surface).** Activating the idle orb plays a three-beat transition — particle implosion (~0.5 s, ease-in), hard white flash (~0.1 s), ease-out fade (~0.4 s) — into a full-screen concentric graph drawn over a **violet-black board disc** that bounds the modeled region, textured by the hexagonal background mesh. From the center outward:
+**Interactive graph view (takeover surface).** Activating the idle orb plays a three-beat transition — particle implosion (~0.5 s, ease-in), hard white flash (~0.1 s), ease-out fade (~0.4 s) — into a full-screen concentric graph on the warm near-black ground, textured by the hexagonal mesh, which **continues past the applications band and fades out with radius** — the modeled region dissolves into space rather than ending at a border. From the center outward:
 
 | Ring | Name | Content | Color rule |
 | --- | --- | --- | --- |
