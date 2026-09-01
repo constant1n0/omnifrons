@@ -66,6 +66,7 @@ Interaction, validated in the study:
 - **Obsidian-style dragging**: dragging a domain carries its whole territory; dragging a topic moves it alone with its dust and bonds. Bond topology derives from base geometry and stays fixed while dragging.
 - **Auto-arrange by relations**: a bounded force pass in which each bond pulls its endpoints proportionally to its order (triple strongest) while every displacement decays back toward its fractal anchor — relations bend the layout, the lattice reclaims it.
 - **Fractal inner worlds ("as above, so below")**: activating a domain dives one level down with a zoom transition into that domain's inner world — its index at the center, its topics as inner domains, their notes as territories, inner bonds between them — rendered monochrome in the domain's color. The inner world is equally draggable; surfacing returns to the outer view. Navigating the vault hierarchy (root index → domain index → topic index, the LLM-Wiki recursion) is literally zooming the fractal.
+- **Radial context menu (target)**: activating a node can raise a ring menu around it — expand, collapse, hide, pin — without disturbing the rest of the graph; pinned nodes hold position through auto-arrange, and saved partial views capture a focus arrangement for later.
 
 The territorial memory model is validated and supersedes ring 3's concentric arcs; the ring table above is retained as the earlier annular model this design evolved from.
 
@@ -74,8 +75,24 @@ The territorial memory model is validated and supersedes ring 3's concentric arc
 The Orb scales by aggregation, never by drawing everything:
 
 - A collapsed folder or sub-index renders as a single ringed sphere carrying a **count badge**; expansion is explicit and per-node. On expansion, children emerge from the parent and travel outward along curved links with an ease-out settle (~1–1.5 s), and a confirmation toast names the result ("Expanded ⟨name⟩ · N items"). A second activation collapses the aggregate. Click and drag are disambiguated by a small movement threshold, so aggregates stay draggable like any node. Bulk expand/collapse operations complement per-node control. Validated in the geometry study: each domain territory carries one aggregate standing in for its deepest sub-index.
-- Bubble radii are graduated (roughly a 6:1 range) and **numeric badges appear only above a size threshold** — a size-based label budget. Note labels are a global toggle, not a zoom behavior; layer and domain labels live in world space.
+- Bubble radii are graduated (roughly a 6:1 range, switchable to a log scale for power-law corpora) and **numeric badges appear only above a size threshold** — a size-based label budget. Note labels are a global toggle, not a zoom behavior; layer and domain labels live in world space.
 - Out-of-focus branches desaturate toward the background while the active branch keeps full color.
+- The formal model is a **multi-resolution cluster index**: badge counts and aggregate metrics are precomputed in the store, a resolution cut marks which aggregates are collapsed or expanded, and expansion is a local operation — never a full-graph traversal.
+- Which nodes surface at each zoom level follows an importance ranking (top ⌈|V|/2ᵏ⌉ by centrality per level, scaled to avoid collisions). Zooming preserves **monotone nesting** — nothing visible ever disappears by zooming in — and newly revealed nodes emerge in the **angular gaps around their persistently positioned parent**, preserving the mental map.
+
+### Scale rules (semantic zoom)
+
+- **Macro — the orb**: domain hubs and aggregates with accumulated badges; only top-ranked nodes surface; relations stay invisible attraction.
+- **Meso — a territory**: aggregates unfold into sub-clusters; bridge nodes (high betweenness centrality) surface; revealed hairlines may bundle.
+- **Micro — an inner world**: full atomic expansion — complete labels, 1–2-hop neighborhood, content previews.
+
+### Rendering budget (definitive build)
+
+SVG holds to roughly a thousand elements and Canvas to ~5k; the 10–35k-node target requires **WebGL**. Decision: **Sigma.js v3 + Graphology** — WebGL drawing fed exact, deterministically computed coordinates (the hexaflake anchors), layout physics confined to WebWorkers, and custom shaders for the non-circular glyphs. GPU engines that own the layout through free-running force grids are rejected: they cannot honor a deterministic orbital lattice. Prototypes remain SVG/Canvas within their element budgets.
+
+### Relation intelligence
+
+Community detection (modularity) plus betweenness centrality identify dense clusters that barely talk to each other; the agent surfaces these structural gaps as **bridge proposals** — candidate cross-domain relations, and the questions that would connect them — through the standard proposal-and-approval flow, never auto-created.
 
 ### Deterministic projection feed
 
@@ -88,6 +105,14 @@ The Orb's data — and any memory retrieval behind it — is produced by plain d
 5. Hand only the extract to the model, which is invoked once.
 
 For the operational-memory plane this feed **is Engram**: its search runs as deterministic code over the local store and returns curated, scored observations whose pointers lead into the vault — exactly steps 2–4, already implemented. The vault side adds index/reference-map scoring over canonical notes (the LLM-Wiki index layer); the two stages compose — observation hit → pointer → vault note → section extract — and neither involves a model call.
+
+Feed scoring upgrades, all composing over the SQLite substrate:
+
+- Hybrid keyword + vector fusion via **adaptive reciprocal-rank fusion**: query-IDF-driven weighting (rare exact terms boost keyword search; diffuse queries boost vectors) with a distance-based relevance cutoff.
+- **Structure-aware tokenization**: compound identifiers split for recall without losing exact-match precision.
+- A **single SQL round-trip** combining full-text search, vector similarity, and bounded recursive-CTE graph traversal, with ontology closure precomputed at insert time so hierarchy expansion is O(1) at query time.
+- **Bitemporal pointer edges** (valid-from / valid-until) so the feed reads current pointer state — or any past state — without parsing markdown on the hot path.
+- Anti-pattern, evidence-backed: **post-fusion temporal decay degrades retrieval precision and is excluded**.
 
 This is the concrete mechanism behind the "typed projection data" invariant and the product's token economy. The acceptance methodology is a paired-session benchmark — the same prompt against default retrieval and against the index feed — with per-category context accounting; the target range is 40–60% savings in both tokens and wall time, with answer correctness verified on every run.
 
