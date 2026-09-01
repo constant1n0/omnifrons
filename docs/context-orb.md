@@ -42,7 +42,7 @@ The Orb has two visual representations, fixed by the project's motion studies:
 | 1 | SKILLS | Thin guide ring carrying its zone label set on the ring; skill nodes render as vertical rhombi along it | Active-model brand color |
 | 2 | DOMAINS | Filled circles of equal size with a thin lighter ring, soft glow, and a white line glyph, placed outside the SKILLS ring at irregular angles; labels below in caps (see Domain lifecycle) | One distinct color per domain, assigned at declaration and recorded in the root index |
 | 3 | MEMORY | Concentric arcs of same-color dots per domain sector, dot size growing outward; the arc extent marks the MEMORY boundary | Dots inherit the domain color; connection lines are curved (~1–1.5 px, opaque) and take the child node's color |
-| 4 | ROUTINES | Thin zone ring with small circle nodes (harness-native and cloud-scheduled routines) | Amber-family zone ring and markers |
+| 4 | ROUTINES | Thin zone ring with orbit-disc nodes — a filled disc inside a thin orbit ring with a satellite dot riding it, the glyph for "a scheduled thing that goes round" | Amber-family zone ring and markers |
 | 5 | APPLICATIONS | Connected external capability: human-launched applications and micro-apps, plus agent-facing connectors (MCP servers, plugins, extensions) | Blue-family zone ring; application nodes snap to cells of the background honeycomb and render as that cell lit up (glyph, glow, translucent fill); the two node natures carry distinct visual treatments |
 
 ### Geometric harmonization (validated: hexaflake lattice)
@@ -56,6 +56,7 @@ Validated anchor mapping:
 - **Domains** occupy the six level-1 cell centers (2S/3) — a natural cap of six per view level, free slots rendered as dashed anchors. Domain colors are assigned in **color-wheel order** around the ring (yellow → orange → red → violet → blue → green), so adjacent territories are natural wheel neighbors and cross-territory bond gradients blend rather than clash.
 - **Memory is territorial**: each domain's topics render as its level-2 sub-cells, keeping **five topics per territory** — the outward anchor chain belongs to the domain's routine, never to memory. Notes and dust fill the deeper levels.
 - **Routines** anchor on the outward level-2→3 chain at 26S/27; **applications** sit just beyond the flake's outer edge (≈1.1S) — external capability living literally outside the knowledge boundary. The bands stay disjoint with clear air: memory ≤ ~0.8S, routines 0.963S, applications 1.1S.
+- **Node geometry is semantic, never decorative**: shape encodes layer — hexagons for applications, orbit-discs for routines, vertical rhombi for skills, plain spheres for notes, and a **ringed sphere with a count badge** for any collapsed aggregate.
 - Connection lines still terminate on **vertices**, never centers, per the registered vertex rule.
 - **Concentric zone guide rings** (skills S/3, domains 2S/3, routines 26S/27, applications ≈1.1S) stay visible over the flake; memory deliberately has no ring — it is territorial.
 - **Whisper budget**: the flake mesh renders as background texture (opacity fading by level), and cross-domain relations are an **invisible attraction** — no permanent strokes. A relation materializes as a single gradient hairline only while its topic (or domain) is hovered or dragged, with opacity encoding strength, and while auto-arrange is pulling; at rest, relation strength lives purely in proximity. The whisper budget is global — multiplying elements divides their per-element presence.
@@ -68,7 +69,27 @@ Interaction, validated in the study:
 
 The territorial memory model is validated and supersedes ring 3's concentric arcs; the ring table above is retained as the earlier annular model this design evolved from.
 
-Graph motion and control: the idle graph is near-static — ring rotation is a user parameter defaulting to 0, and only sub-pixel drift plus twinkle animates while a selection is held. Selecting a node re-renders its branch in a single highlight color with curved lines to its children while the rest dims; selecting a domain fans out its file nodes and desaturates everything else (filter mode). Idle lines carry domain colors; selection overrides them with the highlight color. The layout is switchable (Force / Circle / Hex / Rings — Rings is the default), grouping toggles between domains and folders, and graph parameters (ring spin, link springs, node size, label visibility, expand/collapse) live in the view's menu panel. File labels appear only near zoom or on hover; ring and domain labels survive zoom-out.
+### Aggregation and level of detail
+
+The Orb scales by aggregation, never by drawing everything:
+
+- A collapsed folder or sub-index renders as a single ringed sphere carrying a **count badge**; expansion is explicit and per-node. On expansion, children emerge from the parent and travel outward along curved links with an ease-out settle (~1–1.5 s), and a confirmation toast names the result ("Expanded ⟨name⟩ · N items"). Bulk expand/collapse operations complement per-node control.
+- Bubble radii are graduated (roughly a 6:1 range) and **numeric badges appear only above a size threshold** — a size-based label budget. Note labels are a global toggle, not a zoom behavior; layer and domain labels live in world space.
+- Out-of-focus branches desaturate toward the background while the active branch keeps full color.
+
+### Deterministic projection feed
+
+The Orb's data — and any memory retrieval behind it — is produced by plain deterministic code before any model is involved:
+
+1. Keyword extraction from the query, filler discarded.
+2. Index-based **scoring of candidate notes without opening them**, against the vault's indexes and reference maps.
+3. Open only the top-scored note; extract the specific answering section, never the whole file.
+4. If the section is a pointer, follow it — deterministically and bounded.
+5. Hand only the extract to the model, which is invoked once.
+
+This is the concrete mechanism behind the "typed projection data" invariant and the product's token economy. The acceptance methodology is a paired-session benchmark — the same prompt against default retrieval and against the index feed — with per-category context accounting; the target range is 40–60% savings in both tokens and wall time, with answer correctness verified on every run.
+
+Graph motion and control: the idle graph is near-static — ring rotation is a user parameter ranging from static to a slow continuous drift, and only sub-pixel drift plus twinkle animates while a selection is held. Selecting a node re-renders its branch in a single highlight color with curved lines to its children while the rest dims; selecting a domain fans out its file nodes and desaturates everything else (filter mode). Idle lines carry domain colors; selection overrides them with the highlight color. The layout is switchable (Force / Circle / Hex / Rings — Rings is the default), grouping toggles between domains and folders, and graph parameters (ring spin, link springs, node size, label visibility, expand/collapse) live in the view's menu panel. File labels appear only near zoom or on hover; ring and domain labels survive zoom-out.
 
 Node availability states, in every ring:
 
@@ -137,7 +158,7 @@ Widgets around the Orb sit on a flexible grid with 16–24 px gaps and support d
 - **Idle orb:** slow rotation with per-particle twinkle; the perceived "breathing" is rotation plus a nucleus brightness oscillation, never a scale pulse.
 - **Opening transition:** particle implosion (~0.5 s, ease-in) → hard white flash (~0.1 s) → ease-out fade (~0.4 s) into the full-screen graph view; roughly 1 s total.
 - **Hover:** a tooltip pins beside the node with its name, counts ("N files · N md · N KB"), path, the state verb ("click to expand" / "click to collapse"), and scope pills.
-- **Selection:** the branch re-renders in the highlight color and everything else dims; a domain click fans out its files ("click to filter"). Selection opens the **entity card** — a compact panel with title, scope pills, metadata, path, actions (view here, open on device, copy path, fly to, remove) and a connections list. "View here" (file nodes only) opens the **reader panel**: an in-app panel over roughly 40% of the view rendering the file's markdown with linked references.
+- **Selection:** the branch re-renders in the highlight color and everything else dims; a domain click fans out its files ("click to filter"). Selection opens the **entity card** — a compact panel with title, chips (domain plus executing-agent/permission chips), metadata, path, a canonical action row (fly to, edit, view here, open on device / open folder, copy path, expand, remove — destructive always last and red-tinted) and a connections list. The hover tooltip is the short form of the same record, ending with its affordance hint ("click to expand"). "View here" (file nodes only) opens the **reader panel**: an in-app dock over roughly a quarter to 40% of the view rendering the file's markdown, with code blocks scrolling horizontally in place.
 - "Open on device" / "open folder" are external launches governed by the surfaces model and the renderer content-security contract.
 - **View chrome:** a "back to the OS" pill returns to the dashboard; a menu pill opens the panel with global search ("/" shortcut) and the graph parameters above.
 - Opening a remote-only node is the explicit hydration flow of the target architecture, with progress and verification state visible; the node is not recolored until verification succeeds.
@@ -206,7 +227,7 @@ Constraints:
 | Domain overflow beyond the six-slot wheel (paging, nesting, or merge) | Open |
 | Inner-world recursion beyond one level (topic worlds) | Open; one level validated in the study |
 | Usage-data source per provider (API, local telemetry, manual) | Open implementation decision |
-| Orb data feed (how vault/Engram/OpenSpec/catalog state reaches the renderer as typed projection data) | Open; constrained by the components and trust boundaries of the target architecture |
+| Orb data feed implementation (index formats, scoring function, pointer-follow bounds for the deterministic projection feed) | Open; the feed's shape is specified in "Deterministic projection feed" |
 
 ## References
 
