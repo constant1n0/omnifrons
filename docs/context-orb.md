@@ -208,9 +208,33 @@ Rules:
 - A headless skill run fired from the skills deck completes into a result report presented as a tabbed panel or artifact reference; execution feedback is never delivered by silently opening external content.
 - Surface choice is presentation policy and never changes authority: whatever surface displays content, the Orb and dashboard remain read/status projections (invariant 10).
 
+## Dashboard set
+
+The dashboard is a **launcher of views**, not a single page. The initial set is deliberately small — four — and grows by need, never by speculation:
+
+| Dashboard | Job |
+| --- | --- |
+| **Home** | The daily homepage: the idle orb (particle globe with the twin-axis cubes) at the center, summary gadgets at the periphery |
+| **Orb** | The interactive graph takeover, entered from the idle orb |
+| **Ops** | The machine room: sessions monitor, full routines board with staleness states, approval queue, checkpoint/handoff state per device, sync health per data plane |
+| **Studio** | Creative output: generations gallery, artifacts search, micro-app launchers |
+
+Navigation between dashboards is launcher-style tab routing (the tabbed-panel surface). Home shows **summaries and badges**; detail lives in the dedicated dashboard — the summary always precedes the detail.
+
+**Home's proposed default layout** — a proposal, never an imposition (see Gadget system): center — the idle orb, its CTA, and an arc rail of quick-action buttons with badges; left column — Today (large dot-matrix clock, day's calendar, time zones) and micro-app quick links; right column — inbox digest, skills deck (headless runs with in-place progress and result reports), and the routines summary table (fired / next / queued); bottom strip — usage and spend (subscription quota bars, metered token counters) beside the status line (active model, honest handoff state, scope/trust chip, sync stamp).
+
+### Gadget system
+
+Every widget is a **gadget** from a shared catalog, and every dashboard is a user-composed arrangement of them:
+
+- **Picker**: the user chooses which gadgets appear on each dashboard; any gadget can live on any dashboard, or on several at once.
+- **Edit mode**: an explicit editor state where gadgets are added, removed, dragged, and resized on the flexible grid. Leaving edit mode **locks the layout** — in normal use nothing moves accidentally.
+- **Defaults are proposals**: each dashboard ships with an ideal default arrangement (Home's is above); the user's customization always wins, persists per dashboard, and survives updates. Resetting to the proposed default is a single action.
+- Layouts are per-dashboard portable state, versioned like other portable content. Gadget availability follows the same capability probe as everything else: a gadget whose data source the current setup cannot provide renders degraded — never silently removed from the layout.
+
 ## Dashboard widget roster
 
-Peripheral widgets form the modular surface around the Orb. This roster is target direction, not a commitment; every widget obeys the surfaces model above and the projection invariants.
+Peripheral widgets form the modular surface around the Orb. This roster is the initial **gadget catalog** (see Gadget system) — target direction, not a commitment; every gadget obeys the surfaces model above and the projection invariants.
 
 Adapted from prior art:
 
