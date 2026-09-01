@@ -7,8 +7,9 @@ Omnifrons is currently in the design phase. These documents describe target dire
 1. [Target architecture](target-architecture.md) — product boundary, invariants, trust boundaries, components, handoff, memory, and storage.
 2. [Product roadmap](roadmap.md) — maturity stages and evidence required to advance.
 3. [Versioning and compatibility](versioning-and-compatibility.md) — intended public contracts, migration, and support policy.
-4. [ADR index and convention](adr/README.md) — decision status and governance.
-5. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
+4. [Context Orb presentation specification](context-orb.md) — dashboard visual structure, theming, interaction, and usage widgets.
+5. [ADR index and convention](adr/README.md) — decision status and governance.
+6. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
 
 ## Decision status
 
@@ -17,6 +18,7 @@ Omnifrons is currently in the design phase. These documents describe target dire
 | Target architecture | Draft |
 | Roadmap | Draft |
 | Versioning and compatibility | Draft |
+| Context Orb presentation specification | Draft |
 | ADR convention | Draft |
 | ADR-0001: Apache-2.0 license | Accepted |
 | ADR-0002: Desktop technology stack | Proposed |

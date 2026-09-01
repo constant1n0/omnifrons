@@ -1,0 +1,6 @@
+# OS artifacts
+.DS_Store
+
+# Local tooling state (never published)
+.atl/
+.engram/

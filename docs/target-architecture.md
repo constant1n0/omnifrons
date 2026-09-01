@@ -46,6 +46,9 @@ It does not own model inference, provider accounts, hidden reasoning, private ve
 - **Handoff commit:** Disposable Omnifrons-managed Git commit that transports approved in-progress file state without changing user history.
 - **Checkpoint:** Portable task/context envelope; it references but does not replace authoritative artifacts.
 - **Claim:** Verified transition making one handoff current on a receiving device. Publication alone is not a claim.
+- **Startup brief:** The bounded facts-and-references package handed to a harness as startup context after a switch or claim — goal, active project, task state, validations, unresolved risks, and artifact references drawn from the checkpoint. Always untrusted input: it cannot restore approvals, executable profiles, secret references, or permission elevation, and side effects require fresh approval.
+- **Context Catalog:** Metadata registry for the heavy-asset tier: logical identity, relationships, provenance, remote locator, availability, size, and integrity metadata for every asset, local or remote-only. It lets the Orb and diagnostics keep the complete graph visible without pretending remote bytes are local, and it is never the content authority (ADR-0003).
+- **Context Orb (Orb):** The dashboard's central visual: a read/status projection of the knowledge, memory, delivery, and catalog planes showing the active model, skills, memory, context, routines, and applications. Never a persistence, synchronization, or conflict-resolution authority. Presentation is specified in the [Context Orb presentation specification](context-orb.md).
 
 ## Proposed invariants
 

@@ -33,6 +33,7 @@ The initial supported Linux blob path is the official Proton Drive CLI. User-man
 - [Target architecture](docs/target-architecture.md)
 - [Product roadmap](docs/roadmap.md)
 - [Versioning and compatibility](docs/versioning-and-compatibility.md)
+- [Context Orb presentation specification](docs/context-orb.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Product naming and clearance](docs/product-naming.md)
 
