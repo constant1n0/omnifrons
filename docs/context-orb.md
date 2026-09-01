@@ -58,7 +58,7 @@ Validated anchor mapping:
 - **Routines** anchor at 8S/9; **applications** light the flake's outer edge cells at ≈S. The bands stay disjoint by construction: memory ≤ ~0.8S, routines 0.889S, applications S.
 - Connection lines still terminate on **vertices**, never centers, per the registered vertex rule.
 - **Concentric zone guide rings** (skills S/3, domains 2S/3, routines 8S/9, applications S) stay visible over the flake; memory deliberately has no ring — it is territorial.
-- **Whisper budget**: the flake mesh renders as background texture (opacity fading by level) and relation bonds are thin, low-opacity chemistry strokes (single/double/triple = weak/medium/strong, gradient blending both domains' colors); the territories carry the visual weight. The whisper budget is global — multiplying elements divides their per-element presence.
+- **Whisper budget**: the flake mesh renders as background texture (opacity fading by level), and cross-domain relations are an **invisible attraction** — no permanent strokes. A relation materializes as a single gradient hairline only while its topic (or domain) is hovered or dragged, with opacity encoding strength, and while auto-arrange is pulling; at rest, relation strength lives purely in proximity. The whisper budget is global — multiplying elements divides their per-element presence.
 
 Interaction, validated in the study:
 
