@@ -55,9 +55,9 @@ Validated anchor mapping:
 - **Skills** sit on the center cell's boundary vertices (S/3) — the core's immediate surface.
 - **Domains** occupy the six level-1 cell centers (2S/3) — a natural cap of six per view level, free slots rendered as dashed anchors. Domain colors are assigned in **color-wheel order** around the ring (yellow → orange → red → violet → blue → green), so adjacent territories are natural wheel neighbors and cross-territory bond gradients blend rather than clash.
 - **Memory is territorial**: each domain's topics render as its level-2 sub-cells, keeping **five topics per territory** — the outward anchor chain belongs to the domain's routine, never to memory. Notes and dust fill the deeper levels.
-- **Routines** anchor on the outward level-2→3 chain at 26S/27; **applications** sit just beyond the flake's outer edge (≈1.05S) — external capability living literally outside the knowledge boundary. The bands stay disjoint with clear air: memory ≤ ~0.8S, routines 0.963S, applications 1.05S.
+- **Routines** anchor on the outward level-2→3 chain at 26S/27; **applications** sit just beyond the flake's outer edge (≈1.1S) — external capability living literally outside the knowledge boundary. The bands stay disjoint with clear air: memory ≤ ~0.8S, routines 0.963S, applications 1.1S.
 - Connection lines still terminate on **vertices**, never centers, per the registered vertex rule.
-- **Concentric zone guide rings** (skills S/3, domains 2S/3, routines 26S/27, applications ≈1.05S) stay visible over the flake; memory deliberately has no ring — it is territorial.
+- **Concentric zone guide rings** (skills S/3, domains 2S/3, routines 26S/27, applications ≈1.1S) stay visible over the flake; memory deliberately has no ring — it is territorial.
 - **Whisper budget**: the flake mesh renders as background texture (opacity fading by level), and cross-domain relations are an **invisible attraction** — no permanent strokes. A relation materializes as a single gradient hairline only while its topic (or domain) is hovered or dragged, with opacity encoding strength, and while auto-arrange is pulling; at rest, relation strength lives purely in proximity. The whisper budget is global — multiplying elements divides their per-element presence.
 
 Interaction, validated in the study:
