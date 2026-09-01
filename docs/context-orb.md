@@ -34,7 +34,7 @@ The Orb has two visual representations, fixed by the project's motion studies:
 
 **Idle orb (dashboard center).** A particle globe: a cloud of 1–2 px colored dots, clustered by domain color, inside a faint geodesic wireframe sphere with scattered star specks. Idle motion is slow rotation (~1 revolution per ≥8 s) plus per-particle twinkle — there is no measurable scale or position "breathing". At the sphere's heart orbits a **cube of sub-cubes** rotating about its own space diagonal, so its silhouette remains hexagonal: a hexagon is a cube seen along that diagonal, which makes the idle orb the 3-D lift of the hexaflake graph — the cube that is conceptually a sphere (the squaring of the circle). A dot-matrix CTA beneath the globe invites opening the full view.
 
-**Interactive graph view (takeover surface).** Activating the idle orb plays a three-beat transition — particle implosion (~0.5 s, ease-in), hard white flash (~0.1 s), ease-out fade (~0.4 s) — into a full-screen concentric graph drawn over a hexagonal background mesh. From the center outward:
+**Interactive graph view (takeover surface).** Activating the idle orb plays a three-beat transition — particle implosion (~0.5 s, ease-in), hard white flash (~0.1 s), ease-out fade (~0.4 s) — into a full-screen concentric graph drawn over a **violet-black board disc** that bounds the modeled region, textured by the hexagonal background mesh. From the center outward:
 
 | Ring | Name | Content | Color rule |
 | --- | --- | --- | --- |
@@ -73,7 +73,7 @@ The territorial memory model is validated and supersedes ring 3's concentric arc
 
 The Orb scales by aggregation, never by drawing everything:
 
-- A collapsed folder or sub-index renders as a single ringed sphere carrying a **count badge**; expansion is explicit and per-node. On expansion, children emerge from the parent and travel outward along curved links with an ease-out settle (~1–1.5 s), and a confirmation toast names the result ("Expanded ⟨name⟩ · N items"). Bulk expand/collapse operations complement per-node control.
+- A collapsed folder or sub-index renders as a single ringed sphere carrying a **count badge**; expansion is explicit and per-node. On expansion, children emerge from the parent and travel outward along curved links with an ease-out settle (~1–1.5 s), and a confirmation toast names the result ("Expanded ⟨name⟩ · N items"). A second activation collapses the aggregate. Click and drag are disambiguated by a small movement threshold, so aggregates stay draggable like any node. Bulk expand/collapse operations complement per-node control. Validated in the geometry study: each domain territory carries one aggregate standing in for its deepest sub-index.
 - Bubble radii are graduated (roughly a 6:1 range) and **numeric badges appear only above a size threshold** — a size-based label budget. Note labels are a global toggle, not a zoom behavior; layer and domain labels live in world space.
 - Out-of-focus branches desaturate toward the background while the active branch keeps full color.
 
