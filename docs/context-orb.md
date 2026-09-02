@@ -205,17 +205,16 @@ Warm-industrial command-center aesthetic, fixed by the project's design studies.
 - **Outfit** (geometric sans; weights 100–900) for UI text and reading content, with tight negative tracking (−0.2 to −1.5 px) on headings.
 - A monospaced face remains for machine values: identifiers, model names, effort levels, schedule times, and spend counters.
 
-### Accent themes (user preference)
+### Accent themes
 
-The dashboard chrome carries one user-selected accent, independent of the active model's brand color:
+The dashboard chrome accent — buttons, active states, interactive glows — has two modes:
 
-- **Industrial Orange `#FF6B1A`** — default; it reads coherently with Claude as the default model brand.
-- **Volt Yellow** — `#FFF000` or a nearby more fluorescent variant; the exact value is pending per-theme contrast validation, especially on the light/paper theme.
-- Additional curated accents are an open decision; the set stays deliberately small.
+- **Model-follow (default):** the chrome accent is the effective model's brand color — orange under Claude, blue under Gemini, green under ChatGPT — and switches live with the observed model, fallbacks included.
+- **Pinned accent (user preference):** the user fixes a curated accent that no model change overrides: **Industrial Orange `#FF6B1A`** (reads coherently with Claude as the default brand) or **Volt Yellow** (`#FFF000` or a nearby more fluorescent variant; the exact value is pending per-theme contrast validation, especially on the light/paper theme). Additional curated accents are an open decision; the set stays deliberately small.
 
 ### Two theming layers
 
-Base theme (dark/light) and accent are user preferences applied to the dashboard chrome. The `data-model` brand color (see Active model presentation and theming) overlays only model-bound elements: the core, the SKILLS ring, routine markers, and the model selector. Changing the model never changes the user's base theme or accent; changing the accent never obscures which model is active.
+Base theme (dark/light) and accent mode are user preferences applied to the dashboard chrome. The `data-model` brand color (see Active model presentation and theming) overlays the model-bound elements — the core, the SKILLS ring, routine markers, and the model selector — and, in Model-follow mode, drives the chrome accent as well. Changing the model never changes the user's base theme or a pinned accent; in either mode the model-bound elements always carry the brand color, so no accent choice can obscure which model is active.
 
 Widgets around the Orb sit on a flexible grid with 16–24 px gaps and support drag-and-drop repositioning and resizing.
 
