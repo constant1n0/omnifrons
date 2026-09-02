@@ -278,7 +278,7 @@ These are placeholders, not existing files or implemented guarantees.
 | UTA-001 | Update trust architecture | Keys, metadata, freshness, anti-rollback, compromise recovery |
 | MRP-001 | Migration and recovery plan | Upgrade graph, backups, delta recovery, tombstones, restore |
 | GOV-001 | Governance and support matrix | Named roles, approvals, exceptions, evidence, supported combinations |
-| AEC-001 | Adapter and event contract | Capabilities, ordering, at-least-once replay, overflow, terminal states, and PTY byte/control normalization into allowlisted typed actions |
+| AEC-001 | Adapter and event contract | Capabilities, ordering, at-least-once replay, overflow, terminal states, and PTY byte/control normalization into allowlisted typed actions; the feed profile (event catalog and approvals write path) is drafted in [adapter-feed-events](adapter-feed-events.md) |
 | RCS-001 | Renderer content-security contract | Plain/rich/terminal content, CSP, constrained URLs/navigation, OSC clipboard/link/file actions, attachments/downloads, and redacted scrollback/support exports |
 | VOC-001 | Voice interaction contract | Consent, visibility, processing, retention, accessibility, text fallback |
 | VP-001 | Desktop stack verification plan | Pinned multi-OS executable evidence for ADR-0002 |

@@ -336,3 +336,4 @@ Constraints:
 
 - [Target architecture](target-architecture.md) — invariants 10–12, knowledge/memory/delivery planes, switching semantics, secret rules.
 - [ADR-0003](adr/0003-local-markdown-and-tiered-assets.md) — local Markdown, tiered assets, grey remote-only nodes.
+- [Adapter feed event schema](adapter-feed-events.md) — the typed events behind the dashboards, gadgets, and observed-model presentation.
