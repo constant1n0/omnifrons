@@ -16,7 +16,7 @@ This document owns the presentation of the Context Orb and its surrounding dashb
 
 ## Definition
 
-The **Context Orb** (short form: **Orb**) is the central visual of the Omnifrons dashboard. It is a read/status projection that shows, in one place: the active model/harness, available skills, operational memory, canonical knowledge context, scheduled routines, and connected applications.
+The **Context Orb** (short form: **Orb**) is the central visual of the Omnifrons dashboard. It is a read/status projection that shows, in one place: the active model/harness, available skills, operational memory, canonical knowledge context, scheduled routines, and connected applications. What it projects is always the **active context scope** (see Context scopes and agent bindings); one Omnifrons installation can hold several scopes.
 
 The Orb inherits the projection invariants of the target architecture:
 
@@ -138,14 +138,45 @@ The ring 2 domain list is data owned by the knowledge plane, never presentation 
 - **No shipped taxonomy.** Omnifrons ships no predefined domain list. Onboarding proposes an initial set instead: for an existing vault, a small set derived from a content scan; for an empty vault, either no domains (inbox only) or a minimal seed proposed from the user's stated intended use. Proposals become domains only on user approval.
 - **Empty and unfiled states.** A declared domain with no content is not rendered (at most as a dimmed placeholder). Content not yet classified lives in the raw-sources/inbox zone and is surfaced as an explicit unfiled indicator on the Orb, never hidden and never shown as filed (invariant 8).
 
+## Context scopes and agent bindings
+
+The Orb is not the projection of one fixed context: it is a projection **function**. Everything this document specifies renders against the **active context scope**, a first-class entity naming which world is being projected:
+
+- **Knowledge root** — the vault/workspace path whose indexes the projection reads.
+- **Memory binding** — which operational-memory store (an Engram project, or a runtime agent's own memory) feeds retrieval and the memory territories.
+- **Delivery binding** — the delivery-plane surface attached to that root, where one exists.
+- **Agent binding** — which logical agent works in this scope, with its identity class (below) and brand identity.
+- **Layouts** — gadget arrangements are portable state keyed per dashboard *and* per scope; a scope without its own saved layout inherits the dashboard's proposed default.
+
+The single shared context the rest of this document describes is simply the **default shared scope**. Nothing else changes: every invariant, ring rule, and gadget rule applies within whichever scope is active.
+
+Scope rules:
+
+- **A visible scope selector, separate from the model selector.** The model selector answers *who thinks*; the scope selector answers *over which world*. Switching scope replays the standard takeover transition (implosion → flash → fade) into the new scope's graph, and the dashboard re-renders that scope's layouts, feeds, and gadget states.
+- **The projection feed is parameterized by scope.** The deterministic feed — index scoring, memory search, pointer follows — runs against the active scope's knowledge root and memory binding; nothing global is assumed.
+- **Scopes never blend silently.** Data from two scopes never renders in one graph; badges, layouts, and approvals are always attributed to their scope. Cross-scope aggregate views are a deliberate non-goal until specified.
+
+### Agent identity classes and model authority
+
+Who chooses the model depends on the agent's identity class:
+
+- **Harness-bound agents** run under an interactive CLI harness (Claude Code, OpenCode, Codex, and peers). For these, Omnifrons owns model selection: the model switches **for the same agent, over the same scope**, through the checkpoint-and-restart handoff. The agent's personality and active skills are supplied by the scope's context root — pointing the same harness at a different root produces a different specialist, not a different model.
+- **Runtime-managed agents** belong to an external agent runtime (for example OpenClaw) that owns its own model policy — configured model plus fallback chains. Omnifrons **never overrides runtime model policy**: for these scopes the model selector renders read-only and shows the *observed* model instead of offering a switch. Additional runtimes (for example Hermes) receive scope-provider adapters when agents exist there.
+
+### Observed model and runtime identity
+
+- **The core shows the effective model, detected live.** For runtime-managed scopes the adapter reports the model actually in use for the current run — fallbacks included — and the graph core bears that model's mark and brand color exactly as for a harness-bound scope. Configured model and effective model can differ; the Orb shows the effective one, as observation, never as control — the honest-status rule applied to models. When the effective model is unknown or stale, the core says so; it never renders a guessed brand.
+- **The idle globe carries the runtime's identity.** When the active scope is runtime-managed, the Home globe tints its predominant particle coloring toward the runtime's accent (OpenClaw: red family) and displays a clearly visible runtime mark, so the active world is never ambiguous at a glance. Runtime marks follow the same licensed-logo-versus-designed-monogram decision as model marks.
+- Runtime scopes arrive through the same adapter feed as everything else — typed events, signed, replay-protected, idempotent; scope descriptors and observed-model events are part of that feed.
+
 ## Active model presentation and theming
 
 The dashboard always shows which model/harness is active. The default is Claude Code; candidate integrations follow the product boundary in the [README](../README.md).
 
 - The root element carries a `data-model` attribute; changing it swaps the model brand color instantly at the presentation layer (base theme and user accent are separate; see Style system). Reference brand colors: Claude `#D97706`, ChatGPT `#10B981`, Codex `#38BDF8`, Qwen `#8B5CF6`, Gemini `#2563EB`. Additional harnesses (GLM, Kimi, OpenRouter-configured clients, …) receive theme entries when their adapters exist.
-- Switching is requested from a visible selector on the dashboard or a `/switch <model>` command. Either path triggers the checkpoint-and-restart handoff defined in the target architecture; only the visual theme change is instantaneous. The UI must not present a switch as complete while the handoff is `uncertain`.
+- Switching is requested from a visible selector on the dashboard or a `/switch <model>` command. Either path triggers the checkpoint-and-restart handoff defined in the target architecture; only the visual theme change is instantaneous. The UI must not present a switch as complete while the handoff is `uncertain`. Model switching exists only for harness-bound scopes; on a runtime-managed scope the selector is read-only and shows the observed model (see Context scopes and agent bindings).
 - Truthful capability status: harness-native features degrade visibly on switch. For example, Claude-native local routines become disabled/read-only while a non-Claude harness is active; cloud-scheduled routines remain active through the adapter of the selected harness.
-- The logical agent's identity and personality do not change with the model. They are supplied by Omnifrons-owned context, not by any vendor session.
+- The logical agent's identity and personality do not change with the model. They are supplied by the active scope's Omnifrons-owned context root, not by any vendor session.
 - Active does not mean exclusive. Exactly one model is the foreground interactive harness — it drives the conversation surface and the `data-model` theming — while other harnesses may execute concurrently: cloud-scheduled routines, headless skill runs, and background tasks. Concurrent executions are surfaced by the sessions monitor widget with their own harness identity and never inherit the foreground theming. Execution concurrency never weakens the single-writer coordination of portable state defined by the target architecture.
 
 ## Style system
@@ -232,7 +263,7 @@ Every widget is a **gadget** from a shared catalog, and every dashboard is a use
 - **Picker**: the user chooses which gadgets appear on each dashboard; any gadget can live on any dashboard, or on several at once.
 - **Edit mode**: an explicit editor state where gadgets are added, removed, dragged, and resized on the flexible grid. Leaving edit mode **locks the layout** — in normal use nothing moves accidentally.
 - **Defaults are proposals**: each dashboard ships with an ideal default arrangement (Home's is above); the user's customization always wins, persists per dashboard, and survives updates. Resetting to the proposed default is a single action.
-- Layouts are per-dashboard portable state, versioned like other portable content. Gadget availability follows the same capability probe as everything else: a gadget whose data source the current setup cannot provide renders degraded — never silently removed from the layout.
+- Layouts are per-dashboard, per-scope portable state, versioned like other portable content. Gadget availability follows the same capability probe as everything else: a gadget whose data source the current setup cannot provide renders degraded — never silently removed from the layout.
 
 ## Dashboard widget roster
 
@@ -286,6 +317,9 @@ Constraints:
 | Accent theme set beyond Industrial Orange and Volt Yellow; final Volt Yellow value | Open; requires per-theme contrast validation |
 | Connector category taxonomy for ring 5 clustering | Open; derive from the connectors users actually attach |
 | Model marks at the core: licensed logos vs designed monograms | Open; prototypes use monograms |
+| Runtime accent values and runtime marks (OpenClaw red family; mark treatment) | Open; follows the model-marks decision |
+| Observed-model detection contract per runtime (event stream vs polling; staleness threshold) | Open implementation decision; the honest-status rule is fixed |
+| Scope selector placement and cross-scope aggregate views | Open; single-scope rendering is fixed, aggregates are a non-goal until specified |
 | Domain overflow beyond the six-slot wheel (paging, nesting, or merge) | Open |
 | Inner-world recursion beyond one level (topic worlds) | Open; one level validated in the study |
 | Usage-data source per provider (API, local telemetry, manual) | Open implementation decision |
