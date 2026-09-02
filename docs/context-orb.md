@@ -38,7 +38,7 @@ The Orb has two visual representations, fixed by the project's motion studies:
 
 | Ring | Name | Content | Color rule |
 | --- | --- | --- | --- |
-| Core | Context root | Rounded-square node bearing the active-model glyph, wrapped in a bright ring with a soft glow; the vault's root index, labeled below in caps | Active-model brand color |
+| Core | Context root | Rounded-square node bearing the active harness/runtime glyph, wrapped in a bright ring with a soft glow; the vault's root index, labeled below in caps | Effective-model brand color (see Identity mark hierarchy) |
 | 1 | SKILLS | Thin guide ring carrying its zone label set on the ring; skill nodes render as vertical rhombi along it | Active-model brand color |
 | 2 | DOMAINS | Filled circles of equal size with a thin lighter ring, soft glow, and a white line glyph, placed outside the SKILLS ring at irregular angles; labels below in caps (see Domain lifecycle) | One distinct color per domain, assigned at declaration and recorded in the root index |
 | 3 | MEMORY | Concentric arcs of same-color dots per domain sector, dot size growing outward; the arc extent marks the MEMORY boundary | Dots inherit the domain color; connection lines are curved (~1–1.5 px, opaque) and take the child node's color |
@@ -51,7 +51,7 @@ Chosen from the five-candidate geometry study and validated interactively in its
 
 Validated anchor mapping:
 
-- **Core** occupies the flake's center cell and bears the **active model's mark** in its brand color; the brand color also drives the SKILLS ring and the skill rhombi. Prototypes use monograms as stand-ins for the marks.
+- **Core** occupies the flake's center cell and bears the mark of the **execution vehicle** — the harness for harness-bound scopes, the runtime for runtime-managed ones — washed in the **effective model's brand color**; that color also drives the SKILLS ring and the skill rhombi, and the model's own mark rides a secondary position on the core (see Identity mark hierarchy). Prototypes use monograms as stand-ins for the marks.
 - **Skills** sit on the center cell's boundary vertices (S/3) — the core's immediate surface.
 - **Domains** occupy the six level-1 cell centers (2S/3) — a natural cap of six per view level, free slots rendered as dashed anchors. Domain colors are assigned in **color-wheel order** around the ring (yellow → orange → red → violet → blue → green), so adjacent territories are natural wheel neighbors and cross-territory bond gradients blend rather than clash.
 - **Memory is territorial**: each domain's topics render as its level-2 sub-cells, keeping **five topics per territory** — the outward anchor chain belongs to the domain's routine, never to memory. Notes and dust fill the deeper levels.
@@ -165,9 +165,17 @@ Who chooses the model depends on the agent's identity class:
 
 ### Observed model and runtime identity
 
-- **The core shows the effective model, detected live.** For runtime-managed scopes the adapter reports the model actually in use for the current run — fallbacks included — and the graph core bears that model's mark and brand color exactly as for a harness-bound scope. Configured model and effective model can differ; the Orb shows the effective one, as observation, never as control — the honest-status rule applied to models. When the effective model is unknown or stale, the core says so; it never renders a guessed brand.
+- **The core shows the effective model, detected live.** For runtime-managed scopes the adapter reports the model actually in use for the current run — fallbacks included — and the core takes that model's brand color and secondary mark per the identity mark hierarchy, exactly as for a harness-bound scope. Configured model and effective model can differ; the Orb shows the effective one, as observation, never as control — the honest-status rule applied to models. When the effective model is unknown or stale, the core says so; it never renders a guessed brand.
 - **The idle globe carries the runtime's identity.** When the active scope is runtime-managed, the Home globe tints its predominant particle coloring toward the runtime's accent (OpenClaw: red family) and displays a clearly visible runtime mark, so the active world is never ambiguous at a glance. Runtime marks follow the same licensed-logo-versus-designed-monogram decision as model marks.
 - Runtime scopes arrive through the same adapter feed as everything else — typed events, signed, replay-protected, idempotent; scope descriptors and observed-model events are part of that feed.
+
+### Identity mark hierarchy
+
+Two identities coexist at the core, and each has its fixed place:
+
+- **The core glyph is the execution vehicle's mark**: the harness for harness-bound scopes, the runtime for runtime-managed ones. The vehicle is the stable identity of the scope; it holds the center.
+- **The effective model expresses itself through color and a secondary mark**: its brand color washes the model-bound elements (core, SKILLS ring, skill rhombi, model selector), and its own mark rides a secondary, clearly legible position on the core — for example a badge on the core's bright ring. When the effective model changes (a runtime fallback fires, a harness switch completes), color and secondary mark change; the vehicle glyph does not.
+- **Mark fallback policy**: where a licensed logo — model, harness, or runtime — cannot be used, Omnifrons ships an **original designed mark** that is instantly recognizable as referring to that brand, evoking its colorway and silhouette without copying the licensed asset. Recognition at a glance is the acceptance test. Prototypes use monograms as stand-ins throughout.
 
 ## Active model presentation and theming
 
@@ -316,8 +324,8 @@ Constraints:
 | Theme entries for GLM, Kimi, OpenRouter-based harnesses | Open; pending adapter existence |
 | Accent theme set beyond Industrial Orange and Volt Yellow; final Volt Yellow value | Open; requires per-theme contrast validation |
 | Connector category taxonomy for ring 5 clustering | Open; derive from the connectors users actually attach |
-| Model marks at the core: licensed logos vs designed monograms | Open; prototypes use monograms |
-| Runtime accent values and runtime marks (OpenClaw red family; mark treatment) | Open; follows the model-marks decision |
+| Which licensed logos (model, harness, runtime) may be used as-is | Open per mark; the fallback policy is fixed by the Identity mark hierarchy — an original, instantly recognizable designed mark, never a copy |
+| Runtime accent values and runtime marks (OpenClaw red family; mark treatment) | Open; follows the identity-mark fallback policy |
 | Observed-model detection contract per runtime (event stream vs polling; staleness threshold) | Open implementation decision; the honest-status rule is fixed |
 | Scope selector placement and cross-scope aggregate views | Open; single-scope rendering is fixed, aggregates are a non-goal until specified |
 | Domain overflow beyond the six-slot wheel (paging, nesting, or merge) | Open |
