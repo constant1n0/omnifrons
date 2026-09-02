@@ -210,7 +210,7 @@ Warm-industrial command-center aesthetic, fixed by the project's design studies.
 The dashboard chrome accent — buttons, active states, interactive glows — has two modes:
 
 - **Model-follow (default):** the chrome accent is the effective model's brand color — orange under Claude, blue under Gemini, green under ChatGPT — and switches live with the observed model, fallbacks included.
-- **Pinned accent (user preference):** the user fixes any accent color they choose, and no model change overrides it. Curated presets are offered — **Industrial Orange `#FF6B1A`** (reads coherently with Claude as the default brand) and **Volt Yellow** (`#FFF000` or a nearby more fluorescent variant; exact value pending per-theme contrast validation) — alongside a free custom color. Any pinned value passes the same per-theme contrast validation on both base themes; a failing choice is flagged, never silently corrected.
+- **Pinned accent (user preference):** the user fixes one accent from a **curated palette**, and no model change overrides it. Every palette member is project-approved: it holds the warm-industrial aesthetic and passes contrast validation on both base themes before admission — there is no free color picker. Current members: **Industrial Orange `#FF6B1A`** (reads coherently with Claude as the default brand) and **Volt Yellow** (`#FFF000` or a nearby more fluorescent variant; exact value pending per-theme contrast validation). The palette grows by curation, never by request volume.
 
 ### Two theming layers
 
@@ -321,7 +321,7 @@ Constraints:
 | --- | --- |
 | Onboarding domain-proposal flow (content-scan heuristics, intended-use questions, proposal UX) | Open implementation decision; constrained by the Domain lifecycle section |
 | Theme entries for GLM, Kimi, OpenRouter-based harnesses | Open; pending adapter existence |
-| Final Volt Yellow value; contrast-validation thresholds for custom pinned accents | Open; requires per-theme contrast validation |
+| Curated accent palette beyond Industrial Orange and Volt Yellow; final Volt Yellow value | Open; every candidate requires aesthetic approval and per-theme contrast validation |
 | Connector category taxonomy for ring 5 clustering | Open; derive from the connectors users actually attach |
 | Which licensed logos (model, harness, runtime) may be used as-is | Open per mark; the fallback policy is fixed by the Identity mark hierarchy — an original, instantly recognizable designed mark, never a copy |
 | Runtime accent values and runtime marks (OpenClaw red family; mark treatment) | Open; follows the identity-mark fallback policy |
