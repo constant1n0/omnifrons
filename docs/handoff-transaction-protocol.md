@@ -272,7 +272,7 @@ Each requirement is an acceptance gate with a testable condition.
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) — writer epochs, compare-and-set claim records, fencing of workspace writers, divergence detection and recovery, and the RSP-001-R9 watermark gate.
 - [Adapter feed event schema](adapter-feed-events.md) — the `handoff.state` wire event and the producer identity/signing primitive (AEC-001 feed profile).
 - [Threat model](threat-model.md) (TM-001) — the attacker model that gates automatic claim; drafted, acceptance pending.
-- Migration and recovery plan (MRP-001) — backup, restore, and cutover sagas; not yet drafted.
+- [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001) — backup, restore, and cutover sagas; drafted, acceptance pending.
 - Update trust architecture (UTA-001) — key rotation and compromise recovery for product updates, distinct from device-level producer identity; not yet drafted.
 - [Context Orb specification](context-orb.md) — the checkpoint/handoff gadget and status line presentation of handoff state.
 - [Versioning and compatibility](versioning-and-compatibility.md) — the checkpoint/handoff envelope version domain and the public state vocabulary.

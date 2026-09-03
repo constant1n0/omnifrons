@@ -149,7 +149,7 @@ Automatic snapshot rollback is allowed only when Omnifrons proves that **no auth
 
 Every authoritative write after the upgrade commit is journaled or exported into a recovery delta, including remotely received or background mutations. If any such write exists—or the absence of writes cannot be proven—Omnifrons stops snapshot rollback and requires delta-preserving reconciliation. Destructive recovery requires preview and explicit consent.
 
-The planned migration/recovery artifact owns cutover sagas, backup verification, binary retention, tombstones, restore epochs, and Engram authority migration.
+The planned migration/recovery artifact ([migration-and-recovery-plan](migration-and-recovery-plan.md), MRP-001) owns the artifact formats the cutover checklist references (the checklist itself is the RSP-001 core's), backup verification, binary retention, tombstones, restore epochs, and Engram authority migration.
 
 ## Update trust
 

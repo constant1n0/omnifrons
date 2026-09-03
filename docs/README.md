@@ -10,10 +10,11 @@ Omnifrons is currently in the design phase. These documents describe target dire
 4. [Context Orb presentation specification](context-orb.md) — dashboard visual structure, theming, interaction, and usage widgets.
 5. [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) — memory-plane continuity across devices, sync profiles, watermarks, and observable replication.
 6. [Workspace roaming protocol](workspace-roaming-protocol.md) — writer epochs, claim records, fencing, divergence, recovery, and the Git Sync to Cloud cutover (RSP-001 core).
-7. [Handoff transaction protocol](handoff-transaction-protocol.md) — the handoff lifecycle, state vector, claim, authenticity, and cleanup.
-8. [Threat model](threat-model.md) — attacker classes, protected assets, trust boundaries, and the harness/Git/remote-content/secrets/process/prompt-injection threat catalog.
-9. [ADR index and convention](adr/README.md) — decision status and governance.
-10. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
+7. [Migration and recovery plan](migration-and-recovery-plan.md) — upgrade graph, backups, delta recovery, tombstones, and restore epochs (MRP-001).
+8. [Handoff transaction protocol](handoff-transaction-protocol.md) — the handoff lifecycle, state vector, claim, authenticity, and cleanup.
+9. [Threat model](threat-model.md) — attacker classes, protected assets, trust boundaries, and the harness/Git/remote-content/secrets/process/prompt-injection threat catalog.
+10. [ADR index and convention](adr/README.md) — decision status and governance.
+11. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
 
 ## Decision status
 
@@ -25,6 +26,7 @@ Omnifrons is currently in the design phase. These documents describe target dire
 | Context Orb presentation specification | Draft |
 | Workspace roaming and Engram sync protocol (RSP-001) | Draft |
 | Workspace roaming protocol (RSP-001 core) | Draft |
+| Migration and recovery plan (MRP-001) | Draft |
 | Handoff transaction protocol (HTP-001) | Draft |
 | Threat model (TM-001) | Draft |
 | ADR convention | Draft |
