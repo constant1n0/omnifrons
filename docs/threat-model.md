@@ -17,7 +17,7 @@ This document drafts the planned threat model (TM-001): the attacker classes and
 
 This draft does not redefine work already owned elsewhere:
 
-- **RCS-001** owns renderer content-security mechanics — sanitization, CSP, constrained navigation, OSC allowlisting. TM-001 states the threat and the boundary RCS-001 enforces; it does not restate RCS-001's mechanism.
+- **[RCS-001](renderer-content-security.md)** owns renderer content-security mechanics — sanitization, CSP, constrained navigation, OSC allowlisting. TM-001 states the threat and the boundary RCS-001 enforces; it does not restate RCS-001's mechanism.
 - **AEC-001** owns typed actions, the producer identity/signing primitive, and the approvals write path (drafted in part by [adapter-feed-events.md](adapter-feed-events.md)). TM-001 defines the attacker model that primitive is evaluated against.
 - **UTA-001** owns update trust: keys, metadata, freshness, anti-rollback, and compromise recovery for the product's own updates — not for harness or adapter distribution, which TM-001 mitigates only through re-approval (HAR-3; actor A10).
 - **HTP-001** owns the handoff lifecycle, state vector, and claim protocol; it consumes TM-001's attacker model to gate automatic claim ([HTP-001-R5, R9, R10](handoff-transaction-protocol.md)).
@@ -314,7 +314,7 @@ Debt, not drafted here. This document does not evaluate a public adapter SDK, a 
 - [Handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001) — the attacker model this document supplies gates automatic claim (R5, R9, R10).
 - [Adapter feed event schema](adapter-feed-events.md) — producer identity, the `untrusted` verdict, and the approvals write path this document's attacker model is evaluated against.
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) (RSP-001) — credential custody, `<private>` spans, and secret-detection heuristics (D6) this document assumes.
-- Renderer content-security contract (RCS-001) — plain/rich/terminal content mechanics; not yet drafted.
+- [Renderer content-security contract](renderer-content-security.md) (RCS-001) — plain/rich/terminal content mechanics; drafted, acceptance pending.
 - Update trust architecture (UTA-001) — key rotation and compromise recovery for product updates; not yet drafted.
 - Governance and support matrix (GOV-001) — named roles, approvals, and exceptions this document assumes; not yet drafted.
 - [Context Orb specification](context-orb.md) — the scope/trust indicator and honest-status presentation of the states this document names.
