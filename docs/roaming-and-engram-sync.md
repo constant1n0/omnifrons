@@ -13,7 +13,7 @@
 
 ## Document authority
 
-This document drafts the **memory synchronization profile** of the planned workspace roaming and Engram sync protocol (RSP-001): how the memory plane stays continuous across devices under each supported Engram sync profile, what a device may truthfully claim about its memory, and which product behaviors make that claim observable. Workspace writer coordination — writer epochs, compare-and-set claim records, fencing of workspace writers, divergence detection, and recovery — and the Git Sync to Cloud cutover remain owned by RSP-001 itself and are listed under follow-up. The [target architecture](target-architecture.md) governs any conflict; the handoff lifecycle and state vector remain owned by the handoff transaction protocol (HTP-001); presentation is owned by the [Context Orb specification](context-orb.md).
+This document drafts the **memory synchronization profile** of the planned workspace roaming and Engram sync protocol (RSP-001): how the memory plane stays continuous across devices under each supported Engram sync profile, what a device may truthfully claim about its memory, and which product behaviors make that claim observable. Workspace writer coordination — writer epochs, compare-and-set claim records, fencing of workspace writers, divergence detection, and recovery — and the Git Sync to Cloud cutover remain owned by RSP-001 itself and are listed under follow-up. The [target architecture](target-architecture.md) governs any conflict; the handoff lifecycle and state vector remain owned by the [handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001); presentation is owned by the [Context Orb specification](context-orb.md).
 
 ## Purpose and scope
 
@@ -238,7 +238,7 @@ RSP-001 depends on Engram runtime behavior that changes between releases. A late
 
 - [Target architecture](target-architecture.md) — Engram authority, handoff state vector, required failure states, planned artifacts.
 - [Adapter feed event schema](adapter-feed-events.md) — `sync.state` and `handoff.state` events (AEC-001 feed profile).
-- Handoff transaction protocol (HTP-001) — the lifecycle and state vector the watermark gate attaches to.
+- [Handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001) — the lifecycle and state vector the watermark gate attaches to.
 - [ADR-0002](adr/0002-desktop-technology-stack.md), Engram subsection — supported contracts and credential custody.
 - [ADR-0003](adr/0003-local-markdown-and-tiered-assets.md) — knowledge-plane locality, out of scope here.
 - [Versioning and compatibility](versioning-and-compatibility.md) — public synchronization states and Engram runtime compatibility.

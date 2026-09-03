@@ -91,7 +91,7 @@ Payload: executor identity, schedule or interval, skip-empty-tick policy, delibe
 
 ### Handoff and sync
 
-`handoff.state` — handoff identity, state per the handoff transaction protocol (HTP-001), device references. `uncertain` is carried verbatim and never masked.
+`handoff.state` — handoff identity, state per the [handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001), device references. `uncertain` is carried verbatim and never masked.
 
 `sync.state` — data plane (`knowledge` | `memory` | `delivery`), control-plane instance identity and role, replication and authority state. Multiple instances per plane are modeled first-class; a single authority is never assumed.
 
