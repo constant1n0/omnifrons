@@ -128,6 +128,10 @@ Each release pins exact test evidence and separately states minimum supported ve
 
 The planned desktop verification plan records exact build numbers, architectures, runtime versions, assistive technology, and test dates. “Latest” is not reproducible evidence.
 
+### Engram runtime compatibility
+
+Each Omnifrons release declares the Engram version range it supports; the range is a support-matrix promise, not a detection result. Behavior verified against a specific Engram version is labelled with that version in the release evidence, and the [memory synchronization profile](roaming-and-engram-sync.md) records the version its statements were checked against. A newer Engram release is `detected`, not `supported`, until that profile is re-validated against it; memory continuity read through an unvalidated release is reported as `uncertain`. A breaking upstream change — a removed or changed CLI/API surface, a new mutation state, or a schema change behind a supported surface — requires a compatibility note in the release notes under support changes. Version-dependent Engram behavior is isolated behind one adapter so that a range change never spreads through product code.
+
 ## Migration and upgrade graph
 
 Every release publishes a directed graph of accepted source-state versions and whether each edge is direct or stepped.
