@@ -325,7 +325,7 @@ Constraints:
 | Connector category taxonomy for ring 5 clustering | Open; derive from the connectors users actually attach |
 | Which licensed logos (model, harness, runtime) may be used as-is | Open per mark; the fallback policy is fixed by the Identity mark hierarchy — an original, instantly recognizable designed mark, never a copy |
 | Runtime accent values and runtime marks (OpenClaw red family; mark treatment) | Open; follows the identity-mark fallback policy |
-| Observed-model detection contract per runtime (event stream vs polling; staleness threshold) | Open implementation decision; the honest-status rule is fixed |
+| Observed-model detection contract per runtime (event stream vs polling; staleness threshold) | Open implementation decision; the honest-status rule is fixed; threshold proposed in the AEC-001 feed profile: 2 × declared observation interval, default 15 minutes |
 | Scope selector placement and cross-scope aggregate views | Open; single-scope rendering is fixed, aggregates are a non-goal until specified |
 | Domain overflow beyond the six-slot wheel (paging, nesting, or merge) | Open |
 | Inner-world recursion beyond one level (topic worlds) | Open; one level validated in the study |
