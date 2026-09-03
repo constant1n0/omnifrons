@@ -15,8 +15,9 @@ Omnifrons is currently in the design phase. These documents describe target dire
 9. [Handoff transaction protocol](handoff-transaction-protocol.md) — the handoff lifecycle, state vector, claim, authenticity, and cleanup.
 10. [Threat model](threat-model.md) — attacker classes, protected assets, trust boundaries, and the harness/Git/remote-content/secrets/process/prompt-injection threat catalog.
 11. [Renderer content-security contract](renderer-content-security.md) — content classes, sanitization, CSP, navigation, terminal control policy, clipboard, attachments and downloads, and redacted exports (RCS-001).
-12. [ADR index and convention](adr/README.md) — decision status and governance.
-13. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
+12. [Update trust architecture](update-trust-architecture.md) — trust roots and online roles, release metadata, freshness, anti-rollback, platform signing, compromise recovery, and app bundle signing (UTA-001).
+13. [ADR index and convention](adr/README.md) — decision status and governance.
+14. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
 
 ## Decision status
 
@@ -33,10 +34,12 @@ Omnifrons is currently in the design phase. These documents describe target dire
 | Handoff transaction protocol (HTP-001) | Draft |
 | Threat model (TM-001) | Draft |
 | Renderer content-security contract (RCS-001) | Draft |
+| Update trust architecture (UTA-001) | Draft |
 | ADR convention | Draft |
 | ADR-0001: Apache-2.0 license | Accepted |
 | ADR-0002: Desktop technology stack | Proposed |
 | ADR-0003: Local Markdown and tiered assets | Accepted |
+| ADR-0004: Fully open platform and custom integrated apps | Accepted |
 | Product name: Omnifrons | Selected; formal trademark clearance pending |
 
 Unreconciled early visual and generic-wrapper notes are historical inputs, not current architecture. They should be restored only with explicit status and reconciliation rather than silently mixed into this baseline.

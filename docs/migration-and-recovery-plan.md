@@ -346,6 +346,7 @@ The public vocabulary column uses the states in the [compatibility policy](versi
 - [Handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001) — the state vector this document's recovery point is deliberately distinct from.
 - [Threat model](threat-model.md) (TM-001) — the stolen-device warning (SEC-5, D6) this document's local-backup encryption posture cites; invariant 9's restored-authority boundary; the secret-detection "cannot prove absence" caveat (SEC-3) the memory-plane backup inherits; and actor entries A5/A8, cross-referenced by the restore-epoch log's seed-digest recording.
 - [Adapter feed event schema](adapter-feed-events.md) (AEC-001) — the `sync.state` event this document's restore-epoch announcement extends.
+- [Update trust architecture](update-trust-architecture.md) (UTA-001) — decides whether a binary is trusted; MRP-001 decides when it may migrate; drafted, acceptance pending.
 - [ADR-0003: Local Markdown and tiered heavy assets](adr/0003-local-markdown-and-tiered-assets.md) — the knowledge vault's always-local guarantee and the heavy-asset tier this document's best-effort backup (D10) covers.
 - [ADR-0002: Desktop technology stack](adr/0002-desktop-technology-stack.md) — Git executed through explicit argv and isolated temporary state, the mechanism workspace backups rely on.
 - [Product roadmap](roadmap.md) — the Alpha stage's backup and migration-fixture scope items, the Beta stage's controlled-migration and guided-recovery scope items, and the Alpha → Beta gate that names this plan directly as required evidence.

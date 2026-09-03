@@ -335,7 +335,7 @@ Debt, not drafted here. This document does not specify the exact sanitizer libra
 - [Versioning and compatibility](versioning-and-compatibility.md) — the public state vocabulary this document's Signal mapping reuses, and the compatibility surface open decision D9 would extend.
 - [Product roadmap](roadmap.md) — the Alpha renderer content-security baseline and the Alpha → Beta renderer-content review gate this document's acceptance satisfies.
 - Voice interaction contract (VOC-001) — accessibility text fallback and reading order this document's sanitization rule (RCS-001-R18) defers to; not yet drafted.
-- Update trust architecture (UTA-001) — key rotation and compromise recovery for the product's own updates, distinct from and unrelated to rendered content; not yet drafted.
+- [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for the product's own updates, distinct from and unrelated to rendered content; drafted, acceptance pending.
 - Governance and support matrix (GOV-001) — named roles and approval authority this document assumes without redefining; not yet drafted.
 
 ## References

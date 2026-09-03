@@ -315,7 +315,7 @@ Debt, not drafted here. This document does not evaluate a public adapter SDK, a 
 - [Adapter feed event schema](adapter-feed-events.md) — producer identity, the `untrusted` verdict, and the approvals write path this document's attacker model is evaluated against.
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) (RSP-001) — credential custody, `<private>` spans, and secret-detection heuristics (D6) this document assumes.
 - [Renderer content-security contract](renderer-content-security.md) (RCS-001) — plain/rich/terminal content mechanics; drafted, acceptance pending.
-- Update trust architecture (UTA-001) — key rotation and compromise recovery for product updates; not yet drafted.
+- [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for product updates; drafted, acceptance pending.
 - Governance and support matrix (GOV-001) — named roles, approvals, and exceptions this document assumes; not yet drafted.
 - [Context Orb specification](context-orb.md) — the scope/trust indicator and honest-status presentation of the states this document names.
 - [Product roadmap](roadmap.md) — the Alpha → Beta promotion gate this document's acceptance satisfies.

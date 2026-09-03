@@ -273,7 +273,7 @@ Each requirement is an acceptance gate with a testable condition.
 - [Adapter feed event schema](adapter-feed-events.md) — the `handoff.state` wire event and the producer identity/signing primitive (AEC-001 feed profile).
 - [Threat model](threat-model.md) (TM-001) — the attacker model that gates automatic claim; drafted, acceptance pending.
 - [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001) — backup, restore, and cutover sagas; drafted, acceptance pending.
-- Update trust architecture (UTA-001) — key rotation and compromise recovery for product updates, distinct from device-level producer identity; not yet drafted.
+- [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for product updates, distinct from device-level producer identity; drafted, acceptance pending.
 - [Context Orb specification](context-orb.md) — the checkpoint/handoff gadget and status line presentation of handoff state.
 - [Versioning and compatibility](versioning-and-compatibility.md) — the checkpoint/handoff envelope version domain and the public state vocabulary.
 - [ADR-0002](adr/0002-desktop-technology-stack.md) — device-local executable approval and handoff commits created through isolated temporary state.
