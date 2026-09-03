@@ -135,7 +135,7 @@ Status: proposed in this draft; decided by the owner.
 
 ## Producer identity and key distribution
 
-This corrects the open question's current pointer: producer identity does not ride the update trust architecture (UTA-001). UTA-001 owns software update trust — keys, metadata, freshness, anti-rollback, and compromise recovery for the product's own updates, per the target architecture's planned artifacts. A producer's identity is adapter identity, already governed by [ADR-0002](adr/0002-desktop-technology-stack.md)'s device-local executable approval, which binds identity evidence — digest/signature, version, adapter, transport, plugin inventory, security-relevant configuration — at approval time. The threat model (TM-001) owns the attacker model this identity is evaluated against.
+This corrects the open question's current pointer: producer identity does not ride the update trust architecture (UTA-001). UTA-001 owns software update trust — keys, metadata, freshness, anti-rollback, and compromise recovery for the product's own updates, per the target architecture's planned artifacts. A producer's identity is adapter identity, already governed by [ADR-0002](adr/0002-desktop-technology-stack.md)'s device-local executable approval, which binds identity evidence — digest/signature, version, adapter, transport, plugin inventory, security-relevant configuration — at approval time. The [threat model](threat-model.md) (TM-001) owns the attacker model this identity is evaluated against.
 
 First contact is pairing. When a producer — an adapter instance — is approved on a device, the device records the producer's public key fingerprint as part of that same device-local approval and shows it to the user at approval time: trust on first use with an explicit approval, in the style of a known-hosts entry. Keys are scoped per `producer_instance`; a producer running on several hosts has several instances and a fingerprint for each.
 
@@ -191,5 +191,5 @@ A consumer bootstraps from a **snapshot**: current scope descriptors, executor d
 - [Target architecture](target-architecture.md) — AEC-001 scope, transport and events, required failure states, portable references.
 - [Context Orb specification](context-orb.md) — fleet health semantics, dashboard set, context scopes, observed model.
 - [ADR-0002](adr/0002-desktop-technology-stack.md) — device-local executable approval and the identity evidence it binds, which governs producer identity.
-- Threat model (TM-001) — the planned artifact owning the attacker model producer verification is evaluated against; see [target architecture](target-architecture.md), planned assurance artifacts.
+- [Threat model](threat-model.md) (TM-001) — the planned artifact owning the attacker model producer verification is evaluated against; see [target architecture](target-architecture.md), planned assurance artifacts.
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) — D1's 15-minute continuous-posture staleness threshold, reused here as the default observation horizon.

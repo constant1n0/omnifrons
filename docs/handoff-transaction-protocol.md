@@ -19,7 +19,7 @@ This draft does not redefine work already owned elsewhere:
 
 - **RSP-001** owns writer epochs, compare-and-set claim records, fencing of workspace writers, divergence detection and recovery, and memory-plane watermarks/continuity. HTP-001 consumes the writer epoch as a component of handoff identity and consumes RSP-001-R9's watermark gate result; it defines the handoff-level *release* obligation of the source device and the hook by which a post-claim source mutation becomes `forked`, but the fencing mechanism itself stays in RSP-001. Until RSP-001 drafts compare-and-set claim records, a claim record's `source_release` field carries `unreleased-unfenced` as an explicit, visible condition — never an implied guarantee.
 - **AEC-001** owns the wire event `handoff.state` and the producer identity/signing primitive. HTP-001 defines which values are valid in that event and adopts the producer identity primitive at device level (see Authenticity and replay).
-- **TM-001** owns the attacker model. Until it is accepted, automatic claim stays blocked and manual claim shows the device fingerprint.
+- **[TM-001](threat-model.md)** owns the attacker model. Until it is accepted, automatic claim stays blocked and manual claim shows the device fingerprint.
 - **MRP-001** owns migration, backup, and restore. **UTA-001** owns update trust. **[context-orb.md](context-orb.md)** owns presentation.
 - The same-device model/harness switch described in the target architecture's Model and harness switching section is the degenerate case of this protocol — source and receiver are one device, transport is local. HTP-001 does not change that flow; it frames it.
 
@@ -271,7 +271,7 @@ Each requirement is an acceptance gate with a testable condition.
 - [Target architecture](target-architecture.md) — the Handoff transaction section, invariants 7 and 9, required failure states, and planned artifacts.
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) — writer epochs, compare-and-set claim records, fencing of workspace writers, divergence detection and recovery, and the RSP-001-R9 watermark gate.
 - [Adapter feed event schema](adapter-feed-events.md) — the `handoff.state` wire event and the producer identity/signing primitive (AEC-001 feed profile).
-- Threat model (TM-001) — the attacker model that gates automatic claim; not yet drafted.
+- [Threat model](threat-model.md) (TM-001) — the attacker model that gates automatic claim; drafted, acceptance pending.
 - Migration and recovery plan (MRP-001) — backup, restore, and cutover sagas; not yet drafted.
 - Update trust architecture (UTA-001) — key rotation and compromise recovery for product updates, distinct from device-level producer identity; not yet drafted.
 - [Context Orb specification](context-orb.md) — the checkpoint/handoff gadget and status line presentation of handoff state.
