@@ -273,7 +273,7 @@ These are placeholders, not existing files or implemented guarantees.
 | ID | Planned artifact | Intended ownership |
 | --- | --- | --- |
 | HTP-001 | Handoff transaction protocol | Saga, state vector, authenticity, replay, claim, cleanup; the lifecycle, state vector, claim, authenticity, and cleanup protocol is drafted in [handoff-transaction-protocol](handoff-transaction-protocol.md) |
-| RSP-001 | Workspace roaming and Engram sync protocol | Epochs, fencing, authority detection, privacy inventory, cutover; the memory synchronization profile (Git Sync and Cloud continuity, watermarks, and product requirements) is drafted in [roaming-and-engram-sync](roaming-and-engram-sync.md) |
+| RSP-001 | Workspace roaming and Engram sync protocol | Epochs, fencing, authority detection, privacy inventory, cutover; the memory synchronization profile (Git Sync and Cloud continuity, watermarks, and product requirements) is drafted in [roaming-and-engram-sync](roaming-and-engram-sync.md); writer coordination and the cutover are drafted in [workspace-roaming-protocol](workspace-roaming-protocol.md) |
 | TM-001 | Threat model | Harness, Git, remote content, secrets, process, prompt injection; the attacker model, trust boundaries, Git classification policy, and acceptance evidence are drafted in [threat-model](threat-model.md) |
 | UTA-001 | Update trust architecture | Keys, metadata, freshness, anti-rollback, compromise recovery |
 | MRP-001 | Migration and recovery plan | Upgrade graph, backups, delta recovery, tombstones, restore |
