@@ -306,6 +306,7 @@ D1 through D4 are process questions this document can answer for itself at accep
 - [ADR-0004: Fully open platform with custom integrated apps](adr/0004-open-platform-and-custom-apps.md) — the self-approval disclosure this document generalizes into a requirement.
 - [ADR-0002: Desktop technology stack](adr/0002-desktop-technology-stack.md) — a currently Proposed decision the status workflow above applies to directly, pending its own acceptance gate.
 - [Desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001) — the exception-registry mechanics, evidence-retention rule, and approval-record schema this document owns and VP-001 borrows rather than redefines; drafted, acceptance pending.
+- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — the Security Reviewer and Legal Counsel advice GOV-001-R4 requires before voice ships, and the frozen planned-assurance-artifacts table VOC-001's own registry entry sits in; drafted, acceptance pending.
 
 ## References
 

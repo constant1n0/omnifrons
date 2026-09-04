@@ -318,6 +318,7 @@ Debt, not drafted here. This document does not evaluate a public adapter SDK, a 
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for product updates; drafted, acceptance pending.
 - [Governance](governance.md) (GOV-001) — named roles, approvals, and exceptions this document assumes; drafted, acceptance pending.
 - [Desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001) — the per-OS containment proof (PRC-1..5, TM-001-R9) this document's threat catalog names but does not itself execute; drafted, acceptance pending.
+- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — proposes the ambient-voice asset, actor, and prompt-injection-source additions this document's own debt note (Acceptance evidence and follow-up, above) requires before voice ships; drafted, acceptance pending.
 - [Context Orb specification](context-orb.md) — the scope/trust indicator and honest-status presentation of the states this document names.
 - [Product roadmap](roadmap.md) — the Alpha → Beta promotion gate this document's acceptance satisfies.
 

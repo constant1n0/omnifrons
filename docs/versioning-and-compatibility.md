@@ -92,7 +92,7 @@ Stable text behavior covers input ownership, approval visibility, cancellation, 
 - complete text fallback when voice is denied, unavailable, or fails;
 - persisted voice preferences and their migration.
 
-Recognition quality, voice availability, latency, and provider-specific retention remain external characteristics unless the support matrix explicitly promises them. The planned voice contract owns the detailed protocol and tests.
+Recognition quality, voice availability, latency, and provider-specific retention remain external characteristics unless the support matrix explicitly promises them. [The planned voice contract](voice-interaction-contract.md) owns the detailed protocol and tests.
 
 ### Persisted UI state
 

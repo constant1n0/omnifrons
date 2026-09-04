@@ -242,7 +242,7 @@ RSP-001 depends on Engram runtime behavior that changes between releases. A late
 - [ADR-0002](adr/0002-desktop-technology-stack.md), Engram subsection — supported contracts and credential custody.
 - [ADR-0003](adr/0003-local-markdown-and-tiered-assets.md) — knowledge-plane locality, out of scope here.
 - [Versioning and compatibility](versioning-and-compatibility.md) — public synchronization states and Engram runtime compatibility.
-- Voice interaction contract (VOC-001) — a spoken staleness warning or sync proposal follows the same proposal-only and text-fallback rules.
+- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — a spoken staleness warning or sync proposal follows the same proposal-only and text-fallback rules; drafted, acceptance pending.
 - [Governance](governance.md) (GOV-001) — roles, approvals, exceptions, and evidence retention this document's acceptance relies on; drafted, acceptance pending.
 
 ## References

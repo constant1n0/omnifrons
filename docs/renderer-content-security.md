@@ -21,7 +21,7 @@ This draft does not redefine work already owned elsewhere:
 - **[TM-001](threat-model.md)** owns the attacker model — actor classes, trust boundaries, and residual risk. RCS-001 enforces the boundary TM-001 states as B1 (renderer ↔ core) and supplies the mitigation TM-001's CNT-1..6, HAR-5, and PRC-2 threats credit.
 - **AEC-001** (feed profile) owns the approvals write path; **[TM-001](threat-model.md)-R7, HAR-6, and INJ-3** own what an approval surface must display. RCS-001 does not restate either requirement — it guarantees only that no rendered content can appear inside an approval surface, and that no terminal pane hosts one, as if it were part of it.
 - **[context-orb.md](context-orb.md)** owns presentation and layout — how a reader panel, terminal frame, or entity card is composed on screen. RCS-001 owns what content class each surface is permitted to hold and what that content is permitted to do.
-- **VOC-001** owns voice interaction and accessibility text fallback generally. RCS-001 guarantees only that sanitization never removes textual content or reading order.
+- **[VOC-001](voice-interaction-contract.md)** owns voice interaction and accessibility text fallback generally. RCS-001 guarantees only that sanitization never removes textual content or reading order.
 - **UTA-001** owns update trust for the product's own binary; unrelated to rendered content.
 - **[ADR-0002](adr/0002-desktop-technology-stack.md)** owns the desktop stack decision. RCS-001 is the "renderer-content review" its acceptance evidence (#2) names.
 - **[ADR-0004](adr/0004-open-platform-and-custom-apps.md)** owns the third-party app distribution and monetization decision. RCS-001 states the content-security constraints a custom app must respect (ADR-0004, Costs and limits).
@@ -51,7 +51,7 @@ Out of scope:
 - the attacker model, trust boundaries, and residual risk — TM-001;
 - the approvals write path and what an approval surface must display — AEC-001; TM-001-R7;
 - presentation and layout of any surface this document constrains — [context-orb.md](context-orb.md);
-- voice interaction and accessibility text fallback generally — VOC-001;
+- voice interaction and accessibility text fallback generally — [VOC-001](voice-interaction-contract.md);
 - update trust for the product's own binary — UTA-001;
 - the desktop stack decision itself — [ADR-0002](adr/0002-desktop-technology-stack.md).
 
@@ -231,9 +231,9 @@ A third-party app declares which content classes it renders and receives no rela
 
 An app's own code is bundled and hashed by the product at install time (ADR-0004; signing per UTA-001 once accepted), the same treatment `script-src 'self'` requires of the core renderer's scripts — an app never ships script the CSP baseline would not already admit from the core. An app MUST NOT open a browser window, a webview, or any browsing context outside the renderer policy this document states; every surface an app presents, including one it spawns itself, inherits the CSP baseline and navigation rules with no exception (extends RCS-001-R17).
 
-Sanitization never removes textual content: plain-text fallback and reading order are always preserved, regardless of content class or the app rendering it. VOC-001 owns voice and text-fallback behavior generally; alt text is text, and this document sanitizes it like any other text rather than stripping it as markup. A sanitizer that strips a disallowed element MUST preserve that element's own text content in reading-order position rather than discarding the whole node — the allowlist governs structure and interactivity, never the words themselves.
+Sanitization never removes textual content: plain-text fallback and reading order are always preserved, regardless of content class or the app rendering it. [VOC-001](voice-interaction-contract.md) owns voice and text-fallback behavior generally; alt text is text, and this document sanitizes it like any other text rather than stripping it as markup. A sanitizer that strips a disallowed element MUST preserve that element's own text content in reading-order position rather than discarding the whole node — the allowlist governs structure and interactivity, never the words themselves.
 
-Where VOC-001 defines voice output reading from rendered content, it reads the same sanitized, reading-order-preserved text this document guarantees exists; VOC-001 does not receive raw markup, an unstripped attribute, or a terminal escape sequence as an input to synthesize.
+Where [VOC-001](voice-interaction-contract.md) defines voice output reading from rendered content, it reads the same sanitized, reading-order-preserved text this document guarantees exists; VOC-001 does not receive raw markup, an unstripped attribute, or a terminal escape sequence as an input to synthesize.
 
 ## Product requirements
 
@@ -334,7 +334,7 @@ Debt, not drafted here. This document does not specify the exact sanitizer libra
 - [Context Orb specification](context-orb.md) — the reader panel, terminal frame, entity card, and external-launch presentation this document's content classes and navigation rules constrain.
 - [Versioning and compatibility](versioning-and-compatibility.md) — the public state vocabulary this document's Signal mapping reuses, and the compatibility surface open decision D9 would extend.
 - [Product roadmap](roadmap.md) — the Alpha renderer content-security baseline and the Alpha → Beta renderer-content review gate this document's acceptance satisfies.
-- Voice interaction contract (VOC-001) — accessibility text fallback and reading order this document's sanitization rule (RCS-001-R18) defers to; not yet drafted.
+- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — accessibility text fallback and reading order this document's sanitization rule (RCS-001-R18) defers to; drafted, acceptance pending.
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for the product's own updates, distinct from and unrelated to rendered content; drafted, acceptance pending.
 - [Governance](governance.md) (GOV-001) — named roles and approval authority this document assumes without redefining; drafted, acceptance pending.
 - [Desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001) — the sanitizer/CSP-delivery binding, bridge-protocol enumeration, and quarantine-directory disk-behavior evidence this document defers to it; drafted, acceptance pending.

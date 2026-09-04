@@ -292,6 +292,7 @@ It does not define the CI-runner or manual-execution infrastructure that will ac
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — the two-distinct-rows rule for platform-signature and role-metadata evidence (:176), and the offline platform-revocation `uncertain` outcome (:174); drafted, acceptance pending.
 - [Renderer content-security contract](renderer-content-security.md) (RCS-001) — the CSP-delivery and sanitizer-binding debt named at :322, and the quarantine-directory disk-behavior evidence named at :293; drafted, acceptance pending.
 - [Adapter feed event schema](adapter-feed-events.md) (AEC-001 feed profile) — the PTY normalization implementation VP-S4 and VP-S16 exercise against the terminal control policy RCS-001 states; drafted, acceptance pending.
+- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — the VP-S19 accessibility scenario and pinned-baseline evidence VOC-001's accessibility claims depend on; drafted, acceptance pending.
 - [Handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001) and [Workspace roaming protocol](workspace-roaming-protocol.md) (RSP-001 core) — the interruption-recovery scenarios (VP-S11, VP-S17) this plan exercises on a packaged build; neither document names a platform of its own; drafted, acceptance pending.
 - [ADR convention](adr/README.md) — the status lifecycle VP-001 follows once it leaves Draft.
 
