@@ -351,6 +351,7 @@ The public vocabulary column uses the states in the [compatibility policy](versi
 - [ADR-0002: Desktop technology stack](adr/0002-desktop-technology-stack.md) — Git executed through explicit argv and isolated temporary state, the mechanism workspace backups rely on.
 - [Product roadmap](roadmap.md) — the Alpha stage's backup and migration-fixture scope items, the Beta stage's controlled-migration and guided-recovery scope items, and the Alpha → Beta gate that names this plan directly as required evidence.
 - [Context Orb specification](context-orb.md) — presentation of the states this document names; the recovery-gadget gap recorded in D8.
+- [Governance](governance.md) (GOV-001) — roles, approvals, exceptions, and evidence retention this document's acceptance relies on; drafted, acceptance pending.
 
 ## References
 

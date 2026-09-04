@@ -323,7 +323,7 @@ Debt, not drafted here. This document does not resolve whether unsigned third-pa
 - [Handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001) and [Workspace roaming protocol](workspace-roaming-protocol.md) (RSP-001 core) — device identity keys and handoff/claim signatures, distinct from this document's roles.
 - [Product roadmap](roadmap.md) — the Alpha → Beta promotion gate naming update trust directly as required evidence, approved by the Project Owner after Security Reviewer and Legal Counsel advice; the Beta scope's signed installers and the 1.0 exit criteria's published update trust posture.
 - [Context Orb specification](context-orb.md) — presentation of the states this document names; the disclosure-home open decision (D9) this document leaves to that specification's own acceptance.
-- Governance and support matrix (GOV-001) — named roles and approval authority, including who holds a root role share; not yet drafted.
+- [Governance](governance.md) (GOV-001) — named roles and approval authority, including who holds a root role share; drafted, acceptance pending.
 
 ## References
 

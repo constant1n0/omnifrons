@@ -336,7 +336,7 @@ Debt, not drafted here. This document does not specify the exact sanitizer libra
 - [Product roadmap](roadmap.md) — the Alpha renderer content-security baseline and the Alpha → Beta renderer-content review gate this document's acceptance satisfies.
 - Voice interaction contract (VOC-001) — accessibility text fallback and reading order this document's sanitization rule (RCS-001-R18) defers to; not yet drafted.
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for the product's own updates, distinct from and unrelated to rendered content; drafted, acceptance pending.
-- Governance and support matrix (GOV-001) — named roles and approval authority this document assumes without redefining; not yet drafted.
+- [Governance](governance.md) (GOV-001) — named roles and approval authority this document assumes without redefining; drafted, acceptance pending.
 
 ## References
 

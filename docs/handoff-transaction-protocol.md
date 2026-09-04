@@ -278,6 +278,7 @@ Each requirement is an acceptance gate with a testable condition.
 - [Versioning and compatibility](versioning-and-compatibility.md) — the checkpoint/handoff envelope version domain and the public state vocabulary.
 - [ADR-0002](adr/0002-desktop-technology-stack.md) — device-local executable approval and handoff commits created through isolated temporary state.
 - [Product roadmap](roadmap.md) — the pre-alpha exit criteria this protocol's requirements satisfy.
+- [Governance](governance.md) (GOV-001) — roles, approvals, exceptions, and evidence retention this document's acceptance relies on; drafted, acceptance pending.
 
 ## References
 

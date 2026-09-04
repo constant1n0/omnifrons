@@ -307,6 +307,7 @@ The public vocabulary column uses the states in the [compatibility policy](versi
 - [Product roadmap](roadmap.md) — the Alpha stage's "one active writer and explicit fork detection" scope item and the pre-alpha recoverable-or-uncertain exit criterion this protocol satisfies.
 - [ADR-0002](adr/0002-desktop-technology-stack.md), Git subsection — fetch-plus-inspection preference, explicit argv, and isolated temporary state for managed-ref writes.
 - [Context Orb specification](context-orb.md) — presentation of writer, claim, and fork state, out of scope here.
+- [Governance](governance.md) (GOV-001) — roles, approvals, exceptions, and evidence retention this document's acceptance relies on; drafted, acceptance pending.
 
 ## References
 

@@ -116,3 +116,5 @@ An exception never changes a failed test into a pass. It records bounded accepte
 ## Planned governance artifact
 
 A dedicated governance/support-matrix artifact must replace these interim rules before beta. It will name actual people or bodies, quorum/delegation, evidence retention, conflict handling, contributor governance, release authority, and status-change mechanics. Until it is accepted, these draft rules cannot be used to claim external governance maturity.
+
+Drafted as [governance](../governance.md) (GOV-001); acceptance pending — until then these interim rules apply.
