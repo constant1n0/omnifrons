@@ -179,12 +179,14 @@ A consumer bootstraps from a **snapshot**: current scope descriptors, executor d
 
 ## Open questions
 
-| Topic | Status |
-| --- | --- |
-| Staleness threshold for `model.observed` | Proposed in this draft ([Staleness of the observed model](#staleness-of-the-observed-model)); owner decision pending |
-| Error and artifact reference resolution (Context Catalog vs adapter-local store) | Proposed in this draft ([Reference resolution](#reference-resolution)); owner decision pending |
-| Producer key distribution and rotation | Proposed in this draft ([Producer identity and key distribution](#producer-identity-and-key-distribution)); owner decision pending |
-| Payload schema evolution rules | Open; rides the [compatibility policy](versioning-and-compatibility.md) |
+As with every other planned artifact, the Project Owner's recorded approval closes a decision, not the presence of a default (governance:29).
+
+| Topic | Status | Default proposal |
+| --- | --- | --- |
+| Staleness threshold for `model.observed` | Proposed in this draft ([Staleness of the observed model](#staleness-of-the-observed-model)) | A producer with no declared interval falls back to the shared default horizon: 15 minutes, the same figure RSP-001's D1 uses (adapter-feed-events:118) |
+| Error and artifact reference resolution (Context Catalog vs adapter-local store) | Proposed in this draft ([Reference resolution](#reference-resolution)) | The Context Catalog resolves artifacts and errors carrying workspace identity; the adapter-local store serves producer-private ones through AEC-001 transport capabilities; the feed profile owns only the `ref` shape and the `unresolved` state, not the resolvers themselves (adapter-feed-events:132) |
+| Producer key distribution and rotation | Proposed in this draft ([Producer identity and key distribution](#producer-identity-and-key-distribution)) | A producer instance is paired trust-on-first-use at device-local approval time (adapter-feed-events:140), and rotation is announced via `producer.key_rotated` under an overlap window, with revocation following user action or `producer.key_revoked` (adapter-feed-events:144) |
+| Payload schema evolution rules | Open; rides the [compatibility policy](versioning-and-compatibility.md) | No default proposed |
 
 ## References
 

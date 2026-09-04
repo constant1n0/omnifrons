@@ -98,6 +98,12 @@ The binding principle, holding for every surface below: **content is never autho
 | Availability of feed, handoff, and memory replication | Feed transport, managed refs, Engram sync targets | Denial here degrades every state this document and its siblings depend on to render honestly |
 | Third-party app capability declarations | Manifest checked at install/launch (ADR-0004) | The record that bounds what an app may do; a forged or drifted manifest is the difference between declared and ambient authority |
 | Producer signing keys and rotation state | OS secret store, paired per producer instance (AEC-001) | Compromise lets an attacker impersonate a trusted producer until revocation and re-pairing complete |
+| Update-trust signing keys (root shares and the online role keys UTA-001 names: release, freshness, apps) | Root shares offline and hardware-backed by default; online role keys in release infrastructure only, with access logging (UTA-001) | Root-role compromise forges root metadata, rotates or revokes roles, or publishes to the curated registry (UTA-001); online role key compromise requires emergency root-signed rotation plus revocation (UTA-001); today one of three root shares is held, so no root-signed operation is possible (GOV-001) |
+| Live audio buffer | Device-local, recognition-scoped, never persisted by default | Contains the raw captured utterance before recognition; the shortest-lived and least-reviewed asset this document names (VOC-001) |
+| Retained transcript | Memory plane, under RSP-001/MRP-001 tombstone and retention rules once opted in | A speech-derived record that may carry the same sensitive detail as any other memory observation (VOC-001) |
+| Speech-provider credential | OS credential storage; `unprovisioned-secret` when absent | Grants remote recognition or synthesis on the user's behalf; compromise exposes captured audio to an unintended party (VOC-001) |
+
+Adopted from VOC-001's proposed threat-model additions: the retained transcript row carries a residual risk mirroring SEC-3's own disclosure above — `<private>` stripping and tombstone deletion remove what they are told to, not what a reviewer failed to tag or a restore failed to exclude, and a transcript already synchronized before deletion has already reached every device and Cloud target the namespace replicates to (voice-interaction-contract:178).
 
 ## Actors and capabilities
 
@@ -113,6 +119,10 @@ The binding principle, holding for every surface below: **content is never autho
 | A8 | Compromised paired peer device | Signs valid envelopes and claims under its own paired key | Impersonate a device it has not been paired with; forge another device's signature |
 | A9 | Injected instructions through any of the above | Places instruction-like text in any content A1–A8 can deliver | Convert that text into authority — approval, authorization, or elevation — by itself (this document's binding principle) |
 | A10 | Compromised harness or adapter distribution channel (a legitimate update replaced with a malicious build) | Delivers a trojanized binary or package to a future install or auto-update outside Omnifrons's own update path | Bypass device-local re-probe and re-approval on the next launch (HAR-3); forge the digest/signature identity evidence recorded at approval time |
+| A11 | Bystander in physical space | Hears spoken output; may be captured incidentally by an open microphone | Consent on the user's behalf; be assumed absent by the product |
+| A12 | Remote speech provider | Receives audio or derived data the user opted to transmit; retains it under its own, external policy | Receive audio the user did not opt to transmit; be treated as equivalent in trust to local processing |
+
+Adopted from VOC-001's proposed threat-model additions: A11 and A12 sit in the same class as A4/A5, the network-attacker and remote-service-insider rows above — capability bounded by what was actually transmitted, never a source of authority over the device. Both also carry a residual risk. A11's is structural, not incidental: push-to-talk (VOC-001 D1) puts the decision to open a capture window solely in the user's hands, and the product has no channel to detect or exclude a bystander within range before that window opens — VOC-001's Consent and visibility mitigations narrow the exposure but do not close it. A12's "cannot receive audio the user did not opt to transmit" claim is enforced by opt-in policy and by the core owning the audio path, not by verified control over a third-party provider SDK's own network behavior; verifying that boundary belongs to a VP-001 scenario to be added, not to this table's capability claim alone (voice-interaction-contract:187, :189).
 
 ## Trust boundaries
 
@@ -210,7 +220,7 @@ Containment mechanism is platform-specific — Job Object policy on Windows, cgr
 
 ## Prompt injection
 
-Sources: repository files; content a harness fetches; feed events; startup briefs; memory; handoff task text; third-party app output; terminal or command output that re-enters a harness's own context; file and path names; and commit messages or branch names. Posture:
+Sources: repository files; content a harness fetches; feed events; startup briefs; memory; handoff task text; third-party app output; terminal or command output that re-enters a harness's own context; a transcript that is misheard, spoken back, or re-entered as instruction-like content reaching a harness (the spoken-misheard-re-entered round trip, adopted from VOC-001's proposed threat-model additions, voice-interaction-contract:191); file and path names; and commit messages or branch names. Posture:
 
 (a) Omnifrons never acts on instruction-like content itself — it renders and proposes.
 (b) Every untrusted source that reaches a harness or the user is labelled with its provenance, and the startup brief is always untrusted input.
@@ -304,7 +314,7 @@ Additional evidence this document requires directly:
 - A stolen-device warning test: the one-time undetected-full-disk-encryption warning (open decision D6) fires on a device holding handoff commits or memory.
 - Renderer content-security review is handled by RCS-001 and is a precondition, not a substitute, for this document's acceptance.
 
-Debt, not drafted here. This document does not evaluate a public adapter SDK, a public headless CLI, mobile or ambient-voice surfaces, or multiwriter roaming — each is a post-1.0 evidence horizon the roadmap gates separately, and each would need its own attacker-surface addition here before it ships. Resource-limit enforcement (open decision D3) and the third-party app runtime-probing gap (open decision D4) remain accepted residual risk, tracked but not closed, until their owning follow-up lands.
+Debt, not drafted here. This document does not evaluate a public adapter SDK, a public headless CLI, mobile surfaces, or multiwriter roaming — each is a post-1.0 evidence horizon the roadmap gates separately, and each would need its own attacker-surface addition here before it ships. The non-ambient voice surface's asset, actor, and prompt-injection-source rows are now recorded here in Draft, adopted from VOC-001's proposed threat-model additions; ambient and always-listening voice surfaces remain unevaluated, excluded by the roadmap before 1.0 (roadmap:134, :187), and would each need their own attacker-surface addition here before shipping. Resource-limit enforcement (open decision D3) and the third-party app runtime-probing gap (open decision D4) remain accepted residual risk, tracked but not closed, until their owning follow-up lands.
 
 ## Related contracts
 
@@ -318,7 +328,7 @@ Debt, not drafted here. This document does not evaluate a public adapter SDK, a 
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for product updates; drafted, acceptance pending.
 - [Governance](governance.md) (GOV-001) — named roles, approvals, and exceptions this document assumes; drafted, acceptance pending.
 - [Desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001) — the per-OS containment proof (PRC-1..5, TM-001-R9) this document's threat catalog names but does not itself execute; drafted, acceptance pending.
-- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — proposes the ambient-voice asset, actor, and prompt-injection-source additions this document's own debt note (Acceptance evidence and follow-up, above) requires before voice ships; drafted, acceptance pending.
+- [Voice interaction contract](voice-interaction-contract.md) (VOC-001) — carries the rationale for the non-ambient voice asset rows, actors A11 and A12, and the prompt-injection-source entry this document adopted in Draft; ambient and always-listening surfaces still need their own addition before shipping; drafted, acceptance pending.
 - [Context Orb specification](context-orb.md) — the scope/trust indicator and honest-status presentation of the states this document names.
 - [Product roadmap](roadmap.md) — the Alpha → Beta promotion gate this document's acceptance satisfies.
 

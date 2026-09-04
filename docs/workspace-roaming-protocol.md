@@ -50,7 +50,7 @@ Out of scope:
 - the memory plane's sync profiles, watermarks, continuity, and posture — owned by the [memory synchronization profile](roaming-and-engram-sync.md);
 - the handoff lifecycle, state vector, and claim-record replay rules — owned by [HTP-001](handoff-transaction-protocol.md), which only consumes the primitives defined here;
 - the wire envelope, signing primitive, and transport epochs — owned by [AEC-001](adapter-feed-events.md);
-- backup formats, restore epochs, tombstone formats, and the upgrade graph — owned by MRP-001;
+- backup formats, restore epochs, tombstone formats, and the upgrade graph — owned by [MRP-001](migration-and-recovery-plan.md);
 - the attacker model — owned by [TM-001](threat-model.md);
 - presentation — owned by [context-orb.md](context-orb.md).
 
@@ -159,7 +159,7 @@ Automatic takeover across devices is not part of this protocol; takeover always 
 | Claim ref missing or unreadable | `uncertain` |
 | Remote unreachable | `offline` |
 
-Every row is observed from the remote, never inferred from a local setting — the same principle the memory profile states for replication: "replication is never assumed; it is observed." A device's own belief about who holds the claim is not evidence; only a read of the claim ref is. The `authority-conflict` row implicates the remote itself rather than a device, and it has more than one cause: two valid-looking claim records for the same writer epoch mean either a bug in the compare-and-set implementation or a rewritten/forced ref history; a claim ref that reverts to an older tip a device has already seen superseded looks identical — a restored or rolled-back workspace remote produces the same symptom as a rewritten one. Either way it is treated as a possible integrity incident, not routine contention: resolution is human review, followed by a fresh takeover once the anomaly is understood, never an automatic pick of either record. MRP-001's restore epochs cover memory-namespace restores; they say nothing about a restored workspace Git remote, which has no generation marker of its own yet (D18).
+Every row is observed from the remote, never inferred from a local setting — the same principle the memory profile states for replication: "replication is never assumed; it is observed." A device's own belief about who holds the claim is not evidence; only a read of the claim ref is. The `authority-conflict` row implicates the remote itself rather than a device, and it has more than one cause: two valid-looking claim records for the same writer epoch mean either a bug in the compare-and-set implementation or a rewritten/forced ref history; a claim ref that reverts to an older tip a device has already seen superseded looks identical — a restored or rolled-back workspace remote produces the same symptom as a rewritten one. Either way it is treated as a possible integrity incident, not routine contention: resolution is human review, followed by a fresh takeover once the anomaly is understood, never an automatic pick of either record. [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001)'s restore epochs cover memory-namespace restores; they say nothing about a restored workspace Git remote, which has no generation marker of its own yet (D18).
 
 ## Recovery
 
@@ -211,7 +211,7 @@ Presentation of this authority state — alongside the profile's Sync health gad
 
 ## Git Sync to Cloud cutover
 
-Moving a memory namespace from the Git Sync profile to the Cloud profile is a checklist with gates, not a setting flip. It belongs here rather than in MRP-001 because it is fundamentally an authority handover — the same shape as the workspace-writer handover above, applied to a namespace's replication authority instead of a workspace's write claim. MRP-001 owns the backup, restore-epoch, and tombstone artifact *formats* the checklist references; this document owns the sequence and the gates. Each step below is a gate the next step depends on.
+Moving a memory namespace from the Git Sync profile to the Cloud profile is a checklist with gates, not a setting flip. It belongs here rather than in [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001) because it is fundamentally an authority handover — the same shape as the workspace-writer handover above, applied to a namespace's replication authority instead of a workspace's write claim. MRP-001 owns the backup, restore-epoch, and tombstone artifact *formats* the checklist references; this document owns the sequence and the gates. Each step below is a gate the next step depends on.
 
 1. **Quiescence** on every device holding the namespace, per the profile's definition — no in-flight mutation anywhere.
 2. **Final watermark.** Publish and import under Git Sync until every device is `current`. Record the resulting chunk digest set as the final set for this cutover.
@@ -301,7 +301,7 @@ The public vocabulary column uses the states in the [compatibility policy](versi
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) — the memory synchronization profile this document completes; RSP-001-R1 through R14 and D1 through D8.
 - [Handoff transaction protocol](handoff-transaction-protocol.md) (HTP-001) — consumes the writer epoch and the claim/release primitives defined here.
 - [Adapter feed event schema](adapter-feed-events.md) (AEC-001) — the `sync.state` wire event and the producer identity primitive reused for claim and release signatures.
-- [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001, drafted, acceptance pending) — backup, restore-epoch, and tombstone formats the cutover checklist depends on.
+- [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001) — backup, restore-epoch, and tombstone formats the cutover checklist depends on; drafted, acceptance pending.
 - [Threat model](threat-model.md) (TM-001) — the attacker model authenticity and replay protection depend on.
 - [Versioning and compatibility](versioning-and-compatibility.md) — the public state vocabulary this document's signal mapping rides, and the pre-1.0 channel rules the cutover checklist's staged rollout follows.
 - [Product roadmap](roadmap.md) — the Alpha stage's "one active writer and explicit fork detection" scope item and the pre-alpha recoverable-or-uncertain exit criterion this protocol satisfies.

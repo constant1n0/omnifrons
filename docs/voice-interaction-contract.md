@@ -18,7 +18,7 @@ This document drafts the planned voice interaction contract (VOC-001): the conse
 This draft does not redefine work already owned elsewhere:
 
 - **Sanitization, allowlists, CSP, and reading order** — owned by [RCS-001](renderer-content-security.md) (renderer-content-security:16, :234, :261). VOC-001's spoken output reads only RCS-001's sanitized, reading-order-preserved text.
-- **The attacker model** — owned by [TM-001](threat-model.md) (threat-model:31, :102-128). VOC-001 proposes the additions TM-001's own debt note calls for (threat-model:307) as text for TM-001's next revision; it does not edit TM-001's tables itself.
+- **The attacker model** — owned by [TM-001](threat-model.md) (threat-model:31, :108-138). VOC-001 proposes the additions TM-001's own debt note calls for (threat-model:317) as text for TM-001's next revision; it does not edit TM-001's tables itself.
 - **Roles, approvals, exceptions, and evidence** — owned by [GOV-001](governance.md) (governance:16, :33-51).
 - **The typed event catalog and the approvals write path** — owned by [AEC-001](adapter-feed-events.md) (adapter-feed-events:15, :150-162).
 - **Sync mechanics and credential custody** — owned by [RSP-001](roaming-and-engram-sync.md) (roaming-and-engram-sync:237-246).
@@ -78,7 +78,7 @@ A voice subsystem fails mid-session — the local engine crashes, or a remote ca
 - **Bystander:** A person other than the device's user who may hear spoken output or be captured incidentally by an open microphone.
 - **Capture trigger:** The mechanism that starts capture — push-to-talk (an explicit hold or tap) or a wake word (passive listening for a phrase). VOC-001 fixes push-to-talk as the only trigger through 1.0 (D1; roadmap:134, :187).
 - **Provider class:** The disclosed category of a remote speech provider (for example, a named vendor family or a self-hosted class) shown to the user before the opt-in that would send audio there is granted; not the provider's exact endpoint or internal configuration.
-- **Approval surface:** The product surface a destructive, elevating, or publishing action is confirmed on, showing identity evidence and the act-as identity, per TM-001-R7 (threat-model:244). Voice can reach this surface only as a proposal, never as the confirming act itself.
+- **Approval surface:** The product surface a destructive, elevating, or publishing action is confirmed on, showing identity evidence and the act-as identity, per TM-001-R7 (threat-model:254). Voice can reach this surface only as a proposal, never as the confirming act itself.
 - **Text fallback:** The guarantee, symmetrical in both directions, that every voice command has a typed equivalent and every spoken output has a visible text equivalent (versioning-and-compatibility:92).
 - **Capture indicator:** The persistent, product-controlled UI element showing that the microphone is capturing. Never a rendered-content surface, and never themeable or overridable by content (Consent and visibility, below).
 - **Transmission indicator:** The persistent, product-controlled UI element showing that audio is being transmitted off-device. Distinct from the capture indicator; the two MUST NOT be merged into one signal (Consent and visibility, below).
@@ -107,7 +107,7 @@ Bystander protection is a per-scope opt-out: a scope can disable spoken output, 
 
 Local-only processing is the default: recognition and synthesis run on-device, and nothing about a captured utterance leaves the device unless the user has separately opted in to remote processing. Remote processing requires its own explicit opt-in, distinct from the capture consent above, disclosing the provider class and — in the spirit of the enrollment dry-run's inclusion-set disclosure (target-architecture:213) — an enumerated list of what leaves the device (D3; versioning-and-compatibility:90, :95). That enumerated list names, at minimum, whether raw audio, a derived transcript, or request metadata crosses the device boundary — the same granularity the enrollment dry-run already uses for personal-observation inclusion, applied here to a spoken utterance instead of a memory namespace. Provider-specific retention, recognition quality, availability, and latency remain external characteristics VOC-001 does not promise (versioning-and-compatibility:95).
 
-A remote provider's credential lives in OS credential storage, the same custody discipline every other Omnifrons secret follows (target-architecture:245); when absent, it is labelled `unprovisioned-secret` (target-architecture:262), with no in-product secret entry (threat-model:263). Detecting that a credential is unprovisioned is a custody fact, not a security judgment on its own — the same distinction TM-001 draws between a Git binary's presence and its trustworthiness applies here.
+A remote provider's credential lives in OS credential storage, the same custody discipline every other Omnifrons secret follows (target-architecture:245); when absent, it is labelled `unprovisioned-secret` (target-architecture:262), with no in-product secret entry (threat-model:273). Detecting that a credential is unprovisioned is a custody fact, not a security judgment on its own — the same distinction TM-001 draws between a Git binary's presence and its trustworthiness applies here.
 
 The local engine itself is expected to be OS-provided per platform by default, recorded as a VP-001 baseline field alongside the assistive-technology product and version VP-001-R1 already records for every other baseline (D2; desktop-stack-verification-plan:215).
 
@@ -127,7 +127,7 @@ Provider substitution — falling back from one remote provider to another witho
 
 Audio is buffered for recognition only and is never persisted by default; it never enters a portable artifact, a backup, or a support export (renderer-content-security:258).
 
-A retained transcript is opt-in per scope and, once retained, is a memory-plane item: it inherits Engram's `<private>` stripping before storage, which strips only explicitly tagged spans and is not itself a confidentiality boundary — a retained transcript synchronizes to every paired device and to Cloud exactly like any other memory observation (roaming-and-engram-sync:85; threat-model:93, :184). This residual exposure is why the default below is session-only rather than a retain-by-default opt-out (D4). Deleting a retained transcript writes a tombstone of kind `observation` that propagates through backup and restore (migration-and-recovery-plan:203-212).
+A retained transcript is opt-in per scope and, once retained, is a memory-plane item: it inherits Engram's `<private>` stripping before storage, which strips only explicitly tagged spans and is not itself a confidentiality boundary — a retained transcript synchronizes to every paired device and to Cloud exactly like any other memory observation (roaming-and-engram-sync:85; threat-model:93, :194). This residual exposure is why the default below is session-only rather than a retain-by-default opt-out (D4). Deleting a retained transcript writes a tombstone of kind `observation` that propagates through backup and restore (migration-and-recovery-plan:203-212).
 
 The default transcript retention is session-only — a transcript does not outlive the session that produced it unless the user opts in, per scope, to memory-item retention (D4). Where a transcript is retained as a memory item, VOC-001 MAY set a shorter retention default than the memory plane's own, and MUST NOT set a longer one: the memory plane's 180-day tombstone-retention default (migration-and-recovery-plan:321, MRP-001 D6) is a ceiling this document does not raise. Deletion is always a tombstone, never a hard delete indistinguishable from content that never existed — a restore MUST NOT resurrect a tombstoned transcript (migration-and-recovery-plan:212).
 
@@ -151,23 +151,23 @@ Applied to the problem statement's third scenario above: a local engine crash or
 
 ## Approval semantics
 
-An utterance is content. It can propose an action; it cannot approve, authorize, elevate, or restore a prior approval — the rule TM-001 states for every other content source applies to voice without a voice-shaped exception (threat-model:63; TM-001-R1, threat-model:238). A destructive, elevating, or publishing action a voice command proposes requires the same typed or clicked confirmation, on an approval surface showing identity evidence and the act-as identity, that any other proposal requires (TM-001-R7, threat-model:244); that confirmation reaches the product only through AEC-001's approvals write path, whose disposition is authorized by "human and local" action, never inferred from feed or spoken contents (adapter-feed-events:154, :162).
+An utterance is content. It can propose an action; it cannot approve, authorize, elevate, or restore a prior approval — the rule TM-001 states for every other content source applies to voice without a voice-shaped exception (threat-model:63; TM-001-R1, threat-model:248). A destructive, elevating, or publishing action a voice command proposes requires the same typed or clicked confirmation, on an approval surface showing identity evidence and the act-as identity, that any other proposal requires (TM-001-R7, threat-model:254); that confirmation reaches the product only through AEC-001's approvals write path, whose disposition is authorized by "human and local" action, never inferred from feed or spoken contents (adapter-feed-events:154, :162).
 
-Applied to the problem statement's first scenario above: the spoken "yes" is logged as heard text, not executed. The action it named surfaces on the approval surface exactly as if a typed command had proposed it, showing identity evidence and the act-as identity, and only a subsequent typed or clicked confirmation on that surface disposes of it (TM-001-R7, threat-model:244; adapter-feed-events:154, :162).
+Applied to the problem statement's first scenario above: the spoken "yes" is logged as heard text, not executed. The action it named surfaces on the approval surface exactly as if a typed command had proposed it, showing identity evidence and the act-as identity, and only a subsequent typed or clicked confirmation on that surface disposes of it (TM-001-R7, threat-model:254; adapter-feed-events:154, :162).
 
 This is D10's default below, not yet a Project Owner-approved decision: an utterance may open an approval item, never carry the proof that disposes of one (Open decisions, below).
 
-A spoken staleness warning, sync proposal, or other notification is proposal-only, exactly like its typed counterpart: the system proposes, the user disposes (roaming-and-engram-sync:78, :245; threat-model:215, :220; invariant 1, target-architecture:55).
+A spoken staleness warning, sync proposal, or other notification is proposal-only, exactly like its typed counterpart: the system proposes, the user disposes (roaming-and-engram-sync:78, :245; threat-model:225, :230; invariant 1, target-architecture:55).
 
-Residual risk exists on this surface exactly as it does on RCS-001's rendered content and TM-001's every other content source: a technically compliant confirmation dialog can still be misread by a rushed user, and a manipulated harness can still misuse authority it legitimately holds through a properly confirmed action (threat-model:222).
+Residual risk exists on this surface exactly as it does on RCS-001's rendered content and TM-001's every other content source: a technically compliant confirmation dialog can still be misread by a rushed user, and a manipulated harness can still misuse authority it legitimately holds through a properly confirmed action (threat-model:232).
 
 VOC-001's job is to make the boundary — that an utterance alone never disposes — hold structurally; it does not claim to make every confirmation impossible to misread.
 
 ## Proposed threat-model additions
 
-TM-001 names ambient-voice surfaces as unevaluated and states that each "would need its own attacker-surface addition here before it ships" (threat-model:307). VOC-001 proposes the following as text for TM-001's next revision rather than editing `docs/threat-model.md` directly — the same precedent MRP-001 used when it proposed an answer to the workspace roaming protocol's open generation-record question rather than editing that document itself (migration-and-recovery-plan:247). TM-001's own tables are unchanged by this document.
+TM-001 named ambient-voice surfaces as unevaluated and stated that each "would need its own attacker-surface addition here before it ships" (threat-model:317). VOC-001 proposed the following as text for TM-001's next revision rather than editing `docs/threat-model.md` directly — the same precedent MRP-001 used when it proposed an answer to the workspace roaming protocol's open generation-record question rather than editing that document itself (migration-and-recovery-plan:247). TM-001 has adopted the rows below into its own asset, actor, and prompt-injection-source tables in Draft; this section keeps the rationale behind them.
 
-Proposed additions to the asset table (threat-model:86-100):
+Rows adopted into the asset table (threat-model:86-104):
 
 | Asset | Where it lives | Why it matters |
 | --- | --- | --- |
@@ -175,26 +175,26 @@ Proposed additions to the asset table (threat-model:86-100):
 | Retained transcript | Memory plane, under RSP-001/MRP-001 tombstone and retention rules once opted in | A speech-derived record that may carry the same sensitive detail as any other memory observation |
 | Speech-provider credential | OS credential storage; `unprovisioned-secret` when absent | Grants remote recognition or synthesis on the user's behalf; compromise exposes captured audio to an unintended party |
 
-The retained transcript row carries a residual risk mirroring SEC-3's own disclosure (threat-model:192): `<private>` stripping and tombstone deletion remove what they are told to, not what a reviewer failed to tag or a restore failed to exclude, and a transcript already synchronized before deletion has already reached every device and Cloud target the namespace replicates to.
+The retained transcript row carries a residual risk mirroring SEC-3's own disclosure (threat-model:202): `<private>` stripping and tombstone deletion remove what they are told to, not what a reviewer failed to tag or a restore failed to exclude, and a transcript already synchronized before deletion has already reached every device and Cloud target the namespace replicates to.
 
-Proposed additions to the actors table (threat-model:104-115):
+Rows adopted into the actors table (threat-model:110-123):
 
 | ID | Actor | Capabilities | Cannot |
 | --- | --- | --- | --- |
-| (proposed) | Bystander in physical space | Hears spoken output; may be captured incidentally by an open microphone | Consent on the user's behalf; be assumed absent by the product |
-| (proposed) | Remote speech provider | Receives audio or derived data the user opted to transmit; retains it under its own, external policy | Receive audio the user did not opt to transmit; be treated as equivalent in trust to local processing |
+| A11 | Bystander in physical space | Hears spoken output; may be captured incidentally by an open microphone | Consent on the user's behalf; be assumed absent by the product |
+| A12 | Remote speech provider | Receives audio or derived data the user opted to transmit; retains it under its own, external policy | Receive audio the user did not opt to transmit; be treated as equivalent in trust to local processing |
 
-Both proposed actors sit in the same class as TM-001's existing A4/A5 network-attacker and remote-service-insider rows (threat-model:109-110): capability bounded by what was actually transmitted, never a source of authority over the device.
+Both actors (A11, A12) sit in the same class as TM-001's existing A4/A5 network-attacker and remote-service-insider rows (threat-model:115-116): capability bounded by what was actually transmitted, never a source of authority over the device.
 
-Both proposed actor rows also carry a residual risk. The bystander row's is structural, not incidental: push-to-talk (D1) puts the decision to open a capture window solely in the user's hands, and the product has no channel to detect or exclude a bystander within range before that window opens — the mitigations in Consent and visibility narrow the exposure but do not close it. The remote speech provider row's "Cannot receive audio the user did not opt to transmit" claim is enforced by opt-in policy and by the core owning the audio path, not by verified control over a third-party provider SDK's own network behavior; verifying that boundary belongs to a VP-001 scenario to be added, not to this table's capability claim alone.
+Both actor rows also carry a residual risk. A11's is structural, not incidental: push-to-talk (D1) puts the decision to open a capture window solely in the user's hands, and the product has no channel to detect or exclude a bystander within range before that window opens — the mitigations in Consent and visibility narrow the exposure but do not close it. A12's "cannot receive audio the user did not opt to transmit" claim is enforced by opt-in policy and by the core owning the audio path, not by verified control over a third-party provider SDK's own network behavior; verifying that boundary belongs to a VP-001 scenario to be added, not to this table's capability claim alone.
 
-Proposed addition to the prompt-injection source list (threat-model:213): the spoken-misheard-re-entered round trip — a transcript that is misheard, spoken back, or re-entered as instruction-like content reaching a harness — alongside the existing "terminal or command output that re-enters a harness's own context" source, under the same posture and the same TM-001-R1/TM-001-R2 requirements (threat-model:213, :238-239).
+Entry adopted into the prompt-injection source list (threat-model:223): the spoken-misheard-re-entered round trip — a transcript that is misheard, spoken back, or re-entered as instruction-like content reaching a harness — alongside the existing "terminal or command output that re-enters a harness's own context" source, under the same posture and the same TM-001-R1/TM-001-R2 requirements (threat-model:223, :248-249).
 
-This addition is required before voice ships (threat-model:307).
+This addition is required before voice ships (threat-model:317).
 
-It is not itself an acceptance of these rows into TM-001 — that acceptance runs through TM-001's own change-control process, the same `Proposed`-revision path any other change to an Accepted or Draft artifact's normative content follows (governance:184-192).
+TM-001 has adopted these rows in Draft under its Maintainer (governance:186); this document is not TM-001's acceptance; the rows become normative only when TM-001 itself reaches Accepted through its own status gate.
 
-TM-001's actor A7 (a stolen or lost device) and its open decision D6 (stolen-device posture) already cover offline disk access generally (threat-model:112, :275); neither names an audio buffer, a retained transcript, or a speech-provider credential specifically. That silence is exactly the gap the asset-table rows above close — a lost device's offline disk access already reaches a retained transcript today under A7's general capability, but TM-001's own asset table gives a reviewer nothing to check that against until VOC-001's addition is accepted.
+TM-001's actor A7 (a stolen or lost device) and its open decision D6 (stolen-device posture) already cover offline disk access generally (threat-model:118, :285); neither names an audio buffer, a retained transcript, or a speech-provider credential specifically. That silence is exactly the gap the asset-table rows above close — a lost device's offline disk access already reaches a retained transcript today under A7's general capability, and TM-001's own asset table now records those rows in Draft, adopted from this addition.
 
 Worked example tying the proposed bystander actor to D6's binding default above: a scope with bystander protection opted out still speaks a routine status update, but it never speaks content flagged secret-custody or redaction-flagged, exactly as if a bystander were an unauthenticated reader of the screen rather than a listener — the same custody classes RCS-001's redaction already tracks (renderer-content-security:226) bound the same way for an ear as they do for an eye.
 
@@ -217,13 +217,13 @@ The requirements below cluster into five groups by requirement number: consent a
 | VOC-001-R7 | A retained transcript MUST be treated as a memory-plane item with `<private>` stripping and tombstone deletion, and its retention default MUST NOT exceed the memory plane's own; the per-scope opt-in that retains a transcript MUST disclose, before it is granted, that the transcript will synchronize like any other memory observation and that only explicitly tagged spans are stripped (roaming-and-engram-sync:85; migration-and-recovery-plan:210-212, :321). |
 | VOC-001-R8 | Deleting a transcript MUST write a tombstone that survives backup and restore (migration-and-recovery-plan:212). |
 | VOC-001-R9 | Voice output MUST synthesize only from RCS-001's sanitized, reading-order-preserved text (renderer-content-security:236). |
-| VOC-001-R10 | A recognized utterance MUST NOT approve, authorize, elevate, or restore a prior approval (threat-model:238). |
-| VOC-001-R11 | A destructive, elevating, or publishing action a voice command proposes MUST require the same typed or clicked confirmation, on an approval surface with identity evidence, that any other proposal requires (threat-model:244; adapter-feed-events:162). |
+| VOC-001-R10 | A recognized utterance MUST NOT approve, authorize, elevate, or restore a prior approval (threat-model:248). |
+| VOC-001-R11 | A destructive, elevating, or publishing action a voice command proposes MUST require the same typed or clicked confirmation, on an approval surface with identity evidence, that any other proposal requires (threat-model:254; adapter-feed-events:162). |
 | VOC-001-R12 | Every spoken warning, proposal, or notification MUST be proposal-only and MUST carry a simultaneous visible text equivalent (roaming-and-engram-sync:245, :78). |
 | VOC-001-R13 | Every voice command MUST have a typed equivalent, and a capability reachable only by voice MUST NOT exist. |
 | VOC-001-R14 | When voice is denied, unavailable, or fails, the complete text workflow and recovery control MUST remain, and capture or transmission state MUST NOT be hidden (target-architecture:266; roadmap:127). |
 | VOC-001-R15 | Low confidence or an ambiguous command MUST render `uncertain`, MUST NOT execute, and MUST show the heard text for typed confirmation (target-architecture:62). |
-| VOC-001-R16 | A transcript that re-enters as command or context input MUST carry a visible provenance label and MUST be treated as untrusted (threat-model:239; target-architecture:197). |
+| VOC-001-R16 | A transcript that re-enters as command or context input MUST carry a visible provenance label and MUST be treated as untrusted (threat-model:249; target-architecture:197). |
 | VOC-001-R17 | A persisted voice preference MUST carry the interaction-preferences schema integer, MUST block on an unknown required field, and MUST use safe defaults only for documented optional fields (versioning-and-compatibility:41). |
 | VOC-001-R18 | The product MUST NOT display or document a recognition-quality, availability, latency, or provider-retention guarantee for voice unless the support matrix states it (versioning-and-compatibility:95). |
 | VOC-001-R19 | An accessibility claim MUST be evidenced by a VP-001 scenario against a pinned baseline's assistive technology, and MUST be recorded `uncertain` when that assistive technology is unavailable (desktop-stack-verification-plan:233, :249). |
@@ -231,7 +231,7 @@ The requirements below cluster into five groups by requirement number: consent a
 
 ## Signal mapping
 
-VOC-001 proposes no new public token: every state below reuses a token the compatibility policy's public-state list or support-matrix classifications already define (versioning-and-compatibility:74, :126-127), or a token an existing sibling document already established as public precedent (threat-model:263; renderer-content-security:259).
+VOC-001 proposes no new public token: every state below reuses a token the compatibility policy's public-state list or support-matrix classifications already define (versioning-and-compatibility:74, :126-127), or a token an existing sibling document already established as public precedent (threat-model:273; renderer-content-security:259).
 
 The live capturing/speaking indicator required in Consent and visibility above is transient UI state, not a persisted state, and needs no token of its own — that is exactly why the problem statement's second scenario, a merged capture/transmission indicator, is a design failure this table cannot detect by itself; the honesty of the indicator lives in Consent and visibility's requirement, not in a signal row. Reuse rather than a dedicated capture-state token is this document's own default for D9, below.
 
@@ -246,7 +246,7 @@ The live capturing/speaking indicator required in Consent and visibility above i
 | Voice subsystem unavailable at session start | `voice-unavailable` | `uncertain` | Full text and recovery control preserved (target-architecture:266; renderer-content-security:276) |
 | Playback device unavailable while spoken output is due | `playback-unavailable` | `failed` | The visible text equivalent remains and is the only output |
 | Transcript re-enters as instruction or context input | `transcript-as-content` | `untrusted` | Provenance label shown; every action on it disabled (renderer-content-security:259) |
-| Speech-provider credential absent | `provider-secret-missing` | `unprovisioned-secret` | Custody label shown; no in-product secret entry (threat-model:263) |
+| Speech-provider credential absent | `provider-secret-missing` | `unprovisioned-secret` | Custody label shown; no in-product secret entry (threat-model:273) |
 | Remote processing required, opt-in absent | `remote-not-opted-in` | `failed` | The voice operation fails with a disclosure naming the missing opt-in; the typed path is unchanged |
 | Engine/assistive-technology combination identified but untested | `combination-untested` | `detected` | No support claim made; reviewed at GOV-001-R18's cadence (governance:260) |
 | Persisted voice preference carries an unknown required field | `preference-schema-unknown` | `failed` | Load blocked (versioning-and-compatibility:41) |
@@ -265,7 +265,7 @@ The ten decisions below are distinct from the requirements above: a requirement 
 | D3 | Remote provider policy | Never; opt-in with provider-class disclosure; a named allowlist | Opt-in with provider-class disclosure and an enumerated leaves-the-device list (versioning-and-compatibility:95) |
 | D4 | Transcript retention | Never; session-only; a memory observation under the memory window | Session-only default; memory-item retention as an explicit per-scope opt-in, capped by MRP-001's D6 retention default (migration-and-recovery-plan:321) |
 | D5 | Voice output reading third-party app content | Never; declared classes; the same rule as core content | Same rule as core content, no relaxation (renderer-content-security:230, :260) |
-| D6 | Bystander protection | None; a headphones heuristic; a per-scope opt-out; summary-only output; a per-scope capture pause | Per-scope opt-out of spoken output plus a per-scope capture pause, both reachable from the stop control; never speaking secret-custody or redaction-flagged content; not yet in TM-001 (see Proposed threat-model additions) |
+| D6 | Bystander protection | None; a headphones heuristic; a per-scope opt-out; summary-only output; a per-scope capture pause | Per-scope opt-out of spoken output plus a per-scope capture pause, both reachable from the stop control; never speaking secret-custody or redaction-flagged content; recorded in TM-001 in Draft as actor A11 (see Proposed threat-model additions) |
 | D7 | Accessibility baseline | Pinned assistive technology per VP-001 baseline; an external standard; both | Pinned assistive-technology baseline exercised by VP-001's VP-S19 scenario; an external standard is a Project Owner call (desktop-stack-verification-plan:140) |
 | D8 | Voice before 1.0 | Beta, per the roadmap; post-1.0 only; output-only at Beta | Beta, per roadmap:119, gated by the TM-001 additions above and GOV-001-R4 advice (governance:246) |
 | D9 | New public token for voice states | Reuse existing tokens; add a capture-state token | Reuse existing tokens (see Signal mapping above) |
@@ -287,7 +287,7 @@ A conformance check MUST verify each of the following before VOC-001's guarantee
 
 Debt, not drafted here.
 
-- This document does not draft the proposed TM-001 additions above into `docs/threat-model.md` itself — that acceptance is TM-001's own (threat-model:307).
+- This document does not draft the proposed TM-001 additions above into `docs/threat-model.md` itself — that acceptance is TM-001's own (threat-model:317).
 - It does not obtain the Security Reviewer and Legal Counsel advice GOV-001-R4 requires for the Alpha → Beta gate; both roles are Unassigned today (governance:126-127, :246).
 - It does not choose a speech engine or a remote provider — those are implementation decisions downstream of D2 and D3, below.
 - It does not specify the capture and transmission indicators' visual presentation, which remains [context-orb.md](context-orb.md)'s to design.
@@ -299,7 +299,7 @@ Debt, not drafted here.
 - [Renderer content-security contract](renderer-content-security.md) (RCS-001) — the sanitized, reading-order-preserved text voice output reads from (renderer-content-security:236, R18 :261); drafted, acceptance pending.
 - [Versioning and compatibility](versioning-and-compatibility.md) — the stable voice behavior list, the persisted-preferences schema rule, and the public state vocabulary this document's Signal mapping reuses (versioning-and-compatibility:86-95, :41, :74).
 - [Product roadmap](roadmap.md) — the Beta scope and exit criteria, and the Alpha → Beta and Beta → 1.0 gates this document's evidence feeds (roadmap:119, :126-127, :134, :187).
-- [Threat model](threat-model.md) (TM-001) — the binding principle, TM-001-R1 and TM-001-R7, and the ambient-voice debt this document proposes an answer to (threat-model:63, :238, :244, :307); drafted, acceptance pending.
+- [Threat model](threat-model.md) (TM-001) — the binding principle, TM-001-R1 and TM-001-R7, and the ambient-voice debt this document proposes an answer to (threat-model:63, :248, :254, :317); drafted, acceptance pending.
 - [Adapter feed event schema](adapter-feed-events.md) (AEC-001 feed profile) — the approvals write path a voice-proposed disposition reaches only through a human, local act (adapter-feed-events:150-162); drafted, acceptance pending.
 - [Workspace roaming and Engram sync protocol](roaming-and-engram-sync.md) (RSP-001 memory profile) — proposal-only spoken staleness warnings, and `<private>` stripping for a retained transcript (roaming-and-engram-sync:78, :85, :245); drafted, acceptance pending.
 - [Migration and recovery plan](migration-and-recovery-plan.md) (MRP-001) — tombstone kinds, propagation, and the retention default this document's transcript retention is capped by (migration-and-recovery-plan:203-212, :321); drafted, acceptance pending.
