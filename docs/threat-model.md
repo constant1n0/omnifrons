@@ -198,7 +198,7 @@ A missing device-local binding for a required credential renders `unprovisioned-
 
 ProcessSupervisor owns process lifecycle; descendants are proven stopped or rendered `orphan-risk/uncertain`. PTY is a degraded fallback whose bytes are never authorization. The renderer has no generic shell or filesystem capability. Third-party apps run inside the same boundaries with declared capabilities and no ambient authority. Resource exhaustion by a harness or app is monitored, and hard limits are deferred (open decision D3).
 
-Containment mechanism is platform-specific — Job Object policy on Windows, cgroup/process-group/watchdog on Linux, process-group/watchdog on macOS — and its proof is the planned desktop verification plan's job, not this document's; TM-001 states only the threat each containment gap leaves and the honest-labelling fallback when containment cannot be proven.
+Containment mechanism is platform-specific — Job Object policy on Windows, cgroup/process-group/watchdog on Linux, process-group/watchdog on macOS — and its proof is the planned [desktop stack verification plan](desktop-stack-verification-plan.md)'s job, not this document's; TM-001 states only the threat each containment gap leaves and the honest-labelling fallback when containment cannot be proven.
 
 | ID | Threat | Impact | Mitigation (owning contract) | Residual risk |
 | --- | --- | --- | --- | --- |
@@ -206,7 +206,7 @@ Containment mechanism is platform-specific — Job Object policy on Windows, cgr
 | PRC-2 | A2 the PTY byte stream carries escape/OSC sequences attempting to act as authorization | Unauthorized clipboard, file-transfer, navigation, or notification action | Only allowlisted terminal controls normalize into typed actions; unsupported sequences render inert or are dropped with diagnostics; raw bytes are never authorization (target architecture; AEC-001) | Approval mediation covers only operations visible through the verified adapter; hidden harness/plugin actions are explicitly not covered |
 | PRC-3 | A3 a third-party app attempts an action outside its declared capability set | Privilege escalation beyond what the app disclosed | Same boundaries as core; declared capabilities; no ambient authority (ADR-0004) | The capability model is a declared manifest (open decision D4); runtime-probing coverage is not yet complete |
 | PRC-4 | A2/A3 a harness or app process consumes unbounded CPU, memory, or handles | Local denial of service; device resource exhaustion | None binding yet — advisory monitoring only (open decision D3) | Explicit: hard limits are deferred, and a misbehaving or malicious process can still degrade the device |
-| PRC-5 | A2 a harness profile daemonizes or otherwise escapes the platform's containment mechanism | Containment claims (Job Object, cgroup, process-group) no longer describe the running process tree | Unsupported unless separately handled; the gap is reported as `orphan-risk/uncertain`, never presented as contained (ADR-0002) | Verification requires the planned desktop verification plan (VP-001); until pinned per platform, the containment claim itself is unproven |
+| PRC-5 | A2 a harness profile daemonizes or otherwise escapes the platform's containment mechanism | Containment claims (Job Object, cgroup, process-group) no longer describe the running process tree | Unsupported unless separately handled; the gap is reported as `orphan-risk/uncertain`, never presented as contained (ADR-0002) | Verification requires the planned [desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001); until pinned per platform, the containment claim itself is unproven |
 
 ## Prompt injection
 
@@ -317,6 +317,7 @@ Debt, not drafted here. This document does not evaluate a public adapter SDK, a 
 - [Renderer content-security contract](renderer-content-security.md) (RCS-001) — plain/rich/terminal content mechanics; drafted, acceptance pending.
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for product updates; drafted, acceptance pending.
 - [Governance](governance.md) (GOV-001) — named roles, approvals, and exceptions this document assumes; drafted, acceptance pending.
+- [Desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001) — the per-OS containment proof (PRC-1..5, TM-001-R9) this document's threat catalog names but does not itself execute; drafted, acceptance pending.
 - [Context Orb specification](context-orb.md) — the scope/trust indicator and honest-status presentation of the states this document names.
 - [Product roadmap](roadmap.md) — the Alpha → Beta promotion gate this document's acceptance satisfies.
 

@@ -17,8 +17,9 @@ Omnifrons is currently in the design phase. These documents describe target dire
 11. [Threat model](threat-model.md) — attacker classes, protected assets, trust boundaries, and the harness/Git/remote-content/secrets/process/prompt-injection threat catalog.
 12. [Renderer content-security contract](renderer-content-security.md) — content classes, sanitization, CSP, navigation, terminal control policy, clipboard, attachments and downloads, and redacted exports (RCS-001).
 13. [Update trust architecture](update-trust-architecture.md) — trust roots and online roles, release metadata, freshness, anti-rollback, platform signing, compromise recovery, and app bundle signing (UTA-001).
-14. [ADR index and convention](adr/README.md) — decision status and governance.
-15. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
+14. [Desktop stack verification plan](desktop-stack-verification-plan.md) — pinned per-OS baselines, the scenario catalog, evidence record, exception rule, and cadence for ADR-0002's acceptance gate (VP-001).
+15. [ADR index and convention](adr/README.md) — decision status and governance.
+16. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
 
 ## Decision status
 
@@ -37,6 +38,7 @@ Omnifrons is currently in the design phase. These documents describe target dire
 | Threat model (TM-001) | Draft |
 | Renderer content-security contract (RCS-001) | Draft |
 | Update trust architecture (UTA-001) | Draft |
+| Desktop stack verification plan (VP-001) | Draft |
 | ADR convention | Draft |
 | ADR-0001: Apache-2.0 license | Accepted |
 | ADR-0002: Desktop technology stack | Proposed |

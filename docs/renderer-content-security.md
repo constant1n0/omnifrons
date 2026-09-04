@@ -201,7 +201,7 @@ Every mechanism above depends on the renderer actually being unable to do what i
 
 `script-src 'self'` with bundled, hashed scripts excludes both an external CDN load and runtime `eval`-style execution; a script the renderer runs must have shipped inside the application bundle and matched its hash, never have been fetched, generated, or evaluated at runtime from any content source. No embedded browsing context is permitted. The `style-src` nonce covers only product-defined theme-variable values — the curated accent palette [context-orb.md](context-orb.md) defines — never a style computed from or influenced by rendered content; no content source can inject a value that reaches the nonce'd style block.
 
-`connect-src 'none'` governs network-shaped requests a browsing context could otherwise issue — `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource` — and does not govern the typed IPC channel itself: typed IPC rides the desktop framework's own bridge API (ADR-0002), not any of those primitives, and is not a network request this directive was designed to gate. Where a platform's bridge implementation requires a custom protocol handler to carry that traffic, the protocol is added to `connect-src` explicitly, documented in this section, and verified under VP-001 — never left as an implicit, undocumented exception to the baseline above.
+`connect-src 'none'` governs network-shaped requests a browsing context could otherwise issue — `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource` — and does not govern the typed IPC channel itself: typed IPC rides the desktop framework's own bridge API (ADR-0002), not any of those primitives, and is not a network request this directive was designed to gate. Where a platform's bridge implementation requires a custom protocol handler to carry that traffic, the protocol is added to `connect-src` explicitly, documented in this section, and verified under [VP-001](desktop-stack-verification-plan.md) — never left as an implicit, undocumented exception to the baseline above.
 
 The baseline is enforced as the renderer's actual CSP policy — a header or an equivalent webview policy under the desktop stack ADR-0002 selects — not as guidance a component may opt out of, and RCS-001-R13 makes it a conformance-tested acceptance gate rather than an aspiration. A third-party app inherits this baseline exactly, with no relaxation (ADR-0004): a custom app's content class rules, CSP, and navigation constraints are the same ones this document states for the core renderer, and no app manifest field can widen a directive.
 
@@ -290,7 +290,7 @@ Each requirement is an acceptance gate with a testable condition.
 | D9 | Does content-level renderer state need dedicated public vocabulary tokens (for example `inert`, `quarantined`), or does it reuse `failed`/`uncertain`/`unresolved`? | Add dedicated tokens through the compatibility policy; reuse the existing vocabulary | Reuse `failed`, `uncertain`, and `unresolved` until a dedicated token is proposed through the compatibility policy, consistent with [TM-001's D8](threat-model.md) |
 | D10 | What is the registration source for an application scheme eligible for external launch? | Approved-app manifest (ADR-0004 capability declaration); adapter declaration (AEC-001 producer identity); OS handler list (platform-reported, unauthenticated) | Approved-app manifest — a scheme is added to the device-local registration list only when an approved app's own manifest declares it at install/approval time, never inferred from an OS-reported handler list alone |
 | D11 | What is the maximum length and terminator timeout for a DCS/APC/PM/SOS or OSC string before it is aborted? | Fixed byte bound only; fixed bound plus a terminator timeout; no bound (rely on ECMA-48 conformance) | 4 KiB maximum length plus a terminator timeout; on overflow or timeout the sequence aborts and subsequent bytes render as plain text |
-| D12 | What is the maximum size for a single download or attachment? | No limit; a fixed size cap; a user-configurable cap with a safe default | A fixed default cap, exact figure pending VP-001 evidence on quarantine-directory disk behavior; configurable per the support matrix once VP-001 lands |
+| D12 | What is the maximum size for a single download or attachment? | No limit; a fixed size cap; a user-configurable cap with a safe default | A fixed default cap, exact figure pending [VP-001](desktop-stack-verification-plan.md) evidence on quarantine-directory disk behavior; configurable per the support matrix once VP-001 lands |
 
 ## Acceptance evidence and follow-up
 
@@ -319,7 +319,7 @@ The checklist that satisfies the renderer content-security gate the roadmap name
 
 Renderer content-security review is a precondition for TM-001's own acceptance, not a substitute for it (mirroring [TM-001's acceptance evidence](threat-model.md)): TM-001 credits this document's mitigation for B1, CNT-1..6, HAR-5, and PRC-2, and its own acceptance checklist cannot close while this checklist is open.
 
-Debt, not drafted here. This document does not specify the exact sanitizer library or CSP-header delivery mechanism the desktop stack uses to enforce the baseline — that binding is VP-001's evidence to produce against ADR-0002's pinned platforms. Open decisions D1 through D12 remain the owner's calls; a feature that assumes their default proposal before the owner disposes must say so rather than presenting the default as decided.
+Debt, not drafted here. This document does not specify the exact sanitizer library or CSP-header delivery mechanism the desktop stack uses to enforce the baseline — that binding is [VP-001](desktop-stack-verification-plan.md)'s evidence to produce against ADR-0002's pinned platforms. Open decisions D1 through D12 remain the owner's calls; a feature that assumes their default proposal before the owner disposes must say so rather than presenting the default as decided.
 
 ## Related contracts
 
@@ -337,6 +337,7 @@ Debt, not drafted here. This document does not specify the exact sanitizer libra
 - Voice interaction contract (VOC-001) — accessibility text fallback and reading order this document's sanitization rule (RCS-001-R18) defers to; not yet drafted.
 - [Update trust architecture](update-trust-architecture.md) (UTA-001) — key rotation and compromise recovery for the product's own updates, distinct from and unrelated to rendered content; drafted, acceptance pending.
 - [Governance](governance.md) (GOV-001) — named roles and approval authority this document assumes without redefining; drafted, acceptance pending.
+- [Desktop stack verification plan](desktop-stack-verification-plan.md) (VP-001) — the sanitizer/CSP-delivery binding, bridge-protocol enumeration, and quarantine-directory disk-behavior evidence this document defers to it; drafted, acceptance pending.
 
 ## References
 

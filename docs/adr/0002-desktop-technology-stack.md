@@ -141,7 +141,7 @@ Not selected because Dart and platform-channel/plugin work add an ecosystem with
 
 ## Planned verification artifact
 
-Executable spike scenarios belong in planned artifact `VP-001 — Desktop stack verification plan`, registered in the target architecture. It does not yet exist.
+Executable spike scenarios belong in planned artifact `VP-001 — Desktop stack verification plan`, registered in the target architecture. It exists as [desktop-stack-verification-plan.md](../desktop-stack-verification-plan.md): drafted, acceptance pending.
 
 The ADR gate requires that plan to:
 
@@ -173,3 +173,4 @@ Update signing tests do not approve automatic updates until the separate update-
 - [ADR-0001](0001-open-source-license.md)
 - [Target architecture](../target-architecture.md)
 - [Compatibility policy](../versioning-and-compatibility.md)
+- [Desktop stack verification plan](../desktop-stack-verification-plan.md) (VP-001)

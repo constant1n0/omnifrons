@@ -126,7 +126,7 @@ Each release pins exact test evidence and separately states minimum supported ve
 | `detected` | Omnifrons can identify it but does not authorize launch or claim compatibility. |
 | `unsupported` | Launch or migration is blocked unless an explicit unsafe diagnostic mode exists. |
 
-The planned desktop verification plan records exact build numbers, architectures, runtime versions, assistive technology, and test dates. “Latest” is not reproducible evidence.
+The planned [desktop verification plan](desktop-stack-verification-plan.md) (VP-001) records exact build numbers, architectures, runtime versions, assistive technology, and test dates. “Latest” is not reproducible evidence.
 
 ### Engram runtime compatibility
 

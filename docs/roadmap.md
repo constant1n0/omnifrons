@@ -56,7 +56,7 @@ Can a logical agent resume useful work across two different harnesses and two ma
 - Workspace Git roaming plus one selected Engram synchronization profile.
 - An always-local Markdown vault plus a separate user-selected local/on-demand heavy-asset tier; the initial supported Linux blob backend is Proton Drive CLI.
 - Drafts and executable proofs for the planned handoff transaction and roaming/sync protocols registered in the target architecture.
-- The desktop technology spike governed by ADR-0002 and its planned verification plan.
+- The desktop technology spike governed by ADR-0002 and its [planned verification plan](desktop-stack-verification-plan.md) (VP-001).
 
 ### Exit criteria
 
