@@ -62,7 +62,7 @@ Conditions belong in `Acceptance gate`, not in the Status value. Status changes 
 
 ## Interim role glossary
 
-These roles are design placeholders until a dedicated governance artifact is accepted. Every draft header names accountable and approver roles and uses `Named person: Unassigned` or a real name. An Accepted ADR, approved promotion, or release cannot retain `Unassigned` for its accountable person or approver. One person may hold several roles, but each role/person assignment is explicit; Git authorship does not imply approval.
+The dedicated governance artifact is Accepted: [GOV-001](../governance.md) § Role catalog and § Assignments register govern roles and assignments as of 2026-09-04, and this glossary remains only as the ADR-format vocabulary. Every draft header names accountable and approver roles and uses `Named person: Unassigned` or a real name. An Accepted ADR, approved promotion, or release cannot retain `Unassigned` for its accountable person or approver. One person may hold several roles, but each role/person assignment is explicit; Git authorship does not imply approval.
 
 | Role | Responsibility | Decision right |
 | --- | --- | --- |
@@ -87,7 +87,7 @@ Conflicts of interest and combined roles are recorded in the decision evidence.
 | Security exception | Decision Owner | Security Reviewer; scope, expiry, compensating control, rollback | Project Owner accepts residual risk |
 | Public compatibility break | Compatibility Owner | Migration and impact evidence; major-version ADR | Project Owner |
 | Maturity promotion | Project Maintainer | Roadmap gate evidence and open-risk disposition | Project Owner |
-| Release | Release Approver | Support matrix, signatures, migrations, known risks | Project Owner until governance changes |
+| Release | Release Approver | Support matrix, signatures, migrations, known risks | Project Owner, per [GOV-001](../governance.md) § Release authority and key custody |
 
 No approval is inferred from silence. If the same person proposes and approves, the record states that fact and the independent-review requirement, if any.
 
@@ -118,4 +118,4 @@ An exception never changes a failed test into a pass. It records bounded accepte
 
 A dedicated governance/support-matrix artifact must replace these interim rules before beta. It will name actual people or bodies, quorum/delegation, evidence retention, conflict handling, contributor governance, release authority, and status-change mechanics. Until it is accepted, these draft rules cannot be used to claim external governance maturity.
 
-Drafted as [governance](../governance.md) (GOV-001); acceptance pending — until then these interim rules apply.
+Accepted 2026-09-04 as [governance](../governance.md) (GOV-001), which supersedes these interim rules; the ADR status lifecycle in this convention stays in force and GOV-001 aligns to it.
