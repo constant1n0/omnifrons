@@ -23,6 +23,7 @@ No draft or Proposed ADR overrides another document. An Accepted ADR governs onl
 - Number: four digits, monotonic, never reused.
 - Scope: one independently reviewable decision.
 - Links: repository-relative and bidirectional when superseding.
+- Cross-document citations inside prose or evidence text follow the anchor convention in [../README.md](../README.md#citation-convention) — an id, a heading link, or a phrase-pinned section, never a line number.
 
 Required metadata:
 
