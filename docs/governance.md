@@ -1,12 +1,12 @@
 # Governance and Support Matrix
 
 **Document role:** Governance: role catalog, assignments, approvals, status workflow, exceptions, evidence retention, change control, and support-matrix authority (GOV-001)  
-**Status:** Draft  
+**Status:** Proposed  
 **Normative force:** Non-binding target direction; requirements are acceptance gates, not current guarantees  
 **Accountable role:** Project Maintainer  
-**Named person:** Unassigned  
+**Named person:** constant1n0  
 **Approver role:** Project Owner  
-**Approver named person:** Unassigned  
+**Approver named person:** constant1n0  
 **Effective date:** None  
 **Supersedes:** the interim role glossary and approval matrix in docs/adr/README.md once accepted  
 **Name status:** Selected public name; preliminary screening complete, formal trademark clearance pending
@@ -117,7 +117,7 @@ Role names above are identical to the ADR convention's interim role glossary whe
 
 | Role | Named person or body | Effective date | Note |
 | --- | --- | --- | --- |
-| Project Owner | constant1n0 | 2026-09-01 | Signing key: not yet recorded (see Approval record and repository integrity) |
+| Project Owner | constant1n0 | 2026-09-01 | Signing key: SSH ed25519, fingerprint SHA256:5AS/VaM/V7gsR+MdtgL0N0zQ3D7fCZ4z8LnOIRK2ThQ, recorded 2026-09-04; registration as a GitHub signing key pending |
 | Project Maintainer | constant1n0 | 2026-09-01 | Same person as Project Owner |
 | Decision Owner (default) | constant1n0 | 2026-09-01 | Default until an artifact's own header names a distinct Decision Owner |
 | Compatibility Owner | constant1n0 | 2026-09-01 | Interim, per versioning-and-compatibility.md's own header |
@@ -280,16 +280,16 @@ D1 through D4 are process questions this document can answer for itself at accep
 
 - The assignments register above is filled for every currently Accepted artifact (ADR-0001, ADR-0003, ADR-0004) and for the Active product-naming decision.
 - The exception registry is present and currently empty; no exception has been recorded against GOV-001-R4, and none is valid — that gate has no exception path. The registry's renewal cap (at most two renewals, 270 cumulative days) is untested until a first exception is recorded and renewed.
-- The evidence location this document defines is live, referenced by identifier, with at least the ledgers of the drafts accepted so far, once those ledgers exist; none exist yet because this document is itself Draft.
+- The evidence location this document defines is live under `docs/evidence/`, holding the first retained ledger [GOV-001-ledger-2026-09-04](evidence/GOV-001/ledger-2026-09-04.md) and the [approvals record](evidence/approvals.md) with no rows yet.
 - The ADR convention's interim role glossary and approval matrix point to this document once it is accepted, per the wiring recorded there.
 - The roadmap's 1.0 exit criterion — "governance ... evidence is approved and retained" — is satisfied only once this document is `Accepted` and at least one status transition has run under it with its evidence retained.
 - The Root Key Holder shortfall the assignments register records (one holder, one share, not a threshold; no root-signed operation possible; automatic updates and the curated registry blocked) is carried as an open risk, owned by the Project Owner, targeted for closure before the Alpha → Beta gate — not for this document's own acceptance.
-- `main`'s signed-commit and linear-history protection (GOV-001-R15) and `docs/evidence/approvals.md` do not yet exist; both are required before this document's own first `Accepted` transition can produce a valid signed acceptance tag.
+- The approvals record exists as of 2026-09-04; `main`'s signed-commit and linear-history protection (GOV-001-R15) does not yet; both are required before this document's own first `Accepted` transition can produce a valid signed acceptance tag.
 - The frozen-sections list (GOV-001-R16) has not yet been exercised by an attempted change; the first test is a `Proposed` revision to one of its four listed tables, carrying a signed acceptance tag.
 - The sealed root-share recovery arrangement GOV-001-R17 requires (open decision D6) does not yet exist; it is targeted before the Alpha → Beta gate, tracked alongside the Root Key Holder shortfall above.
 - The `advice_kind` field and its five permitted values (GOV-001-R14) are defined here but not yet exercised by any recorded approval; the first Security Reviewer advice recorded must carry a signature to test the requirement, and the first `none` record must show the self-approval flag beside it.
 - No `detected` support-matrix combination has yet reached a minor release under GOV-001-R18's review cadence; the rule is untested.
-- A dry run of one status transition, with its record, is required follow-up evidence before this document itself can move past `Proposed`.
+- The dry run is planned as the retroactive attribution of ADR-0001's existing acceptance, to be recorded with a signed tag and an approvals row before this document moves past `Proposed`.
 
 ## Related artifacts
 
