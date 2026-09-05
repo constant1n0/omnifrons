@@ -4,3 +4,32 @@
 # Local tooling state (never published)
 .atl/
 .engram/
+.codegraph/
+
+# Rust build output
+/target
+**/target
+*.pdb
+
+# Node/JS tooling
+node_modules/
+renderer/dist/
+.vite/
+*.tsbuildinfo
+coverage/
+.pnpm-store/
+vitest.config.*.timestamp*
+
+# Tauri shell (part B)
+src-tauri/target/
+src-tauri/gen/
+src-tauri/WixTools/
+
+# Local secrets and keys (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
