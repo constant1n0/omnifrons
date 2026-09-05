@@ -1,0 +1,32 @@
+name: Gitleaks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# read-all only: pull-requests: write is deliberately not granted, so gitleaks
+# cannot post inline PR annotations — findings surface only in the job log/summary.
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # TODO: pin by SHA once this workflow stabilizes
+        uses: actions/checkout@v7 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        # TODO: pin by SHA once this workflow stabilizes
+        uses: gitleaks/gitleaks-action@v3 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE is only needed for organizations.

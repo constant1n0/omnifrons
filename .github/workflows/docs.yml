@@ -1,0 +1,35 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # TODO: pin by SHA once this workflow stabilizes
+        uses: actions/checkout@v7 # v7
+
+      - name: Check links
+        # TODO: pin by SHA once this workflow stabilizes
+        uses: lycheeverse/lychee-action@v2 # v2
+        with:
+          args: >-
+            --offline
+            --no-progress
+            --include-fragments
+            'docs/**/*.md'
+            'README.md'
+            'CONTRIBUTING.md'
+            'SECURITY.md'
+          fail: true

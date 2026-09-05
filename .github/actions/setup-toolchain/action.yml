@@ -1,0 +1,60 @@
+name: Setup toolchain
+description: >-
+  Shared Rust + Node/pnpm toolchain setup used by ci.yml and tauri-build.yml,
+  so the two workflows do not drift on how each language toolchain is installed.
+
+inputs:
+  linux-prereqs:
+    description: Install the Tauri Linux build prerequisites (apt packages) on ubuntu runners.
+    required: false
+    default: 'false'
+  extra-apt-packages:
+    description: Extra apt packages to install alongside the Tauri prerequisites (space-separated).
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux prerequisites
+      if: runner.os == 'Linux' && inputs.linux-prereqs == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev ${{ inputs.extra-apt-packages }}
+
+    - name: Install Rust toolchain
+      # Guarded on rust-toolchain.toml existing: the Rust steps only activate once the
+      # toolchain file is present in the repository (kept consistent everywhere this
+      # guard appears, per docs/repository-layout.md's toolchain-pins description).
+      if: hashFiles('rust-toolchain.toml') != ''
+      shell: bash
+      run: |
+        rustup toolchain install
+        rustup show active-toolchain
+
+    - name: Cache Rust
+      if: hashFiles('rust-toolchain.toml') != ''
+      # TODO: pin by SHA once this workflow stabilizes
+      uses: Swatinem/rust-cache@v2 # v2
+
+    - name: Setup pnpm
+      # TODO: pin by SHA once this workflow stabilizes
+      # pnpm/setup replaces the pnpm/action-setup + actions/setup-node pair:
+      # pnpm 11 dropped support for `pnpm/action-setup` (documented for
+      # pnpm <=10 only), and pnpm/setup installs both pnpm and its Node
+      # runtime in one step. `version` and `runtime` are both left unset so
+      # the action reads its pins from package.json -- `packageManager` /
+      # `devEngines.packageManager` for the pnpm version, `devEngines.runtime`
+      # for the Node version (docs/repository-layout.md's toolchain-pins
+      # description) -- rather than duplicating them here. `install: false`
+      # keeps this action's own frozen-lockfile install below as the single
+      # place that installs dependencies.
+      uses: pnpm/setup@v2 # v2
+      with:
+        cache: true
+        install: false
+
+    - name: Install dependencies
+      shell: bash
+      run: pnpm install --frozen-lockfile
