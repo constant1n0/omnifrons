@@ -117,7 +117,7 @@ Role names above are identical to the ADR convention's interim role glossary whe
 
 | Role | Named person or body | Effective date | Note |
 | --- | --- | --- | --- |
-| Project Owner | constant1n0 | 2026-09-01 | Signing key: SSH ed25519, fingerprint SHA256:5AS/VaM/V7gsR+MdtgL0N0zQ3D7fCZ4z8LnOIRK2ThQ, recorded 2026-09-04; registered as a GitHub signing key 2026-09-04 |
+| Project Owner | constant1n0 | 2026-09-01 | Signing keys, one per device: SSH ed25519, fingerprint SHA256:5AS/VaM/V7gsR+MdtgL0N0zQ3D7fCZ4z8LnOIRK2ThQ (workstation), and SSH RSA 3072, fingerprint SHA256:Mu2SrAgouMGfuw0tCafrYHiYHLjC9YHDTjV+k5aQyUQ (laptop); both recorded 2026-09-04 and registered as GitHub signing keys |
 | Project Maintainer | constant1n0 | 2026-09-01 | Same person as Project Owner |
 | Decision Owner (default) | constant1n0 | 2026-09-01 | Default until an artifact's own header names a distinct Decision Owner |
 | Compatibility Owner | constant1n0 | 2026-09-01 | Interim, per versioning-and-compatibility.md's own header |
