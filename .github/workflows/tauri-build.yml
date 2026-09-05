@@ -6,6 +6,12 @@ on:
     - cron: '0 3 * * *'
 
 permissions:
+
+defaults:
+  run:
+    # bash on every runner, so the pnpm wrapper installed by the composite
+    # action (a bash script) is what `pnpm` resolves to on Windows as well.
+    shell: bash
   contents: read
 
 concurrency:

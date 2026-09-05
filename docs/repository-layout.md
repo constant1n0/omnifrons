@@ -69,8 +69,8 @@ The pins recorded here — package manager, Node runtime, and renderer toolchain
 
 Current pins:
 
-- Package manager: pnpm, pinned exactly via `packageManager` and `devEngines.packageManager` in the root `package.json`, enforced by `engineStrict` in `pnpm-workspace.yaml`. CI's `pnpm/setup` action (see CI overview) reads this same pin, so there is one source of truth for the pnpm version.
-- Node runtime: pinned for CI via `devEngines.runtime` in the root `package.json`, which `pnpm/setup` installs directly (pnpm 11 dropped support for `pnpm/action-setup`, documented for pnpm <=10 only, so CI no longer pairs a separate Node setup action with it); `.node-version` remains the pin for local tooling that reads it (e.g. `nvm`, `fnm`), and `engines.node` in the root `package.json` states the minimum supported range.
+- Package manager: pnpm, pinned exactly via `packageManager` and `devEngines.packageManager` in the root `package.json`, enforced by `engineStrict` in `pnpm-workspace.yaml`. CI installs that exact version with `npm install -g` after reading it from `package.json`, the same way on every runner, and caches the pnpm store keyed on the lockfile.
+- Node runtime: pinned in `.node-version` (also mirrored in `devEngines.runtime`), which `actions/setup-node` reads in CI. `pnpm/setup` and `pnpm/action-setup` are deliberately not used: the first hung while downloading pnpm on a Windows runner, the second is documented for pnpm 10 and earlier.
 - Renderer toolchain: React 19, TypeScript, Vite, Vitest with `jsdom`, `@testing-library/react`, and ESLint, all pinned in `renderer/package.json`.
 - Rust toolchain: pinned via `rust-toolchain.toml` (`channel = "1.98.1"`, `components = ["rustfmt", "clippy"]`, `profile = "minimal"`); the workspace's `[workspace.package]` restates the same version as `rust-version` and pins `edition = "2024"`; `rustfmt.toml` and `clippy.toml` pin `edition = "2024"` and `msrv = "1.98.1"` respectively for their own tools.
 
