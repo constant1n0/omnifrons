@@ -280,8 +280,8 @@ These are placeholders, not existing files or implemented guarantees.
 | GOV-001 | Governance and support matrix | Named roles, approvals, exceptions, evidence, supported combinations; roles, assignments, approvals, exceptions, and evidence retention are drafted in [governance](governance.md) |
 | AEC-001 | Adapter and event contract | Capabilities, ordering, at-least-once replay, overflow, terminal states, and PTY byte/control normalization into allowlisted typed actions; the feed profile (event catalog and approvals write path) is drafted in [adapter-feed-events](adapter-feed-events.md) |
 | RCS-001 | Renderer content-security contract | Plain/rich/terminal content, CSP, constrained URLs/navigation, OSC clipboard/link/file actions, attachments/downloads, and redacted scrollback/support exports; the content classes, sanitization, CSP, navigation, terminal control policy, and export redaction are drafted in [renderer-content-security](renderer-content-security.md) |
-| VOC-001 | Voice interaction contract | Consent, visibility, processing, retention, accessibility, text fallback |
-| VP-001 | Desktop stack verification plan | Pinned multi-OS executable evidence for ADR-0002 |
+| VOC-001 | Voice interaction contract | Consent, visibility, processing, retention, accessibility, text fallback; the consent model, capture and transmission indicators, processing and retention rules, text fallback, and approval semantics are drafted in [voice interaction contract](voice-interaction-contract.md) |
+| VP-001 | Desktop stack verification plan | Pinned multi-OS executable evidence for ADR-0002; the baseline fields, scenario catalog, evidence record, exception rule, and cadence are drafted in [desktop stack verification plan](desktop-stack-verification-plan.md) |
 
 A feature cannot claim the guarantee owned by a placeholder until its artifact is accepted and its tests pass.
 

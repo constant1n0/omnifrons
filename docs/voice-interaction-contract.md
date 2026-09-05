@@ -291,7 +291,7 @@ Debt, not drafted here.
 - It does not obtain the Security Reviewer and Legal Counsel advice GOV-001-R4 requires for the Alpha → Beta gate; both roles are Unassigned today (GOV-001, Security Reviewer assignment; GOV-001, Legal Counsel assignment; GOV-001-R4).
 - It does not choose a speech engine or a remote provider — those are implementation decisions downstream of D2 and D3, below.
 - It does not specify the capture and transmission indicators' visual presentation, which remains [context-orb.md](context-orb.md)'s to design.
-- The pointer from the target architecture's planned-assurance-artifacts row (target architecture, VOC-001 row) to this document is deferred to that table's first `Proposed` revision carrying a signed acceptance tag (GOV-001-R16, [Change control](governance.md#change-control) ("Some sections are frozen regardless"), [Acceptance evidence and follow-up](governance.md#acceptance-evidence-and-follow-up) ("exercised by an attempted change")), because the table is frozen and changes only that way.
+- The pointer from the target architecture's planned-assurance-artifacts row (target architecture, VOC-001 row) to this document was added by that table's first `Proposed` revision, accepted with the signed tag `accept/target-architecture/2026-09-05` (GOV-001-R16).
 
 ## Related contracts
 
