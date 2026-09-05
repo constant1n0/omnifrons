@@ -1,0 +1,16 @@
+[package]
+name = "omnifrons-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+contract-tests = []
+
+[dependencies]
+omnifrons-domain = { path = "../omnifrons-domain" }
+thiserror.workspace = true

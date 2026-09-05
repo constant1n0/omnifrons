@@ -1,0 +1,21 @@
+[package]
+name = "omnifrons-supervisor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+omnifrons-domain = { path = "../omnifrons-domain" }
+omnifrons-app = { path = "../omnifrons-app" }
+tokio = { workspace = true, features = ["rt", "process", "time"] }
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal"] }
+
+[dev-dependencies]
+omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }
