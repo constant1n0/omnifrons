@@ -1,0 +1,30 @@
+{
+  "name": "omnifrons",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Omnifrons workspace root: pnpm workspace pins and repository-wide scripts.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "pnpm --filter renderer dev",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "build": "pnpm -r build"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@11.0.9",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.0.9",
+      "onFail": "download"
+    },
+    "runtime": {
+      "name": "node",
+      "version": "22.23.2",
+      "onFail": "download"
+    }
+  },
+  "devDependencies": {}
+}
