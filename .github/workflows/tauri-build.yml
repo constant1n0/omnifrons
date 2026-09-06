@@ -52,6 +52,17 @@ jobs:
         if: hashFiles('rust-toolchain.toml') != ''
         run: cargo test --workspace --all-targets --all-features
 
+      - name: cargo test (feature-gate, no features)
+        if: hashFiles('rust-toolchain.toml') != ''
+        # tests/feature_gate.rs is `#![cfg(not(feature = "demo-harness"))]`:
+        # the step above always passes --all-features, so it reports zero
+        # tests for that file and could never catch a regression that made
+        # the demo-harness feature default-on. This step runs deliberately
+        # without --all-features or --features -- the only invocation that
+        # actually executes that file's assertions (docs/repository-layout.md
+        # § Build and test commands; src-tauri/tests/feature_gate_present.rs).
+        run: cargo test -p omnifrons-shell --test feature_gate
+
       - name: Build renderer
         run: pnpm -r build
 
