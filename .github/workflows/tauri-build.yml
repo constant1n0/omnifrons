@@ -19,8 +19,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test:
-    name: build-test (${{ matrix.os }})
+  # Named differently from ci.yml's build-test so the required status checks on
+  # main never match a packaging run.
+  package:
+    name: package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
