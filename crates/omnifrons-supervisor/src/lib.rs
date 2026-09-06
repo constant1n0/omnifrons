@@ -508,7 +508,10 @@ impl TokioProcessSupervisor {
             }
             omnifrons_app::ExecHandle::File(file) => {
                 drop(file);
+                #[cfg(unix)]
                 let mut command = Command::new(display_path);
+                #[cfg(not(unix))]
+                let command = Command::new(display_path);
                 #[cfg(unix)]
                 command.process_group(0);
                 self.finish_spawn(command, &label)

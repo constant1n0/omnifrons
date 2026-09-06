@@ -78,7 +78,7 @@ impl ExecutableProber for FsExecutableProber {
 
         let platform = match platform_evidence(&canonical_path, &metadata) {
             Ok(evidence) => evidence,
-            Err(outcome) => return outcome,
+            Err(outcome) => return ProbeOutcome::from(outcome),
         };
 
         let size = metadata.len();
@@ -126,15 +126,33 @@ fn open_checked(candidate: &Path) -> std::io::Result<File> {
     }
 }
 
+/// The ways a platform-evidence check can refuse a candidate. Kept small
+/// on purpose: `ProbeOutcome` carries a full identity in its `Identity`
+/// variant, so returning it as an `Err` payload trips clippy's
+/// `result_large_err` on Windows; this enum converts into the matching
+/// `ProbeOutcome` at the single call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailure {
+    NotExecutable,
+}
+
+impl From<ProbeFailure> for ProbeOutcome {
+    fn from(failure: ProbeFailure) -> Self {
+        match failure {
+            ProbeFailure::NotExecutable => ProbeOutcome::NotExecutable,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn platform_evidence(
     _canonical_path: &Path,
     metadata: &std::fs::Metadata,
-) -> Result<PlatformEvidence, ProbeOutcome> {
+) -> Result<PlatformEvidence, ProbeFailure> {
     use std::os::unix::fs::PermissionsExt;
     let mode = metadata.permissions().mode();
     if mode & 0o111 == 0 {
-        return Err(ProbeOutcome::NotExecutable);
+        return Err(ProbeFailure::NotExecutable);
     }
     Ok(PlatformEvidence::Unix { mode })
 }
@@ -147,7 +165,7 @@ fn platform_evidence(
 fn platform_evidence(
     canonical_path: &Path,
     metadata: &std::fs::Metadata,
-) -> Result<PlatformEvidence, ProbeOutcome> {
+) -> Result<PlatformEvidence, ProbeFailure> {
     use std::os::windows::fs::MetadataExt;
     let extension = canonical_path
         .extension()
@@ -155,7 +173,7 @@ fn platform_evidence(
         .map(str::to_lowercase)
         .unwrap_or_default();
     if !is_windows_executable_extension(&extension) {
-        return Err(ProbeOutcome::NotExecutable);
+        return Err(ProbeFailure::NotExecutable);
     }
     Ok(PlatformEvidence::Windows {
         extension,

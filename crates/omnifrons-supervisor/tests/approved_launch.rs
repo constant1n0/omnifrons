@@ -9,6 +9,7 @@
 //! regardless of what the display path resolves to by the time this call
 //! runs.
 
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,7 @@ fn wait_for_terminal(
 
 /// Collect every `Text` frame's line, in order, discarding the final
 /// `State` frame.
+#[cfg(target_os = "linux")]
 fn text_lines(frames: &[omnifrons_app::OutputFrame]) -> Vec<String> {
     frames
         .iter()

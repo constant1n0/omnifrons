@@ -64,7 +64,9 @@ mod unix_tests {
     use std::time::{Duration, Instant};
 
     use omnifrons_adapters::FsExecutableProber;
-    use omnifrons_app::{ExecHandle, ExecutableProber, ProbeOutcome};
+    #[cfg(target_os = "linux")]
+    use omnifrons_app::ExecHandle;
+    use omnifrons_app::{ExecutableProber, ProbeOutcome};
     use sha2::{Digest, Sha256};
 
     use super::{TempDir, expect_identity};
