@@ -53,7 +53,7 @@ pub enum ProcessStatus {
 }
 
 /// An error a `ProcessSupervisor` operation can report.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SupervisorError {
     /// The process failed to spawn.
     #[error("failed to spawn process: {0}")]
@@ -61,6 +61,24 @@ pub enum SupervisorError {
     /// The given `ProcessId` is not known to this supervisor.
     #[error("unknown process id")]
     UnknownProcess,
+    /// A second `subscribe` call was made for a `ProcessId` that already
+    /// has a live subscription.
+    ///
+    /// Chosen over reusing [`Self::UnknownProcess`] for this case: the id
+    /// *is* known, so collapsing the two would tell a caller that
+    /// legitimately still holds the first receiver that its process
+    /// vanished, when the real problem is a duplicate subscribe attempt
+    /// (`docs/spike-log.md` § IPC contract records this choice).
+    #[error("process output already subscribed")]
+    AlreadySubscribed,
+    /// `spawn` was refused because this supervisor already tracks its
+    /// maximum number of concurrently `Running` processes.
+    ///
+    /// A closed cap, not an unbounded map, is what keeps a long-lived
+    /// supervisor's own bookkeeping bounded regardless of how many spawn
+    /// requests a caller issues (`docs/spike-log.md` § IPC contract).
+    #[error("too many processes are already running")]
+    TooManyProcesses,
 }
 
 /// A port for supervising a single external process end-to-end: spawn,
