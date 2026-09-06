@@ -1,0 +1,45 @@
+{
+  "productName": "Omnifrons",
+  "version": "0.1.0",
+  "identifier": "dev.omnifrons.app",
+  "build": {
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../renderer/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Omnifrons"
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'none'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "img-src": "'self' artifact:",
+        "media-src": "'self' artifact:",
+        "font-src": "'self'",
+        "manifest-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "frame-src": "'none'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "worker-src": "'self'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
