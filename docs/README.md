@@ -20,8 +20,9 @@ Omnifrons is currently in the design phase. These documents describe target dire
 14. [Voice interaction contract](voice-interaction-contract.md) — consent, visibility, processing, retention, accessibility, and text fallback for voice interaction (VOC-001).
 15. [Desktop stack verification plan](desktop-stack-verification-plan.md) — pinned per-OS baselines, the scenario catalog, evidence record, exception rule, and cadence for ADR-0002's acceptance gate (VP-001).
 16. [Repository layout](repository-layout.md) — repository skeleton, planned crate map, renderer package, toolchain pins, and CI overview.
-17. [ADR index and convention](adr/README.md) — decision status and governance.
-18. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
+17. [Spike log](spike-log.md) — ADR-0002 implementation spikes: what each slice proves, defers, its IPC contract, and its relationship to VP-001 acceptance evidence.
+18. [ADR index and convention](adr/README.md) — decision status and governance.
+19. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
 
 ## Citation convention
 
@@ -56,6 +57,7 @@ A cross-reference into another document never cites a line number. Line numbers 
 | Voice interaction contract (VOC-001) | Draft |
 | Desktop stack verification plan (VP-001) | Draft |
 | Repository layout | Draft |
+| Spike log | Draft |
 | ADR convention | Draft |
 | ADR-0001: Apache-2.0 license | Accepted |
 | ADR-0002: Desktop technology stack | Proposed |
