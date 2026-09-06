@@ -24,7 +24,12 @@ use omnifrons_app::{
 use omnifrons_supervisor::TokioProcessSupervisor;
 
 /// How long to wait for the harness's `"ready"` frame before giving up.
-const READY_DEADLINE: Duration = Duration::from_secs(5);
+///
+/// 10s, not a shorter bound: a loaded CI runner needs generous scheduling
+/// margin to spawn demo-harness and have it print `"ready"`, independent of
+/// `stop`'s own deadline handling measured separately below (`stop_started`
+/// is not set until after this wait returns).
+const READY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Block until `rx` delivers the harness's `"ready"` text frame, or panic
 /// once `deadline` passes -- the synchronization point that replaces a

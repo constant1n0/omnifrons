@@ -17,7 +17,14 @@ use omnifrons_supervisor::TokioProcessSupervisor;
 
 /// How long to wait for the demo harness (a handful of lines at a modest
 /// rate) to run to completion and be confirmed reaped.
-const REAP_DEADLINE: Duration = Duration::from_secs(5);
+///
+/// 10s, not a shorter bound: this run's total wall-clock time still depends
+/// on `rate_hz` sleeps between lines (unlike the burst-driven tests), and a
+/// loaded/virtualized CI runner's coarser timer granularity can stretch
+/// each of those sleeps well past what a developer's own machine sees, so
+/// the deadline needs generous headroom rather than merely covering the
+/// nominal (200 Hz, 10 lines) runtime.
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
 
 #[test]
 fn ten_lines_yield_ten_stdout_two_stderr_and_a_final_exited_state() {

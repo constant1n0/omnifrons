@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use omnifrons_app::{FramePayload, OutputStream, ProcessOutput, ProcessStatus, ProcessSupervisor};
 use omnifrons_supervisor::TokioProcessSupervisor;
 
-const REAP_DEADLINE: Duration = Duration::from_secs(5);
+// 10s, not a shorter bound: a loaded CI runner needs generous scheduling
+// margin to spawn demo-harness and confirm its reap, well beyond what these
+// test-only flags' own near-instant, sleep-free output would suggest.
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
 
 fn demo_harness_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_demo-harness"))

@@ -5,34 +5,48 @@
 //! exited -- must still see it as the very last frame once it drains
 //! everything, never silently lose it to the same `try_send`-drops-the-
 //! newest-frame policy that governs stdout/stderr text.
+//!
+//! Driven through a direct `ProcessSpec` with the test-only `--burst` flag
+//! (bypassing `HarnessRequest`/`HarnessKind`, like `output_backpressure.rs`
+//! and `output_framing.rs`), not the rate-limited real demo harness: this
+//! test used to drive `HarnessKind::DemoLines` at 1000 Hz for 1500 lines,
+//! relying on that producing enough output to overflow the channel within a
+//! fixed wall-clock deadline. On macOS, coarse timer granularity stretches
+//! the resulting 1 ms inter-line sleeps far past what was requested, so the
+//! demo harness sometimes had not even finished emitting its lines -- let
+//! alone exited -- by the time the deadline below elapsed, and the test
+//! failed waiting for a terminal state that had not arrived yet, not on the
+//! property actually under test. `--burst` writes every line with no
+//! inter-line sleeping at all, which removes that platform dependency
+//! entirely while still deterministically overflowing the 1024-capacity
+//! channel.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use omnifrons_app::{
-    FramePayload, HarnessKind, HarnessRequest, ProcessOutput, ProcessStatus, ProcessSupervisor,
-};
+use omnifrons_app::{FramePayload, ProcessOutput, ProcessSpec, ProcessStatus, ProcessSupervisor};
 use omnifrons_supervisor::TokioProcessSupervisor;
 
-/// Comfortably above the 1024-frame channel capacity: stdout lines alone
-/// (`1500`) plus every 5th line's stderr echo (`300`) total roughly 1800
-/// delivery attempts against a queue nobody drains until after exit.
-const LINES: u32 = 1500;
-const RATE_HZ: u16 = 1000;
+/// Comfortably above the 1024-frame channel capacity, so the burst
+/// deterministically overflows it regardless of platform timer granularity.
+const BURST_LINES: u32 = 1500;
 
 const REAP_DEADLINE: Duration = Duration::from_secs(10);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
+fn demo_harness_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_demo-harness"))
+}
+
 #[test]
 fn the_final_state_frame_survives_a_full_undrained_channel() {
-    let mut supervisor = TokioProcessSupervisor::with_demo_launcher(PathBuf::from(env!(
-        "CARGO_BIN_EXE_demo-harness"
-    )));
-    let request = HarnessRequest::new(HarnessKind::DemoLines, RATE_HZ, LINES)
-        .expect("1000 Hz, 1500 lines must be a valid request");
+    let mut supervisor = TokioProcessSupervisor::with_demo_launcher(demo_harness_path());
+
+    let spec = ProcessSpec::new(demo_harness_path().to_string_lossy().into_owned())
+        .with_args(["--burst".to_string(), BURST_LINES.to_string()]);
 
     let id = supervisor
-        .spawn_harness(request)
+        .spawn(spec)
         .expect("spawning the demo harness must succeed");
     let rx = supervisor
         .subscribe(id)

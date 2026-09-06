@@ -19,13 +19,14 @@ use omnifrons_app::{ProcessSpec, ProcessStatus, ProcessSupervisor, ProcessTermin
 #[cfg(unix)]
 use omnifrons_supervisor::TokioProcessSupervisor;
 
-// 5s, not 2s: this test spawns and reaps a real OS process, and a loaded CI
-// runner needs more scheduling margin than a developer's own machine to
-// avoid a flaky failure that has nothing to do with the behaviour under
-// test. `KILL_GRACE` inside the supervisor is unaffected -- it bounds only
-// the SIGKILL escalation step, not this test's overall deadline.
+// 10s, not a shorter bound: this test spawns and reaps a real OS process,
+// and a loaded CI runner needs generous scheduling margin over a
+// developer's own machine to avoid a flaky failure that has nothing to do
+// with the behaviour under test. `KILL_GRACE` inside the supervisor is
+// unaffected -- it bounds only the SIGKILL escalation step, not this
+// test's overall deadline.
 #[cfg(unix)]
-const STOP_DEADLINE: Duration = Duration::from_secs(5);
+const STOP_DEADLINE: Duration = Duration::from_secs(10);
 
 #[cfg(unix)]
 #[test]

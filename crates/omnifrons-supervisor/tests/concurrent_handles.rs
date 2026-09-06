@@ -10,6 +10,14 @@
 //! a *different* process on another cloned handle, from another thread,
 //! must return promptly -- it must never wait for the concurrent `stop` to
 //! finish.
+//!
+//! The concurrency assertion itself holds on every platform, but what
+//! `stop` completing actually proves is platform-specific: on unix it is a
+//! confirmed `Killed` after a real SIGTERM/SIGKILL escalation, while on
+//! Windows `stop` is still the Job Object placeholder (VP-001 VP-S5) and
+//! always reports `OrphanRiskUncertain` -- see the platform-gated
+//! assertions at the end of the test for why that also makes the
+//! concurrency assertion trivially true there.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -68,9 +76,35 @@ fn observe_on_another_handle_is_not_blocked_by_a_concurrent_stop() {
         .join()
         .expect("the stop thread must not panic")
         .expect("stop must still succeed once it completes");
+
+    // Unix: `stop` (crates/omnifrons-supervisor/src/lib.rs `unix::stop`)
+    // genuinely waited out SIGTERM's grace period, escalated to SIGKILL,
+    // and confirmed the reap -- `Killed` is a real, proven outcome, and the
+    // concurrency assertion above means something: `observe` returned
+    // promptly *while* that multi-second escalation was actually in
+    // flight.
+    #[cfg(unix)]
     assert_eq!(
         terminal,
         omnifrons_app::ProcessTerminalState::Killed,
         "the SIGTERM-ignoring process must have been escalated to SIGKILL"
+    );
+
+    // Windows: `windows::stop` (crates/omnifrons-supervisor/src/lib.rs) is
+    // a stub pending the Job Object implementation (VP-001 VP-S5) -- it
+    // never signals the process group or waits out a deadline at all, it
+    // just calls `start_kill` best-effort and reports `OrphanRiskUncertain`
+    // immediately. That also means the concurrency assertion above is
+    // trivially true on this platform: `stop` returns almost instantly, so
+    // there is no multi-second window for `observe` to actually race
+    // against -- this test still runs unconditionally on Windows so that
+    // fact stays documented here rather than the test being silently
+    // skipped.
+    #[cfg(windows)]
+    assert_eq!(
+        terminal,
+        omnifrons_app::ProcessTerminalState::OrphanRiskUncertain,
+        "the Windows stop stub (VP-001 VP-S5 Job Object placeholder) always reports \
+         OrphanRiskUncertain, never a proven Killed"
     );
 }

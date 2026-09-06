@@ -18,7 +18,11 @@ use omnifrons_app::{
 };
 use omnifrons_supervisor::TokioProcessSupervisor;
 
-const REAP_DEADLINE: Duration = Duration::from_secs(5);
+// 10s, not a shorter bound: this waits for a demo harness driven by
+// `rate_hz` sleeps to reach a terminal state, and a loaded CI runner's
+// coarser timer granularity can stretch those sleeps well past what this
+// machine sees, so the deadline needs generous headroom.
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
 
 #[test]
 fn a_finalized_and_fully_drained_entry_is_removed() {
