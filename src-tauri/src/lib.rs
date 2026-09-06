@@ -5,11 +5,16 @@
 //! coordinators`). Nothing depends on this crate
 //! (docs/repository-layout.md § Crate map).
 
+mod executable_state;
 mod health;
 mod ipc;
 
+use executable_state::ExecutableState;
 use health::ShellHealth;
-use ipc::commands::{harness_observe, harness_spawn, harness_stop};
+use ipc::commands::{
+    approvals_list, executable_approve, executable_pick_and_probe, executable_revoke,
+    harness_observe, harness_spawn, harness_stop,
+};
 use omnifrons_supervisor::TokioProcessSupervisor;
 use tauri::Manager as _;
 
@@ -34,11 +39,14 @@ fn shell_health() -> ShellHealth {
 ///
 /// Panics if the Tauri application fails to build or exits with an error
 /// (for example, an invalid `tauri.conf.json` or a `WebView` that failed
-/// to initialize), or if `tauri::process::current_binary` cannot resolve
-/// this process's own path (the demo harness launcher).
+/// to initialize), if `tauri::process::current_binary` cannot resolve this
+/// process's own path (the demo harness launcher), if this platform's
+/// application-local data directory cannot be resolved, or if the
+/// approval store under it could not be opened.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // No program path or argument vector for a harness request
             // ever crosses IPC (docs/spike-log.md § IPC contract): this is
@@ -54,6 +62,15 @@ pub fn run() {
             // running a multi-second `stop` (`ipc::commands::with_supervisor`).
             let launcher = tauri::process::current_binary(&app.env())?;
             app.manage(TokioProcessSupervisor::with_demo_launcher(launcher));
+
+            // The approval store's path is logged at debug only -- it is
+            // never itself IPC output, and debug-level logs are not the
+            // renderer-facing surface `docs/spike-log.md` § IPC contract's
+            // no-path-leak rule governs, but there is still no reason to
+            // print it any louder than that.
+            let store_dir = app.path().app_local_data_dir()?;
+            tracing::debug!(store_dir = %store_dir.display(), "opening the approval store");
+            app.manage(ExecutableState::open(store_dir)?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -61,6 +78,10 @@ pub fn run() {
             harness_spawn,
             harness_stop,
             harness_observe,
+            executable_pick_and_probe,
+            executable_approve,
+            executable_revoke,
+            approvals_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

@@ -24,7 +24,9 @@ tauri-build.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tracing.workspace = true
 omnifrons-domain = { path = "../crates/omnifrons-domain" }
 omnifrons-app = { path = "../crates/omnifrons-app" }
+omnifrons-adapters = { path = "../crates/omnifrons-adapters" }
 omnifrons-supervisor = { path = "../crates/omnifrons-supervisor" }
