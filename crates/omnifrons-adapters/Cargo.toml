@@ -11,3 +11,21 @@ workspace = true
 [dependencies]
 omnifrons-domain = { path = "../omnifrons-domain" }
 omnifrons-app = { path = "../omnifrons-app" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `fs` gates everything this crate needs from `nix`: `OFlag::O_NOFOLLOW`
+# (`fs_prober::open_checked`), `sys::memfd::{memfd_create, MFdFlags}`, and
+# `fcntl`'s `FcntlArg::F_ADD_SEALS`/`SealFlag` (`fs_prober`'s Linux
+# sealed-memfd path). Verified against the vendored 0.31.3 source
+# (`nix::fcntl`/`nix::sys::memfd` are both gated by this one Cargo
+# feature, not a separate "fcntl" feature -- 0.31.3 has none by that
+# name) rather than assumed. `user` additionally gates
+# `nix::unistd::Uid::effective`/`is_root`, used only by this crate's own
+# tests to skip a permission-bit assertion when running as root.
+nix = { version = "0.31.3", default-features = false, features = ["fs", "user"] }
+
+[dev-dependencies]
+omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }
