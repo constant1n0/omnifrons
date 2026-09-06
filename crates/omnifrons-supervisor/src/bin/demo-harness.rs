@@ -14,10 +14,12 @@
 //!   the real demo harness behavior (`omnifrons_supervisor::demo::run`).
 //! - `demo-harness --long-line <bytes>` / `demo-harness --invalid-utf8` /
 //!   `demo-harness --long-line-utf8 <chars>` / `demo-harness --crlf` /
-//!   `demo-harness --no-trailing-newline` -- test-only flags that exercise
-//!   the capture pipeline's line-length cap, lossy UTF-8 decoding, UTF-8
-//!   character-boundary-safe splitting, CRLF stripping, and final
-//!   unterminated-line delivery directly, independent of `HarnessKind`.
+//!   `demo-harness --no-trailing-newline` / `demo-harness --burst <lines>`
+//!   -- test-only flags that exercise the capture pipeline's line-length
+//!   cap, lossy UTF-8 decoding, UTF-8 character-boundary-safe splitting,
+//!   CRLF stripping, final unterminated-line delivery, and (`--burst`)
+//!   deterministic output-channel overflow, directly and independent of
+//!   `HarnessKind`.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -44,6 +46,13 @@ fn main() -> ExitCode {
         }
         Some("--crlf") => emit_crlf_lines(),
         Some("--no-trailing-newline") => emit_no_trailing_newline(),
+        Some("--burst") => {
+            let lines: u32 = args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .expect("--burst requires a line count argument");
+            emit_burst(lines)
+        }
         Some(kind_arg) => {
             let kind = demo::parse_kind(kind_arg)
                 .unwrap_or_else(|| panic!("unknown demo harness kind: {kind_arg}"));
@@ -124,5 +133,24 @@ fn emit_no_trailing_newline() -> ExitCode {
         .write_all(b"no trailing newline")
         .expect("stdout must accept output with no trailing newline");
     stdout.flush().expect("stdout must flush");
+    ExitCode::SUCCESS
+}
+
+/// Emit `lines` lines to stdout with no inter-line sleeping at all (unlike
+/// the real demo harness's rate-limited `demo::run`), then exit `0`.
+///
+/// Deliberately deterministic and platform-timer-independent: with no
+/// sleep, a large `lines` count is written far faster than any consumer's
+/// bounded channel capacity, so this reliably overflows it regardless of a
+/// platform's timer granularity -- unlike driving `HarnessKind::DemoLines`
+/// at a high `rate_hz` and hoping enough lines land within a fixed
+/// wall-clock window
+/// (`crates/omnifrons-supervisor/tests/output_backpressure.rs`).
+fn emit_burst(lines: u32) -> ExitCode {
+    let mut stdout = std::io::stdout();
+    for n in 1..=lines {
+        writeln!(stdout, "line {n} out").expect("stdout must accept the burst harness's output");
+        stdout.flush().expect("stdout must flush");
+    }
     ExitCode::SUCCESS
 }
