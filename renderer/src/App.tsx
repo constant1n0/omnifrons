@@ -1,3 +1,4 @@
+import { HarnessPanel } from './HarnessPanel'
 import { UntrustedText } from './UntrustedText'
 
 /** Shown only when `untrustedContent` is omitted (`undefined`), never for an explicit empty string. */
@@ -20,6 +21,7 @@ export function App({ untrustedContent = DEFAULT_UNTRUSTED_CONTENT }: AppProps) 
     <>
       <h1>Omnifrons</h1>
       <UntrustedText content={untrustedContent} />
+      <HarnessPanel />
     </>
   )
 }
