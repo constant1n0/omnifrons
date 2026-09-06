@@ -2,10 +2,16 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  approvalsList,
+  executableApprove,
+  executablePickAndProbe,
+  executableRevoke,
   harnessObserve,
   harnessSpawn,
   harnessStop,
   isShellError,
+  type Approval,
+  type Evidence,
   type HarnessFrame,
 } from './harness'
 
@@ -16,8 +22,28 @@ afterEach(() => {
   clearMocks()
 })
 
+const SAMPLE_EVIDENCE: Evidence = {
+  canonicalPath: '/opt/tool/app',
+  size: 4096,
+  sha256: 'a'.repeat(64),
+  sha256Short: 'aaaaaaaa',
+  modifiedAt: 1_000,
+  platform: { os: 'unix', mode: 0o755 },
+}
+
+function sampleApproval(overrides: Partial<Approval> = {}): Approval {
+  return {
+    approvalId: 42,
+    evidence: SAMPLE_EVIDENCE,
+    approvedAt: 500,
+    status: 'active',
+    revokedAt: null,
+    ...overrides,
+  }
+}
+
 describe('harnessSpawn', () => {
-  it('invokes harness_spawn with exactly the keys kind, rateHz, lines, onFrame', async () => {
+  it('invokes harness_spawn with exactly the keys kind and onFrame, kind carrying rateHz/lines for a demo kind', async () => {
     let capturedArgs: Record<string, unknown> | undefined
     mockIPC((cmd, args) => {
       if (cmd === 'harness_spawn') {
@@ -27,14 +53,40 @@ describe('harnessSpawn', () => {
       throw new Error(`unexpected command: ${cmd}`)
     })
 
-    const id = await harnessSpawn({ kind: 'demo-lines', rateHz: 10, lines: 5 }, () => {})
+    const id = await harnessSpawn({ type: 'demo-lines', rateHz: 10, lines: 5 }, () => {})
 
     expect(id).toBe(42)
     expect(capturedArgs).toBeDefined()
-    expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'lines', 'onFrame', 'rateHz'])
-    expect(capturedArgs!.kind).toBe('demo-lines')
-    expect(capturedArgs!.rateHz).toBe(10)
-    expect(capturedArgs!.lines).toBe(5)
+    expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'onFrame'])
+    expect(capturedArgs!.kind).toEqual({ type: 'demo-lines', rateHz: 10, lines: 5 })
+    for (const key of Object.keys(capturedArgs!)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
+    for (const key of Object.keys(capturedArgs!.kind as Record<string, unknown>)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
+  })
+
+  it('invokes harness_spawn for the approved kind with exactly { kind: { type: "approved", approvalId }, onFrame } and no path-shaped key', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        capturedArgs = args as Record<string, unknown>
+        return 99
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const id = await harnessSpawn({ type: 'approved', approvalId: 42 }, () => {})
+
+    expect(id).toBe(99)
+    expect(capturedArgs).toBeDefined()
+    expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'onFrame'])
+    expect(capturedArgs!.kind).toEqual({ type: 'approved', approvalId: 42 })
+    expect(Object.keys(capturedArgs!.kind as Record<string, unknown>).sort()).toEqual([
+      'approvalId',
+      'type',
+    ])
     for (const key of Object.keys(capturedArgs!)) {
       expect(key.toLowerCase()).not.toContain('path')
     }
@@ -57,7 +109,7 @@ describe('harnessSpawn', () => {
     })
 
     const received: HarnessFrame[] = []
-    await harnessSpawn({ kind: 'demo-lines', rateHz: 1, lines: 1 }, (frame) => {
+    await harnessSpawn({ type: 'demo-lines', rateHz: 1, lines: 1 }, (frame) => {
       received.push(frame)
     })
 
@@ -83,7 +135,7 @@ describe('harnessSpawn', () => {
     })
 
     await expect(
-      harnessSpawn({ kind: 'demo-lines', rateHz: 1, lines: 1 }, () => {}),
+      harnessSpawn({ type: 'demo-lines', rateHz: 1, lines: 1 }, () => {}),
     ).rejects.toMatchObject({
       code: 'spawn-failed',
       message: 'failed to start the requested process',
@@ -136,9 +188,98 @@ describe('harnessObserve', () => {
   })
 })
 
+describe('executablePickAndProbe', () => {
+  it('invokes executable_pick_and_probe with no arguments and returns the probe result verbatim', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'executable_pick_and_probe') {
+        expect(args).toEqual({})
+        return { candidateId: 7, evidence: SAMPLE_EVIDENCE }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await executablePickAndProbe()
+
+    expect(result).toEqual({ candidateId: 7, evidence: SAMPLE_EVIDENCE })
+  })
+
+  it('rejects with the ShellError payload when the command rejects', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'executable_pick_and_probe') {
+        return Promise.reject({ code: 'no-candidate', message: 'no file was selected' })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    await expect(executablePickAndProbe()).rejects.toMatchObject({
+      code: 'no-candidate',
+      message: 'no file was selected',
+    })
+  })
+})
+
+describe('executableApprove', () => {
+  it('invokes executable_approve with exactly { candidateId } and returns the approval', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'executable_approve') {
+        expect(args).toEqual({ candidateId: 7 })
+        return sampleApproval({ approvalId: 42 })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await executableApprove(7)
+
+    expect(result).toEqual(sampleApproval({ approvalId: 42 }))
+  })
+})
+
+describe('executableRevoke', () => {
+  it('invokes executable_revoke with exactly { approvalId } and resolves to undefined', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'executable_revoke') {
+        capturedArgs = args as Record<string, unknown>
+        return null
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    await expect(executableRevoke(42)).resolves.toBeUndefined()
+    expect(capturedArgs).toEqual({ approvalId: 42 })
+  })
+})
+
+describe('approvalsList', () => {
+  it('invokes approvals_list with no arguments and returns the list verbatim', async () => {
+    const approvals = [sampleApproval({ approvalId: 1 }), sampleApproval({ approvalId: 2 })]
+    mockIPC((cmd, args) => {
+      if (cmd === 'approvals_list') {
+        expect(args).toEqual({})
+        return approvals
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await approvalsList()
+
+    expect(result).toEqual(approvals)
+  })
+})
+
 describe('isShellError', () => {
   it('identifies a ShellError-shaped value', () => {
     expect(isShellError({ code: 'spawn-failed', message: 'x' })).toBe(true)
+  })
+
+  it('identifies a ShellError-shaped value carrying a detail object', () => {
+    expect(
+      isShellError({
+        code: 'changed-since-approval',
+        message: 'x',
+        detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+      }),
+    ).toBe(true)
   })
 
   it('rejects values missing the shape', () => {

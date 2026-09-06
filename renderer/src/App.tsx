@@ -1,3 +1,4 @@
+import { ApprovalSurface } from './ApprovalSurface'
 import { HarnessPanel } from './HarnessPanel'
 import { UntrustedText } from './UntrustedText'
 
@@ -22,6 +23,10 @@ export function App({ untrustedContent = DEFAULT_UNTRUSTED_CONTENT }: AppProps) 
       <h1>Omnifrons</h1>
       <UntrustedText content={untrustedContent} />
       <HarnessPanel />
+      {/* A sibling of HarnessPanel, never a child -- RCS-001-R6 and
+          docs/renderer-content-security.md's guarantee that no rendered
+          content appears inside an approval surface. */}
+      <ApprovalSurface />
     </>
   )
 }

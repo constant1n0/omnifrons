@@ -2,14 +2,35 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { ApprovalSurface } from './ApprovalSurface'
 import { HarnessPanel } from './HarnessPanel'
-import type { HarnessFrame } from './ipc/harness'
+import type { Approval, Evidence, HarnessFrame } from './ipc/harness'
 
 // The jsdom crypto polyfill and React Testing Library's `cleanup()` are
 // installed once for every test file by `testSupport/setup.ts`
 // (`vite.config.ts`'s `test.setupFiles`) -- not repeated here.
 
 const SESSION_STORAGE_KEY = 'omnifrons.harness.processIds'
+
+const SAMPLE_EVIDENCE: Evidence = {
+  canonicalPath: '/opt/tool/app',
+  size: 4096,
+  sha256: 'a'.repeat(64),
+  sha256Short: 'aaaaaaaa',
+  modifiedAt: 1_000,
+  platform: { os: 'unix', mode: 0o755 },
+}
+
+function sampleApproval(overrides: Partial<Approval> = {}): Approval {
+  return {
+    approvalId: 42,
+    evidence: SAMPLE_EVIDENCE,
+    approvedAt: 500,
+    status: 'active',
+    revokedAt: null,
+    ...overrides,
+  }
+}
 
 beforeEach(() => {
   window.sessionStorage.clear()
@@ -48,7 +69,7 @@ describe('HarnessPanel', () => {
 
     const kindSelect = screen.getByLabelText('Kind') as HTMLSelectElement
     const options = Array.from(kindSelect.options).map((option) => option.value)
-    expect(options).toEqual(['demo-lines', 'demo-ignores-sigterm'])
+    expect(options).toEqual(['demo-lines', 'demo-ignores-sigterm', 'approved'])
 
     const rateInput = screen.getByLabelText('Rate (Hz)') as HTMLInputElement
     expect(rateInput.min).toBe('1')
@@ -513,5 +534,339 @@ describe('HarnessPanel', () => {
     })
 
     expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBe(JSON.stringify([99]))
+  })
+
+  it('hides the Rate/Lines inputs and shows an approval select when Kind is "approved"', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [sampleApproval({ approvalId: 42 })]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+
+    await screen.findByLabelText('Approval')
+    expect(screen.queryByLabelText('Rate (Hz)')).toBeNull()
+    expect(screen.queryByLabelText('Lines')).toBeNull()
+  })
+
+  it('lists only active approvals in the approval select', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [
+          sampleApproval({ approvalId: 1, status: 'active' }),
+          sampleApproval({ approvalId: 2, status: 'revoked', revokedAt: 600 }),
+        ]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    const values = Array.from(approvalSelect.options).map((option) => option.value)
+    expect(values).toContain('1')
+    expect(values).not.toContain('2')
+  })
+
+  it('renders the approval option label as the control-character-stripped canonical path (R3-013)', async () => {
+    const esc = String.fromCharCode(0x1b)
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [
+          sampleApproval({
+            approvalId: 42,
+            evidence: { ...SAMPLE_EVIDENCE, canonicalPath: `/opt/tool${esc}/app` },
+          }),
+        ]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    const option = Array.from(approvalSelect.options).find((candidate) => candidate.value === '42')
+    expect(option?.textContent).toBe('/opt/tool/app')
+  })
+
+  it('spawns with exactly { kind: { type: "approved", approvalId }, onFrame } for the approved kind', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'approvals_list') {
+        return [sampleApproval({ approvalId: 42 })]
+      }
+      if (cmd === 'harness_spawn') {
+        capturedArgs = args as Record<string, unknown>
+        return 7
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    fireEvent.change(approvalSelect, { target: { value: '42' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+
+    expect(capturedArgs).toBeDefined()
+    expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'onFrame'])
+    expect(capturedArgs!.kind).toEqual({ type: 'approved', approvalId: 42 })
+  })
+
+  it('shows a denial in the banner with the public "untrusted" wording for a revoked approval', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [sampleApproval({ approvalId: 42 })]
+      }
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'revoked',
+          message: 'the approval for this executable was revoked',
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    fireEvent.change(approvalSelect, { target: { value: '42' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toContain('untrusted')
+    expect(banner.textContent).toContain('revoked')
+    expect(banner.textContent).toContain('the approval for this executable was revoked')
+  })
+
+  it('shows a denial in the banner with the public "untrusted" wording for an unapproved candidate (R3-014)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [sampleApproval({ approvalId: 42 })]
+      }
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'unapproved',
+          message: 'this executable has not been approved',
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    fireEvent.change(approvalSelect, { target: { value: '42' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toContain('untrusted')
+    expect(banner.textContent).toContain('unapproved')
+    expect(banner.textContent).toContain('this executable has not been approved')
+  })
+
+  it('shows a denial in the banner with the public "untrusted" wording for a shadowed path (R3-014)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [sampleApproval({ approvalId: 42 })]
+      }
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'shadowed-path',
+          message: 'the approved path now resolves somewhere else',
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    fireEvent.change(approvalSelect, { target: { value: '42' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toContain('untrusted')
+    expect(banner.textContent).toContain('shadowed-path')
+    expect(banner.textContent).toContain('the approved path now resolves somewhere else')
+  })
+
+  it('shows a changed-since-approval denial with both digests in the banner detail', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [sampleApproval({ approvalId: 42 })]
+      }
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'changed-since-approval',
+          message: "the executable's content has changed since it was approved",
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    fireEvent.change(approvalSelect, { target: { value: '42' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toContain('untrusted')
+    expect(banner.textContent).toContain('aaaaaaaa')
+    expect(banner.textContent).toContain('bbbbbbbb')
+  })
+
+  it('clears the error banner and resets the approval selection when switching away from "approved" (R3-007/R3-011)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'revoked',
+          message: 'the approval for this executable was revoked',
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    fireEvent.change(approvalSelect, { target: { value: '42' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByRole('alert')
+
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'demo-lines' } })
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    const reselectedApprovalSelect = (await screen.findByLabelText(
+      'Approval',
+    )) as HTMLSelectElement
+    expect(reselectedApprovalSelect.value).toBe('')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+  })
+
+  it('ignores a stale approvals_list response that resolves after a newer request (R3-008)', async () => {
+    let callCount = 0
+    const resolvers: Array<(records: Approval[]) => void> = []
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        callCount += 1
+        return new Promise<Approval[]>((resolve) => {
+          resolvers[callCount - 1] = resolve
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    await waitFor(() => {
+      expect(callCount).toBe(1)
+    })
+
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'demo-lines' } })
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    await waitFor(() => {
+      expect(callCount).toBe(2)
+    })
+
+    // The newer request (#2) resolves first...
+    act(() => {
+      resolvers[1]!([sampleApproval({ approvalId: 2 })])
+    })
+    await waitFor(() => {
+      const approvalSelect = screen.getByLabelText('Approval') as HTMLSelectElement
+      expect(Array.from(approvalSelect.options).map((option) => option.value)).toContain('2')
+    })
+
+    // ...then the stale older request (#1) resolves after it -- it must be
+    // ignored, not overwrite the newer, already-applied response. Flushed
+    // with a real macrotask tick (not just a synchronous act()) so the
+    // stale response's own .then chain -- two async-function hops plus
+    // the effect's own .then -- has fully settled before asserting.
+    await act(async () => {
+      resolvers[0]!([sampleApproval({ approvalId: 1 })])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    const approvalSelect = screen.getByLabelText('Approval') as HTMLSelectElement
+    const values = Array.from(approvalSelect.options).map((option) => option.value)
+    expect(values).toContain('2')
+    expect(values).not.toContain('1')
+  })
+
+  it('renders detail only for a changed-since-approval error, never for another code that happens to carry one (R3-009)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'invalid-request',
+          message: 'bad request',
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toContain('invalid-request')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(banner.textContent).not.toContain('bbbbbbbb')
+    expect(banner.textContent).not.toContain('recorded')
+  })
+
+  it('keeps Start disabled while the approvals list is still loading for the approved kind (R3-010)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') return new Promise<never[]>(() => {})
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<HarnessPanel />)
+    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+    await screen.findByLabelText('Approval')
+
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+  })
+
+  it('never renders the approval region inside the output log element (RCS-001-R6)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') return []
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(
+      <>
+        <HarnessPanel />
+        <ApprovalSurface />
+      </>,
+    )
+
+    const region = await screen.findByRole('region', { name: 'Executable approval' })
+    const log = screen.getByLabelText('Output log')
+    expect(log.contains(region)).toBe(false)
+    expect(document.body.contains(region)).toBe(true)
   })
 })

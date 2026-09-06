@@ -1,9 +1,41 @@
-import { render } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
+import { render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import App, { DEFAULT_UNTRUSTED_CONTENT } from './App'
 
+// `ApprovalSurface` (mounted by `App`) calls `approvals_list` on mount in
+// every test in this file -- mock it here, for every test, so this
+// module's IPC surface is deterministic rather than leaving `invoke`
+// unmocked, which throws a bare `TypeError` (no `__TAURI_INTERNALS__` in
+// this jsdom environment) instead of a proper `ShellError` rejection
+// (R3-003). Any other command is a real error in this file's tests, so
+// it rejects with a fixed, catalogue `ShellError` rather than throwing.
+beforeEach(() => {
+  mockIPC((cmd) => {
+    if (cmd === 'approvals_list') return []
+    return Promise.reject({ code: 'invalid-request', message: 'unexpected command in test' })
+  })
+})
+
+afterEach(() => {
+  clearMocks()
+})
+
 describe('App', () => {
+  it('renders no alert on mount', async () => {
+    render(<App />)
+
+    // Flush every pending microtask in the mount-time approvalsList() ->
+    // .then/.catch chain (each async-function hop schedules its own
+    // microtask) before asserting nothing rendered an alert.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('renders untrusted content as plain text by default', () => {
     const untrustedContent = 'Reported note: <b>bold</b> should stay literal.'
 

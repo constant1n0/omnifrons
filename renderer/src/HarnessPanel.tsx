@@ -1,20 +1,42 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { stripControlCharacters } from './controlCharacters'
 import {
+  approvalsList,
   harnessObserve,
   harnessSpawn,
   harnessStop,
   isShellError,
+  type Approval,
+  type ApprovalId,
   type HarnessFrame,
   type HarnessKind,
   type ProcessId,
   type ProcessTerminalState,
   type ShellError,
+  type ShellErrorCode,
 } from './ipc/harness'
 import { PlainTextLine } from './PlainTextLine'
 
-/** The two demo harness kinds the Rust catalog accepts. */
-const HARNESS_KINDS: HarnessKind[] = ['demo-lines', 'demo-ignores-sigterm']
+/** The tag alone of {@link HarnessKind} -- what the Kind select offers. */
+type HarnessKindTag = HarnessKind['type']
+
+/** The three harness kinds the Kind select offers. */
+const HARNESS_KIND_TAGS: HarnessKindTag[] = ['demo-lines', 'demo-ignores-sigterm', 'approved']
+
+/**
+ * The four `LaunchGate` denial codes `harness_spawn`'s `approved` kind can
+ * reject with -- rendered in the banner with the shared public wording
+ * "untrusted", since every one of them means the same thing to a caller:
+ * this executable is not cleared to launch right now
+ * (`docs/threat-model.md` HAR-3/HAR-4).
+ */
+const DENIAL_CODES: ReadonlySet<ShellErrorCode> = new Set([
+  'unapproved',
+  'changed-since-approval',
+  'shadowed-path',
+  'revoked',
+])
 
 /**
  * Bounds mirroring `omnifrons_app::harness_catalog`'s validated range.
@@ -160,7 +182,7 @@ type PanelError = ShellError | 'unexpected'
  * text only, per RCS-001-R1 -- never as markup.
  */
 export function HarnessPanel() {
-  const [kind, setKind] = useState<HarnessKind>('demo-lines')
+  const [kindTag, setKindTag] = useState<HarnessKindTag>('demo-lines')
   // Held as raw strings, not numbers: an in-progress edit (empty, a bare
   // "-", a partial number) must stay representable in the input while
   // still being validated on every keystroke (R3-006).
@@ -168,6 +190,9 @@ export function HarnessPanel() {
   const [linesInput, setLinesInput] = useState(String(DEFAULT_LINES))
   const rateHz = parseCount(rateHzInput, MIN_RATE_HZ, MAX_RATE_HZ)
   const lines = parseCount(linesInput, MIN_LINES, MAX_LINES)
+  /** Active approvals offered by the `approved` kind's own select. */
+  const [approvals, setApprovals] = useState<Approval[]>([])
+  const [approvedId, setApprovedId] = useState<ApprovalId | null>(null)
   const [activeId, setActiveId] = useState<ProcessId | null>(null)
   /** True from `handleStart`'s call until its spawn settles, one way or the other. */
   const [isSpawning, setIsSpawning] = useState(false)
@@ -190,6 +215,38 @@ export function HarnessPanel() {
       mountedRef.current = false
     }
   }, [])
+
+  /**
+   * The sequence number of the most recently *started* `approvals_list`
+   * fetch below. Compared against the request id each fetch captured at
+   * its own start, so a response is only ever applied if it is still the
+   * latest one in flight -- otherwise it is a stale response from an
+   * earlier fetch (e.g. leaving `approved` and re-selecting it before the
+   * first fetch settled) and is silently dropped (R3-008).
+   */
+  const latestApprovalsRequestRef = useRef(0)
+
+  /**
+   * Fetches the active-approvals list lazily, only once the `approved`
+   * kind is actually selected -- every other test/usage of this panel
+   * never triggers an `approvals_list` call at all, keeping the demo-kind
+   * paths' own IPC surface unchanged from slice 1.
+   */
+  useEffect(() => {
+    if (kindTag !== 'approved') return
+    const requestId = (latestApprovalsRequestRef.current += 1)
+    approvalsList()
+      .then((records) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestApprovalsRequestRef.current) return
+        setApprovals(records)
+      })
+      .catch((listError: unknown) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestApprovalsRequestRef.current) return
+        setError(isShellError(listError) ? listError : 'unexpected')
+      })
+  }, [kindTag])
 
   const handleFrame = useCallback((frame: HarnessFrame) => {
     if (!mountedRef.current) return
@@ -238,16 +295,24 @@ export function HarnessPanel() {
   }, [])
 
   async function handleStart() {
-    // Belt-and-suspenders: the Start button is already disabled while
-    // either field is invalid, but never spawn on a value this panel
-    // itself considers out of range.
-    if (rateHz === null || lines === null) return
+    // Belt-and-suspenders: the Start button is already disabled while the
+    // active kind's own required input is missing, but never spawn on a
+    // value this panel itself considers out of range or unselected.
+    let requestedKind: HarnessKind
+    if (kindTag === 'approved') {
+      if (approvedId === null) return
+      requestedKind = { type: 'approved', approvalId: approvedId }
+    } else {
+      if (rateHz === null || lines === null) return
+      requestedKind = { type: kindTag, rateHz, lines }
+    }
+
     setError(null)
     setLog(EMPTY_LOG)
     setReconnectedIds([])
     setIsSpawning(true)
     try {
-      const id = await harnessSpawn({ kind, rateHz, lines }, handleFrame)
+      const id = await harnessSpawn(requestedKind, handleFrame)
       setActiveId(id)
       setBadge('running')
       persistIds([...loadPersistedIds(), id])
@@ -274,6 +339,26 @@ export function HarnessPanel() {
     }
   }
 
+  /**
+   * Leaving the `approved` kind clears its own error banner and forgets
+   * the previously selected approval, rather than letting either linger
+   * once they no longer apply to the now-selected kind -- switching back
+   * to `approved` later always requires re-selecting an approval
+   * (R3-007/R3-011).
+   */
+  function handleKindChange(nextKind: HarnessKindTag) {
+    if (kindTag === 'approved' && nextKind !== 'approved') {
+      setError(null)
+      setApprovedId(null)
+    }
+    setKindTag(nextKind)
+  }
+
+  const activeApprovals = approvals.filter((approval) => approval.status === 'active')
+  const missingRequiredInput =
+    kindTag === 'approved' ? approvedId === null : rateHz === null || lines === null
+  const startDisabled = isSpawning || activeId !== null || missingRequiredInput
+
   return (
     <section aria-label="Demo harness">
       <h2>Demo harness</h2>
@@ -284,10 +369,22 @@ export function HarnessPanel() {
             <strong>unexpected error</strong>
           ) : (
             <>
+              {DENIAL_CODES.has(error.code) && (
+                <>
+                  <strong>untrusted</strong>{' '}
+                </>
+              )}
               <strong>
                 <PlainTextLine text={error.code} />
               </strong>
               : <PlainTextLine text={error.message} />
+              {error.code === 'changed-since-approval' && error.detail && (
+                <span>
+                  {' '}
+                  (recorded <PlainTextLine text={error.detail.recordedSha256Short} />, observed{' '}
+                  <PlainTextLine text={error.detail.observedSha256Short} />)
+                </span>
+              )}
             </>
           )}
         </div>
@@ -297,53 +394,71 @@ export function HarnessPanel() {
         <label htmlFor="harness-kind">Kind</label>
         <select
           id="harness-kind"
-          value={kind}
-          onChange={(event) => setKind(event.target.value as HarnessKind)}
+          value={kindTag}
+          onChange={(event) => handleKindChange(event.target.value as HarnessKindTag)}
         >
-          {HARNESS_KINDS.map((value) => (
+          {HARNESS_KIND_TAGS.map((value) => (
             <option key={value} value={value}>
               {value}
             </option>
           ))}
         </select>
 
-        <label htmlFor="harness-rate-hz">Rate (Hz)</label>
-        <input
-          id="harness-rate-hz"
-          type="number"
-          min={MIN_RATE_HZ}
-          max={MAX_RATE_HZ}
-          value={rateHzInput}
-          onChange={(event) => setRateHzInput(event.target.value)}
-          aria-invalid={rateHz === null}
-        />
-        {rateHz === null && (
-          <p data-testid="rate-hz-validation">
-            {`Rate (Hz) must be a whole number from ${MIN_RATE_HZ} to ${MAX_RATE_HZ}.`}
-          </p>
+        {kindTag === 'approved' ? (
+          <>
+            <label htmlFor="harness-approval">Approval</label>
+            <select
+              id="harness-approval"
+              value={approvedId === null ? '' : String(approvedId)}
+              onChange={(event) =>
+                setApprovedId(event.target.value === '' ? null : Number(event.target.value))
+              }
+            >
+              <option value="">Select an approval</option>
+              {activeApprovals.map((approval) => (
+                <option key={approval.approvalId} value={approval.approvalId}>
+                  {stripControlCharacters(approval.evidence.canonicalPath)}
+                </option>
+              ))}
+            </select>
+          </>
+        ) : (
+          <>
+            <label htmlFor="harness-rate-hz">Rate (Hz)</label>
+            <input
+              id="harness-rate-hz"
+              type="number"
+              min={MIN_RATE_HZ}
+              max={MAX_RATE_HZ}
+              value={rateHzInput}
+              onChange={(event) => setRateHzInput(event.target.value)}
+              aria-invalid={rateHz === null}
+            />
+            {rateHz === null && (
+              <p data-testid="rate-hz-validation">
+                {`Rate (Hz) must be a whole number from ${MIN_RATE_HZ} to ${MAX_RATE_HZ}.`}
+              </p>
+            )}
+
+            <label htmlFor="harness-lines">Lines</label>
+            <input
+              id="harness-lines"
+              type="number"
+              min={MIN_LINES}
+              max={MAX_LINES}
+              value={linesInput}
+              onChange={(event) => setLinesInput(event.target.value)}
+              aria-invalid={lines === null}
+            />
+            {lines === null && (
+              <p data-testid="lines-validation">
+                {`Lines must be a whole number from ${MIN_LINES} to ${MAX_LINES}.`}
+              </p>
+            )}
+          </>
         )}
 
-        <label htmlFor="harness-lines">Lines</label>
-        <input
-          id="harness-lines"
-          type="number"
-          min={MIN_LINES}
-          max={MAX_LINES}
-          value={linesInput}
-          onChange={(event) => setLinesInput(event.target.value)}
-          aria-invalid={lines === null}
-        />
-        {lines === null && (
-          <p data-testid="lines-validation">
-            {`Lines must be a whole number from ${MIN_LINES} to ${MAX_LINES}.`}
-          </p>
-        )}
-
-        <button
-          type="button"
-          onClick={handleStart}
-          disabled={isSpawning || activeId !== null || rateHz === null || lines === null}
-        >
+        <button type="button" onClick={handleStart} disabled={startDisabled}>
           Start
         </button>
         <button type="button" onClick={handleStop} disabled={activeId === null}>
