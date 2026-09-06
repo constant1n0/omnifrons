@@ -2155,10 +2155,14 @@ dependencies = [
 name = "omnifrons-shell"
 version = "0.1.0"
 dependencies = [
+ "omnifrons-app",
+ "omnifrons-domain",
+ "omnifrons-supervisor",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tracing",
 ]
 
 [[package]]

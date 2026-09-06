@@ -112,3 +112,19 @@ fn default_capability_grants_only_core_default() {
         "the default capability must not disable local app URL access"
     );
 }
+
+/// `docs/spike-log.md`'s IPC contract keeps this shell's capabilities at
+/// `core:default` only, even after adding the three demo-harness commands:
+/// `build.rs` must never opt into `AppManifest::commands` (a
+/// `tauri-build` mechanism for auto-generating a broader ACL from command
+/// signatures), which would widen the capability surface silently.
+#[test]
+fn build_script_does_not_reference_app_manifest() {
+    let path = format!("{}/build.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+
+    assert!(
+        !source.contains("AppManifest"),
+        "build.rs must not reference AppManifest::commands; capabilities stay at core:default only"
+    );
+}

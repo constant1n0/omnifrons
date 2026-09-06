@@ -8,6 +8,15 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Compiles in the hidden `--demo-harness <kind> <rate_hz> <lines>` argv
+# branch (src/main.rs), parsed before `tauri::Builder` runs. Not part of
+# the default feature set: no program path or argument vector for a
+# harness request ever crosses IPC in a normal build
+# (docs/spike-log.md § IPC contract), and `tests/feature_gate.rs` asserts
+# the literal string is absent from a binary built without this feature.
+demo-harness = []
+
 [build-dependencies]
 tauri-build.workspace = true
 
@@ -15,3 +24,7 @@ tauri-build.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tauri.workspace = true
+tracing.workspace = true
+omnifrons-domain = { path = "../crates/omnifrons-domain" }
+omnifrons-app = { path = "../crates/omnifrons-app" }
+omnifrons-supervisor = { path = "../crates/omnifrons-supervisor" }
