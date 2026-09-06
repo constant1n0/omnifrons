@@ -12,15 +12,73 @@
 //! "cleanly stopped" (docs/target-architecture.md § Required failure
 //! states).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use omnifrons_app::{
-    ProcessId, ProcessSpec, ProcessStatus, ProcessSupervisor, ProcessTerminalState, SupervisorError,
+    HarnessRequest, ProcessId, ProcessOutput, ProcessSpec, ProcessStatus, ProcessSupervisor,
+    ProcessTerminalState, SupervisorError,
 };
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+pub mod demo;
+mod output_capture;
+
+use output_capture::OutputTable;
+
+/// The maximum number of concurrently `Running` children one supervisor
+/// tracks at once. `spawn`/`spawn_harness` refuse a request beyond this cap
+/// with [`SupervisorError::TooManyProcesses`], rather than growing
+/// `Inner::children` (and the OS resources a real spawn would consume)
+/// without bound.
+const MAX_RUNNING_CHILDREN: usize = 16;
+
+/// The maximum number of `Terminal` entries retained once evicted from the
+/// running cap above. Past this, the oldest entry by termination order
+/// (`Inner::terminal_order`) is evicted from `Inner::children` outright: a
+/// later `stop`/`observe` on an evicted id then reports
+/// `SupervisorError::UnknownProcess`/`None`, exactly as it would for an id
+/// this supervisor never spawned. This never re-signals a pid the OS may
+/// have since recycled -- an evicted entry was, by construction, already
+/// confirmed reaped (`Tracked::Terminal`) before it was ever eligible for
+/// eviction.
+const MAX_RETAINED_TERMINAL_CHILDREN: usize = 256;
+
+/// Record that `id` just transitioned to `Tracked::Terminal` (the caller
+/// has already made that assignment in `children`), and evict the oldest
+/// retained terminal entry if [`MAX_RETAINED_TERMINAL_CHILDREN`] is now
+/// exceeded.
+///
+/// Called with `children`'s own lock already released by the caller: this
+/// briefly re-acquires it only to remove the evicted entry, never while
+/// still holding it from the transition itself, so it composes safely with
+/// call sites that already had `children` locked a moment before (both
+/// `TokioProcessSupervisor::observe` and `unix::poll_until_reaped` drop
+/// their guard first).
+fn record_terminal_order(
+    children: &Mutex<HashMap<ProcessId, Tracked>>,
+    terminal_order: &Mutex<VecDeque<ProcessId>>,
+    id: ProcessId,
+) {
+    let mut order = terminal_order
+        .lock()
+        .expect("terminal_order mutex poisoned by a prior panic");
+    order.push_back(id);
+    if order.len() > MAX_RETAINED_TERMINAL_CHILDREN
+        && let Some(evicted) = order.pop_front()
+    {
+        children
+            .lock()
+            .expect("children mutex poisoned by a prior panic")
+            .remove(&evicted);
+    }
+}
 
 /// The bookkeeping this supervisor holds for one spawned process.
 ///
@@ -49,14 +107,84 @@ enum Tracked {
 /// A `ProcessSupervisor` backed by `tokio::process`, driven from behind a
 /// synchronous interface.
 ///
-/// The port is sync-with-deadline (see `omnifrons_app::ProcessSupervisor`
-/// docs), while the actual process I/O this crate needs -- Tokio's SIGCHLD-
-/// driven child-exit notification -- is async. This struct owns a private
-/// current-thread [`Runtime`] and enters it around every Tokio call, so the
-/// asynchrony stays an implementation detail behind the synchronous port.
+/// A cheap, `Clone`-able handle over shared state (`Arc<Inner>`), not a
+/// value that itself needs an external lock to be shared across threads.
+/// The port's `spawn`/`stop`/`observe` methods take `&mut self` (see
+/// `omnifrons_app::ProcessSupervisor`), but that requirement is satisfied
+/// per-clone: two clones are two independent local values, so two threads
+/// each holding their own clone can call `&mut self` methods concurrently
+/// without contending on any single call's duration -- the actual shared
+/// mutable state (`Inner::children`, `Inner::outputs`) is separately, and
+/// far more finely, synchronized inside. This is what lets a caller (the
+/// Tauri shell) store the handle in managed state with no outer `Mutex`:
+/// wrapping the whole supervisor in one `Mutex` would otherwise serialize
+/// every command behind whichever one happened to be running a
+/// multi-second `stop` (`tests/concurrent_handles.rs`).
+#[derive(Clone)]
 pub struct TokioProcessSupervisor {
-    runtime: Runtime,
+    inner: Arc<Inner>,
+}
+
+/// The state every [`TokioProcessSupervisor`] handle shares a clone of.
+///
+/// The actual process I/O this crate needs -- Tokio's SIGCHLD-driven
+/// child-exit notification, and the output-capture reader tasks
+/// (`docs/spike-log.md` § IPC contract) -- is async. This struct owns a
+/// private current-thread [`Runtime`], wrapped in its own [`Arc`] so a
+/// dedicated background driver thread (spawned in [`TokioProcessSupervisor::build`])
+/// can hold its own clone and actually drive it, independent of `Inner`'s
+/// own reference count.
+///
+/// ## Why a driver thread, not just `enter()`
+///
+/// Merely `enter()`ing a current-thread runtime around each synchronous
+/// call (an earlier implementation) makes the runtime's handle available so
+/// `tokio::process::Command` and friends can be constructed, but it does
+/// not poll anything: a current-thread runtime's I/O and timer drivers, and
+/// every task ever `spawn`ed onto it, only make progress while some thread
+/// is inside [`Runtime::block_on`] for that specific runtime (a `Handle`'s
+/// own `block_on` does not count -- it "cannot drive IO or timer drivers"
+/// on a current-thread runtime "unless another thread is actively calling
+/// `Runtime::block_on` on the same runtime", per the Tokio documentation).
+/// Without a driver, a reader task spawned to drain a child's stdout would
+/// simply never run. The driver thread's sole job is to call
+/// `Runtime::block_on` on a future that only resolves when [`Drop`] signals
+/// it to (`driver_shutdown`), so the runtime is driven for this
+/// supervisor's entire lifetime; `spawn`/`stop`/`observe` still use
+/// `enter()` from whichever thread calls them, exactly as before, purely to
+/// construct runtime-dependent resources on that thread.
+struct Inner {
+    runtime: Arc<Runtime>,
     children: Mutex<HashMap<ProcessId, Tracked>>,
+    /// The order, oldest first, in which entries in `children` transitioned
+    /// to `Tracked::Terminal`. Every id pushed here exactly once, at the
+    /// moment of that transition (`record_terminal_order`); consulted only
+    /// to decide which entry to evict once [`MAX_RETAINED_TERMINAL_CHILDREN`]
+    /// is exceeded.
+    terminal_order: Mutex<VecDeque<ProcessId>>,
+    /// Per-child output-capture bookkeeping (`output_capture` module),
+    /// deliberately a separate table from `children`: it must outlive a
+    /// `Tracked` entry's own Running/Terminal transition (`observe`/`stop`
+    /// must keep reporting a confirmed reap immediately, not wait on
+    /// output capture), and a `subscribe` call must still find a process
+    /// that has already gone terminal.
+    outputs: OutputTable,
+    /// Set only by [`TokioProcessSupervisor::with_demo_launcher`]; the path
+    /// `spawn_harness` execs. No program path or argument vector for a
+    /// harness request ever crosses IPC -- this is the one place a real
+    /// path lives, fixed at construction (`docs/spike-log.md` § IPC
+    /// contract).
+    demo_launcher: Option<PathBuf>,
+    /// Sending on this tells the driver thread's `block_on` to return.
+    /// `None` after `Drop` has already taken it. Never touched outside
+    /// construction and `Drop`, so this needs no lock of its own: by the
+    /// time `Drop::drop` runs, this `Inner` -- the last surviving
+    /// `Arc<Inner>` having just been dropped -- is uniquely owned again.
+    driver_shutdown: Option<oneshot::Sender<()>>,
+    /// Joined in `Drop`, after signalling shutdown, so the driver thread's
+    /// own `Arc<Runtime>` clone is guaranteed dropped before this `Inner`'s
+    /// other fields (including its own `runtime` clone) are.
+    driver_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Default for TokioProcessSupervisor {
@@ -66,28 +194,134 @@ impl Default for TokioProcessSupervisor {
 }
 
 impl TokioProcessSupervisor {
-    /// Build a new supervisor with its own private Tokio runtime.
+    /// Build a new supervisor with its own private Tokio runtime, driven by
+    /// a dedicated background thread for this supervisor's entire lifetime.
     ///
     /// # Panics
     ///
     /// Panics if a current-thread Tokio runtime could not be built (e.g.
-    /// the OS refuses to create the runtime's I/O/timer driver).
+    /// the OS refuses to create the runtime's I/O/timer driver), or if the
+    /// driver thread could not be spawned.
     #[must_use]
     pub fn new() -> Self {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build the process supervisor's Tokio runtime");
+        Self::build(None)
+    }
+
+    /// Build a supervisor exactly like [`Self::new`], additionally
+    /// configured to run demo harness requests against the binary at
+    /// `path` (the shell passes `tauri::process::current_binary(&env)`;
+    /// this crate's own tests pass `env!("CARGO_BIN_EXE_demo-harness")`).
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::new`].
+    #[must_use]
+    pub fn with_demo_launcher(path: PathBuf) -> Self {
+        Self::build(Some(path))
+    }
+
+    /// Shared construction for [`Self::new`] and [`Self::with_demo_launcher`].
+    /// `demo_launcher` must be known up front, before `Inner` is wrapped in
+    /// its `Arc`: unlike the pre-handle design, there is no later point at
+    /// which a lone, uniquely-owned value could still be mutated in place.
+    fn build(demo_launcher: Option<PathBuf>) -> Self {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build the process supervisor's Tokio runtime"),
+        );
+
+        let (driver_shutdown, shutdown_rx) = oneshot::channel();
+        let driver_runtime = Arc::clone(&runtime);
+        let driver_thread = std::thread::Builder::new()
+            .name("omnifrons-supervisor-driver".to_string())
+            .spawn(move || {
+                // `Runtime::block_on` (not `Handle::block_on`) is required
+                // here: only it actually drives a current-thread runtime's
+                // I/O and timer reactors and every task spawned onto it --
+                // see `Inner`'s own doc comment.
+                driver_runtime.block_on(async move {
+                    let _ = shutdown_rx.await;
+                });
+            })
+            .expect("failed to spawn the process supervisor's runtime driver thread");
+
         Self {
-            runtime,
-            children: Mutex::new(HashMap::new()),
+            inner: Arc::new(Inner {
+                runtime,
+                children: Mutex::new(HashMap::new()),
+                terminal_order: Mutex::new(VecDeque::new()),
+                outputs: Arc::new(Mutex::new(HashMap::new())),
+                demo_launcher,
+                driver_shutdown: Some(driver_shutdown),
+                driver_thread: Some(driver_thread),
+            }),
         }
+    }
+
+    /// Turn a validated [`HarnessRequest`] into a real process, without
+    /// ever letting a program path or argument vector cross whatever
+    /// boundary produced the request (`docs/spike-log.md` § IPC contract):
+    /// the launcher path was already fixed at construction
+    /// ([`Self::with_demo_launcher`]), and `kind`/`rate_hz`/`lines` are the
+    /// only values this method turns into argv.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::Spawn`] if the underlying process could
+    /// not be started.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this supervisor was not built via
+    /// [`Self::with_demo_launcher`].
+    pub fn spawn_harness(&mut self, request: HarnessRequest) -> Result<ProcessId, SupervisorError> {
+        let launcher = self.inner.demo_launcher.clone().expect(
+            "spawn_harness requires a supervisor built via TokioProcessSupervisor::with_demo_launcher",
+        );
+        let spec = ProcessSpec::new(launcher.to_string_lossy().into_owned()).with_args([
+            demo::kind_arg(request.kind()).to_string(),
+            request.rate_hz().to_string(),
+            request.lines().to_string(),
+        ]);
+        self.spawn(spec)
+    }
+
+    /// Spawn `future` onto this supervisor's runtime, to actually run in
+    /// the background on its driver thread.
+    ///
+    /// Exposed beyond this crate's own use (the output-capture reader
+    /// tasks) so the runtime-is-actually-driven property is independently
+    /// testable (`tests/runtime_drives_tasks.rs`) without reaching into
+    /// this struct's private fields.
+    pub fn spawn_on_runtime<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner.runtime.spawn(future)
     }
 }
 
 impl ProcessSupervisor for TokioProcessSupervisor {
     fn spawn(&mut self, spec: ProcessSpec) -> Result<ProcessId, SupervisorError> {
-        let _guard = self.runtime.enter();
+        let _guard = self.inner.runtime.enter();
+
+        {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("children mutex poisoned by a prior panic");
+            let running_count = children
+                .values()
+                .filter(|tracked| matches!(tracked, Tracked::Running(_)))
+                .count();
+            if running_count >= MAX_RUNNING_CHILDREN {
+                return Err(SupervisorError::TooManyProcesses);
+            }
+        }
 
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
@@ -110,7 +344,13 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         // -- see `Drop`'s own doc comment.
         command.kill_on_drop(true);
 
-        let child = command.spawn().map_err(|error| {
+        // Piped, not inherited: output capture (below) is what drains
+        // these, one reader task per stream, so the child never blocks
+        // writing into a full, undrained OS pipe buffer.
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        let mut child = command.spawn().map_err(|error| {
             tracing::warn!(program = %spec.program, %error, "failed to spawn process");
             SupervisorError::Spawn(error.to_string())
         })?;
@@ -119,7 +359,43 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .ok_or_else(|| SupervisorError::Spawn("spawned child reported no pid".to_string()))?;
         let id = ProcessId(pid);
 
-        self.children
+        // Taken before this child is ever inserted into `children`, so no
+        // other code path can observe a `Tracked::Running` whose stdout/
+        // stderr have already been taken out from under it.
+        let stdout = child
+            .stdout
+            .take()
+            .expect("stdout was configured as piped above");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("stderr was configured as piped above");
+
+        let (output_state, stdout_handles) = output_capture::new_channel();
+        let stderr_handles = stdout_handles.clone();
+        self.inner
+            .outputs
+            .lock()
+            .expect("outputs mutex poisoned by a prior panic")
+            .insert(id, output_state);
+
+        self.spawn_on_runtime(output_capture::drain_stream(
+            stdout,
+            omnifrons_app::OutputStream::Stdout,
+            stdout_handles,
+            Arc::clone(&self.inner.outputs),
+            id,
+        ));
+        self.spawn_on_runtime(output_capture::drain_stream(
+            stderr,
+            omnifrons_app::OutputStream::Stderr,
+            stderr_handles,
+            Arc::clone(&self.inner.outputs),
+            id,
+        ));
+
+        self.inner
+            .children
             .lock()
             .expect("children mutex poisoned by a prior panic")
             .insert(id, Tracked::Running(Box::new(child)));
@@ -133,26 +409,34 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         id: ProcessId,
         deadline: Duration,
     ) -> Result<ProcessTerminalState, SupervisorError> {
-        let _guard = self.runtime.enter();
+        let _guard = self.inner.runtime.enter();
 
         #[cfg(unix)]
         {
-            unix::stop(&self.children, id, deadline)
+            unix::stop(
+                &self.inner.children,
+                &self.inner.terminal_order,
+                &self.inner.outputs,
+                id,
+                deadline,
+            )
         }
         #[cfg(windows)]
         {
-            windows::stop(&self.children, id, deadline)
+            windows::stop(&self.inner.children, &self.inner.outputs, id, deadline)
         }
     }
 
     fn observe(&self, id: ProcessId) -> Option<ProcessStatus> {
-        let _guard = self.runtime.enter();
+        let _guard = self.inner.runtime.enter();
         let mut children = self
+            .inner
             .children
             .lock()
             .expect("children mutex poisoned by a prior panic");
         let tracked = children.get_mut(&id)?;
-        match tracked {
+        let mut just_became_terminal = false;
+        let result = match tracked {
             Tracked::Terminal(state) => Some(ProcessStatus::Terminal(*state)),
             Tracked::Running(child) => match child.try_wait() {
                 Ok(Some(status)) => {
@@ -162,6 +446,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                     // Confirmed reaped: evict now, so nothing ever touches
                     // this pid/pgid again.
                     *tracked = Tracked::Terminal(state);
+                    just_became_terminal = true;
                     Some(ProcessStatus::Terminal(state))
                 }
                 Ok(None) => Some(ProcessStatus::Running),
@@ -174,19 +459,48 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                     ProcessTerminalState::OrphanRiskUncertain,
                 )),
             },
+        };
+        drop(children);
+
+        // Recorded only on the transition itself (not on a later `observe`
+        // of an already-`Terminal` entry), so `Inner::terminal_order` holds
+        // each id at most once -- see `record_terminal_order`'s own doc
+        // comment on why this must run with `children` already unlocked.
+        if just_became_terminal {
+            record_terminal_order(&self.inner.children, &self.inner.terminal_order, id);
         }
+
+        // Output capture's own finalize is independent of, and must never
+        // gate, this port's own reap reporting above -- see
+        // `output_capture`'s doc comment.
+        if let Some(ProcessStatus::Terminal(state)) = result {
+            output_capture::record_confirmed_state(&self.inner.outputs, id, state);
+        }
+
+        result
     }
 }
 
-impl Drop for TokioProcessSupervisor {
-    /// Best-effort cleanup, not containment: if this supervisor is dropped
-    /// without a prior `stop` for every child it spawned (e.g. a panicking
-    /// test, or an early return), send SIGKILL to the process group of
-    /// every entry still `Running` on unix, so a bug elsewhere in this
-    /// process does not silently orphan a live descendant. Errors are
-    /// swallowed except for a `warn`: there is no caller left to report
-    /// them to, and this runs during unwinding as readily as during a
-    /// normal drop, where panicking would abort the process.
+impl ProcessOutput for TokioProcessSupervisor {
+    fn subscribe(
+        &mut self,
+        id: ProcessId,
+    ) -> Result<std::sync::mpsc::Receiver<omnifrons_app::OutputFrame>, SupervisorError> {
+        output_capture::take_receiver(&self.inner.outputs, id)
+    }
+}
+
+impl Drop for Inner {
+    /// Best-effort cleanup, not containment: runs only once the *last*
+    /// [`TokioProcessSupervisor`] handle sharing this `Inner` is dropped
+    /// (`Arc`'s own contract). If that happens without a prior `stop` for
+    /// every child spawned through any handle (e.g. a panicking test, or an
+    /// early return), send SIGKILL to the process group of every entry
+    /// still `Running` on unix, so a bug elsewhere in this process does not
+    /// silently orphan a live descendant. Errors are swallowed except for a
+    /// `warn`: there is no caller left to report them to, and this runs
+    /// during unwinding as readily as during a normal drop, where panicking
+    /// would abort the process.
     ///
     /// Also makes a short, bounded best-effort attempt to reap each child it
     /// kills: `stop`'s normal reap relies on this supervisor's own Tokio
@@ -200,7 +514,36 @@ impl Drop for TokioProcessSupervisor {
     /// This does not attempt Windows containment (the Job Object policy
     /// VP-001 VP-S5 needs is not yet implemented there, matching `stop`'s
     /// own honesty about that gap).
+    ///
+    /// Before any of that, this signals the driver thread to stop and joins
+    /// it, so its `Arc<Runtime>` clone is guaranteed dropped -- and the
+    /// runtime therefore guaranteed to actually shut down, not merely lose
+    /// one of two owners -- before this function returns.
     fn drop(&mut self) {
+        if let Some(shutdown) = self.driver_shutdown.take() {
+            // The driver thread's receiver can only already be gone if the
+            // driver thread itself already exited (e.g. it panicked); a
+            // send error here is not actionable beyond skipping the join.
+            let _ = shutdown.send(());
+        }
+        if let Some(driver_thread) = self.driver_thread.take()
+            && let Err(panic_payload) = driver_thread.join()
+        {
+            // `Box<dyn Any + Send>` has no `Debug` impl; a panic payload is
+            // almost always the `&str`/`String` message `panic!` itself
+            // constructs, so recover that where possible rather than
+            // logging an opaque payload description.
+            let message = panic_payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            tracing::error!(
+                message,
+                "the process supervisor's runtime driver thread panicked"
+            );
+        }
+
         #[cfg(unix)]
         {
             let children = match self.children.lock() {
@@ -248,7 +591,7 @@ impl Drop for TokioProcessSupervisor {
 
 #[cfg(unix)]
 mod unix {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -258,6 +601,8 @@ mod unix {
     use omnifrons_app::{ProcessId, ProcessTerminalState, SupervisorError};
 
     use crate::Tracked;
+    use crate::output_capture::{self, OutputTable};
+    use crate::record_terminal_order;
 
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
     const KILL_GRACE: Duration = Duration::from_millis(500);
@@ -288,6 +633,8 @@ mod unix {
 
     pub(crate) fn stop(
         children: &Mutex<HashMap<ProcessId, Tracked>>,
+        terminal_order: &Mutex<VecDeque<ProcessId>>,
+        outputs: &OutputTable,
         id: ProcessId,
         deadline: Duration,
     ) -> Result<ProcessTerminalState, SupervisorError> {
@@ -333,6 +680,8 @@ mod unix {
 
         if let Some(state) = poll_until_reaped(
             children,
+            terminal_order,
+            outputs,
             id,
             deadline,
             ProcessTerminalState::Exited { code: None },
@@ -357,9 +706,14 @@ mod unix {
             return Ok(ProcessTerminalState::OrphanRiskUncertain);
         }
 
-        if let Some(state) =
-            poll_until_reaped(children, id, KILL_GRACE, ProcessTerminalState::Killed)
-        {
+        if let Some(state) = poll_until_reaped(
+            children,
+            terminal_order,
+            outputs,
+            id,
+            KILL_GRACE,
+            ProcessTerminalState::Killed,
+        ) {
             return Ok(state);
         }
 
@@ -384,6 +738,8 @@ mod unix {
     /// been recycled by the OS.
     fn poll_until_reaped(
         children: &Mutex<HashMap<ProcessId, Tracked>>,
+        terminal_order: &Mutex<VecDeque<ProcessId>>,
+        outputs: &OutputTable,
         id: ProcessId,
         budget: Duration,
         on_reap: ProcessTerminalState,
@@ -406,6 +762,9 @@ mod unix {
                         other => other,
                     };
                     *tracked = Tracked::Terminal(state);
+                    drop(guard);
+                    record_terminal_order(children, terminal_order, id);
+                    output_capture::record_confirmed_state(outputs, id, state);
                     return Some(state);
                 }
             }
@@ -466,6 +825,7 @@ mod windows {
     use omnifrons_app::{ProcessId, ProcessTerminalState, SupervisorError};
 
     use crate::Tracked;
+    use crate::output_capture::OutputTable;
 
     /// Stub pending the Job Object implementation (VP-001 VP-S5).
     ///
@@ -478,9 +838,12 @@ mod windows {
     /// supervision). Because containment is unproven, a confirmed reap
     /// never happens here either, so the entry is deliberately never
     /// evicted to `Terminal`: every call, including a repeat one, takes the
-    /// same honest, unproven path.
+    /// same honest, unproven path. Output capture's final `State` frame is
+    /// consequently never sent on Windows either -- the same, already-
+    /// documented gap, not a new one (`output_capture`'s own doc comment).
     pub(crate) fn stop(
         children: &Mutex<HashMap<ProcessId, Tracked>>,
+        _outputs: &OutputTable,
         id: ProcessId,
         _deadline: Duration,
     ) -> Result<ProcessTerminalState, SupervisorError> {

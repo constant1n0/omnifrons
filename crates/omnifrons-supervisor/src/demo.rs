@@ -1,0 +1,118 @@
+//! The demo harness's actual business logic, shared by the test-only
+//! `demo-harness` binary (`src/bin/demo-harness.rs`) and, behind the
+//! `demo-harness` cargo feature, the shell's hidden
+//! `--demo-harness <kind> <rate_hz> <lines>` argv branch.
+//!
+//! No program path or argument vector for this crosses IPC
+//! (`docs/spike-log.md` § IPC contract): the shell only ever receives a
+//! validated `omnifrons_app::HarnessRequest`, and [`kind_arg`]/[`parse_kind`]
+//! are the one stable, closed vocabulary the supervisor and this binary
+//! agree on to encode [`HarnessKind`] as a single argv token.
+
+use std::io::Write as _;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use omnifrons_app::HarnessKind;
+
+/// The stable argv token for `kind`: [`kind_arg`] encodes it (used by
+/// `TokioProcessSupervisor::spawn_harness`), [`parse_kind`] decodes it
+/// (used by the `demo-harness` binary's own argv parsing).
+#[must_use]
+pub const fn kind_arg(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::DemoLines => "demo-lines",
+        HarnessKind::DemoIgnoresSigterm => "demo-ignores-sigterm",
+    }
+}
+
+/// Parse a [`kind_arg`] token back into a [`HarnessKind`], or `None` if it
+/// is not one of the two recognized tokens.
+#[must_use]
+pub fn parse_kind(arg: &str) -> Option<HarnessKind> {
+    match arg {
+        "demo-lines" => Some(HarnessKind::DemoLines),
+        "demo-ignores-sigterm" => Some(HarnessKind::DemoIgnoresSigterm),
+        _ => None,
+    }
+}
+
+/// Run the demo harness: print a leading `"ready"` line to stdout, then
+/// `lines` lines to stdout at `rate_hz` (`"line <n> out"`), and every 5th
+/// line also to stderr (`"line <n> err"`), then exit `0`.
+///
+/// [`HarnessKind::DemoIgnoresSigterm`] additionally installs a `SIGTERM`
+/// ignore handler (unix only) before emitting, so only a forceful stop
+/// (`SIGKILL`) can terminate it early; on any other platform this is
+/// currently indistinguishable from [`HarnessKind::DemoLines`].
+///
+/// The `"ready"` line is printed only *after* that handler is installed --
+/// for both kinds, symmetrically, even though [`HarnessKind::DemoLines`]
+/// installs no handler of its own -- so a caller that subscribes to this
+/// process's output and waits for `"ready"` before calling `stop` has a
+/// genuine synchronization point for "the handler, if any, is in place
+/// now", rather than a fixed sleep and a guess at how long installation
+/// takes (`crates/omnifrons-supervisor/tests/demo_harness.rs`).
+///
+/// # Panics
+///
+/// Panics if stdout or stderr cannot be written to or flushed (e.g. a
+/// broken pipe), or (unix, `DemoIgnoresSigterm` only) if the `SIGTERM`
+/// ignore handler could not be installed.
+#[must_use]
+pub fn run(kind: HarnessKind, rate_hz: u16, lines: u32) -> ExitCode {
+    if matches!(kind, HarnessKind::DemoIgnoresSigterm) {
+        #[cfg(unix)]
+        unix::ignore_sigterm();
+    }
+
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
+
+    writeln!(stdout, "ready").expect("stdout must accept the demo harness's ready line");
+    stdout.flush().expect("stdout must flush");
+
+    let interval = Duration::from_secs_f64(1.0 / f64::from(rate_hz.max(1)));
+
+    for n in 1..=lines {
+        if n > 1 {
+            std::thread::sleep(interval);
+        }
+        writeln!(stdout, "line {n} out").expect("stdout must accept the demo harness's output");
+        stdout.flush().expect("stdout must flush");
+        if n % 5 == 0 {
+            writeln!(stderr, "line {n} err").expect("stderr must accept the demo harness's output");
+            stderr.flush().expect("stderr must flush");
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+#[cfg(unix)]
+mod unix {
+    /// Install a `SIGTERM`-ignoring disposition.
+    ///
+    /// `nix::sys::signal::signal` is `unsafe` in general (installing an
+    /// arbitrary signal-handler function pointer is inherently unsafe --
+    /// the handler must be async-signal-safe), but the only disposition
+    /// ever installed here is `SigHandler::SigIgn`, which runs no handler
+    /// function of ours at all, so nothing here can violate async-signal-
+    /// safety. This one call is therefore isolated behind an explicit,
+    /// documented `#[allow(unsafe_code)]`, matching the workspace's
+    /// `unsafe_code = "deny"` default everywhere else.
+    #[allow(unsafe_code)]
+    pub(super) fn ignore_sigterm() {
+        // SAFETY: SigIgn installs no handler function of ours, so there is
+        // nothing that could violate async-signal-safety; ignoring
+        // SIGTERM is the documented, deliberate behavior under test
+        // (`DemoIgnoresSigterm`).
+        unsafe {
+            nix::sys::signal::signal(
+                nix::sys::signal::Signal::SIGTERM,
+                nix::sys::signal::SigHandler::SigIgn,
+            )
+        }
+        .expect("failed to install the SIGTERM-ignore handler");
+    }
+}

@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 omnifrons-domain = { path = "../omnifrons-domain" }
 omnifrons-app = { path = "../omnifrons-app" }
-tokio = { workspace = true, features = ["rt", "process", "time"] }
+tokio = { workspace = true, features = ["rt", "process", "time", "sync", "io-util"] }
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
