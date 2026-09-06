@@ -21,7 +21,9 @@ jobs:
   build-test:
     name: build-test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The shell now compiles tauri, wry, and webkit bindings on three runners;
+    # a cold cache needs the extra margin over the previous 30-minute budget.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +35,9 @@ jobs:
 
       - name: Setup toolchain
         uses: ./.github/actions/setup-toolchain
+        with:
+          # omnifrons-shell (src-tauri) links WebKitGTK on ubuntu runners.
+          linux-prereqs: 'true'
 
       - name: cargo fmt
         if: hashFiles('rust-toolchain.toml') != ''
