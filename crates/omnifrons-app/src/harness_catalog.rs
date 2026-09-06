@@ -9,11 +9,16 @@
 //! time (`TokioProcessSupervisor::with_demo_launcher`), not one carried by
 //! the request.
 
-/// The closed set of demo harness behaviors a caller may request.
+/// The closed set of harness behaviors a caller may request.
 ///
-/// Closed and exhaustive by design: the renderer names one of these kinds,
-/// never a program path or argument vector (`docs/spike-log.md` § IPC
-/// contract).
+/// Closed and exhaustive by design: the renderer names one of these
+/// kinds, never a program path or argument vector (`docs/spike-log.md` §
+/// IPC contract). `Approved` was added in the spike slice-2 spike
+/// alongside executable identity and approval
+/// (`crates/omnifrons-app/src/launch_gate.rs`): unlike the two demo
+/// kinds, it never flows through [`HarnessRequest`]/`spawn_harness`'s
+/// argv-encoding path -- a launch it names goes through
+/// `LaunchGate::decide` and the supervisor's `spawn_approved` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HarnessKind {
     /// Emit `lines` lines at `rate_hz`, then exit `0`.
@@ -21,6 +26,9 @@ pub enum HarnessKind {
     /// Behave like [`Self::DemoLines`], but ignore `SIGTERM` so a caller
     /// must escalate to a forceful stop to terminate it.
     DemoIgnoresSigterm,
+    /// Launch the real executable behind this approval id, subject to a
+    /// `LaunchGate` decision immediately before launch.
+    Approved(omnifrons_domain::executable::ApprovalId),
 }
 
 /// Why a [`HarnessRequest`] was rejected.
@@ -34,6 +42,12 @@ pub enum InvalidRequest {
     LinesZero,
     /// `lines` exceeded the bound (`100_000`).
     LinesTooHigh,
+    /// `kind` was [`HarnessKind::Approved`]: that variant never flows
+    /// through this argv-encoding, rate/lines-bounded request shape at
+    /// all -- a launch it names goes through `LaunchGate::decide` and
+    /// the supervisor's `spawn_approved` instead
+    /// (`docs/spike-log.md` § Slice 2).
+    KindNotDemo,
 }
 
 impl std::fmt::Display for InvalidRequest {
@@ -43,6 +57,7 @@ impl std::fmt::Display for InvalidRequest {
             Self::RateHzTooHigh => "rate_hz must not exceed 1000",
             Self::LinesZero => "lines must not be zero",
             Self::LinesTooHigh => "lines must not exceed 100_000",
+            Self::KindNotDemo => "kind must be a demo harness kind, not Approved",
         };
         f.write_str(message)
     }
@@ -73,9 +88,14 @@ impl HarnessRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidRequest`] if `rate_hz` is `0` or exceeds `1000`, or
-    /// if `lines` is `0` or exceeds `100_000`.
+    /// Returns [`InvalidRequest::KindNotDemo`] if `kind` is
+    /// [`HarnessKind::Approved`]; otherwise [`InvalidRequest`] if
+    /// `rate_hz` is `0` or exceeds `1000`, or if `lines` is `0` or exceeds
+    /// `100_000`.
     pub fn new(kind: HarnessKind, rate_hz: u16, lines: u32) -> Result<Self, InvalidRequest> {
+        if matches!(kind, HarnessKind::Approved(_)) {
+            return Err(InvalidRequest::KindNotDemo);
+        }
         if rate_hz == 0 {
             return Err(InvalidRequest::RateHzZero);
         }
@@ -143,6 +163,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_approved_kind_outright() {
+        let error = HarnessRequest::new(
+            HarnessKind::Approved(omnifrons_domain::executable::ApprovalId(1)),
+            10,
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(error, InvalidRequest::KindNotDemo);
+    }
+
+    #[test]
     fn accepts_a_well_formed_request() {
         let request = HarnessRequest::new(HarnessKind::DemoIgnoresSigterm, 1000, 100_000)
             .expect("boundary values (1000 Hz, 100_000 lines) must be accepted");
@@ -152,15 +183,20 @@ mod tests {
     }
 
     /// Not a runtime assertion so much as a maintenance trip-wire: adding a
-    /// third `HarnessKind` variant makes this `match` non-exhaustive and
+    /// fourth `HarnessKind` variant makes this `match` non-exhaustive and
     /// fails the build, forcing a deliberate decision here rather than a
-    /// silently incomplete catalog.
+    /// silently incomplete catalog. Three variants, deliberately, as of
+    /// the spike slice-2 spike: the two demo kinds plus `Approved`.
     #[test]
-    fn harness_kind_has_exactly_two_variants() {
+    fn harness_kind_has_exactly_three_variants_deliberately() {
         let assert_exhaustive = |kind: HarnessKind| match kind {
-            HarnessKind::DemoLines | HarnessKind::DemoIgnoresSigterm => {}
+            HarnessKind::DemoLines | HarnessKind::DemoIgnoresSigterm | HarnessKind::Approved(_) => {
+            }
         };
         assert_exhaustive(HarnessKind::DemoLines);
         assert_exhaustive(HarnessKind::DemoIgnoresSigterm);
+        assert_exhaustive(HarnessKind::Approved(
+            omnifrons_domain::executable::ApprovalId(1),
+        ));
     }
 }

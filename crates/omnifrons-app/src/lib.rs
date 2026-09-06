@@ -4,11 +4,21 @@
 //! (docs/repository-layout.md § Crate map): this crate and the domain core
 //! it sits on must run and test without Tauri, Tokio, or any adapter.
 
+pub mod approval_store;
+pub mod clock;
+pub mod executable_prober;
 mod harness_catalog;
+pub mod launch_gate;
 mod process_output;
 mod process_supervisor;
 
+pub use approval_store::{ApprovalStore, ApprovalStoreError};
+pub use clock::Clock;
+pub use executable_prober::{
+    ExecHandle, ExecutableIdentity, ExecutableProber, ProbeOutcome, ProbedExecutable,
+};
 pub use harness_catalog::{HarnessKind, HarnessRequest, InvalidRequest};
+pub use launch_gate::{GateDecision, LaunchGate};
 pub use process_output::{FramePayload, OutputFrame, OutputStream, ProcessOutput};
 pub use process_supervisor::{
     ProcessId, ProcessSpec, ProcessStatus, ProcessSupervisor, ProcessTerminalState, SupervisorError,
