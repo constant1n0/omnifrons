@@ -15,7 +15,11 @@ tokio = { workspace = true, features = ["rt", "process", "time", "sync", "io-uti
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["signal"] }
+# "signal" for `demo::unix::ignore_sigterm`; "fs" (added for the spike
+# slice-2 review fixes) for `nix::fcntl::{fcntl, FcntlArg, FdFlag}`,
+# clearing close-on-exec on an approved executable's sealed memfd
+# immediately before `spawn_approved` execs it.
+nix = { version = "0.31.3", default-features = false, features = ["signal", "fs"] }
 
 [dev-dependencies]
 omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }

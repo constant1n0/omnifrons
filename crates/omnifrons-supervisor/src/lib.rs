@@ -281,7 +281,13 @@ impl TokioProcessSupervisor {
             "spawn_harness requires a supervisor built via TokioProcessSupervisor::with_demo_launcher",
         );
         let spec = ProcessSpec::new(launcher.to_string_lossy().into_owned()).with_args([
-            demo::kind_arg(request.kind()).to_string(),
+            demo::kind_arg(request.kind())
+                .expect(
+                    "omnifrons_app::HarnessRequest::new rejects HarnessKind::Approved with \
+                     InvalidRequest::KindNotDemo, so a HarnessRequest's own kind() is never \
+                     Approved here",
+                )
+                .to_string(),
             request.rate_hz().to_string(),
             request.lines().to_string(),
         ]);
@@ -304,10 +310,21 @@ impl TokioProcessSupervisor {
     }
 }
 
-impl ProcessSupervisor for TokioProcessSupervisor {
-    fn spawn(&mut self, spec: ProcessSpec) -> Result<ProcessId, SupervisorError> {
-        let _guard = self.inner.runtime.enter();
-
+impl TokioProcessSupervisor {
+    /// Shared tail of [`ProcessSupervisor::spawn`] and [`Self::spawn_approved`]:
+    /// given an already-configured `Command` (program, args, and any
+    /// platform-specific process-group setup already applied by the
+    /// caller), enforce the running-process cap, pipe stdout/stderr for
+    /// capture, spawn, and wire this supervisor's own bookkeeping.
+    ///
+    /// `program_label` is used only for `tracing`/error text -- never the
+    /// literal argv the child actually receives, which the caller has
+    /// already baked into `command`.
+    fn finish_spawn(
+        &mut self,
+        mut command: Command,
+        program_label: &str,
+    ) -> Result<ProcessId, SupervisorError> {
         {
             let children = self
                 .inner
@@ -321,19 +338,6 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             if running_count >= MAX_RUNNING_CHILDREN {
                 return Err(SupervisorError::TooManyProcesses);
             }
-        }
-
-        let mut command = Command::new(&spec.program);
-        command.args(&spec.args);
-
-        #[cfg(unix)]
-        {
-            // Group the child under its own process group so a later stop
-            // can signal the whole group, not just the direct child
-            // (docs/adr/0002 § Process supervision). Stable since Rust
-            // 1.64 (`std::os::unix::process::CommandExt::process_group`,
-            // re-exposed by `tokio::process::Command`).
-            command.process_group(0);
         }
 
         // Best-effort safety net: if this supervisor is dropped without an
@@ -351,7 +355,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         command.stderr(std::process::Stdio::piped());
 
         let mut child = command.spawn().map_err(|error| {
-            tracing::warn!(program = %spec.program, %error, "failed to spawn process");
+            tracing::warn!(program = %program_label, %error, "failed to spawn process");
             SupervisorError::Spawn(error.to_string())
         })?;
         let pid = child
@@ -400,8 +404,137 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .expect("children mutex poisoned by a prior panic")
             .insert(id, Tracked::Running(Box::new(child)));
 
-        tracing::debug!(program = %spec.program, pid, "spawned process");
+        tracing::debug!(program = %program_label, pid, "spawned process");
         Ok(id)
+    }
+
+    /// Launch `handle` with no arguments and `stdin` always `/dev/null`
+    /// (never the executable's own bytes), after a `LaunchGate` decision
+    /// has confirmed it may run (`docs/spike-log.md` § Slice 2).
+    /// `display_path` is used only for `tracing`/error text.
+    ///
+    /// ## `ExecHandle::SealedMemory` (Linux)
+    ///
+    /// Execs the sealed `memfd` itself via the classic `/proc/self/fd/<n>`
+    /// technique (glibc's own `fexecve` falls back to exactly this on
+    /// Linux when the direct `execveat` syscall path is unavailable): the
+    /// *path string* given to `execve`, `/proc/self/fd/<n>`, is resolved
+    /// through `/proc`'s special handling to the exact open file
+    /// description fd `<n>` names, not looked up by name in the ordinary
+    /// filesystem -- so the content actually read for the exec is exactly
+    /// the sealed bytes `omnifrons_app::ExecutableProber::probe` hashed,
+    /// regardless of what `display_path` resolves to by the time this
+    /// call runs, or ever again afterward (the seal makes further
+    /// modification impossible in the first place).
+    ///
+    /// The memfd was created `MFD_CLOEXEC` (`omnifrons-adapters`'
+    /// `fs_prober` doc comment) so it is never inherited by some
+    /// unrelated `exec` before this deliberate moment; immediately before
+    /// spawning, this method clears that flag (`fcntl(F_SETFD,
+    /// FdFlag::empty())`) so it *is* inherited across *this* `exec` --
+    /// with no `unsafe` code, since `nix`'s `fcntl` wrapper is itself
+    /// safe. A direct-binary target only ever needs the kernel's own
+    /// single internal open of `/proc/self/fd/<n>` (performed before the
+    /// calling process's old image is replaced), but a *script* target (a
+    /// `#!`-interpreted file) does not: the kernel's shebang handling
+    /// re-execs the named interpreter, whose own userspace start-up code
+    /// re-opens that same `/proc/self/fd/<n>` string a *second* time, as
+    /// an ordinary syscall from its own, by then fully-committed process
+    /// image -- which only succeeds because the fd survived the first
+    /// `execve` inheritably. The fd therefore remains open in the child by
+    /// design, for as long as the child process runs -- not a leak.
+    ///
+    /// `stdin` is always `Stdio::null()`: unlike an earlier version of
+    /// this method (which passed the executable itself as `stdin` to
+    /// exploit `dup2`'s always-inheritable duplicate, sidestepping the
+    /// close-on-exec question a different way), the executable's own
+    /// bytes must never be reachable through the child's standard input
+    /// (`crates/omnifrons-supervisor/tests/approved_launch.rs`'s
+    /// `spawn_approved_never_feeds_the_executable_as_stdin` proves a
+    /// fixture reading its own `stdin` observes immediate `EOF`, never the
+    /// script's own source).
+    ///
+    /// ## `ExecHandle::File` (macOS, Windows, or a Linux fallback)
+    ///
+    /// Spawns by `display_path` directly, dropping `handle` first: no
+    /// sealing is available for a plain, unsealed file, so only the
+    /// *inode identity* observed while hashing is guaranteed -- nothing
+    /// prevents that same inode's content from being modified in place,
+    /// or the path from being retargeted, between this call and the
+    /// actual `execve`/`CreateProcess` (`docs/spike-log.md` § Slice 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::Spawn`] if the underlying process could
+    /// not be started (including if clearing close-on-exec on a sealed
+    /// memfd failed), or [`SupervisorError::TooManyProcesses`] under the
+    /// same running-child cap as [`ProcessSupervisor::spawn`].
+    pub fn spawn_approved(
+        &mut self,
+        handle: omnifrons_app::ExecHandle,
+        display_path: PathBuf,
+    ) -> Result<ProcessId, SupervisorError> {
+        let _guard = self.inner.runtime.enter();
+        let label = display_path.to_string_lossy().into_owned();
+
+        match handle {
+            #[cfg(target_os = "linux")]
+            omnifrons_app::ExecHandle::SealedMemory(file) => {
+                use std::os::fd::AsFd as _;
+
+                nix::fcntl::fcntl(
+                    file.as_fd(),
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(|error| {
+                    SupervisorError::Spawn(format!(
+                        "failed to clear close-on-exec on the approved executable's sealed \
+                         memfd: {error}"
+                    ))
+                })?;
+
+                let fd = {
+                    use std::os::fd::AsRawFd as _;
+                    file.as_raw_fd()
+                };
+                let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+                command.stdin(std::process::Stdio::null());
+                command.process_group(0);
+                // `file` must stay alive (and therefore its fd open) until
+                // `finish_spawn` has actually called `spawn`.
+                let result = self.finish_spawn(command, &label);
+                drop(file);
+                result
+            }
+            omnifrons_app::ExecHandle::File(file) => {
+                drop(file);
+                let mut command = Command::new(display_path);
+                #[cfg(unix)]
+                command.process_group(0);
+                self.finish_spawn(command, &label)
+            }
+        }
+    }
+}
+
+impl ProcessSupervisor for TokioProcessSupervisor {
+    fn spawn(&mut self, spec: ProcessSpec) -> Result<ProcessId, SupervisorError> {
+        let _guard = self.inner.runtime.enter();
+
+        let mut command = Command::new(&spec.program);
+        command.args(&spec.args);
+
+        #[cfg(unix)]
+        {
+            // Group the child under its own process group so a later stop
+            // can signal the whole group, not just the direct child
+            // (docs/adr/0002 § Process supervision). Stable since Rust
+            // 1.64 (`std::os::unix::process::CommandExt::process_group`,
+            // re-exposed by `tokio::process::Command`).
+            command.process_group(0);
+        }
+
+        self.finish_spawn(command, &spec.program)
     }
 
     fn stop(

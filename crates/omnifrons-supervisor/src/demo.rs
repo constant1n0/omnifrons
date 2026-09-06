@@ -15,14 +15,44 @@ use std::time::Duration;
 
 use omnifrons_app::HarnessKind;
 
+/// Why [`kind_arg`] could not encode a [`HarnessKind`] as an argv token:
+/// `kind` was [`HarnessKind::Approved`], which never crosses the demo
+/// harness's argv-encoding path at all.
+///
+/// Structurally unreachable in practice --
+/// `omnifrons_app::HarnessRequest::new` already rejects
+/// `HarnessKind::Approved` with `InvalidRequest::KindNotDemo` before a
+/// `HarnessRequest` (the only thing `kind_arg`'s one real caller,
+/// `TokioProcessSupervisor::spawn_harness`, ever holds a `kind` from) can
+/// even be constructed -- but `kind_arg` itself takes a bare
+/// `HarnessKind`, not a `HarnessRequest`, so it stays a total function
+/// over every value its own parameter type allows, an error, never a
+/// panic, if that invariant is ever violated by some future caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NotADemoKind;
+
+impl std::fmt::Display for NotADemoKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HarnessKind::Approved is not a demo harness kind")
+    }
+}
+
+impl std::error::Error for NotADemoKind {}
+
 /// The stable argv token for `kind`: [`kind_arg`] encodes it (used by
 /// `TokioProcessSupervisor::spawn_harness`), [`parse_kind`] decodes it
 /// (used by the `demo-harness` binary's own argv parsing).
-#[must_use]
-pub const fn kind_arg(kind: HarnessKind) -> &'static str {
+///
+/// # Errors
+///
+/// Returns [`NotADemoKind`] if `kind` is [`HarnessKind::Approved`]: see
+/// that type's own doc comment for why this is an error, not a panic,
+/// even though `spawn_harness`'s own caller has already ruled it out.
+pub fn kind_arg(kind: HarnessKind) -> Result<&'static str, NotADemoKind> {
     match kind {
-        HarnessKind::DemoLines => "demo-lines",
-        HarnessKind::DemoIgnoresSigterm => "demo-ignores-sigterm",
+        HarnessKind::DemoLines => Ok("demo-lines"),
+        HarnessKind::DemoIgnoresSigterm => Ok("demo-ignores-sigterm"),
+        HarnessKind::Approved(_) => Err(NotADemoKind),
     }
 }
 
