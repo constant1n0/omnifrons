@@ -210,8 +210,14 @@ fn observed_env_equals_the_allowlist_excluding_a_planted_secret_shaped_key() {
         .expect("an init line must be present");
     let observed_cwd =
         extract_json_text_field(init_line, "cwd").expect("cwd field must be present");
+    // Platform assumption: the child reports its cwd as the OS hands it
+    // over, while `WorkspaceRoot` is canonical. On Windows the canonical
+    // form carries the verbatim `\\?\` prefix and the child's does not, so
+    // the comparison must canonicalize the observed side too.
+    let observed_cwd = std::fs::canonicalize(&observed_cwd)
+        .unwrap_or_else(|error| panic!("the observed cwd must canonicalize: {error}"));
     assert_eq!(
-        PathBuf::from(observed_cwd),
+        observed_cwd,
         workspace.path().to_path_buf(),
         "the child's observed cwd must equal the workspace"
     );
