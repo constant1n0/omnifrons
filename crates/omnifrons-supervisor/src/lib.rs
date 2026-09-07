@@ -17,7 +17,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use omnifrons_app::harness_adapter::{EnvPlan, LaunchPlan};
+use omnifrons_app::harness_adapter::{EnvPlan, LaunchPlan, TransportClass};
 use omnifrons_app::{
     HarnessRequest, ProcessId, ProcessOutput, ProcessSpec, ProcessStatus, ProcessSupervisor,
     ProcessTerminalState, StdinPlan, SupervisorError, is_secret_shaped,
@@ -31,8 +31,151 @@ use tokio::task::JoinHandle;
 
 pub mod demo;
 mod output_capture;
+#[cfg(unix)]
+mod pty;
 
-use output_capture::OutputTable;
+use output_capture::{OutputTable, ReaderHandles};
+
+/// How a child's standard streams are wired -- the one choice
+/// [`TokioProcessSupervisor::finish_spawn`] branches on, after the shared
+/// launch policy (environment allowlist, running cap, `kill_on_drop`,
+/// bookkeeping) has been applied identically to both.
+enum StdioPlan {
+    /// Piped stdout/stderr (one reader task each) and stdin per the plan:
+    /// the demo harness, the plain `ProcessSpec` path, and every
+    /// `TransportClass::StructuredStreamingCli` launch.
+    Pipes(StdinPlan),
+    /// One pseudo-terminal as stdin, stdout, and stderr, read by one task
+    /// on its master side (`docs/spike-log.md` § Slice 4). Unix only in
+    /// this slice.
+    #[cfg(unix)]
+    Pty(pty::PtyPair),
+}
+
+/// What [`TokioProcessSupervisor::finish_spawn`] prepared on `command`
+/// before spawning, so the reader and prompt tasks can be attached after.
+enum Wiring {
+    Pipes,
+    #[cfg(unix)]
+    Pty(pty::Master),
+}
+
+impl Wiring {
+    /// How many reader tasks this wiring spawns -- what gates the final
+    /// `State` frame (`output_capture::new_channel`).
+    const fn reader_count(&self) -> u8 {
+        match self {
+            Self::Pipes => 2,
+            #[cfg(unix)]
+            Self::Pty(_) => 1,
+        }
+    }
+}
+
+/// Turn a `LaunchPlan`'s transport into the stdio wiring plus the prompt
+/// bytes to deliver: over stdin (only under `StdinPlan::PipePromptThenClose`)
+/// for the structured transport, or typed into the terminal for the PTY
+/// transport. This is where a pseudo-terminal is actually opened, so
+/// [`TokioProcessSupervisor::spawn_approved`] runs its running-cap check
+/// before calling it. On a platform without the PTY path a `Pty` plan is
+/// refused here too (keeping this total), though `spawn_approved` has
+/// already refused it before consulting the cap.
+fn plan_stdio(plan: &LaunchPlan) -> Result<(StdioPlan, Option<Vec<u8>>), SupervisorError> {
+    let prompt_bytes = plan
+        .prompt
+        .as_ref()
+        .map(|prompt| prompt.as_str().as_bytes().to_vec());
+    match plan.transport {
+        TransportClass::StructuredStreamingCli => {
+            let prompt = match plan.stdin {
+                StdinPlan::PipePromptThenClose => prompt_bytes,
+                StdinPlan::Null => None,
+            };
+            Ok((StdioPlan::Pipes(plan.stdin), prompt))
+        }
+        TransportClass::Pty => {
+            #[cfg(unix)]
+            {
+                Ok((StdioPlan::Pty(pty::open_pair()?), prompt_bytes))
+            }
+            #[cfg(not(unix))]
+            {
+                Err(SupervisorError::PtyUnsupported)
+            }
+        }
+    }
+}
+
+/// Apply `env` to `command`: inherit everything, or clear and set only the
+/// allowlisted keys -- re-validating every one of them against
+/// [`is_secret_shaped`] immediately before it would be set on a real
+/// child, regardless of what the caller's own `EnvPlan` claims. The one
+/// place in this crate that ever sets an environment variable on a child.
+fn apply_env(command: &mut Command, env: &EnvPlan) {
+    match env {
+        EnvPlan::Inherit => {}
+        EnvPlan::Allowlist(keys) => {
+            command.env_clear();
+            for key in keys {
+                if is_secret_shaped(key) {
+                    tracing::warn!(
+                        key,
+                        "refusing to set a secret-shaped environment variable on a spawned \
+                         child, even though it was allowlisted"
+                    );
+                    continue;
+                }
+                if let Ok(value) = std::env::var(key) {
+                    command.env(key, value);
+                }
+            }
+        }
+    }
+}
+
+/// Wire `command`'s standard streams and process grouping per `stdio`,
+/// returning what [`TokioProcessSupervisor::attach_output`] needs after
+/// the spawn. The one place in this crate that ever configures a child's
+/// standard streams.
+///
+/// On a platform without the PTY path, `StdioPlan` has one `Copy`-able
+/// variant and this function has no error case, so the by-value parameter
+/// and the `Result` are only needed on unix -- the allows are scoped to
+/// exactly that, rather than restructuring the shared signature per
+/// platform.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)
+)]
+fn configure_stdio(command: &mut Command, stdio: StdioPlan) -> Result<Wiring, SupervisorError> {
+    match stdio {
+        StdioPlan::Pipes(stdin_plan) => {
+            command.stdin(match stdin_plan {
+                StdinPlan::Null => std::process::Stdio::null(),
+                StdinPlan::PipePromptThenClose => std::process::Stdio::piped(),
+            });
+            // Piped, not inherited: output capture is what drains these,
+            // one reader task per stream, so the child never blocks
+            // writing into a full, undrained OS pipe buffer.
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::piped());
+            #[cfg(unix)]
+            {
+                // Group the child under its own process group so a later
+                // stop can signal the whole group, not just the direct
+                // child (docs/adr/0002 § Process supervision). Stable since
+                // Rust 1.64 (`std::os::unix::process::CommandExt::process_group`,
+                // re-exposed by `tokio::process::Command`). Not on the PTY
+                // path: `setsid` there makes the child a session and group
+                // leader by itself (`pty::install_controlling_terminal`).
+                command.process_group(0);
+            }
+            Ok(Wiring::Pipes)
+        }
+        #[cfg(unix)]
+        StdioPlan::Pty(pair) => Ok(Wiring::Pty(pty::prepare_child(command, pair)?)),
+    }
+}
 
 /// The maximum number of concurrently `Running` children one supervisor
 /// tracks at once. `spawn`/`spawn_harness` refuse a request beyond this cap
@@ -316,6 +459,35 @@ impl TokioProcessSupervisor {
 }
 
 impl TokioProcessSupervisor {
+    /// Refuse now, with [`SupervisorError::TooManyProcesses`], if
+    /// [`MAX_RUNNING_CHILDREN`] children are already `Running`.
+    ///
+    /// Called twice on an approved launch: by [`Self::spawn_approved`]
+    /// before any transport-specific resource is allocated (so a caller at
+    /// the cap is refused before a pseudo-terminal is ever opened, exactly
+    /// as the pipe path -- which allocates nothing before
+    /// [`Self::finish_spawn`] -- always was), and by `finish_spawn` itself
+    /// immediately before the spawn. Neither call holds the `children` lock
+    /// through to the insertion, so two concurrent launches can both pass
+    /// the check and briefly exceed the cap by one: a pre-existing window,
+    /// shared by both transports, and accepted for a bound that exists to
+    /// keep bookkeeping finite rather than to be exact.
+    fn ensure_running_capacity(&self) -> Result<(), SupervisorError> {
+        let children = self
+            .inner
+            .children
+            .lock()
+            .expect("children mutex poisoned by a prior panic");
+        let running_count = children
+            .values()
+            .filter(|tracked| matches!(tracked, Tracked::Running(_)))
+            .count();
+        if running_count >= MAX_RUNNING_CHILDREN {
+            return Err(SupervisorError::TooManyProcesses);
+        }
+        Ok(())
+    }
+
     /// Shared tail of [`ProcessSupervisor::spawn`] and [`Self::spawn_approved`]:
     /// given an already-configured `Command` (program, args, and any
     /// platform-specific process-group setup already applied by the
@@ -326,69 +498,38 @@ impl TokioProcessSupervisor {
     /// literal argv the child actually receives, which the caller has
     /// already baked into `command`.
     ///
-    /// `env` and `stdin` are applied here, centrally, so both callers
-    /// ([`ProcessSupervisor::spawn`] and [`Self::spawn_approved`]) share
-    /// exactly one place that ever actually sets an environment variable
-    /// or configures stdin on a real child -- including the secret-shaped
+    /// `env` and the stdio wiring are applied here, centrally, so every
+    /// caller ([`ProcessSupervisor::spawn`] and [`Self::spawn_approved`],
+    /// on either transport) shares exactly one place that ever actually
+    /// sets an environment variable, configures a standard stream, or
+    /// groups a child on a real process -- including the secret-shaped
     /// re-check ([`is_secret_shaped`]) on every allowlisted key, a single
     /// choke point regardless of what the caller's own `env` claims
-    /// (`docs/spike-log.md` § Slice 3). `stdin_prompt`, when `Some`, is
-    /// written to the child's stdin then the write end is dropped
-    /// (signalling EOF), on this supervisor's own runtime so it never
-    /// blocks the calling thread; a write failure is surfaced as a
-    /// `stderr` frame (`output_capture::emit_stdin_write_failed`) rather
-    /// than silently swallowed or left to hang. `stdin_prompt` must be
-    /// `Some` only when `stdin` is [`StdinPlan::PipePromptThenClose`] --
-    /// every call site in this crate upholds that pairing itself.
+    /// (`docs/spike-log.md` § Slice 3), and, as of spike slice 4, the
+    /// branch between piped stdio and a pseudo-terminal ([`StdioPlan`]).
+    ///
+    /// `prompt`, when `Some`, is delivered on this supervisor's own runtime
+    /// so it never blocks the calling thread: written to the child's stdin
+    /// then the write end dropped (signalling EOF) under
+    /// [`StdioPlan::Pipes`], or typed into the terminal followed by a
+    /// carriage return under [`StdioPlan::Pty`]. Either way a write failure
+    /// is surfaced as a `stderr` frame
+    /// (`output_capture::emit_stdin_write_failed`) rather than silently
+    /// swallowed or left to hang. Under `Pipes`, `prompt` must be `Some`
+    /// only when its stdin is [`StdinPlan::PipePromptThenClose`] --
+    /// [`plan_stdio`] upholds that pairing for every caller.
     fn finish_spawn(
         &mut self,
         mut command: Command,
         program_label: &str,
         env: &EnvPlan,
-        stdin: StdinPlan,
-        stdin_prompt: Option<Vec<u8>>,
+        stdio: StdioPlan,
+        prompt: Option<Vec<u8>>,
     ) -> Result<ProcessId, SupervisorError> {
-        match env {
-            EnvPlan::Inherit => {}
-            EnvPlan::Allowlist(keys) => {
-                command.env_clear();
-                for key in keys {
-                    // Single choke point: re-validate every allowlisted key
-                    // immediately before it would be set on a real child,
-                    // regardless of what the caller's own `EnvPlan` claims.
-                    if is_secret_shaped(key) {
-                        tracing::warn!(
-                            key,
-                            "refusing to set a secret-shaped environment variable on a spawned \
-                             child, even though it was allowlisted"
-                        );
-                        continue;
-                    }
-                    if let Ok(value) = std::env::var(key) {
-                        command.env(key, value);
-                    }
-                }
-            }
-        }
-        command.stdin(match stdin {
-            StdinPlan::Null => std::process::Stdio::null(),
-            StdinPlan::PipePromptThenClose => std::process::Stdio::piped(),
-        });
+        apply_env(&mut command, env);
+        let wiring = configure_stdio(&mut command, stdio)?;
 
-        {
-            let children = self
-                .inner
-                .children
-                .lock()
-                .expect("children mutex poisoned by a prior panic");
-            let running_count = children
-                .values()
-                .filter(|tracked| matches!(tracked, Tracked::Running(_)))
-                .count();
-            if running_count >= MAX_RUNNING_CHILDREN {
-                return Err(SupervisorError::TooManyProcesses);
-            }
-        }
+        self.ensure_running_capacity()?;
 
         // Best-effort safety net: if this supervisor is dropped without an
         // explicit `stop` for this child (a panicking test, an early
@@ -398,76 +539,32 @@ impl TokioProcessSupervisor {
         // -- see `Drop`'s own doc comment.
         command.kill_on_drop(true);
 
-        // Piped, not inherited: output capture (below) is what drains
-        // these, one reader task per stream, so the child never blocks
-        // writing into a full, undrained OS pipe buffer.
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-
         let mut child = command.spawn().map_err(|error| {
             tracing::warn!(program = %program_label, %error, "failed to spawn process");
             SupervisorError::Spawn(error.to_string())
         })?;
+        // Released now, deliberately: on the PTY path `command` still
+        // holds this process's copies of the slave end, and the master
+        // only reports EOF once every slave descriptor outside the child
+        // is closed. On the pipe path this is a no-op.
+        drop(command);
         let pid = child
             .id()
             .ok_or_else(|| SupervisorError::Spawn("spawned child reported no pid".to_string()))?;
         let id = ProcessId(pid);
 
-        // Taken before this child is ever inserted into `children`, so no
-        // other code path can observe a `Tracked::Running` whose stdout/
-        // stderr have already been taken out from under it.
-        let stdout = child
-            .stdout
-            .take()
-            .expect("stdout was configured as piped above");
-        let stderr = child
-            .stderr
-            .take()
-            .expect("stderr was configured as piped above");
-
-        let (output_state, stdout_handles) = output_capture::new_channel();
-        let stderr_handles = stdout_handles.clone();
+        let (output_state, handles) = output_capture::new_channel(wiring.reader_count());
         self.inner
             .outputs
             .lock()
             .expect("outputs mutex poisoned by a prior panic")
             .insert(id, output_state);
 
-        self.spawn_on_runtime(output_capture::drain_stream(
-            stdout,
-            omnifrons_app::OutputStream::Stdout,
-            stdout_handles,
-            Arc::clone(&self.inner.outputs),
-            id,
-        ));
-        self.spawn_on_runtime(output_capture::drain_stream(
-            stderr,
-            omnifrons_app::OutputStream::Stderr,
-            stderr_handles,
-            Arc::clone(&self.inner.outputs),
-            id,
-        ));
-
-        // Taken before this child is inserted into `children`, exactly
-        // like stdout/stderr above. Writing happens on this supervisor's
-        // own runtime, never the calling thread, so a slow or absent
-        // reader on the child's side can never block `spawn`/
-        // `spawn_approved` itself.
-        if let Some(prompt_bytes) = stdin_prompt {
-            let mut stdin_handle = child
-                .stdin
-                .take()
-                .expect("stdin was configured as piped for a Some stdin_prompt");
-            let outputs_for_stdin = Arc::clone(&self.inner.outputs);
-            self.spawn_on_runtime(async move {
-                if stdin_handle.write_all(&prompt_bytes).await.is_err() {
-                    output_capture::emit_stdin_write_failed(&outputs_for_stdin, id);
-                }
-                // Dropping the write end signals EOF to the child,
-                // regardless of whether the write itself succeeded.
-                drop(stdin_handle);
-            });
-        }
+        // Every reader and writer task is attached before this child is
+        // ever inserted into `children`, so no other code path can observe
+        // a `Tracked::Running` whose streams have already been taken out
+        // from under it.
+        self.attach_output(&mut child, wiring, handles, id, prompt);
 
         self.inner
             .children
@@ -477,6 +574,93 @@ impl TokioProcessSupervisor {
 
         tracing::debug!(program = %program_label, pid, "spawned process");
         Ok(id)
+    }
+
+    /// Attach the reader task(s) and, when `prompt` is `Some`, the prompt
+    /// writer for a freshly spawned `child`, per its [`Wiring`]: two
+    /// drains (stdout, stderr) plus a stdin writer under `Pipes`; one drain
+    /// on the master plus the prompt typist under `Pty`. Every task runs on
+    /// this supervisor's own runtime, never the calling thread, so a slow
+    /// or absent reader on the child's side can never block
+    /// `spawn`/`spawn_approved` itself.
+    ///
+    /// `wiring` is consumed on unix (the `Pty` variant moves the master
+    /// into its tasks); on a platform without the PTY path it is a
+    /// single `Copy`-able variant, hence the scoped allow.
+    #[cfg_attr(not(unix), allow(clippy::needless_pass_by_value))]
+    fn attach_output(
+        &self,
+        child: &mut Child,
+        wiring: Wiring,
+        handles: ReaderHandles,
+        id: ProcessId,
+        prompt: Option<Vec<u8>>,
+    ) {
+        match wiring {
+            Wiring::Pipes => {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .expect("stdout was configured as piped by configure_stdio");
+                let stderr = child
+                    .stderr
+                    .take()
+                    .expect("stderr was configured as piped by configure_stdio");
+                let stderr_handles = handles.clone();
+                self.spawn_on_runtime(output_capture::drain_stream(
+                    stdout,
+                    omnifrons_app::OutputStream::Stdout,
+                    handles,
+                    Arc::clone(&self.inner.outputs),
+                    id,
+                ));
+                self.spawn_on_runtime(output_capture::drain_stream(
+                    stderr,
+                    omnifrons_app::OutputStream::Stderr,
+                    stderr_handles,
+                    Arc::clone(&self.inner.outputs),
+                    id,
+                ));
+
+                if let Some(prompt_bytes) = prompt {
+                    let mut stdin_handle = child
+                        .stdin
+                        .take()
+                        .expect("stdin was configured as piped for a Some prompt");
+                    let outputs_for_stdin = Arc::clone(&self.inner.outputs);
+                    self.spawn_on_runtime(async move {
+                        if stdin_handle.write_all(&prompt_bytes).await.is_err() {
+                            output_capture::emit_stdin_write_failed(&outputs_for_stdin, id);
+                        }
+                        // Dropping the write end signals EOF to the child,
+                        // regardless of whether the write itself succeeded.
+                        drop(stdin_handle);
+                    });
+                }
+            }
+            #[cfg(unix)]
+            Wiring::Pty(master) => {
+                // One reader on the master, labelled `stdout`: a
+                // pseudo-terminal has no separate stderr, and the frames
+                // keep slice 1's framing (cap, `continued`, CRLF handling)
+                // by reusing the same drain.
+                self.spawn_on_runtime(output_capture::drain_stream(
+                    pty::MasterReader::new(Arc::clone(&master)),
+                    omnifrons_app::OutputStream::Stdout,
+                    handles,
+                    Arc::clone(&self.inner.outputs),
+                    id,
+                ));
+                if let Some(prompt_bytes) = prompt {
+                    self.spawn_on_runtime(pty::type_prompt(
+                        master,
+                        prompt_bytes,
+                        Arc::clone(&self.inner.outputs),
+                        id,
+                    ));
+                }
+            }
+        }
     }
 
     /// Launch `handle` with no arguments and `stdin` always `/dev/null`
@@ -547,12 +731,33 @@ impl TokioProcessSupervisor {
     /// an allowlist environment plan, and `StdinPlan::Null` reproduces the
     /// slice-2 no-argument, `/dev/null`-stdin launch precisely).
     ///
+    /// ## `TransportClass::Pty` (spike slice 4, unix only)
+    ///
+    /// When `plan.transport` is [`TransportClass::Pty`], the child gets one
+    /// pseudo-terminal (fixed 80x24) as stdin, stdout, and stderr, runs as
+    /// the session leader of that controlling terminal (`setsid` plus
+    /// `TIOCSCTTY` in a `pre_exec`, in place of `process_group(0)` -- see
+    /// `pty::install_controlling_terminal`), and receives `TERM=dumb`,
+    /// `COLUMNS=80`, `LINES=24` set explicitly by this supervisor on top
+    /// of `plan.env`; `plan.prompt`, when `Some`, is typed into the
+    /// terminal followed by a carriage return, and `plan.stdin` is unused.
+    /// Output is captured by one reader on the master, labelled `stdout`
+    /// (a terminal has no stderr). Both handle kinds work on this path:
+    /// the sealed-memfd exec survives the fork-then-exec `pre_exec`
+    /// forces, since `std` never closes inherited descriptors in the
+    /// child. On Windows this returns [`SupervisorError::PtyUnsupported`]
+    /// before touching the handle or any bookkeeping
+    /// (`docs/spike-log.md` § Slice 4).
+    ///
     /// # Errors
     ///
     /// Returns [`SupervisorError::Spawn`] if the underlying process could
     /// not be started (including if clearing close-on-exec on a sealed
-    /// memfd failed), or [`SupervisorError::TooManyProcesses`] under the
-    /// same running-child cap as [`ProcessSupervisor::spawn`].
+    /// memfd failed, or a pseudo-terminal could not be opened),
+    /// [`SupervisorError::TooManyProcesses`] under the same running-child
+    /// cap as [`ProcessSupervisor::spawn`], or
+    /// [`SupervisorError::PtyUnsupported`] for a `Pty` plan on a platform
+    /// without the PTY path.
     pub fn spawn_approved(
         &mut self,
         handle: omnifrons_app::ExecHandle,
@@ -561,13 +766,17 @@ impl TokioProcessSupervisor {
     ) -> Result<ProcessId, SupervisorError> {
         let _guard = self.inner.runtime.enter();
         let label = display_path.to_string_lossy().into_owned();
-        let stdin_prompt = match plan.stdin {
-            StdinPlan::PipePromptThenClose => plan
-                .prompt
-                .as_ref()
-                .map(|prompt| prompt.as_str().as_bytes().to_vec()),
-            StdinPlan::Null => None,
-        };
+        // Decided before `handle` is touched, in this order: an unsupported
+        // transport is refused first, with nothing else consulted; then the
+        // running cap, before any transport-specific resource exists (a
+        // pseudo-terminal is opened by `plan_stdio` below, and a caller at
+        // the cap must never cause that allocation); only then the wiring.
+        #[cfg(not(unix))]
+        if plan.transport == TransportClass::Pty {
+            return Err(SupervisorError::PtyUnsupported);
+        }
+        self.ensure_running_capacity()?;
+        let (stdio, prompt) = plan_stdio(plan)?;
 
         match handle {
             #[cfg(target_os = "linux")]
@@ -592,11 +801,9 @@ impl TokioProcessSupervisor {
                 let mut command = Command::new(format!("/proc/self/fd/{fd}"));
                 command.args(&plan.argv);
                 command.current_dir(plan.cwd.path());
-                command.process_group(0);
                 // `file` must stay alive (and therefore its fd open) until
                 // `finish_spawn` has actually called `spawn`.
-                let result =
-                    self.finish_spawn(command, &label, &plan.env, plan.stdin, stdin_prompt);
+                let result = self.finish_spawn(command, &label, &plan.env, stdio, prompt);
                 drop(file);
                 result
             }
@@ -605,9 +812,7 @@ impl TokioProcessSupervisor {
                 let mut command = Command::new(display_path);
                 command.args(&plan.argv);
                 command.current_dir(plan.cwd.path());
-                #[cfg(unix)]
-                command.process_group(0);
-                self.finish_spawn(command, &label, &plan.env, plan.stdin, stdin_prompt)
+                self.finish_spawn(command, &label, &plan.env, stdio, prompt)
             }
         }
     }
@@ -623,17 +828,13 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             command.current_dir(cwd);
         }
 
-        #[cfg(unix)]
-        {
-            // Group the child under its own process group so a later stop
-            // can signal the whole group, not just the direct child
-            // (docs/adr/0002 § Process supervision). Stable since Rust
-            // 1.64 (`std::os::unix::process::CommandExt::process_group`,
-            // re-exposed by `tokio::process::Command`).
-            command.process_group(0);
-        }
-
-        self.finish_spawn(command, &spec.program, &spec.env, spec.stdin, None)
+        self.finish_spawn(
+            command,
+            &spec.program,
+            &spec.env,
+            StdioPlan::Pipes(spec.stdin),
+            None,
+        )
     }
 
     fn stop(

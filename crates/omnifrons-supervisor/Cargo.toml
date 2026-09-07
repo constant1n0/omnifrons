@@ -11,15 +11,31 @@ workspace = true
 [dependencies]
 omnifrons-domain = { path = "../omnifrons-domain" }
 omnifrons-app = { path = "../omnifrons-app" }
-tokio = { workspace = true, features = ["rt", "process", "time", "sync", "io-util"] }
+# "net" (added for spike slice 4) gates `tokio::io::unix::AsyncFd`, the
+# non-blocking reader/writer over the pseudo-terminal master (`src/pty.rs`);
+# verified against the vendored 1.53.1 source (`cfg_net_unix!` is
+# `all(unix, feature = "net")`). Its transitive `socket2`/`mio` were
+# already in `Cargo.lock` through the shell's Tauri dependency.
+tokio = { workspace = true, features = ["rt", "process", "time", "sync", "io-util", "net"] }
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # "signal" for `demo::unix::ignore_sigterm`; "fs" (added for the spike
 # slice-2 review fixes) for `nix::fcntl::{fcntl, FcntlArg, FdFlag}`,
 # clearing close-on-exec on an approved executable's sealed memfd
-# immediately before `spawn_approved` execs it.
-nix = { version = "0.31.3", default-features = false, features = ["signal", "fs"] }
+# immediately before `spawn_approved` execs it; "term" (added for spike
+# slice 4) for `nix::pty::openpty` and `nix::sys::termios::Termios` --
+# verified against the vendored 0.31.3 source, where `pty` is gated by
+# that one feature and `unistd::setsid` sits in the `process` block
+# "signal" already enables.
+nix = { version = "0.31.3", default-features = false, features = ["signal", "fs", "term"] }
 
 [dev-dependencies]
 omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# "resource" (added for the spike slice-4 review fixes) for
+# `tests/pty_running_cap.rs`, which lowers this test process's own
+# descriptor limit to prove the running cap is checked before `openpty`
+# ever runs. A dev-dependency feature only: the library never enables it.
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }

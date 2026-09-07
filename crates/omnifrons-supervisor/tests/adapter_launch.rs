@@ -24,6 +24,7 @@ use omnifrons_app::{
     AgentPrompt, EnvPlan, ExecHandle, FramePayload, LaunchPlan, ProcessOutput, ProcessStatus,
     ProcessSupervisor, ProcessTerminalState, StdinPlan, WorkspaceRoot,
 };
+use omnifrons_domain::adapter::TransportClass;
 use omnifrons_domain::scope::ScopeMode;
 use omnifrons_supervisor::TokioProcessSupervisor;
 
@@ -177,6 +178,7 @@ fn observed_env_equals_the_allowlist_excluding_a_planted_secret_shaped_key() {
         stdin: StdinPlan::PipePromptThenClose,
         prompt: Some(AgentPrompt::new("hello\nworld").expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::StructuredStreamingCli,
     };
 
     let mut supervisor = TokioProcessSupervisor::new();
@@ -288,6 +290,7 @@ fn no_eof_with_a_custom_exit_code_terminates_without_hanging() {
         stdin: StdinPlan::PipePromptThenClose,
         prompt: Some(AgentPrompt::new("ignored by --no-eof").expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::StructuredStreamingCli,
     };
 
     let mut supervisor = TokioProcessSupervisor::new();

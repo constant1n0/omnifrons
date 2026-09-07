@@ -43,6 +43,27 @@
 //! line, `stdin-byte-count <n>`, with the number of bytes read, then exits
 //! -- for proving a `StdinPlan::Null` launch really hands the child an
 //! empty stdin on every platform (`tests/approved_launch.rs`).
+//!
+//! Spike slice 4's pseudo-terminal modes (`tests/pty_launch.rs`):
+//!
+//! `--pty-report`: prints `isatty stdin=<bool> stdout=<bool>
+//! stderr=<bool>`, then `TERM=<value>`, `COLUMNS=<value>`, and
+//! `LINES=<value>` (the three values the supervisor itself sets on a PTY
+//! child), then one `env-keys <K1> <K2> ...` line naming every
+//! environment key this process observes -- names only, never values --
+//! and exits 0.
+//!
+//! `--pty-echo`: reads one line from stdin and prints `typed: <line>`
+//! (line terminator stripped), then exits 0.
+//!
+//! `--pty-corpus`: writes the shared terminal corpus
+//! (`omnifrons_app::terminal_normalizer::corpus::bytes`) to stdout
+//! verbatim, then a newline and a final `corpus-done` line, and exits 0.
+//!
+//! `--pty-ignore-sigterm` (unix): installs the demo harness's own
+//! `SIGTERM`-ignore disposition, prints `ready` once it is in place (the
+//! synchronization point a test waits on before calling `stop`), then
+//! sleeps until killed.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -56,10 +77,18 @@ fn main() -> ExitCode {
     let mut huge_line: Option<usize> = None;
     let mut stdin_byte_count = false;
     let mut no_eof = false;
+    let mut pty_report = false;
+    let mut pty_echo = false;
+    let mut pty_corpus = false;
+    let mut pty_ignore_sigterm = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--pty-report" => pty_report = true,
+            "--pty-echo" => pty_echo = true,
+            "--pty-corpus" => pty_corpus = true,
+            "--pty-ignore-sigterm" => pty_ignore_sigterm = true,
             "--exit-code" => {
                 i += 1;
                 exit_code = args
@@ -91,6 +120,41 @@ fn main() -> ExitCode {
     }
 
     let mut stdout = std::io::stdout();
+
+    if pty_report {
+        run_pty_report(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
+    if pty_echo {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .expect("reading one line from stdin must succeed");
+        let line = line.trim_end_matches(['\r', '\n']);
+        emit(&mut stdout, &format!("typed: {line}"));
+        return ExitCode::from(exit_code);
+    }
+
+    if pty_corpus {
+        stdout
+            .write_all(&omnifrons_app::terminal_normalizer::corpus::bytes())
+            .expect("stdout must accept the corpus");
+        stdout
+            .write_all(b"\ncorpus-done\n")
+            .expect("stdout must accept the corpus-done line");
+        stdout.flush().expect("stdout must flush");
+        return ExitCode::from(exit_code);
+    }
+
+    if pty_ignore_sigterm {
+        #[cfg(unix)]
+        omnifrons_supervisor::demo::ignore_sigterm();
+        emit(&mut stdout, "ready");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 
     if stdin_byte_count {
         let mut bytes = Vec::new();
@@ -170,6 +234,34 @@ fn run_default_sequence(stdout: &mut impl Write, no_eof: bool) {
     emit(stdout, &assistant_text_line(&env_dump));
 
     emit(stdout, r#"{"type":"result","subtype":"success"}"#);
+}
+
+/// `--pty-report`: whether each standard stream is a terminal, the three
+/// variables the supervisor sets on a PTY child, and every environment key
+/// name (never a value).
+fn run_pty_report(stdout: &mut impl Write) {
+    use std::io::IsTerminal as _;
+
+    emit(
+        stdout,
+        &format!(
+            "isatty stdin={} stdout={} stderr={}",
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal()
+        ),
+    );
+    for key in ["TERM", "COLUMNS", "LINES"] {
+        emit(
+            stdout,
+            &format!("{key}={}", std::env::var(key).unwrap_or_default()),
+        );
+    }
+    let mut keys: Vec<String> = std::env::vars_os()
+        .map(|(key, _value)| key.to_string_lossy().into_owned())
+        .collect();
+    keys.sort();
+    emit(stdout, &format!("env-keys {}", keys.join(" ")));
 }
 
 /// Write `line` followed by a newline, then flush -- every emitted line is

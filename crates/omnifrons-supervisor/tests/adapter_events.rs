@@ -12,7 +12,7 @@ use omnifrons_app::{
     AgentPrompt, Assembled, AssembledLine, EnvPlan, ExecHandle, FramePayload, LaunchPlan,
     LineAssembler, ProcessOutput, ProcessStatus, ProcessSupervisor, StdinPlan, WorkspaceRoot,
 };
-use omnifrons_domain::adapter::AdapterEvent;
+use omnifrons_domain::adapter::{AdapterEvent, TransportClass};
 use omnifrons_domain::output::MAX_TEXT_FRAME_BYTES;
 use omnifrons_domain::scope::ScopeMode;
 use omnifrons_supervisor::TokioProcessSupervisor;
@@ -61,6 +61,7 @@ fn base_plan(workspace: WorkspaceRoot, argv: Vec<String>) -> LaunchPlan {
         stdin: StdinPlan::PipePromptThenClose,
         prompt: Some(AgentPrompt::new("unused").expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::StructuredStreamingCli,
     }
 }
 

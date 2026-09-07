@@ -17,6 +17,7 @@ use omnifrons_app::{
     EnvPlan, ExecHandle, FramePayload, LaunchPlan, ProcessOutput, ProcessStatus, ProcessSupervisor,
     ProcessTerminalState, StdinPlan, WorkspaceRoot,
 };
+use omnifrons_domain::adapter::TransportClass;
 use omnifrons_domain::scope::ScopeMode;
 use omnifrons_supervisor::TokioProcessSupervisor;
 
@@ -36,6 +37,7 @@ fn default_plan() -> LaunchPlan {
         stdin: StdinPlan::Null,
         prompt: None,
         scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::StructuredStreamingCli,
     }
 }
 

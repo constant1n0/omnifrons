@@ -57,6 +57,19 @@ pub fn kind_arg(kind: &HarnessKind) -> Result<&'static str, NotADemoKind> {
     }
 }
 
+/// Install the `SIGTERM`-ignoring disposition [`run`] uses for
+/// [`HarnessKind::DemoIgnoresSigterm`], exposed so the `fake-agent` test
+/// binary's `--pty-ignore-sigterm` mode (spike slice 4) reuses this one
+/// audited call rather than adding a second `unsafe` site of its own.
+///
+/// # Panics
+///
+/// Panics if the disposition could not be installed.
+#[cfg(unix)]
+pub fn ignore_sigterm() {
+    unix::ignore_sigterm();
+}
+
 /// Parse a [`kind_arg`] token back into a [`HarnessKind`], or `None` if it
 /// is not one of the two recognized tokens.
 #[must_use]

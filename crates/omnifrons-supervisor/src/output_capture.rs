@@ -89,8 +89,10 @@ pub(crate) struct OutputChannelState {
     /// operation.
     seq: Arc<AtomicU64>,
     pending_drops: Arc<AtomicU64>,
-    /// Starts at 2 (stdout, stderr); each reader task decrements it once,
-    /// on EOF or a read error.
+    /// Starts at the number of reader tasks actually spawned for this
+    /// child (two for piped stdout/stderr, one for a pseudo-terminal
+    /// master -- `docs/spike-log.md` § Slice 4); each reader task
+    /// decrements it once, on EOF or a read error.
     active_readers: Arc<AtomicU8>,
     /// Set once `observe`/`stop` confirms the process's terminal state,
     /// independent of whether the readers are done yet.
@@ -134,12 +136,16 @@ pub(crate) struct ReaderHandles {
 }
 
 /// Build a fresh channel and bookkeeping for a newly spawned child, and the
-/// [`ReaderHandles`] template to clone once per stream.
-pub(crate) fn new_channel() -> (OutputChannelState, ReaderHandles) {
+/// [`ReaderHandles`] template to clone once per stream. `reader_count` is
+/// the number of reader tasks the caller will actually spawn: the final
+/// `State` frame is gated on exactly that many finishing, so a launch
+/// with one master reader never waits for a second reader that does not
+/// exist.
+pub(crate) fn new_channel(reader_count: u8) -> (OutputChannelState, ReaderHandles) {
     let (sender, receiver) = sync_channel(CHANNEL_CAPACITY);
     let seq = Arc::new(AtomicU64::new(0));
     let pending_drops = Arc::new(AtomicU64::new(0));
-    let active_readers = Arc::new(AtomicU8::new(2));
+    let active_readers = Arc::new(AtomicU8::new(reader_count));
 
     let handles = ReaderHandles {
         sender: sender.clone(),
@@ -581,7 +587,7 @@ mod tests {
     /// frame's `(text, continued)`, in order.
     fn stdout_frames_for_chunks(chunks: &[&[u8]]) -> Vec<(String, bool)> {
         let id = ProcessId(7);
-        let (state, handles) = new_channel();
+        let (state, handles) = new_channel(2);
         let outputs: OutputTable = Arc::new(Mutex::new(HashMap::from([(id, state)])));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -802,7 +808,7 @@ mod tests {
     #[test]
     fn emit_stdin_write_failed_delivers_one_stderr_frame_with_seq_and_dropped_before() {
         let id = ProcessId(4242);
-        let (state, handles) = new_channel();
+        let (state, handles) = new_channel(2);
         // Two frames already delivered (`seq` 2 is next), three dropped
         // since the last delivery.
         state.seq.store(2, Ordering::Release);
@@ -844,7 +850,7 @@ mod tests {
         emit_stdin_write_failed(&outputs, ProcessId(1));
 
         let id = ProcessId(2);
-        let (mut state, handles) = new_channel();
+        let (mut state, handles) = new_channel(2);
         state.sender = None; // already finalized
         outputs
             .lock()
