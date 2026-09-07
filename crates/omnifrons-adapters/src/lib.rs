@@ -26,6 +26,8 @@
 
 pub mod fs_prober;
 pub mod jsonl_approval_store;
+pub mod line_agent;
 
 pub use fs_prober::FsExecutableProber;
 pub use jsonl_approval_store::JsonlApprovalStore;
+pub use line_agent::LineAgent;
