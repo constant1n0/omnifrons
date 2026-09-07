@@ -2,6 +2,7 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  adaptersList,
   approvalsList,
   executableApprove,
   executablePickAndProbe,
@@ -10,6 +11,8 @@ import {
   harnessSpawn,
   harnessStop,
   isShellError,
+  workspaceCurrent,
+  workspacePick,
   type Approval,
   type Evidence,
   type HarnessFrame,
@@ -116,11 +119,43 @@ describe('harnessSpawn', () => {
     expect(channelRef).toBeDefined()
     const frame: HarnessFrame = {
       stream: 'stdout',
-      body: { id: 7, seq: 0, droppedBefore: 0, text: 'hi' },
+      body: { id: 7, seq: 0, droppedBefore: 0, continued: false, text: 'hi' },
     }
     channelRef!.onmessage(frame)
 
     expect(received).toEqual([frame])
+  })
+
+  it('delivers a text frame flagged continued (more of the same line follows) verbatim', async () => {
+    let channelRef: { onmessage: (frame: HarnessFrame) => void } | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channelRef = (args as Record<string, unknown>).onFrame as {
+          onmessage: (frame: HarnessFrame) => void
+        }
+        return 7
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const received: HarnessFrame[] = []
+    await harnessSpawn({ type: 'demo-lines', rateHz: 1, lines: 1 }, (frame) => {
+      received.push(frame)
+    })
+
+    const head: HarnessFrame = {
+      stream: 'stdout',
+      body: { id: 7, seq: 0, droppedBefore: 0, continued: true, text: 'first half of a ' },
+    }
+    const tail: HarnessFrame = {
+      stream: 'stdout',
+      body: { id: 7, seq: 1, droppedBefore: 0, continued: false, text: 'long line' },
+    }
+    channelRef!.onmessage(head)
+    channelRef!.onmessage(tail)
+
+    expect(received).toEqual([head, tail])
+    expect(received[0]?.stream === 'stdout' && received[0].body.continued).toBe(true)
   })
 
   it('rejects with the ShellError payload when the command rejects', async () => {
@@ -140,6 +175,44 @@ describe('harnessSpawn', () => {
       code: 'spawn-failed',
       message: 'failed to start the requested process',
     })
+  })
+
+  it('invokes harness_spawn for the adapter kind with exactly { kind: { type: "adapter", adapterId, approvalId, prompt }, onFrame } and no path-shaped key', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        capturedArgs = args as Record<string, unknown>
+        return 123
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const id = await harnessSpawn(
+      { type: 'adapter', adapterId: 'claude-code', approvalId: 42, prompt: 'do the thing' },
+      () => {},
+    )
+
+    expect(id).toBe(123)
+    expect(capturedArgs).toBeDefined()
+    expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'onFrame'])
+    expect(capturedArgs!.kind).toEqual({
+      type: 'adapter',
+      adapterId: 'claude-code',
+      approvalId: 42,
+      prompt: 'do the thing',
+    })
+    expect(Object.keys(capturedArgs!.kind as Record<string, unknown>).sort()).toEqual([
+      'adapterId',
+      'approvalId',
+      'prompt',
+      'type',
+    ])
+    for (const key of Object.keys(capturedArgs!)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
+    for (const key of Object.keys(capturedArgs!.kind as Record<string, unknown>)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
   })
 })
 
@@ -264,6 +337,128 @@ describe('approvalsList', () => {
     const result = await approvalsList()
 
     expect(result).toEqual(approvals)
+  })
+})
+
+describe('adaptersList', () => {
+  it('invokes adapters_list with no arguments and returns the descriptors verbatim, with no argv or env keys', async () => {
+    const descriptors = [
+      {
+        id: 'claude-code',
+        displayName: 'Claude Code',
+        transportClass: 'structured-streaming-cli' as const,
+        promptChannel: 'stdin-then-close' as const,
+        scopeMode: 'advisory' as const,
+        notes: 'credentials are harness-owned; not exercised in CI',
+      },
+    ]
+    mockIPC((cmd, args) => {
+      if (cmd === 'adapters_list') {
+        expect(args).toEqual({})
+        return descriptors
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await adaptersList()
+
+    expect(result).toEqual(descriptors)
+    for (const descriptor of result) {
+      expect(Object.keys(descriptor)).not.toContain('argvTemplate')
+      expect(Object.keys(descriptor)).not.toContain('declaredEnv')
+    }
+  })
+})
+
+describe('workspacePick', () => {
+  it('invokes workspace_pick with no arguments and returns the workspace verbatim', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'workspace_pick') {
+        expect(args).toEqual({})
+        return { displayPath: '/home/user/project' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await workspacePick()
+
+    expect(result).toEqual({ displayPath: '/home/user/project' })
+  })
+
+  it('rejects with no-workspace when the folder dialog was canceled', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_pick') {
+        return Promise.reject({ code: 'no-workspace', message: 'no folder was selected' })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    await expect(workspacePick()).rejects.toMatchObject({ code: 'no-workspace' })
+  })
+})
+
+describe('workspaceCurrent', () => {
+  it('invokes workspace_current with no arguments and returns the active workspace', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'workspace_current') {
+        expect(args).toEqual({})
+        return { displayPath: '/home/user/project' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await workspaceCurrent()
+
+    expect(result).toEqual({ displayPath: '/home/user/project' })
+  })
+
+  it('returns null when no workspace is active', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await workspaceCurrent()
+
+    expect(result).toBeNull()
+  })
+})
+
+describe('HarnessFrame event stream', () => {
+  it('delivers an adapter event frame to the onFrame callback verbatim', async () => {
+    let channelRef: { onmessage: (frame: HarnessFrame) => void } | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channelRef = (args as Record<string, unknown>).onFrame as {
+          onmessage: (frame: HarnessFrame) => void
+        }
+        return 7
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const received: HarnessFrame[] = []
+    await harnessSpawn(
+      { type: 'adapter', adapterId: 'claude-code', approvalId: 1, prompt: 'hi' },
+      (frame) => {
+        received.push(frame)
+      },
+    )
+
+    expect(channelRef).toBeDefined()
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 7,
+        seq: 0,
+        droppedBefore: 0,
+        kind: 'message',
+        payload: { text: 'hello' },
+      },
+    }
+    channelRef!.onmessage(frame)
+
+    expect(received).toEqual([frame])
   })
 })
 

@@ -18,8 +18,13 @@ import {
 } from './ipc/harness'
 import { PlainTextLine } from './PlainTextLine'
 
-/** The tag alone of {@link HarnessKind} -- what the Kind select offers. */
-type HarnessKindTag = HarnessKind['type']
+/**
+ * The tag alone of {@link HarnessKind} -- what the Kind select offers.
+ * Excludes `'adapter'` (spike slice 3): the adapter launch surface is
+ * `AgentPanel`, a distinct component -- this panel keeps its own slice
+ * 1/2 kind set unchanged.
+ */
+type HarnessKindTag = Exclude<HarnessKind['type'], 'adapter'>
 
 /** The three harness kinds the Kind select offers. */
 const HARNESS_KIND_TAGS: HarnessKindTag[] = ['demo-lines', 'demo-ignores-sigterm', 'approved']
@@ -123,9 +128,18 @@ function formatTerminalToken(state: ProcessTerminalState): string {
   return state.state
 }
 
+/**
+ * This panel never spawns `kind: "adapter"` (that surface is `AgentPanel`),
+ * so a live `event` frame never actually reaches here -- the `event`
+ * branch exists only so this function stays total over `HarnessFrame`'s
+ * full, slice-3-widened union.
+ */
 function frameLineText(frame: HarnessFrame): string {
   if (frame.stream === 'state') {
     return `${frame.stream}: ${formatTerminalToken(frame.body)}`
+  }
+  if (frame.stream === 'event') {
+    return `${frame.stream}: unexpected event frame`
   }
   return `${frame.stream}: ${frame.body.text}`
 }
@@ -248,8 +262,55 @@ export function HarnessPanel() {
       })
   }, [kindTag])
 
-  const handleFrame = useCallback((frame: HarnessFrame) => {
+  /**
+   * The id of the current generation's run once known, or `null` while
+   * the spawn is still in flight. Set when `harnessSpawn` resolves and
+   * cleared only when the next Start bumps the generation -- deliberately
+   * *not* when the run ends, so a same-channel frame carrying a foreign
+   * id is still dropped after the run's terminal `state` frame or a
+   * successful stop, while a trailing frame carrying the run's own id is
+   * still applied (R1-011/R3-011). A ref rather than state: `handleFrame`
+   * is a stable `useCallback(..., [])` and must never close over a stale
+   * value. Whether the run is *running* is `activeId` state plus
+   * `runEndedRef`, not this.
+   */
+  const runIdRef = useRef<ProcessId | null>(null)
+
+  /**
+   * Per-spawn generation token (R1-001/R3-001). Incremented on every Start
+   * before `harnessSpawn` is called, and captured in the closure of that
+   * spawn's own Channel `onmessage` -- so a frame from an earlier run's
+   * channel is rejected by its generation alone, whatever its timing and
+   * whatever id it carries, and never by relying on the new run's id
+   * already being known.
+   */
+  const spawnGenerationRef = useRef(0)
+
+  /**
+   * True once the current generation's run has ended: its terminal `state`
+   * frame was applied, or a stop succeeded. A terminal frame can arrive
+   * before `harnessSpawn` itself resolves (an instantly exiting process),
+   * so the resolve handler consults this and never marks such a run
+   * active -- nor remembers its id -- after the fact (R3-002).
+   */
+  const runEndedRef = useRef(true)
+
+  const handleFrame = useCallback((generation: number, frame: HarnessFrame) => {
     if (!mountedRef.current) return
+    // Stale-channel guard (R1-001/R3-001): every `harnessSpawn` wires a
+    // fresh Channel to this same handler, so a trailing frame from an
+    // earlier run's channel can still arrive after a new run has started
+    // -- even before the new run's id is known. Only the current
+    // generation's frames are applied; every other channel's are dropped
+    // outright -- never logged, never allowed to move the badge.
+    if (generation !== spawnGenerationRef.current) return
+    // Belt and braces once the id is known: a frame on the current channel
+    // carrying another run's id is dropped too, for the rest of this
+    // generation -- after the run has ended as much as while it runs.
+    // While the spawn is still in flight the generation alone decides, so
+    // a frame that beats the spawn promise is applied, not dropped -- a
+    // terminal frame arriving that early must still end the run (R3-002).
+    if (runIdRef.current !== null && frame.body.id !== runIdRef.current) return
     setLog((previous) =>
       appendLogEntry(previous, {
         key: `${frame.body.id}-${frame.body.seq}`,
@@ -258,7 +319,14 @@ export function HarnessPanel() {
       }),
     )
     if (frame.stream === 'state') {
+      // Every `state` frame is terminal by contract (`HarnessStateFrameBody`
+      // extends `ProcessTerminalState`), so the run is over: free the
+      // single active slot here, not only from the Stop path (R3-002), and
+      // forget the id -- nothing is left to reconnect to (R3-003).
       setBadge(formatTerminalToken(frame.body))
+      runEndedRef.current = true
+      setActiveId(null)
+      removePersistedId(frame.body.id)
     }
   }, [])
 
@@ -307,12 +375,24 @@ export function HarnessPanel() {
       requestedKind = { type: kindTag, rateHz, lines }
     }
 
+    const generation = (spawnGenerationRef.current += 1)
+    runEndedRef.current = false
+    runIdRef.current = null
     setError(null)
     setLog(EMPTY_LOG)
     setReconnectedIds([])
     setIsSpawning(true)
     try {
-      const id = await harnessSpawn(requestedKind, handleFrame)
+      const id = await harnessSpawn(requestedKind, (frame) => handleFrame(generation, frame))
+      if (generation !== spawnGenerationRef.current) return
+      // The id is known from here on for the rest of this generation,
+      // whether or not the run is still going.
+      runIdRef.current = id
+      // The run's terminal `state` frame may already have arrived and
+      // ended it before the id was known: leave it ended, never mark it
+      // active after the fact, and never remember an id there is nothing
+      // left to reconnect to (R3-002/R3-003).
+      if (runEndedRef.current) return
       setActiveId(id)
       setBadge('running')
       persistIds([...loadPersistedIds(), id])
@@ -333,8 +413,12 @@ export function HarnessPanel() {
       // slice 1 allows only one active harness per panel (R3-004) -- once
       // stopped, the slot is free again.
       removePersistedId(activeId)
+      runEndedRef.current = true
       setActiveId(null)
     } catch (stopError: unknown) {
+      // A failed stop leaves the run exactly as it was -- active id kept,
+      // Stop still enabled -- rather than pretending the process ended
+      // (R3-006): the supervisor never confirmed a terminal state.
       setError(isShellError(stopError) ? stopError : 'unexpected')
     }
   }

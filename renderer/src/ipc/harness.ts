@@ -34,10 +34,18 @@ import { Channel, invoke } from '@tauri-apps/api/core'
  * `rateHz`) is inexpressible on the wire, not merely rejected after the
  * fact (`docs/spike-log.md` § Slice 2).
  */
+/**
+ * Launch the built-in adapter named by `adapterId` against the executable
+ * behind `approvalId`, delivering `prompt` -- added in the spike slice-3
+ * spike (`docs/spike-log.md` § Slice 3). Carries no `rateHz`/`lines`, and no
+ * program path or argument vector: `adapterId`'s own fixed `argvTemplate`
+ * supplies the only argv this launch will ever use, entirely Rust-side.
+ */
 export type HarnessKind =
   | { type: 'demo-lines'; rateHz: number; lines: number }
   | { type: 'demo-ignores-sigterm'; rateHz: number; lines: number }
   | { type: 'approved'; approvalId: ApprovalId }
+  | { type: 'adapter'; adapterId: string; approvalId: ApprovalId; prompt: string }
 
 /** A process identifier crossing IPC: a bare number on the wire. */
 export type ProcessId = number
@@ -70,10 +78,60 @@ interface HarnessTextFrameBody {
   id: ProcessId
   seq: number
   droppedBefore: number
+  /**
+   * `true` when this frame's `text` is only the head of a line whose
+   * remainder follows in the next text frame on the same stream -- the
+   * supervisor splits a captured line exceeding its per-frame byte cap
+   * across consecutive frames and flags every frame but the last. `false`
+   * when `text` ends the line. Mirrors `src-tauri/src/ipc/dto.rs`'s text
+   * frame body field-for-field (spike slice 3); no renderer surface
+   * reassembles split lines yet, so this field is carried but not rendered.
+   */
+  continued: boolean
   text: string
 }
 
 interface HarnessStateFrameBody extends ProcessTerminalState {
+  id: ProcessId
+  seq: number
+  droppedBefore: number
+}
+
+/**
+ * [`omnifrons_domain::adapter::AgentPhase`]'s tag, as it crosses IPC --
+ * paired with a `state` {@link AgentEvent}'s own `subtype` as an
+ * always-present (`null` unless `finished`) sibling field.
+ */
+export type AgentPhaseTag = 'init' | 'finished' | 'exited'
+
+/** One named text observation accompanying a `state` {@link AgentEvent}. */
+export interface Observation {
+  key: string
+  value: string
+}
+
+/**
+ * [`omnifrons_domain::adapter::AdapterEvent`], as it crosses IPC.
+ * Adjacently tagged (`kind` + `payload`), mirroring
+ * `src-tauri/src/ipc/dto.rs`'s `AdapterEventDto` verbatim -- added in the
+ * spike slice-3 spike (`docs/spike-log.md` § Slice 3).
+ *
+ * `unknown`'s `raw` is a plain, already-control-strippable string, never
+ * base64 or a byte array -- see `AdapterEventDto::Unknown`'s own doc
+ * comment for why lossy decoding is the expected shape here, not a
+ * defensive escape hatch this type needs to represent separately.
+ */
+export type AgentEvent =
+  | {
+      kind: 'state'
+      payload: { phase: AgentPhaseTag; subtype: string | null; observations: Observation[] }
+    }
+  | { kind: 'message'; payload: { text: string } }
+  | { kind: 'tool-call'; payload: { name: string; argumentsText: string } }
+  | { kind: 'diagnostic'; payload: { text: string } }
+  | { kind: 'unknown'; payload: { raw: string; truncated: boolean } }
+
+interface HarnessEventFrameBody {
   id: ProcessId
   seq: number
   droppedBefore: number
@@ -84,6 +142,7 @@ export type HarnessFrame =
   | { stream: 'stdout'; body: HarnessTextFrameBody }
   | { stream: 'stderr'; body: HarnessTextFrameBody }
   | { stream: 'state'; body: HarnessStateFrameBody }
+  | { stream: 'event'; body: HarnessEventFrameBody & AgentEvent }
 
 /** The closed set of error codes a failed IPC command reports. */
 export type ShellErrorCode =
@@ -101,6 +160,16 @@ export type ShellErrorCode =
   | 'shadowed-path'
   | 'revoked'
   | 'approval-store-unavailable'
+  /** `harness_spawn`'s `kind: "adapter"` named an `adapterId` outside the closed, built-in adapter set. */
+  | 'unknown-adapter'
+  /** An adapter launch's prompt exceeds the 16 KiB size cap. */
+  | 'prompt-too-large'
+  /** No active workspace was picked, or an adapter's `cwd` resolves outside it. */
+  | 'workspace-unavailable'
+  /** An adapter's declared (or otherwise requested) environment variable name looks secret-shaped. */
+  | 'secret-shaped-env'
+  /** `workspace_pick`'s folder dialog was canceled (no folder was selected). */
+  | 'no-workspace'
 
 /**
  * Structured detail for a {@link ShellError}, carrying values a fixed
@@ -174,6 +243,46 @@ export interface Approval {
   revokedAt: number | null
 }
 
+// -- Slice 3: workspace, adapters, and the "event" harness frame --
+
+/**
+ * A workspace directory, as it crosses IPC. `displayPath` is the
+ * workspace's canonical filesystem path -- the same, deliberate exception
+ * `Evidence.canonicalPath` already makes for TM-001-R7 display; a workspace
+ * path is not secret, and an adapter's process runs with it as its own
+ * working directory regardless.
+ */
+export interface Workspace {
+  displayPath: string
+}
+
+/** [`omnifrons_domain::adapter::TransportClass`], as it crosses IPC. */
+export type TransportClass = 'structured-streaming-cli' | 'pty'
+
+/** [`omnifrons_domain::adapter::PromptChannel`], as it crosses IPC. */
+export type PromptChannel = 'stdin-then-close' | 'argv'
+
+/**
+ * [`omnifrons_domain::scope::ScopeMode`], as it crosses IPC -- every
+ * built-in adapter in this slice reports `advisory` (`docs/spike-log.md`
+ * § Slice 3).
+ */
+export type ScopeMode = 'sandbox-enforced' | 'harness-enforced' | 'advisory'
+
+/**
+ * One built-in adapter's descriptor, as it crosses IPC -- metadata only:
+ * deliberately never `argvTemplate` or `declaredEnv`'s resolved values,
+ * which are the shell's own launch-time concern, never the renderer's.
+ */
+export interface AdapterDescriptor {
+  id: string
+  displayName: string
+  transportClass: TransportClass
+  promptChannel: PromptChannel
+  scopeMode: ScopeMode
+  notes: string
+}
+
 /**
  * Spawn a harness or an approved executable, and stream its captured
  * output to `onFrame`.
@@ -230,4 +339,29 @@ export async function executableRevoke(approvalId: ApprovalId): Promise<void> {
 /** List every approval on record. */
 export async function approvalsList(): Promise<Approval[]> {
   return invoke('approvals_list')
+}
+
+/**
+ * Open the native OS folder picker and, on a selection, make it this
+ * shell's single active workspace, replacing any previously active one.
+ *
+ * # Errors
+ * Rejects with `no-workspace` if the dialog was canceled, or the selected
+ * path could not be resolved into a valid, existing directory.
+ */
+export async function workspacePick(): Promise<Workspace> {
+  return invoke('workspace_pick')
+}
+
+/** The currently active workspace, or `null` if none has been picked yet. */
+export async function workspaceCurrent(): Promise<Workspace | null> {
+  return invoke('workspace_current')
+}
+
+/**
+ * List every built-in adapter's descriptor -- metadata only, never argv or
+ * resolved environment values (`docs/spike-log.md` § Slice 3).
+ */
+export async function adaptersList(): Promise<AdapterDescriptor[]> {
+  return invoke('adapters_list')
 }

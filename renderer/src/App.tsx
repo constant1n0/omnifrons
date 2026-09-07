@@ -1,3 +1,4 @@
+import { AgentPanel } from './AgentPanel'
 import { ApprovalSurface } from './ApprovalSurface'
 import { HarnessPanel } from './HarnessPanel'
 import { UntrustedText } from './UntrustedText'
@@ -27,6 +28,11 @@ export function App({ untrustedContent = DEFAULT_UNTRUSTED_CONTENT }: AppProps) 
           docs/renderer-content-security.md's guarantee that no rendered
           content appears inside an approval surface. */}
       <ApprovalSurface />
+      {/* A sibling of HarnessPanel and ApprovalSurface, never nested inside
+          either -- spike slice 3's own adapter launch surface keeps the
+          same containment guarantee (`docs/spike-log.md` § Slice 3
+          renderer). */}
+      <AgentPanel />
     </>
   )
 }

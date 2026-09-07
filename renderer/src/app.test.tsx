@@ -4,8 +4,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import App, { DEFAULT_UNTRUSTED_CONTENT } from './App'
 
-// `ApprovalSurface` (mounted by `App`) calls `approvals_list` on mount in
-// every test in this file -- mock it here, for every test, so this
+// `ApprovalSurface` and `AgentPanel` (both mounted by `App`) each call
+// `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`
+// and `adapters_list` -- mock all four here, for every test, so this
 // module's IPC surface is deterministic rather than leaving `invoke`
 // unmocked, which throws a bare `TypeError` (no `__TAURI_INTERNALS__` in
 // this jsdom environment) instead of a proper `ShellError` rejection
@@ -14,6 +15,8 @@ import App, { DEFAULT_UNTRUSTED_CONTENT } from './App'
 beforeEach(() => {
   mockIPC((cmd) => {
     if (cmd === 'approvals_list') return []
+    if (cmd === 'workspace_current') return null
+    if (cmd === 'adapters_list') return []
     return Promise.reject({ code: 'invalid-request', message: 'unexpected command in test' })
   })
 })

@@ -177,7 +177,7 @@ describe('HarnessPanel', () => {
     act(() => {
       channel.onmessage({
         stream: 'stdout',
-        body: { id: 7, seq: 0, droppedBefore: 0, text: '<b>bold</b>' },
+        body: { id: 7, seq: 0, droppedBefore: 0, continued: false, text: '<b>bold</b>' },
       })
     })
 
@@ -196,7 +196,7 @@ describe('HarnessPanel', () => {
     act(() => {
       channel.onmessage({
         stream: 'stdout',
-        body: { id: 7, seq: 1, droppedBefore: 0, text: osc8 },
+        body: { id: 7, seq: 1, droppedBefore: 0, continued: false, text: osc8 },
       })
     })
 
@@ -216,7 +216,7 @@ describe('HarnessPanel', () => {
     act(() => {
       channel.onmessage({
         stream: 'stdout',
-        body: { id: 7, seq: 12, droppedBefore: 7, text: 'line 13' },
+        body: { id: 7, seq: 12, droppedBefore: 7, continued: false, text: 'line 13' },
       })
     })
 
@@ -231,7 +231,7 @@ describe('HarnessPanel', () => {
       for (let seq = 0; seq < 2500; seq += 1) {
         channel.onmessage({
           stream: 'stdout',
-          body: { id: 7, seq, droppedBefore: 0, text: `line ${seq}` },
+          body: { id: 7, seq, droppedBefore: 0, continued: false, text: `line ${seq}` },
         })
       }
     })
@@ -433,7 +433,7 @@ describe('HarnessPanel', () => {
     expect(() => {
       channelRef!.onmessage({
         stream: 'stdout',
-        body: { id: 7, seq: 0, droppedBefore: 0, text: 'after unmount' },
+        body: { id: 7, seq: 0, droppedBefore: 0, continued: false, text: 'after unmount' },
       })
     }).not.toThrow()
 
@@ -868,5 +868,362 @@ describe('HarnessPanel', () => {
     const log = screen.getByLabelText('Output log')
     expect(log.contains(region)).toBe(false)
     expect(document.body.contains(region)).toBe(true)
+  })
+})
+
+type LiveChannel = { onmessage: (frame: HarnessFrame) => void }
+
+/**
+ * Renders the panel with a `harness_spawn` mock that hands out
+ * incrementing ids (7, 8, ...) and records every live Channel it
+ * receives, so a test can drive more than one run and address each run's
+ * own channel. `harness_stop` resolves `killed`.
+ */
+function renderMultiRun(): { channels: LiveChannel[] } {
+  const channels: LiveChannel[] = []
+  let nextId = 7
+  mockIPC((cmd, args) => {
+    if (cmd === 'harness_spawn') {
+      channels.push((args as { onFrame: LiveChannel }).onFrame)
+      const id = nextId
+      nextId += 1
+      return id
+    }
+    if (cmd === 'harness_stop') return { state: 'killed', code: null }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  render(<HarnessPanel />)
+  return { channels }
+}
+
+describe('HarnessPanel run identity (R1-001 / R3-001)', () => {
+  it('ignores a frame carrying a foreign run id, text and state kinds alike: nothing appended, badge unchanged', async () => {
+    const channel = await startAndCaptureChannel()
+
+    act(() => {
+      channel.onmessage({
+        stream: 'stdout',
+        body: { id: 99, seq: 0, droppedBefore: 0, continued: false, text: 'foreign text' },
+      })
+      channel.onmessage({
+        stream: 'state',
+        body: { id: 99, seq: 1, droppedBefore: 0, state: 'killed', code: null },
+      })
+    })
+
+    const log = screen.getByLabelText('Output log')
+    expect(log.querySelectorAll('li').length).toBe(0)
+    expect(log.textContent).not.toContain('foreign text')
+    expect(screen.getByText('running')).toBeTruthy()
+    expect(screen.queryByText('killed')).toBeNull()
+    expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+  })
+
+  it('once a second run has started, a trailing frame with the first run id is ignored while a frame with the new id is applied', async () => {
+    const { channels } = renderMultiRun()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await screen.findByText('killed')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(channels).toHaveLength(2)
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 7, seq: 5, droppedBefore: 0, continued: false, text: 'late from run A' },
+      })
+      channels[1]!.onmessage({
+        stream: 'stdout',
+        body: { id: 8, seq: 0, droppedBefore: 0, continued: false, text: 'fresh from run B' },
+      })
+    })
+
+    const log = screen.getByLabelText('Output log')
+    expect(log.textContent).not.toContain('late from run A')
+    expect(log.textContent).toContain('stdout: fresh from run B')
+  })
+})
+
+describe('HarnessPanel terminal state frame (R3-002)', () => {
+  it('ends the run: Start re-enabled, Stop disabled, the id forgotten, and a fresh Start spawns a new run', async () => {
+    const { channels } = renderMultiRun()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBe('[7]')
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 3, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+
+    await screen.findByText('exited (code 0)')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    // A terminal frame means nothing is left to reconnect to (R3-003), the
+    // same as a terminal `harness_observe` status or a completed stop.
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBe('[]')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(channels).toHaveLength(2)
+  })
+})
+
+describe('HarnessPanel run id after the run ends (R1-011 / R3-011)', () => {
+  /** Delivers, on `channel`, a foreign-id text frame, a foreign-id state frame, and a trailing text frame carrying the run's own id. */
+  function deliverForeignThenOwn(channel: LiveChannel) {
+    act(() => {
+      channel.onmessage({
+        stream: 'stdout',
+        body: { id: 99, seq: 4, droppedBefore: 0, continued: false, text: 'foreign after end' },
+      })
+      channel.onmessage({
+        stream: 'state',
+        body: { id: 99, seq: 5, droppedBefore: 0, state: 'orphan-risk/uncertain', code: null },
+      })
+      channel.onmessage({
+        stream: 'stdout',
+        body: { id: 7, seq: 4, droppedBefore: 0, continued: false, text: 'trailing and ours' },
+      })
+    })
+  }
+
+  it('after a terminal state frame, a same-channel foreign-id frame is dropped and the badge holds, while a trailing frame with the run id is applied', async () => {
+    const channel = await startAndCaptureChannel()
+    act(() => {
+      channel.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 3, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+
+    deliverForeignThenOwn(channel)
+
+    const log = screen.getByLabelText('Output log')
+    expect(log.textContent).not.toContain('foreign after end')
+    expect(log.textContent).not.toContain('orphan-risk/uncertain')
+    expect(log.textContent).toContain('stdout: trailing and ours')
+    expect(screen.getByText('exited (code 0)')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('orphan-risk/uncertain')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+  })
+
+  it('after a successful Stop, a same-channel foreign-id frame is dropped and the badge holds, while a trailing frame with the run id is applied', async () => {
+    const channel = await startAndCaptureChannel((cmd) => {
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await screen.findByText('killed')
+
+    deliverForeignThenOwn(channel)
+
+    const log = screen.getByLabelText('Output log')
+    expect(log.textContent).not.toContain('foreign after end')
+    expect(log.textContent).toContain('stdout: trailing and ours')
+    expect(screen.getByText('killed')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('orphan-risk/uncertain')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+  })
+})
+
+/**
+ * Renders the panel with a `harness_spawn` mock whose promise stays
+ * pending until the test resolves it -- so frames can be delivered on the
+ * live Channel *before* the panel learns the run's id.
+ */
+function renderWithDeferredSpawn(): {
+  channels: LiveChannel[]
+  resolveSpawn: (id: number) => void
+} {
+  const channels: LiveChannel[] = []
+  let resolveSpawn: (id: number) => void = () => {}
+  mockIPC((cmd, args) => {
+    if (cmd === 'harness_spawn') {
+      channels.push((args as { onFrame: LiveChannel }).onFrame)
+      return new Promise<number>((resolve) => {
+        resolveSpawn = resolve
+      })
+    }
+    if (cmd === 'harness_stop') return { state: 'killed', code: null }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  render(<HarnessPanel />)
+  return { channels, resolveSpawn: (id) => resolveSpawn(id) }
+}
+
+/** Resolves a deferred spawn and drains the resolve handler's microtasks plus one macrotask. */
+async function settleSpawn(resolveSpawn: (id: number) => void, id: number): Promise<void> {
+  await act(async () => {
+    resolveSpawn(id)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+  })
+}
+
+describe('HarnessPanel spawn generation: frames before harness_spawn resolves, and old channels', () => {
+  it('applies a terminal state frame delivered before the spawn resolves: Start ends enabled, Stop disabled, state line in the log, id never persisted', async () => {
+    const { channels, resolveSpawn } = renderWithDeferredSpawn()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    expect(channels).toHaveLength(1)
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 0, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await settleSpawn(resolveSpawn, 7)
+
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect(screen.getByText('exited (code 0)')).toBeTruthy()
+    expect(screen.queryByText('running')).toBeNull()
+    expect(screen.getByLabelText('Output log').textContent).toContain('state: exited (code 0)')
+    // Nothing is left to reconnect to, so the id must not be remembered.
+    expect(JSON.parse(window.sessionStorage.getItem(SESSION_STORAGE_KEY) ?? '[]')).toEqual([])
+  })
+
+  it('applies a text frame delivered before the spawn resolves, then runs normally and still drops a foreign id once the id is known', async () => {
+    const { channels, resolveSpawn } = renderWithDeferredSpawn()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 7, seq: 0, droppedBefore: 0, continued: false, text: 'early but ours' },
+      })
+    })
+    await settleSpawn(resolveSpawn, 7)
+
+    expect(screen.getByText('running')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBe('[7]')
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 99, seq: 1, droppedBefore: 0, continued: false, text: 'foreign after id known' },
+      })
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 7, seq: 1, droppedBefore: 0, continued: false, text: 'later and ours' },
+      })
+    })
+
+    const log = screen.getByLabelText('Output log')
+    expect(log.textContent).toContain('stdout: early but ours')
+    expect(log.textContent).toContain('stdout: later and ours')
+    expect(log.textContent).not.toContain('foreign after id known')
+  })
+
+  it('rejects a frame from a previous run\'s channel while the next spawn is still pending, even with the new id unknown', async () => {
+    const { channels, resolveSpawn } = renderWithDeferredSpawn()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await settleSpawn(resolveSpawn, 7)
+    await screen.findByText('running')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await screen.findByText('killed')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    expect(channels).toHaveLength(2)
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 7, seq: 9, droppedBefore: 0, continued: false, text: 'stale from run A' },
+      })
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 8, seq: 10, droppedBefore: 0, continued: false, text: 'stale channel, forged id' },
+      })
+      channels[1]!.onmessage({
+        stream: 'stdout',
+        body: { id: 8, seq: 0, droppedBefore: 0, continued: false, text: 'early from run B' },
+      })
+    })
+    await settleSpawn(resolveSpawn, 8)
+
+    const log = screen.getByLabelText('Output log')
+    expect(log.textContent).not.toContain('stale from run A')
+    expect(log.textContent).not.toContain('stale channel, forged id')
+    expect(log.textContent).toContain('stdout: early from run B')
+    expect(screen.getByText('running')).toBeTruthy()
+  })
+
+  it('chained: an early terminal frame, then the spawn resolves, then a same-channel foreign id is dropped with the badge held, then the run id is applied', async () => {
+    const { channels, resolveSpawn } = renderWithDeferredSpawn()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 0, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await settleSpawn(resolveSpawn, 7)
+    expect(screen.getByText('exited (code 0)')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+
+    // The id became known only after the run had already ended: it must
+    // still gate every later frame on this channel.
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 99, seq: 1, droppedBefore: 0, continued: false, text: 'foreign after early end' },
+      })
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 99, seq: 2, droppedBefore: 0, state: 'orphan-risk/uncertain', code: null },
+      })
+    })
+    const log = screen.getByLabelText('Output log')
+    expect(log.textContent).not.toContain('foreign after early end')
+    expect(screen.getByText('exited (code 0)')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('orphan-risk/uncertain')
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'stdout',
+        body: { id: 7, seq: 1, droppedBefore: 0, continued: false, text: 'trailing and ours' },
+      })
+    })
+    expect(log.textContent).toContain('stdout: trailing and ours')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect(JSON.parse(window.sessionStorage.getItem(SESSION_STORAGE_KEY) ?? '[]')).toEqual([])
   })
 })
