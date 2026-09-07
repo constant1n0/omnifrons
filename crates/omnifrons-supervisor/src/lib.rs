@@ -17,11 +17,13 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use omnifrons_app::harness_adapter::{EnvPlan, LaunchPlan};
 use omnifrons_app::{
     HarnessRequest, ProcessId, ProcessOutput, ProcessSpec, ProcessStatus, ProcessSupervisor,
-    ProcessTerminalState, SupervisorError,
+    ProcessTerminalState, StdinPlan, SupervisorError, is_secret_shaped,
 };
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -276,12 +278,15 @@ impl TokioProcessSupervisor {
     ///
     /// Panics if this supervisor was not built via
     /// [`Self::with_demo_launcher`].
-    pub fn spawn_harness(&mut self, request: HarnessRequest) -> Result<ProcessId, SupervisorError> {
+    pub fn spawn_harness(
+        &mut self,
+        request: &HarnessRequest,
+    ) -> Result<ProcessId, SupervisorError> {
         let launcher = self.inner.demo_launcher.clone().expect(
             "spawn_harness requires a supervisor built via TokioProcessSupervisor::with_demo_launcher",
         );
         let spec = ProcessSpec::new(launcher.to_string_lossy().into_owned()).with_args([
-            demo::kind_arg(request.kind())
+            demo::kind_arg(&request.kind())
                 .expect(
                     "omnifrons_app::HarnessRequest::new rejects HarnessKind::Approved with \
                      InvalidRequest::KindNotDemo, so a HarnessRequest's own kind() is never \
@@ -320,11 +325,56 @@ impl TokioProcessSupervisor {
     /// `program_label` is used only for `tracing`/error text -- never the
     /// literal argv the child actually receives, which the caller has
     /// already baked into `command`.
+    ///
+    /// `env` and `stdin` are applied here, centrally, so both callers
+    /// ([`ProcessSupervisor::spawn`] and [`Self::spawn_approved`]) share
+    /// exactly one place that ever actually sets an environment variable
+    /// or configures stdin on a real child -- including the secret-shaped
+    /// re-check ([`is_secret_shaped`]) on every allowlisted key, a single
+    /// choke point regardless of what the caller's own `env` claims
+    /// (`docs/spike-log.md` § Slice 3). `stdin_prompt`, when `Some`, is
+    /// written to the child's stdin then the write end is dropped
+    /// (signalling EOF), on this supervisor's own runtime so it never
+    /// blocks the calling thread; a write failure is surfaced as a
+    /// `stderr` frame (`output_capture::emit_stdin_write_failed`) rather
+    /// than silently swallowed or left to hang. `stdin_prompt` must be
+    /// `Some` only when `stdin` is [`StdinPlan::PipePromptThenClose`] --
+    /// every call site in this crate upholds that pairing itself.
     fn finish_spawn(
         &mut self,
         mut command: Command,
         program_label: &str,
+        env: &EnvPlan,
+        stdin: StdinPlan,
+        stdin_prompt: Option<Vec<u8>>,
     ) -> Result<ProcessId, SupervisorError> {
+        match env {
+            EnvPlan::Inherit => {}
+            EnvPlan::Allowlist(keys) => {
+                command.env_clear();
+                for key in keys {
+                    // Single choke point: re-validate every allowlisted key
+                    // immediately before it would be set on a real child,
+                    // regardless of what the caller's own `EnvPlan` claims.
+                    if is_secret_shaped(key) {
+                        tracing::warn!(
+                            key,
+                            "refusing to set a secret-shaped environment variable on a spawned \
+                             child, even though it was allowlisted"
+                        );
+                        continue;
+                    }
+                    if let Ok(value) = std::env::var(key) {
+                        command.env(key, value);
+                    }
+                }
+            }
+        }
+        command.stdin(match stdin {
+            StdinPlan::Null => std::process::Stdio::null(),
+            StdinPlan::PipePromptThenClose => std::process::Stdio::piped(),
+        });
+
         {
             let children = self
                 .inner
@@ -398,6 +448,27 @@ impl TokioProcessSupervisor {
             id,
         ));
 
+        // Taken before this child is inserted into `children`, exactly
+        // like stdout/stderr above. Writing happens on this supervisor's
+        // own runtime, never the calling thread, so a slow or absent
+        // reader on the child's side can never block `spawn`/
+        // `spawn_approved` itself.
+        if let Some(prompt_bytes) = stdin_prompt {
+            let mut stdin_handle = child
+                .stdin
+                .take()
+                .expect("stdin was configured as piped for a Some stdin_prompt");
+            let outputs_for_stdin = Arc::clone(&self.inner.outputs);
+            self.spawn_on_runtime(async move {
+                if stdin_handle.write_all(&prompt_bytes).await.is_err() {
+                    output_capture::emit_stdin_write_failed(&outputs_for_stdin, id);
+                }
+                // Dropping the write end signals EOF to the child,
+                // regardless of whether the write itself succeeded.
+                drop(stdin_handle);
+            });
+        }
+
         self.inner
             .children
             .lock()
@@ -463,6 +534,19 @@ impl TokioProcessSupervisor {
     /// or the path from being retargeted, between this call and the
     /// actual `execve`/`CreateProcess` (`docs/spike-log.md` § Slice 2).
     ///
+    /// As of the spike slice-3 spike, `plan` additionally supplies the
+    /// argument vector (`plan.argv` -- still never anything but a
+    /// `HarnessAdapter`'s own fixed template; see
+    /// `docs/spike-log.md` § Slice 3), the environment (`plan.env`), the
+    /// working directory (`plan.cwd`), and, when `plan.stdin` is
+    /// [`StdinPlan::PipePromptThenClose`], the prompt delivered over
+    /// stdin then the write end closed. `stdin` is otherwise always
+    /// `Stdio::null()` (`plan.stdin` is [`StdinPlan::Null`]) -- never the
+    /// executable's own bytes, matching this method's pre-slice-3
+    /// behavior exactly for a plan carrying no argv/prompt (an empty argv,
+    /// an allowlist environment plan, and `StdinPlan::Null` reproduces the
+    /// slice-2 no-argument, `/dev/null`-stdin launch precisely).
+    ///
     /// # Errors
     ///
     /// Returns [`SupervisorError::Spawn`] if the underlying process could
@@ -473,9 +557,17 @@ impl TokioProcessSupervisor {
         &mut self,
         handle: omnifrons_app::ExecHandle,
         display_path: PathBuf,
+        plan: &LaunchPlan,
     ) -> Result<ProcessId, SupervisorError> {
         let _guard = self.inner.runtime.enter();
         let label = display_path.to_string_lossy().into_owned();
+        let stdin_prompt = match plan.stdin {
+            StdinPlan::PipePromptThenClose => plan
+                .prompt
+                .as_ref()
+                .map(|prompt| prompt.as_str().as_bytes().to_vec()),
+            StdinPlan::Null => None,
+        };
 
         match handle {
             #[cfg(target_os = "linux")]
@@ -498,23 +590,24 @@ impl TokioProcessSupervisor {
                     file.as_raw_fd()
                 };
                 let mut command = Command::new(format!("/proc/self/fd/{fd}"));
-                command.stdin(std::process::Stdio::null());
+                command.args(&plan.argv);
+                command.current_dir(plan.cwd.path());
                 command.process_group(0);
                 // `file` must stay alive (and therefore its fd open) until
                 // `finish_spawn` has actually called `spawn`.
-                let result = self.finish_spawn(command, &label);
+                let result =
+                    self.finish_spawn(command, &label, &plan.env, plan.stdin, stdin_prompt);
                 drop(file);
                 result
             }
             omnifrons_app::ExecHandle::File(file) => {
                 drop(file);
-                #[cfg(unix)]
                 let mut command = Command::new(display_path);
-                #[cfg(not(unix))]
-                let command = Command::new(display_path);
+                command.args(&plan.argv);
+                command.current_dir(plan.cwd.path());
                 #[cfg(unix)]
                 command.process_group(0);
-                self.finish_spawn(command, &label)
+                self.finish_spawn(command, &label, &plan.env, plan.stdin, stdin_prompt)
             }
         }
     }
@@ -526,6 +619,9 @@ impl ProcessSupervisor for TokioProcessSupervisor {
 
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
 
         #[cfg(unix)]
         {
@@ -537,7 +633,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             command.process_group(0);
         }
 
-        self.finish_spawn(command, &spec.program)
+        self.finish_spawn(command, &spec.program, &spec.env, spec.stdin, None)
     }
 
     fn stop(

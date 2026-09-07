@@ -14,9 +14,30 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use omnifrons_app::{
-    ExecHandle, FramePayload, ProcessOutput, ProcessStatus, ProcessSupervisor, ProcessTerminalState,
+    EnvPlan, ExecHandle, FramePayload, LaunchPlan, ProcessOutput, ProcessStatus, ProcessSupervisor,
+    ProcessTerminalState, StdinPlan, WorkspaceRoot,
 };
+use omnifrons_domain::scope::ScopeMode;
 use omnifrons_supervisor::TokioProcessSupervisor;
+
+/// The default plan slice-2's own tests spawn against: empty argv (no
+/// arguments at all, matching this file's pre-slice-3 behavior exactly),
+/// an inherit-free allowlist environment (never `EnvPlan::Inherit` -- see
+/// `docs/spike-log.md` § Slice 3), `StdinPlan::Null`, and
+/// `ScopeMode::Advisory`. `cwd` is the current process's own working
+/// directory: these tests spawn `demo-harness` and small `#!/bin/sh`
+/// fixtures, neither of which cares what directory it runs in.
+fn default_plan() -> LaunchPlan {
+    let cwd = std::env::current_dir().expect("the current directory must be resolvable");
+    LaunchPlan {
+        argv: vec![],
+        env: EnvPlan::new(&[]).expect("an empty declared-key list can never be secret-shaped"),
+        cwd: WorkspaceRoot::new(cwd).expect("the current directory must be a valid workspace"),
+        stdin: StdinPlan::Null,
+        prompt: None,
+        scope_mode: ScopeMode::Advisory,
+    }
+}
 
 /// Generous headroom for a short-lived fixture process to run to
 /// completion and be confirmed reaped, matching this crate's other
@@ -40,6 +61,44 @@ fn wait_for_terminal(
             other => panic!("process did not reach a terminal state in time: {other:?}"),
         }
     }
+}
+
+/// R3-007: `spawn_approved`'s `ExecHandle::File` branch -- the branch
+/// every platform takes for an unsealed handle -- configures the child's
+/// stdin as null under `StdinPlan::Null`, on every platform: a fixture
+/// that reads its own stdin to EOF observes zero bytes. The sealed-memfd
+/// branch's own stdin proof (`spawn_approved_never_feeds_the_executable_as_stdin`)
+/// stays Linux-only below, since that branch only exists there.
+#[test]
+fn file_branch_with_stdin_null_gives_the_child_an_empty_stdin_on_every_platform() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let canonical_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_fake-agent"))
+        .expect("the fake-agent binary must canonicalize");
+    let file = std::fs::File::open(&canonical_path)
+        .expect("opening the fake-agent binary for the File handle must succeed");
+    let mut plan = default_plan();
+    plan.argv = vec!["--stdin-byte-count".to_string()];
+
+    let id = supervisor
+        .spawn_approved(ExecHandle::File(file), canonical_path, &plan)
+        .expect("spawn_approved must succeed for the fake-agent binary");
+    let rx = supervisor
+        .subscribe(id)
+        .expect("subscribing right after spawn must succeed");
+
+    wait_for_terminal(&supervisor, id, Instant::now() + REAP_DEADLINE);
+    let frames: Vec<_> = rx.iter().collect();
+
+    let saw_zero_bytes = frames.iter().any(|frame| {
+        matches!(
+            &frame.payload,
+            FramePayload::Text { text, .. } if text == "stdin-byte-count 0"
+        )
+    });
+    assert!(
+        saw_zero_bytes,
+        "the child must read exactly zero bytes from a null stdin, got {frames:#?}"
+    );
 }
 
 /// Collect every `Text` frame's line, in order, discarding the final
@@ -97,7 +156,7 @@ fn spawn_approved_runs_the_target_with_no_args_and_streams_its_output() {
         .expect("opening the demo-harness binary for the File handle must succeed");
 
     let id = supervisor
-        .spawn_approved(ExecHandle::File(file), canonical_path)
+        .spawn_approved(ExecHandle::File(file), canonical_path, &default_plan())
         .expect("spawn_approved must succeed for a valid executable");
     let rx = supervisor
         .subscribe(id)
@@ -205,7 +264,11 @@ fn sealed_memfd_content_survives_the_display_path_being_replaced_and_overwritten
 
     let mut supervisor = TokioProcessSupervisor::new();
     let id = supervisor
-        .spawn_approved(ExecHandle::SealedMemory(sealed), script_path.clone())
+        .spawn_approved(
+            ExecHandle::SealedMemory(sealed),
+            script_path.clone(),
+            &default_plan(),
+        )
         .expect("spawn_approved must succeed against a sealed memfd handle");
     let rx = supervisor
         .subscribe(id)
@@ -241,6 +304,7 @@ fn spawn_approved_never_feeds_the_executable_as_stdin() {
         .spawn_approved(
             ExecHandle::SealedMemory(sealed),
             PathBuf::from("/approved/stdin-honesty-fixture"),
+            &default_plan(),
         )
         .expect("spawn_approved must succeed against a sealed memfd handle");
     let rx = supervisor

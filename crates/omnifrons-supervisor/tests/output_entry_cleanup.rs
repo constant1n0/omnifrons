@@ -33,7 +33,7 @@ fn a_finalized_and_fully_drained_entry_is_removed() {
         HarnessRequest::new(HarnessKind::DemoLines, 200, 5).expect("valid harness request");
 
     let id = supervisor
-        .spawn_harness(request)
+        .spawn_harness(&request)
         .expect("spawning the demo harness must succeed");
     let rx = supervisor
         .subscribe(id)

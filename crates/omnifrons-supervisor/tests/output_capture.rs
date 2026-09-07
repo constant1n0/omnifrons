@@ -35,7 +35,7 @@ fn ten_lines_yield_ten_stdout_two_stderr_and_a_final_exited_state() {
         .expect("200 Hz, 10 lines must be a valid request");
 
     let id = supervisor
-        .spawn_harness(request)
+        .spawn_harness(&request)
         .expect("spawning the demo harness must succeed");
     let rx = supervisor
         .subscribe(id)

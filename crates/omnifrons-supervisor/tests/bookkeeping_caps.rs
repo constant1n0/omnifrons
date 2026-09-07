@@ -51,13 +51,13 @@ fn a_17th_concurrently_running_process_is_refused() {
     for _ in 0..16 {
         spawned.push(
             supervisor
-                .spawn_harness(long_lived())
+                .spawn_harness(&long_lived())
                 .expect("spawning up to the 16-process cap must succeed"),
         );
     }
 
     let refused = supervisor
-        .spawn_harness(long_lived())
+        .spawn_harness(&long_lived())
         .expect_err("a 17th concurrently running process must be refused");
     assert_eq!(
         refused,
@@ -74,7 +74,7 @@ fn a_17th_concurrently_running_process_is_refused() {
         // The cap freed up now that every tracked process is Terminal, not
         // merely Running-but-about-to-die: a fresh spawn must succeed again.
         let after_cleanup =
-            supervisor.spawn_harness(HarnessRequest::new(HarnessKind::DemoLines, 200, 1).unwrap());
+            supervisor.spawn_harness(&HarnessRequest::new(HarnessKind::DemoLines, 200, 1).unwrap());
         assert!(
             after_cleanup.is_ok(),
             "spawning must succeed again once every previous process is confirmed Terminal, got {after_cleanup:?}"
@@ -115,7 +115,7 @@ fn a_17th_concurrently_running_process_is_refused() {
             );
         }
 
-        let refused_again = supervisor.spawn_harness(long_lived()).expect_err(
+        let refused_again = supervisor.spawn_harness(&long_lived()).expect_err(
             "the 16-running cap must stay permanently reached on Windows: an unproven \
                  stop never evicts an entry, so an 18th spawn must still be refused",
         );
@@ -133,7 +133,7 @@ fn the_oldest_terminal_entry_is_evicted_past_the_retention_cap() {
     let short_lived = || HarnessRequest::new(HarnessKind::DemoLines, 1000, 1).unwrap();
 
     let first_id = supervisor
-        .spawn_harness(short_lived())
+        .spawn_harness(&short_lived())
         .expect("spawning the first (soon-to-be-evicted) process must succeed");
     wait_for_terminal(&supervisor, first_id);
 
@@ -142,7 +142,7 @@ fn the_oldest_terminal_entry_is_evicted_past_the_retention_cap() {
     let mut last_id = first_id;
     for _ in 0..256 {
         last_id = supervisor
-            .spawn_harness(short_lived())
+            .spawn_harness(&short_lived())
             .expect("spawning a short-lived process must succeed");
         wait_for_terminal(&supervisor, last_id);
     }

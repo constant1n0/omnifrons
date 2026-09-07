@@ -1,12 +1,17 @@
 //! Exercises the capture pipeline's framing directly, bypassing
 //! `HarnessRequest`/`spawn_harness`: a line longer than `MAX_LINE_BYTES`
-//! (8192) arrives as consecutive frames with no bytes lost, and invalid
-//! UTF-8 is lossily decoded to U+FFFD rather than dropped or erroring.
+//! (8192) arrives as consecutive frames with no bytes lost, every frame
+//! but the last of such a split flagged `continued: true` and a genuine
+//! line of exactly the cap's length flagged `continued: false` (R3-003:
+//! the flag, never a frame's length, is what says a line continues), and
+//! invalid UTF-8 is lossily decoded to U+FFFD rather than dropped or
+//! erroring.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use omnifrons_app::{FramePayload, OutputStream, ProcessOutput, ProcessStatus, ProcessSupervisor};
+use omnifrons_domain::output::MAX_TEXT_FRAME_BYTES;
 use omnifrons_supervisor::TokioProcessSupervisor;
 
 // 10s, not a shorter bound: a loaded CI runner needs generous scheduling
@@ -43,6 +48,21 @@ fn run_and_collect(args: &[&str]) -> Vec<omnifrons_app::OutputFrame> {
     rx.iter().collect()
 }
 
+/// Every stdout text frame's `(text, continued)`, in delivery order.
+fn stdout_text_frames(frames: &[omnifrons_app::OutputFrame]) -> Vec<(&str, bool)> {
+    frames
+        .iter()
+        .filter_map(|frame| match &frame.payload {
+            FramePayload::Text {
+                stream: OutputStream::Stdout,
+                text,
+                continued,
+            } => Some((text.as_str(), *continued)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn a_line_longer_than_max_line_bytes_splits_without_losing_bytes() {
     const LONG_LINE_BYTES: usize = 20_000;
@@ -52,7 +72,7 @@ fn a_line_longer_than_max_line_bytes_splits_without_losing_bytes() {
     let mut reassembled = String::new();
     let mut text_frame_count = 0;
     for frame in &frames {
-        if let FramePayload::Text { stream, text } = &frame.payload {
+        if let FramePayload::Text { stream, text, .. } = &frame.payload {
             assert_eq!(
                 *stream,
                 OutputStream::Stdout,
@@ -77,6 +97,60 @@ fn a_line_longer_than_max_line_bytes_splits_without_losing_bytes() {
         "x".repeat(LONG_LINE_BYTES),
         "reassembling every text frame in order must recover the exact original line, no bytes lost"
     );
+
+    // R3-003: every frame of the split but the last says the line
+    // continues; the last says it ends.
+    let flags: Vec<bool> = stdout_text_frames(&frames)
+        .iter()
+        .map(|(_, continued)| *continued)
+        .collect();
+    let (last, all_but_last) = flags
+        .split_last()
+        .expect("at least one text frame was counted above");
+    assert!(
+        all_but_last.iter().all(|continued| *continued),
+        "every frame but the last of a forced split must be continued, got {flags:?}"
+    );
+    assert!(
+        !*last,
+        "the last frame of a split line must not be continued, got {flags:?}"
+    );
+}
+
+/// R3-003: a genuine line whose length lands exactly on the per-frame cap
+/// is one complete frame with `continued: false` -- not a continuation
+/// that a consumer would then wrongly merge with the next line.
+#[test]
+fn a_line_of_exactly_max_line_bytes_is_one_frame_that_is_not_continued() {
+    let frames = run_and_collect(&["--long-line", &MAX_TEXT_FRAME_BYTES.to_string()]);
+
+    let text_frames = stdout_text_frames(&frames);
+    assert_eq!(
+        text_frames.len(),
+        1,
+        "an exactly-cap line must arrive as exactly one frame, got {text_frames:?}"
+    );
+    let (text, continued) = text_frames[0];
+    assert_eq!(text.len(), MAX_TEXT_FRAME_BYTES);
+    assert!(
+        !continued,
+        "a genuine exactly-cap line must not be flagged continued"
+    );
+}
+
+/// R3-003: one byte past the cap forces a split into a continued frame
+/// of exactly the cap's length, then a one-byte terminating frame.
+#[test]
+fn a_line_one_byte_past_the_cap_splits_into_a_continued_frame_then_a_terminator() {
+    let frames = run_and_collect(&["--long-line", &(MAX_TEXT_FRAME_BYTES + 1).to_string()]);
+
+    let text_frames = stdout_text_frames(&frames);
+    let expected_head = "x".repeat(MAX_TEXT_FRAME_BYTES);
+    assert_eq!(
+        text_frames,
+        vec![(expected_head.as_str(), true), ("x", false)],
+        "a cap+1 line must split into [cap bytes, continued] then [1 byte, not continued]"
+    );
 }
 
 #[test]
@@ -93,7 +167,7 @@ fn a_long_multibyte_utf8_line_reassembles_exactly_with_no_replacement_characters
     let mut reassembled = String::new();
     let mut text_frame_count = 0;
     for frame in &frames {
-        if let FramePayload::Text { stream, text } = &frame.payload {
+        if let FramePayload::Text { stream, text, .. } = &frame.payload {
             assert_eq!(
                 *stream,
                 OutputStream::Stdout,
@@ -126,6 +200,41 @@ fn a_long_multibyte_utf8_line_reassembles_exactly_with_no_replacement_characters
     );
 }
 
+/// R3-012: a CRLF-terminated line whose content is exactly the per-frame
+/// cap is one frame, not continued, with the CR stripped -- the CRLF
+/// necessarily arrives in a later read than the content that filled the
+/// buffer.
+#[test]
+fn a_crlf_line_of_exactly_max_line_bytes_is_one_frame_that_is_not_continued() {
+    let frames = run_and_collect(&["--crlf-line", &MAX_TEXT_FRAME_BYTES.to_string()]);
+
+    let text_frames = stdout_text_frames(&frames);
+    let expected = "x".repeat(MAX_TEXT_FRAME_BYTES);
+    assert_eq!(
+        text_frames,
+        vec![(expected.as_str(), false)],
+        "an exactly-cap CRLF line must be one frame with the CR stripped, never a continuation \
+         plus an empty terminator"
+    );
+}
+
+/// R3-012: a CRLF-terminated line one byte past the cap splits into a
+/// continued frame of exactly the cap, then a one-byte terminator that
+/// carries no CR.
+#[test]
+fn a_crlf_line_one_byte_past_the_cap_splits_into_a_continued_frame_then_a_terminator_without_cr() {
+    let frames = run_and_collect(&["--crlf-line", &(MAX_TEXT_FRAME_BYTES + 1).to_string()]);
+
+    let text_frames = stdout_text_frames(&frames);
+    let expected_head = "x".repeat(MAX_TEXT_FRAME_BYTES);
+    assert_eq!(
+        text_frames,
+        vec![(expected_head.as_str(), true), ("x", false)],
+        "a cap+1 CRLF line must split into [cap bytes, continued] then [1 byte, not continued, \
+         no CR]"
+    );
+}
+
 #[test]
 fn crlf_terminated_lines_have_their_trailing_cr_stripped() {
     let frames = run_and_collect(&["--crlf"]);
@@ -146,23 +255,20 @@ fn crlf_terminated_lines_have_their_trailing_cr_stripped() {
     );
 }
 
+/// R3-017: the frame flushed at EOF for an unterminated final line is a
+/// complete line -- `continued: false`, exactly like a newline-terminated
+/// one.
 #[test]
 fn a_final_line_with_no_trailing_newline_is_still_delivered_at_eof() {
     let frames = run_and_collect(&["--no-trailing-newline"]);
 
-    let text_frames: Vec<&str> = frames
-        .iter()
-        .filter_map(|frame| match &frame.payload {
-            FramePayload::Text { text, .. } => Some(text.as_str()),
-            FramePayload::State(_) => None,
-        })
-        .collect();
+    let text_frames = stdout_text_frames(&frames);
 
     assert_eq!(
         text_frames,
-        vec!["no trailing newline"],
+        vec![("no trailing newline", false)],
         "a final line with no trailing newline must still be delivered once EOF is reached, \
-         not silently dropped for lacking a terminator"
+         not silently dropped for lacking a terminator, and never flagged continued"
     );
 }
 

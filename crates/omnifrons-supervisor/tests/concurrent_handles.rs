@@ -40,13 +40,13 @@ fn observe_on_another_handle_is_not_blocked_by_a_concurrent_stop() {
     let stopping_request = HarnessRequest::new(HarnessKind::DemoIgnoresSigterm, 20, 10_000)
         .expect("20 Hz, 10_000 lines must be a valid request");
     let stopping_id = supervisor
-        .spawn_harness(stopping_request)
+        .spawn_harness(&stopping_request)
         .expect("spawning the SIGTERM-ignoring demo harness must succeed");
 
     let observed_request = HarnessRequest::new(HarnessKind::DemoLines, 5, 5)
         .expect("5 Hz, 5 lines must be a valid request");
     let observed_id = supervisor
-        .spawn_harness(observed_request)
+        .spawn_harness(&observed_request)
         .expect("spawning the observed demo harness must succeed");
 
     // Give both children a moment to actually start (and the SIGTERM-ignore

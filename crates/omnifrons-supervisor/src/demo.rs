@@ -16,24 +16,25 @@ use std::time::Duration;
 use omnifrons_app::HarnessKind;
 
 /// Why [`kind_arg`] could not encode a [`HarnessKind`] as an argv token:
-/// `kind` was [`HarnessKind::Approved`], which never crosses the demo
-/// harness's argv-encoding path at all.
+/// `kind` was [`HarnessKind::Approved`] or [`HarnessKind::Adapter`],
+/// neither of which ever crosses the demo harness's argv-encoding path at
+/// all.
 ///
 /// Structurally unreachable in practice --
-/// `omnifrons_app::HarnessRequest::new` already rejects
-/// `HarnessKind::Approved` with `InvalidRequest::KindNotDemo` before a
-/// `HarnessRequest` (the only thing `kind_arg`'s one real caller,
-/// `TokioProcessSupervisor::spawn_harness`, ever holds a `kind` from) can
-/// even be constructed -- but `kind_arg` itself takes a bare
-/// `HarnessKind`, not a `HarnessRequest`, so it stays a total function
-/// over every value its own parameter type allows, an error, never a
-/// panic, if that invariant is ever violated by some future caller.
+/// `omnifrons_app::HarnessRequest::new` already rejects both variants with
+/// `InvalidRequest::KindNotDemo` before a `HarnessRequest` (the only thing
+/// `kind_arg`'s one real caller, `TokioProcessSupervisor::spawn_harness`,
+/// ever holds a `kind` from) can even be constructed -- but `kind_arg`
+/// itself takes a bare `HarnessKind`, not a `HarnessRequest`, so it stays a
+/// total function over every value its own parameter type allows, an
+/// error, never a panic, if that invariant is ever violated by some future
+/// caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotADemoKind;
 
 impl std::fmt::Display for NotADemoKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("HarnessKind::Approved is not a demo harness kind")
+        f.write_str("HarnessKind::Approved and HarnessKind::Adapter are not demo harness kinds")
     }
 }
 
@@ -48,11 +49,11 @@ impl std::error::Error for NotADemoKind {}
 /// Returns [`NotADemoKind`] if `kind` is [`HarnessKind::Approved`]: see
 /// that type's own doc comment for why this is an error, not a panic,
 /// even though `spawn_harness`'s own caller has already ruled it out.
-pub fn kind_arg(kind: HarnessKind) -> Result<&'static str, NotADemoKind> {
+pub fn kind_arg(kind: &HarnessKind) -> Result<&'static str, NotADemoKind> {
     match kind {
         HarnessKind::DemoLines => Ok("demo-lines"),
         HarnessKind::DemoIgnoresSigterm => Ok("demo-ignores-sigterm"),
-        HarnessKind::Approved(_) => Err(NotADemoKind),
+        HarnessKind::Approved(_) | HarnessKind::Adapter { .. } => Err(NotADemoKind),
     }
 }
 
@@ -90,7 +91,7 @@ pub fn parse_kind(arg: &str) -> Option<HarnessKind> {
 /// broken pipe), or (unix, `DemoIgnoresSigterm` only) if the `SIGTERM`
 /// ignore handler could not be installed.
 #[must_use]
-pub fn run(kind: HarnessKind, rate_hz: u16, lines: u32) -> ExitCode {
+pub fn run(kind: &HarnessKind, rate_hz: u16, lines: u32) -> ExitCode {
     if matches!(kind, HarnessKind::DemoIgnoresSigterm) {
         #[cfg(unix)]
         unix::ignore_sigterm();
@@ -117,6 +118,44 @@ pub fn run(kind: HarnessKind, rate_hz: u16, lines: u32) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use omnifrons_app::HarnessKind;
+    use omnifrons_domain::adapter::{AdapterId, AgentPrompt};
+    use omnifrons_domain::executable::ApprovalId;
+
+    use super::{NotADemoKind, kind_arg, parse_kind};
+
+    /// R3-011: neither launch kind that reaches a real executable ever
+    /// encodes as a demo-harness argv token -- an error, never a token and
+    /// never a panic.
+    #[test]
+    fn kind_arg_refuses_approved_and_adapter_kinds() {
+        let approved = HarnessKind::Approved(ApprovalId(7));
+        let adapter = HarnessKind::Adapter {
+            adapter: AdapterId::claude_code(),
+            approval: ApprovalId(7),
+            prompt: AgentPrompt::new("do the thing").expect("a short prompt is valid"),
+        };
+
+        assert_eq!(kind_arg(&approved), Err(NotADemoKind));
+        assert_eq!(kind_arg(&adapter), Err(NotADemoKind));
+    }
+
+    #[test]
+    fn kind_arg_and_parse_kind_round_trip_the_two_demo_kinds() {
+        for kind in [HarnessKind::DemoLines, HarnessKind::DemoIgnoresSigterm] {
+            let token = kind_arg(&kind).expect("a demo kind always encodes");
+            assert!(
+                matches!(parse_kind(token), Some(decoded) if std::mem::discriminant(&decoded) == std::mem::discriminant(&kind)),
+                "{token} must decode back to the kind that produced it"
+            );
+        }
+        assert_eq!(parse_kind("approved"), None);
+        assert_eq!(parse_kind("adapter"), None);
+    }
 }
 
 #[cfg(unix)]

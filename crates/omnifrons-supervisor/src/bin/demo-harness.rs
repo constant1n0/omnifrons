@@ -14,12 +14,13 @@
 //!   the real demo harness behavior (`omnifrons_supervisor::demo::run`).
 //! - `demo-harness --long-line <bytes>` / `demo-harness --invalid-utf8` /
 //!   `demo-harness --long-line-utf8 <chars>` / `demo-harness --crlf` /
+//!   `demo-harness --crlf-line <bytes>` /
 //!   `demo-harness --no-trailing-newline` / `demo-harness --burst <lines>`
 //!   -- test-only flags that exercise the capture pipeline's line-length
 //!   cap, lossy UTF-8 decoding, UTF-8 character-boundary-safe splitting,
-//!   CRLF stripping, final unterminated-line delivery, and (`--burst`)
-//!   deterministic output-channel overflow, directly and independent of
-//!   `HarnessKind`.
+//!   CRLF stripping (including a CRLF landing exactly at the per-frame
+//!   cap), final unterminated-line delivery, and (`--burst`) deterministic
+//!   output-channel overflow, directly and independent of `HarnessKind`.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -45,6 +46,13 @@ fn main() -> ExitCode {
             emit_long_line_utf8(chars)
         }
         Some("--crlf") => emit_crlf_lines(),
+        Some("--crlf-line") => {
+            let bytes: usize = args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .expect("--crlf-line requires a byte count argument");
+            emit_crlf_line(bytes)
+        }
         Some("--no-trailing-newline") => emit_no_trailing_newline(),
         Some("--burst") => {
             let lines: u32 = args
@@ -64,7 +72,7 @@ fn main() -> ExitCode {
                 .get(2)
                 .and_then(|value| value.parse().ok())
                 .expect("a valid lines argument is required");
-            demo::run(kind, rate_hz, lines)
+            demo::run(&kind, rate_hz, lines)
         }
         None => {
             eprintln!("usage: demo-harness <demo-lines|demo-ignores-sigterm> <rate_hz> <lines>");
@@ -121,6 +129,18 @@ fn emit_crlf_lines() -> ExitCode {
     stdout
         .write_all(b"line one\r\nline two\r\n")
         .expect("stdout must accept CRLF-terminated output");
+    stdout.flush().expect("stdout must flush");
+    ExitCode::SUCCESS
+}
+
+/// Emit one CRLF-terminated line of exactly `bytes` `'x'` characters, then
+/// exit `0` -- for exercising a CRLF that lands exactly at (or one byte
+/// past) `MAX_LINE_BYTES`, where the capture side must still deliver one
+/// un-continued frame with the CR stripped (R3-012).
+fn emit_crlf_line(bytes: usize) -> ExitCode {
+    let mut stdout = std::io::stdout();
+    let line = "x".repeat(bytes);
+    write!(stdout, "{line}\r\n").expect("stdout must accept the CRLF line");
     stdout.flush().expect("stdout must flush");
     ExitCode::SUCCESS
 }

@@ -80,7 +80,7 @@ fn demo_ignores_sigterm_survives_and_stop_reports_killed_within_deadline() {
         .expect("20 Hz, 10_000 lines must be a valid request");
 
     let id = supervisor
-        .spawn_harness(request)
+        .spawn_harness(&request)
         .expect("spawning the demo harness must succeed");
     let rx = supervisor
         .subscribe(id)
