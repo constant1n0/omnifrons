@@ -7,6 +7,7 @@
 pub mod approval_store;
 pub mod clock;
 pub mod executable_prober;
+pub mod harness_adapter;
 mod harness_catalog;
 pub mod launch_gate;
 mod process_output;
@@ -16,6 +17,11 @@ pub use approval_store::{ApprovalStore, ApprovalStoreError};
 pub use clock::Clock;
 pub use executable_prober::{
     ExecHandle, ExecutableIdentity, ExecutableProber, ProbeOutcome, ProbedExecutable,
+};
+pub use harness_adapter::{
+    AdapterCatalog, AdapterDescriptor, AgentPrompt, Assembled, AssembledLine, EnvPlan,
+    HarnessAdapter, LaunchPlan, LaunchPlanError, LaunchRequest, LineAssembler, StdinPlan,
+    WorkspaceRoot, is_secret_shaped, validate_cwd_within_workspace,
 };
 pub use harness_catalog::{HarnessKind, HarnessRequest, InvalidRequest};
 pub use launch_gate::{GateDecision, LaunchGate};

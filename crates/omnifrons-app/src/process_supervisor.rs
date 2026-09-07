@@ -1,9 +1,12 @@
 //! The `ProcessSupervisor` port: spawn, observe, and stop a single external
 //! process, with a deadline-bounded graceful-then-forceful stop.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub use omnifrons_domain::scope::ProcessTerminalState;
+
+use crate::harness_adapter::{EnvPlan, StdinPlan};
 
 /// A process identifier, opaque to callers beyond equality and hashing.
 ///
@@ -13,25 +16,49 @@ pub use omnifrons_domain::scope::ProcessTerminalState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessId(pub u32);
 
-/// What to spawn: a program and its arguments.
+/// What to spawn: a program, its arguments, its environment, its working
+/// directory, and how its stdin is configured.
 ///
-/// Deliberately minimal for the skeleton -- no `cwd`, environment, or I/O
-/// configuration yet; those join once a real adapter needs them.
+/// `env`/`cwd`/`stdin` were added in the spike slice-3 spike
+/// (`docs/spike-log.md` § Slice 3), alongside the first built-in harness
+/// adapter; [`Self::new`]'s defaults (`EnvPlan::Inherit`, `cwd: None`,
+/// `StdinPlan::Null`) preserve the demo-harness launch path's own
+/// pre-existing behavior unchanged -- full environment inheritance (this
+/// application's own binary, not a caller-supplied executable, so nothing
+/// is at stake the way it would be for an adapter's process) and no
+/// working-directory override. `StdinPlan::Null` is a deliberate
+/// tightening over the literal previous default (an unconfigured stdin,
+/// which `tokio::process::Command` inherits from the parent): the demo
+/// harness never reads its own stdin, so this is behaviorally invisible to
+/// every existing test while closing an unintended inherited-stdin gap for
+/// every spawn this port ever performs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
     /// The program to execute.
     pub program: String,
     /// Arguments passed to the program.
     pub args: Vec<String>,
+    /// The spawned process's environment.
+    pub env: EnvPlan,
+    /// The spawned process's working directory, or `None` to inherit the
+    /// supervisor's own.
+    pub cwd: Option<PathBuf>,
+    /// How the spawned process's stdin is configured.
+    pub stdin: StdinPlan,
 }
 
 impl ProcessSpec {
-    /// Build a spec for `program` with no arguments.
+    /// Build a spec for `program` with no arguments, inheriting the
+    /// parent environment, no working-directory override, and
+    /// [`StdinPlan::Null`].
     #[must_use]
     pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
+            env: EnvPlan::Inherit,
+            cwd: None,
+            stdin: StdinPlan::Null,
         }
     }
 

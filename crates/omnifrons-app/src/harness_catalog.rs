@@ -19,7 +19,16 @@
 /// kinds, it never flows through [`HarnessRequest`]/`spawn_harness`'s
 /// argv-encoding path -- a launch it names goes through
 /// `LaunchGate::decide` and the supervisor's `spawn_approved` instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Adapter` was added in the spike slice-3 spike alongside the first
+/// built-in harness adapter (`docs/spike-log.md` § Slice 3): like
+/// `Approved`, it never flows through this argv-encoding path either -- a
+/// launch it names goes through `LaunchGate::decide` and the adapter's own
+/// `HarnessAdapter::build_launch` instead.
+///
+/// Not `Copy` (unlike slice 2's `HarnessKind`): `Adapter`'s `AdapterId` and
+/// `AgentPrompt` payloads both wrap a `String`, so this type now derives
+/// only `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HarnessKind {
     /// Emit `lines` lines at `rate_hz`, then exit `0`.
     DemoLines,
@@ -29,6 +38,17 @@ pub enum HarnessKind {
     /// Launch the real executable behind this approval id, subject to a
     /// `LaunchGate` decision immediately before launch.
     Approved(omnifrons_domain::executable::ApprovalId),
+    /// Launch the built-in adapter `adapter` against the executable behind
+    /// `approval`, delivering `prompt`, subject to a `LaunchGate` decision
+    /// immediately before launch.
+    Adapter {
+        /// Which built-in adapter to launch.
+        adapter: omnifrons_domain::adapter::AdapterId,
+        /// The approval id naming the executable to launch.
+        approval: omnifrons_domain::executable::ApprovalId,
+        /// The agent prompt to deliver.
+        prompt: omnifrons_domain::adapter::AgentPrompt,
+    },
 }
 
 /// Why a [`HarnessRequest`] was rejected.
@@ -42,11 +62,12 @@ pub enum InvalidRequest {
     LinesZero,
     /// `lines` exceeded the bound (`100_000`).
     LinesTooHigh,
-    /// `kind` was [`HarnessKind::Approved`]: that variant never flows
-    /// through this argv-encoding, rate/lines-bounded request shape at
-    /// all -- a launch it names goes through `LaunchGate::decide` and
-    /// the supervisor's `spawn_approved` instead
-    /// (`docs/spike-log.md` § Slice 2).
+    /// `kind` was [`HarnessKind::Approved`] or [`HarnessKind::Adapter`]:
+    /// neither variant flows through this argv-encoding, rate/lines-bounded
+    /// request shape at all -- a launch either names goes through
+    /// `LaunchGate::decide` and, respectively, the supervisor's
+    /// `spawn_approved` or an adapter's own `build_launch`
+    /// (`docs/spike-log.md` §§ Slice 2, Slice 3).
     KindNotDemo,
 }
 
@@ -76,7 +97,10 @@ const MAX_LINES: u32 = 100_000;
 /// Constructible only through [`Self::new`], so every live `HarnessRequest`
 /// has already passed the bounds every caller (the shell's IPC commands,
 /// the supervisor's own tests) must otherwise re-check by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Not `Copy` as of the spike slice-3 spike: [`HarnessKind`] itself is no
+/// longer `Copy` (its `Adapter` variant wraps `String`-backed payloads).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HarnessRequest {
     kind: HarnessKind,
     rate_hz: u16,
@@ -89,11 +113,11 @@ impl HarnessRequest {
     /// # Errors
     ///
     /// Returns [`InvalidRequest::KindNotDemo`] if `kind` is
-    /// [`HarnessKind::Approved`]; otherwise [`InvalidRequest`] if
-    /// `rate_hz` is `0` or exceeds `1000`, or if `lines` is `0` or exceeds
-    /// `100_000`.
+    /// [`HarnessKind::Approved`] or [`HarnessKind::Adapter`]; otherwise
+    /// [`InvalidRequest`] if `rate_hz` is `0` or exceeds `1000`, or if
+    /// `lines` is `0` or exceeds `100_000`.
     pub fn new(kind: HarnessKind, rate_hz: u16, lines: u32) -> Result<Self, InvalidRequest> {
-        if matches!(kind, HarnessKind::Approved(_)) {
+        if matches!(kind, HarnessKind::Approved(_) | HarnessKind::Adapter { .. }) {
             return Err(InvalidRequest::KindNotDemo);
         }
         if rate_hz == 0 {
@@ -117,8 +141,8 @@ impl HarnessRequest {
 
     /// The requested harness kind.
     #[must_use]
-    pub const fn kind(&self) -> HarnessKind {
-        self.kind
+    pub fn kind(&self) -> HarnessKind {
+        self.kind.clone()
     }
 
     /// The validated emission rate, in Hz (`1..=1000`).
@@ -173,6 +197,31 @@ mod tests {
         assert_eq!(error, InvalidRequest::KindNotDemo);
     }
 
+    /// Slice 3: `HarnessKind::Adapter` never flows through this
+    /// argv-encoding path either, exactly like `Approved`. A prompt at the
+    /// exact 16 KiB boundary is a structurally valid `AgentPrompt` (proving
+    /// the rejection below is not merely a side effect of an invalid
+    /// prompt) -- the kind itself is still rejected outright regardless.
+    #[test]
+    fn rejects_the_adapter_kind_outright_even_with_a_boundary_sized_prompt() {
+        let boundary_prompt = omnifrons_domain::adapter::AgentPrompt::new(
+            "a".repeat(omnifrons_domain::adapter::AgentPrompt::MAX_BYTES),
+        )
+        .expect("a prompt at exactly the 16 KiB cap must be structurally valid");
+
+        let error = HarnessRequest::new(
+            HarnessKind::Adapter {
+                adapter: omnifrons_domain::adapter::AdapterId::stream_json_cli(),
+                approval: omnifrons_domain::executable::ApprovalId(1),
+                prompt: boundary_prompt,
+            },
+            10,
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(error, InvalidRequest::KindNotDemo);
+    }
+
     #[test]
     fn accepts_a_well_formed_request() {
         let request = HarnessRequest::new(HarnessKind::DemoIgnoresSigterm, 1000, 100_000)
@@ -183,20 +232,27 @@ mod tests {
     }
 
     /// Not a runtime assertion so much as a maintenance trip-wire: adding a
-    /// fourth `HarnessKind` variant makes this `match` non-exhaustive and
+    /// fifth `HarnessKind` variant makes this `match` non-exhaustive and
     /// fails the build, forcing a deliberate decision here rather than a
-    /// silently incomplete catalog. Three variants, deliberately, as of
-    /// the spike slice-2 spike: the two demo kinds plus `Approved`.
+    /// silently incomplete catalog. Four variants, deliberately, as of the
+    /// spike slice-3 spike: the two demo kinds, `Approved`, and `Adapter`.
     #[test]
-    fn harness_kind_has_exactly_three_variants_deliberately() {
+    fn harness_kind_has_exactly_four_variants_deliberately() {
         let assert_exhaustive = |kind: HarnessKind| match kind {
-            HarnessKind::DemoLines | HarnessKind::DemoIgnoresSigterm | HarnessKind::Approved(_) => {
-            }
+            HarnessKind::DemoLines
+            | HarnessKind::DemoIgnoresSigterm
+            | HarnessKind::Approved(_)
+            | HarnessKind::Adapter { .. } => {}
         };
         assert_exhaustive(HarnessKind::DemoLines);
         assert_exhaustive(HarnessKind::DemoIgnoresSigterm);
         assert_exhaustive(HarnessKind::Approved(
             omnifrons_domain::executable::ApprovalId(1),
         ));
+        assert_exhaustive(HarnessKind::Adapter {
+            adapter: omnifrons_domain::adapter::AdapterId::stream_json_cli(),
+            approval: omnifrons_domain::executable::ApprovalId(1),
+            prompt: omnifrons_domain::adapter::AgentPrompt::new("hi").expect("valid prompt"),
+        });
     }
 }

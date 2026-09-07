@@ -58,6 +58,7 @@ fn text(seq: u64, stream: OutputStream, text: &str) -> OutputFrame {
         FramePayload::Text {
             stream,
             text: text.to_string(),
+            continued: false,
         },
     )
 }
@@ -87,6 +88,7 @@ fn seeded_frames_arrive_in_seq_order() {
         FramePayload::Text {
             stream: OutputStream::Stderr,
             text: "line 5 err".to_string(),
+            continued: false,
         }
     );
 }
@@ -103,6 +105,7 @@ fn dropped_before_is_preserved_end_to_end() {
             FramePayload::Text {
                 stream: OutputStream::Stdout,
                 text: "line 11 out".to_string(),
+                continued: false,
             },
         )],
     );

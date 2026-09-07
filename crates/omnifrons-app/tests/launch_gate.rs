@@ -228,3 +228,80 @@ fn revoke_never_probes() {
         "revoke must never probe the filesystem"
     );
 }
+
+/// A minimal `ProcessSupervisor` fake that never actually spawns an OS
+/// process: `spawn` always reports `Running`, and nothing (including a
+/// `LaunchGate` revocation elsewhere) ever changes that -- only this
+/// fake's own `observe` decides its status.
+struct AlwaysRunningFakeSupervisor;
+
+impl omnifrons_app::ProcessSupervisor for AlwaysRunningFakeSupervisor {
+    fn spawn(
+        &mut self,
+        _spec: omnifrons_app::ProcessSpec,
+    ) -> Result<omnifrons_app::ProcessId, omnifrons_app::SupervisorError> {
+        Ok(omnifrons_app::ProcessId(1))
+    }
+
+    fn stop(
+        &mut self,
+        _id: omnifrons_app::ProcessId,
+        _deadline: std::time::Duration,
+    ) -> Result<omnifrons_domain::scope::ProcessTerminalState, omnifrons_app::SupervisorError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    fn observe(&self, _id: omnifrons_app::ProcessId) -> Option<omnifrons_app::ProcessStatus> {
+        Some(omnifrons_app::ProcessStatus::Running)
+    }
+}
+
+/// Slice 3: revoking an approval mid-run must never reach into (or affect)
+/// an already-running process -- `LaunchGate::revoke` is a pure store
+/// write (see `revoke_never_probes` above), and a real supervisor has no
+/// hook a revocation could even call. This test makes that boundary
+/// explicit: a fake supervisor's already-`Running` process stays `Running`
+/// through a revoke, and only the *next* `decide` call (e.g. before a
+/// hypothetical restart) reflects the revocation.
+#[test]
+fn revoke_mid_run_leaves_the_running_process_unaffected_but_denies_the_next_decide() {
+    let target = identity("/opt/tool/app", 100, 1);
+    let prober = FakeProber::always(ProbeOutcome::Identity(target.clone()));
+    let mut gate = LaunchGate::new(
+        prober,
+        InMemoryApprovalStore::new(),
+        FixedClock::new(SystemTime::UNIX_EPOCH),
+    );
+
+    let record = gate
+        .approve_candidate(target)
+        .expect("approving a fresh candidate must succeed");
+
+    let first_decision = gate.decide(record.approval_id);
+    assert!(
+        matches!(first_decision, GateDecision::Allowed { .. }),
+        "expected Allowed before revocation, got {first_decision:?}"
+    );
+
+    let mut supervisor = AlwaysRunningFakeSupervisor;
+    let id = omnifrons_app::ProcessSupervisor::spawn(
+        &mut supervisor,
+        omnifrons_app::ProcessSpec::new("fake"),
+    )
+    .expect("the fake supervisor's spawn never fails");
+
+    gate.revoke(record.approval_id)
+        .expect("revoking a known approval must succeed");
+
+    assert_eq!(
+        omnifrons_app::ProcessSupervisor::observe(&supervisor, id),
+        Some(omnifrons_app::ProcessStatus::Running),
+        "a revoke must never affect an already-running process's observed status"
+    );
+
+    let next_decision = gate.decide(record.approval_id);
+    assert!(
+        matches!(next_decision, GateDecision::Denied(DenialReason::Revoked)),
+        "the next decide after a mid-run revoke must deny as Revoked, got {next_decision:?}"
+    );
+}
