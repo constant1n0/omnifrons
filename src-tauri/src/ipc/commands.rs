@@ -1,39 +1,47 @@
 //! The demo-harness IPC commands (`harness_spawn`, `harness_stop`,
-//! `harness_observe`) and, as of the spike slice-2 spike, the
-//! executable-identity-and-approval commands
-//! (`executable_pick_and_probe`, `executable_approve`,
-//! `executable_revoke`, `approvals_list`). Registered next to
-//! `shell_health` (`crate::shell_health`).
+//! `harness_observe`), the spike slice-2 executable-identity-and-approval
+//! commands (`executable_pick_and_probe`, `executable_approve`,
+//! `executable_revoke`, `approvals_list`), and the spike slice-3 built-in
+//! adapter surface (`workspace_pick`, `workspace_current`,
+//! `adapters_list`, and `harness_spawn`'s `kind: "adapter"` case).
+//! Registered next to `shell_health` (`crate::shell_health`).
 //!
 //! No program path or argument vector for a demo-harness request ever
 //! crosses IPC (`docs/spike-log.md` § IPC contract): the renderer names a
 //! [`dto::HarnessKindDto`] plus small bounded numbers, validated into an
 //! `omnifrons_app::HarnessRequest` before the supervisor ever sees it.
-//! `harness_spawn`'s `kind: "approved"` case is the one path that does
-//! reach a real, caller-supplied executable, and only ever by canonical
-//! path after a `LaunchGate` decision -- never a raw argument vector.
-//! Every error surfaces as a [`dto::ShellError`] with a fixed catalogue
-//! message -- never the underlying `SupervisorError::Spawn`'s `io::Error`
-//! text, which can carry a real filesystem path.
+//! `harness_spawn`'s `kind: "approved"` and `kind: "adapter"` cases are the
+//! two paths that do reach a real, caller-supplied executable, and only
+//! ever by canonical path after a `LaunchGate` decision -- never a raw
+//! argument vector; `kind: "adapter"`'s own argv comes only from the named
+//! adapter's own fixed template (`docs/spike-log.md` § Slice 3). Every
+//! error surfaces as a [`dto::ShellError`] with a fixed catalogue message
+//! -- never the underlying `SupervisorError::Spawn`'s `io::Error` text,
+//! which can carry a real filesystem path.
 
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use omnifrons_app::{
-    ApprovalStore, ApprovalStoreError, ExecutableProber, GateDecision, HarnessKind, HarnessRequest,
-    InvalidRequest, OutputFrame, ProcessId, ProcessOutput, ProcessSupervisor, SupervisorError,
+    ApprovalStore, ApprovalStoreError, EnvPlan, ExecutableProber, GateDecision, HarnessKind,
+    HarnessRequest, InvalidRequest, LaunchPlan, LaunchPlanError, LaunchRequest, LineAssembler,
+    OutputFrame, ProcessId, ProcessOutput, ProcessSupervisor, ProcessTerminalState, StdinPlan,
+    SupervisorError, WorkspaceRoot,
 };
+use omnifrons_domain::adapter::{AdapterEvent, AdapterId, AgentPrompt, PromptError};
 use omnifrons_domain::executable::{ApprovalId, DenialReason};
+use omnifrons_domain::scope::ScopeMode;
 use omnifrons_supervisor::TokioProcessSupervisor;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::adapter_state::AdapterState;
 use crate::executable_state::{CandidateId, CandidateTable, ExecutableState, ShellLaunchGate};
 use crate::ipc::dto::{
-    ApprovalDto, CandidateIdDto, EvidenceDto, HarnessFrame, HarnessKindDto, ProbeResultDto,
-    ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto, ShellError, ShellErrorCode,
-    ShellErrorDetail,
+    AdapterDescriptorDto, ApprovalDto, CandidateIdDto, EvidenceDto, HarnessFrame, HarnessKindDto,
+    ProbeResultDto, ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto, ShellError,
+    ShellErrorCode, ShellErrorDetail, WorkspaceDto,
 };
 
 impl From<SupervisorError> for ShellError {
@@ -117,6 +125,49 @@ impl From<DenialReason> for ShellError {
                 },
             ),
             DenialReason::ProbeFailed(ref outcome) => Self::from_probe_failure(outcome),
+        }
+    }
+}
+
+impl From<LaunchPlanError> for ShellError {
+    /// Maps a `HarnessAdapter::build_launch` failure to its catalogue
+    /// error (`docs/spike-log.md` § Slice 3). `CwdOutsideWorkspace` and
+    /// `PromptChannelUnsupported` are both structurally unreachable in
+    /// this slice's own wired flow (every built-in adapter always uses
+    /// the workspace's own path as cwd, and declares
+    /// `PromptChannel::StdinThenClose`) -- mapped defensively rather than
+    /// left a `todo!()`, so this stays total.
+    fn from(error: LaunchPlanError) -> Self {
+        match error {
+            LaunchPlanError::SecretShapedEnvKey(_) => Self::new(
+                ShellErrorCode::SecretShapedEnv,
+                "the adapter declared an environment variable that looks secret-shaped",
+            ),
+            LaunchPlanError::CwdOutsideWorkspace => Self::new(
+                ShellErrorCode::WorkspaceUnavailable,
+                "the working directory resolves outside the workspace",
+            ),
+            LaunchPlanError::PromptChannelUnsupported => Self::new(
+                ShellErrorCode::InvalidRequest,
+                "this adapter's prompt channel is not supported",
+            ),
+        }
+    }
+}
+
+impl From<PromptError> for ShellError {
+    /// Maps an `AgentPrompt::new` validation failure to its catalogue
+    /// error.
+    fn from(error: PromptError) -> Self {
+        match error {
+            PromptError::TooLarge => Self::new(
+                ShellErrorCode::PromptTooLarge,
+                "the prompt exceeds the size limit",
+            ),
+            PromptError::ContainsNul => Self::new(
+                ShellErrorCode::InvalidRequest,
+                "the prompt contains an interior NUL byte",
+            ),
         }
     }
 }
@@ -205,18 +256,203 @@ fn forward_output(id: ProcessId, receiver: Receiver<OutputFrame>, on_frame: Chan
     });
 }
 
-/// Spawn a harness or an approved executable, and stream its captured
-/// output over `on_frame`. `kind` names one of the two synthetic demo
-/// behaviors, or a real, previously approved executable
-/// (`docs/spike-log.md` § Slice 2) -- see [`HarnessKindDto`]'s own doc
+/// Start a detached forwarder thread for an adapter launch: every captured
+/// raw frame is mapped by [`adapter_wire_frames`] to the zero, one, or
+/// several `event`/`state` wire frames it produces, which are then relayed
+/// onto `on_frame` in order (`docs/spike-log.md` § Slice 3: `stdout`/
+/// `stderr` raw frames are never emitted for an adapter launch).
+///
+/// `adapter_id` is looked up in the managed [`AdapterState`] catalog
+/// inside this thread (via a cloned `app`), never carried in as a
+/// borrowed reference: this thread outlives the command call that started
+/// it.
+///
+/// # Panics
+///
+/// Panics if `adapter_id` is not present in the managed catalog -- callers
+/// must validate it against the catalog before ever reaching this
+/// function.
+fn forward_adapter_output(
+    id: ProcessId,
+    adapter_id: AdapterId,
+    receiver: Receiver<OutputFrame>,
+    on_frame: Channel<HarnessFrame>,
+    app: AppHandle,
+) {
+    let id_dto = ProcessIdDto::from(id);
+    std::thread::spawn(move || {
+        let adapter_state = app.state::<AdapterState>();
+        let adapter = adapter_state.catalog.get(&adapter_id).expect(
+            "adapter_id must already have been validated against the catalog before spawning",
+        );
+
+        let mut assembler = LineAssembler::new();
+        let mut sequencer = AdapterWireSequencer::new(id_dto);
+        let mut send_failures = 0u32;
+        'frames: for frame in receiver {
+            for wire_frame in adapter_wire_frames(adapter, &mut assembler, &mut sequencer, frame) {
+                if on_frame.send(wire_frame).is_err() {
+                    send_failures += 1;
+                    break 'frames;
+                }
+            }
+        }
+        if send_failures > 0 {
+            tracing::warn!(
+                pid = id_dto.0,
+                send_failures,
+                "adapter output forwarder stopped after a channel send failure"
+            );
+        }
+    });
+}
+
+/// The shell's own `seq` for one adapter launch's wire frames: a
+/// contiguous count of the `event`/`state` frames actually emitted for
+/// that launch, starting at `0`.
+///
+/// Deliberately not the captured raw frame's own `seq`: a raw frame can
+/// produce zero wire frames (a continuation still being assembled), one,
+/// or several (R3-004: a line carrying several content blocks yields one
+/// `event` per block), so raw `seq` would leave gaps and duplicates on the
+/// event stream -- and the renderer keys transcript entries by
+/// `${id}-${seq}`, so a duplicate would collide. Keeping the wire `seq`
+/// contiguous per launch is what `docs/spike-log.md` § Slice 3's own wire
+/// examples already show.
+struct AdapterWireSequencer {
+    id: ProcessIdDto,
+    next_seq: u64,
+}
+
+impl AdapterWireSequencer {
+    fn new(id: ProcessIdDto) -> Self {
+        Self { id, next_seq: 0 }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    fn event(&mut self, dropped_before: u64, event: AdapterEvent) -> HarnessFrame {
+        let seq = self.next_seq();
+        HarnessFrame::event(self.id, seq, dropped_before, event)
+    }
+
+    fn state(&mut self, dropped_before: u64, state: ProcessTerminalState) -> HarnessFrame {
+        let seq = self.next_seq();
+        HarnessFrame::State {
+            id: self.id,
+            seq,
+            dropped_before,
+            terminal: state.into(),
+        }
+    }
+}
+
+/// Map one captured raw frame of an adapter launch to the wire frames it
+/// produces, in order -- pure over `assembler`/`sequencer`, so the
+/// forwarder's behavior is unit-testable without a live process:
+///
+/// - a stdout text frame is fed to `assembler`; nothing is emitted until
+///   it completes a line, and then `adapter.parse_line`'s events (or one
+///   `Unknown { truncated: true }` for a truncated line) each become an
+///   `event` frame, the line's summed `dropped_before` (R3-002) attached
+///   to the first of them and `0` to the rest;
+/// - a stderr text frame becomes one `Diagnostic` `event` frame with the
+///   raw frame's own `dropped_before`;
+/// - a `State` frame first flushes any partial line still pending in
+///   `assembler` (its terminator can no longer arrive) as
+///   `Unknown { truncated: true }`, then becomes the `state` frame.
+fn adapter_wire_frames(
+    adapter: &dyn omnifrons_app::HarnessAdapter,
+    assembler: &mut LineAssembler,
+    sequencer: &mut AdapterWireSequencer,
+    frame: OutputFrame,
+) -> Vec<HarnessFrame> {
+    match frame.payload {
+        omnifrons_app::FramePayload::Text {
+            stream: omnifrons_app::OutputStream::Stdout,
+            text,
+            continued,
+        } => assembler
+            .push(&text, continued, frame.dropped_before)
+            .map_or_else(Vec::new, |assembled| {
+                assembled_wire_frames(adapter, sequencer, assembled)
+            }),
+        omnifrons_app::FramePayload::Text {
+            stream: omnifrons_app::OutputStream::Stderr,
+            text,
+            continued: _,
+        } => vec![sequencer.event(frame.dropped_before, AdapterEvent::Diagnostic { text })],
+        omnifrons_app::FramePayload::State(state) => {
+            let mut frames = assembler.finish().map_or_else(Vec::new, |pending| {
+                assembled_wire_frames(adapter, sequencer, pending)
+            });
+            frames.push(sequencer.state(frame.dropped_before, state));
+            frames
+        }
+    }
+}
+
+/// The `event` wire frames for one completed line: one per event, the
+/// line's summed `dropped_before` on the first only. Defensive against an
+/// adapter violating `parse_line`'s never-empty contract: an empty event
+/// list is replaced by one `Unknown` carrying the line's bytes, so the
+/// line (and its drop count) is never silently lost.
+fn assembled_wire_frames(
+    adapter: &dyn omnifrons_app::HarnessAdapter,
+    sequencer: &mut AdapterWireSequencer,
+    assembled: omnifrons_app::Assembled,
+) -> Vec<HarnessFrame> {
+    let omnifrons_app::Assembled {
+        line,
+        dropped_before,
+    } = assembled;
+    let events = match line {
+        omnifrons_app::AssembledLine::Line(line) => {
+            let mut events = adapter.parse_line(&line);
+            if events.is_empty() {
+                events.push(AdapterEvent::Unknown {
+                    raw: line.into_bytes(),
+                    truncated: false,
+                });
+            }
+            events
+        }
+        omnifrons_app::AssembledLine::Truncated { raw } => vec![AdapterEvent::Unknown {
+            raw,
+            truncated: true,
+        }],
+    };
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let dropped_before = if index == 0 { dropped_before } else { 0 };
+            sequencer.event(dropped_before, event)
+        })
+        .collect()
+}
+
+/// Spawn a harness or an approved/adapter executable, and stream its
+/// captured output over `on_frame`. `kind` names one of the two synthetic
+/// demo behaviors, a real, previously approved executable
+/// (`docs/spike-log.md` § Slice 2), or a built-in adapter launch
+/// (`docs/spike-log.md` § Slice 3) -- see [`HarnessKindDto`]'s own doc
 /// comment for why the wire shape is tagged rather than flat.
 ///
 /// # Errors
 ///
 /// Returns [`ShellError`] with [`ShellErrorCode::InvalidRequest`] if a demo
 /// kind's `rateHz`/`lines` are out of range, the mapped [`SupervisorError`]
-/// if the process could not be started, or -- for `kind: "approved"` --
-/// the mapped [`DenialReason`] if the `LaunchGate` denies the launch.
+/// if the process could not be started, the mapped [`DenialReason`] if the
+/// `LaunchGate` denies an `"approved"`/`"adapter"` launch, or -- for
+/// `kind: "adapter"` specifically -- [`ShellErrorCode::UnknownAdapter`],
+/// [`ShellErrorCode::PromptTooLarge`]/`invalid-request`,
+/// [`ShellErrorCode::WorkspaceUnavailable`], or the mapped
+/// [`LaunchPlanError`].
 #[tauri::command]
 pub async fn harness_spawn(
     app: AppHandle,
@@ -240,6 +476,11 @@ pub async fn harness_spawn(
         HarnessKindDto::Approved { approval_id } => {
             spawn_approved_harness(app, approval_id.into(), on_frame).await
         }
+        HarnessKindDto::Adapter {
+            adapter_id,
+            approval_id,
+            prompt,
+        } => spawn_adapter_harness(app, adapter_id, approval_id.into(), prompt, on_frame).await,
     }
 }
 
@@ -255,7 +496,7 @@ async fn spawn_demo_harness(
     let request = HarnessRequest::new(kind, rate_hz, lines)?;
 
     let (id, receiver) = with_supervisor(app, move |supervisor| {
-        let id = supervisor.spawn_harness(request)?;
+        let id = supervisor.spawn_harness(&request)?;
         let receiver = supervisor.subscribe(id)?;
         Ok::<_, SupervisorError>((id, receiver))
     })
@@ -295,14 +536,133 @@ async fn spawn_approved_harness(
     };
 
     let display_path = executable.identity.canonical_path.clone();
+    let plan = default_approved_plan()?;
     let (id, receiver) = with_supervisor(app, move |supervisor| {
-        let id = supervisor.spawn_approved(executable.handle, display_path)?;
+        let id = supervisor.spawn_approved(executable.handle, display_path, &plan)?;
         let receiver = supervisor.subscribe(id)?;
         Ok::<_, SupervisorError>((id, receiver))
     })
     .await?;
 
     forward_output(id, receiver, on_frame);
+    Ok(ProcessIdDto::from(id))
+}
+
+/// The plan `kind: "approved"` launches with: empty argv (no arguments,
+/// unchanged from the spike slice-2 spike), the same `env_clear()` plus
+/// base-allowlist environment an adapter launch with no declared extras
+/// gets (`EnvPlan::new(&[])` -- never `EnvPlan::Inherit`: an approved
+/// executable is a caller-supplied program exactly like an adapter's, and
+/// this shell's own environment can carry credentials no launch should
+/// inherit by default; R1-001, fixed in review), no working-directory
+/// override (this shell's own current directory, behaviorally identical
+/// to never setting one), and `StdinPlan::Null` -- which was always this
+/// method's own documented contract, even before `LaunchPlan` existed, and
+/// this now actually enforces on every platform (`docs/spike-log.md` §
+/// Slice 3). Both kinds then pass through `finish_spawn`'s single
+/// secret-shaped re-check.
+///
+/// # Errors
+///
+/// Returns [`ShellError`] if this shell's own current directory could not
+/// be resolved into a [`WorkspaceRoot`] -- expected never to happen in
+/// practice -- or the mapped [`LaunchPlanError`] if the base allowlist
+/// could not be built (structurally impossible: it declares no extra key).
+fn default_approved_plan() -> Result<LaunchPlan, ShellError> {
+    let cwd = std::env::current_dir().map_err(|_| {
+        ShellError::new(
+            ShellErrorCode::WorkspaceUnavailable,
+            "this shell's own current directory could not be resolved",
+        )
+    })?;
+    let workspace = WorkspaceRoot::new(cwd).map_err(|_| {
+        ShellError::new(
+            ShellErrorCode::WorkspaceUnavailable,
+            "this shell's own current directory could not be resolved",
+        )
+    })?;
+    let env = EnvPlan::new(&[])?;
+    Ok(LaunchPlan {
+        argv: vec![],
+        env,
+        cwd: workspace,
+        stdin: StdinPlan::Null,
+        prompt: None,
+        scope_mode: ScopeMode::Advisory,
+    })
+}
+
+/// Validate `adapter_id`/`prompt` and an active workspace, decide (via the
+/// managed `LaunchGate`) whether `approval_id` may launch right now, build
+/// that adapter's own [`LaunchPlan`] for the current workspace and prompt,
+/// and spawn it -- streaming captured output over `on_frame` through
+/// [`forward_adapter_output`] rather than raw (`docs/spike-log.md` §
+/// Slice 3).
+///
+/// # Errors
+///
+/// Returns [`ShellError`] with [`ShellErrorCode::UnknownAdapter`] if
+/// `adapter_id` is not one of the closed, built-in adapters; the mapped
+/// [`PromptError`] if `prompt` is invalid;
+/// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active; the
+/// mapped [`DenialReason`] if the `LaunchGate` denies the launch; the
+/// mapped [`LaunchPlanError`] if the adapter's own `build_launch` fails;
+/// or the mapped [`SupervisorError`] if the process could not be started.
+async fn spawn_adapter_harness(
+    app: AppHandle,
+    adapter_id: String,
+    approval_id: ApprovalId,
+    prompt: String,
+    on_frame: Channel<HarnessFrame>,
+) -> Result<ProcessIdDto, ShellError> {
+    let adapter_id = AdapterId::parse(&adapter_id).ok_or_else(|| {
+        ShellError::new(
+            ShellErrorCode::UnknownAdapter,
+            "the requested adapter is not recognized",
+        )
+    })?;
+    let prompt = AgentPrompt::new(prompt)?;
+
+    let workspace = {
+        let state = app.state::<AdapterState>();
+        state
+            .active_workspace
+            .lock()
+            .expect("active workspace mutex poisoned by a prior panic")
+            .clone()
+            .ok_or_else(|| {
+                ShellError::new(
+                    ShellErrorCode::WorkspaceUnavailable,
+                    "no workspace has been picked yet",
+                )
+            })?
+    };
+
+    let decision = with_gate(app.clone(), move |gate| gate.decide(approval_id)).await;
+    let executable = match decision {
+        GateDecision::Allowed { executable, .. } => executable,
+        GateDecision::Denied(reason) => return Err(ShellError::from(reason)),
+    };
+
+    let plan = {
+        let state = app.state::<AdapterState>();
+        let adapter = state
+            .catalog
+            .get(&adapter_id)
+            .expect("adapter_id was already validated via AdapterId::parse against the catalog");
+        let request = LaunchRequest { prompt, workspace };
+        adapter.build_launch(&request)?
+    };
+
+    let display_path = executable.identity.canonical_path.clone();
+    let (id, receiver) = with_supervisor(app.clone(), move |supervisor| {
+        let id = supervisor.spawn_approved(executable.handle, display_path, &plan)?;
+        let receiver = supervisor.subscribe(id)?;
+        Ok::<_, SupervisorError>((id, receiver))
+    })
+    .await?;
+
+    forward_adapter_output(id, adapter_id, receiver, on_frame, app);
     Ok(ProcessIdDto::from(id))
 }
 
@@ -485,6 +845,79 @@ pub async fn approvals_list(app: AppHandle) -> Result<Vec<ApprovalDto>, ShellErr
     .map_err(ShellError::from)
 }
 
+/// Open the native folder picker and, if a folder was selected, resolve it
+/// into a [`WorkspaceRoot`] and make it this shell's single active
+/// workspace, replacing any previously active one.
+///
+/// Run on a blocking thread (`tauri::async_runtime::spawn_blocking`):
+/// `blocking_pick_folder` would deadlock if called directly from the async
+/// executor's own thread, exactly like `executable_pick_and_probe`'s own
+/// `blocking_pick_file` above.
+///
+/// # Errors
+///
+/// Returns [`ShellError`] with [`ShellErrorCode::NoWorkspace`] if no
+/// folder was selected (canceled), or if the selected path could not be
+/// resolved into a valid, existing directory.
+#[tauri::command]
+pub async fn workspace_pick(app: AppHandle) -> Result<WorkspaceDto, ShellError> {
+    let dialog_app = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app.dialog().file().blocking_pick_folder()
+    })
+    .await
+    .expect("the blocking folder-picker task panicked");
+
+    let no_workspace = || ShellError::new(ShellErrorCode::NoWorkspace, "no folder was selected");
+
+    let picked = picked.ok_or_else(no_workspace)?;
+    let candidate_path = picked.into_path().map_err(|_| no_workspace())?;
+    let workspace = WorkspaceRoot::new(candidate_path).map_err(|_| no_workspace())?;
+
+    let dto = WorkspaceDto::from_workspace(&workspace);
+    let state = app.state::<AdapterState>();
+    *state
+        .active_workspace
+        .lock()
+        .expect("active workspace mutex poisoned by a prior panic") = Some(workspace);
+
+    Ok(dto)
+}
+
+/// The currently active workspace, if any.
+///
+/// `app` is taken by value, not `&AppHandle`, even though this function
+/// only ever borrows it: that is the parameter shape `#[tauri::command]`'s
+/// own argument-extraction expects for an injected `AppHandle`.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn workspace_current(app: AppHandle) -> Option<WorkspaceDto> {
+    let state = app.state::<AdapterState>();
+    state
+        .active_workspace
+        .lock()
+        .expect("active workspace mutex poisoned by a prior panic")
+        .as_ref()
+        .map(WorkspaceDto::from_workspace)
+}
+
+/// List every built-in adapter's descriptor -- metadata only, never argv
+/// or resolved environment values (`docs/spike-log.md` § Slice 3).
+///
+/// `app` is taken by value for the same reason as [`workspace_current`]'s
+/// own `app` parameter.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn adapters_list(app: AppHandle) -> Vec<AdapterDescriptorDto> {
+    let state = app.state::<AdapterState>();
+    state
+        .catalog
+        .descriptors()
+        .iter()
+        .map(AdapterDescriptorDto::from_descriptor)
+        .collect()
+}
+
 /// Stop a spawned demo harness, gracefully then forcefully, within
 /// `deadline_ms`.
 ///
@@ -532,10 +965,34 @@ pub async fn harness_observe(
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellError, find_candidate};
+    use super::{AdapterWireSequencer, ShellError, adapter_wire_frames, find_candidate};
     use crate::executable_state::CandidateTable;
-    use crate::ipc::dto::{CandidateIdDto, ShellErrorCode};
-    use omnifrons_app::SupervisorError;
+    use crate::ipc::dto::{CandidateIdDto, HarnessFrame, ProcessIdDto, ShellErrorCode};
+    use omnifrons_app::{EnvPlan, LineAssembler, StdinPlan, SupervisorError};
+
+    /// R1-001: a `kind: "approved"` launch must never inherit this shell's
+    /// own environment. Its plan carries the same base allowlist an
+    /// adapter launch with no declared extras gets -- structurally
+    /// `EnvPlan::Allowlist`, with exactly the base key set -- plus empty
+    /// argv, `StdinPlan::Null`, and no prompt.
+    #[test]
+    fn default_approved_plan_uses_the_base_allowlist_never_inherit() {
+        let plan = super::default_approved_plan().expect("the shell's own cwd must resolve");
+
+        assert!(
+            matches!(plan.env, EnvPlan::Allowlist(_)),
+            "the approved plan's env must be an allowlist, got {:?}",
+            plan.env
+        );
+        assert_eq!(
+            plan.env,
+            EnvPlan::new(&[]).expect("an empty declared-key list can never be secret-shaped"),
+            "the approved plan's allowlist must be exactly the base key set"
+        );
+        assert!(plan.argv.is_empty());
+        assert_eq!(plan.stdin, StdinPlan::Null);
+        assert!(plan.prompt.is_none());
+    }
     use omnifrons_domain::executable::{DenialReason, Sha256Digest};
 
     #[test]
@@ -628,6 +1085,240 @@ mod tests {
         let error = find_candidate(&candidates, CandidateIdDto(evicted_id.raw())).unwrap_err();
 
         assert_eq!(error.code, ShellErrorCode::NoCandidate);
+    }
+
+    // -- Slice 3: the adapter forwarder's pure frame mapping --
+
+    /// A fake adapter for the forwarder tests: the line `"two"` yields a
+    /// `Message` then a `ToolCall` (two events from one line); any other
+    /// line yields a single `Message` echoing it.
+    struct TwoEventAdapter;
+
+    impl omnifrons_app::HarnessAdapter for TwoEventAdapter {
+        fn describe(&self) -> omnifrons_app::AdapterDescriptor {
+            omnifrons_app::AdapterDescriptor {
+                id: omnifrons_domain::adapter::AdapterId::stream_json_cli(),
+                display_name: "Two-event fake".to_string(),
+                transport_class: omnifrons_domain::adapter::TransportClass::StructuredStreamingCli,
+                prompt_channel: omnifrons_domain::adapter::PromptChannel::StdinThenClose,
+                argv_template: vec![],
+                declared_env: vec![],
+                scope_mode: omnifrons_domain::scope::ScopeMode::Advisory,
+                notes: String::new(),
+            }
+        }
+
+        fn build_launch(
+            &self,
+            request: &omnifrons_app::LaunchRequest,
+        ) -> Result<omnifrons_app::LaunchPlan, omnifrons_app::LaunchPlanError> {
+            Ok(omnifrons_app::LaunchPlan {
+                argv: vec![],
+                env: omnifrons_app::EnvPlan::new(&[])?,
+                cwd: request.workspace.clone(),
+                stdin: omnifrons_app::StdinPlan::PipePromptThenClose,
+                prompt: Some(request.prompt.clone()),
+                scope_mode: omnifrons_domain::scope::ScopeMode::Advisory,
+            })
+        }
+
+        fn parse_line(&self, line: &str) -> Vec<omnifrons_domain::adapter::AdapterEvent> {
+            use omnifrons_domain::adapter::{AdapterEvent, ToolCallProposal};
+            if line == "two" {
+                vec![
+                    AdapterEvent::Message {
+                        text: "first".to_string(),
+                    },
+                    AdapterEvent::ToolCall(ToolCallProposal {
+                        name: "write_file".to_string(),
+                        arguments_text: "{}".to_string(),
+                    }),
+                ]
+            } else {
+                vec![AdapterEvent::Message {
+                    text: line.to_string(),
+                }]
+            }
+        }
+    }
+
+    fn stdout_frame(
+        seq: u64,
+        dropped_before: u64,
+        text: &str,
+        continued: bool,
+    ) -> omnifrons_app::OutputFrame {
+        omnifrons_app::OutputFrame::with_dropped_before(
+            seq,
+            dropped_before,
+            omnifrons_app::FramePayload::Text {
+                stream: omnifrons_app::OutputStream::Stdout,
+                text: text.to_string(),
+                continued,
+            },
+        )
+    }
+
+    fn stderr_frame(seq: u64, dropped_before: u64, text: &str) -> omnifrons_app::OutputFrame {
+        omnifrons_app::OutputFrame::with_dropped_before(
+            seq,
+            dropped_before,
+            omnifrons_app::FramePayload::Text {
+                stream: omnifrons_app::OutputStream::Stderr,
+                text: text.to_string(),
+                continued: false,
+            },
+        )
+    }
+
+    fn state_frame(seq: u64, dropped_before: u64) -> omnifrons_app::OutputFrame {
+        omnifrons_app::OutputFrame::with_dropped_before(
+            seq,
+            dropped_before,
+            omnifrons_app::FramePayload::State(omnifrons_app::ProcessTerminalState::Exited {
+                code: Some(0),
+            }),
+        )
+    }
+
+    /// `(seq, droppedBefore, kind)` of an emitted wire frame.
+    fn summarize(frame: &HarnessFrame) -> (u64, u64, &'static str) {
+        use crate::ipc::dto::AdapterEventDto;
+        match frame {
+            HarnessFrame::Event {
+                seq,
+                dropped_before,
+                event,
+                ..
+            } => {
+                let kind = match event {
+                    AdapterEventDto::State { .. } => "state",
+                    AdapterEventDto::Message { .. } => "message",
+                    AdapterEventDto::ToolCall { .. } => "tool-call",
+                    AdapterEventDto::Diagnostic { .. } => "diagnostic",
+                    AdapterEventDto::Unknown { .. } => "unknown",
+                };
+                (*seq, *dropped_before, kind)
+            }
+            HarnessFrame::State {
+                seq,
+                dropped_before,
+                ..
+            } => (*seq, *dropped_before, "terminal"),
+            HarnessFrame::Stdout { .. } | HarnessFrame::Stderr { .. } => {
+                panic!("an adapter launch must never emit a raw stdout/stderr frame, got {frame:?}")
+            }
+        }
+    }
+
+    /// R3-002: the summed `dropped_before` of every raw frame that fed a
+    /// coalesced line reaches the wire, not only the last frame's own.
+    #[test]
+    fn adapter_forwarder_sums_dropped_before_across_coalesced_frames() {
+        use crate::ipc::dto::AdapterEventDto;
+        let mut assembler = LineAssembler::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let first = adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            stdout_frame(0, 2, "abc", true),
+        );
+        assert!(first.is_empty(), "a continued frame completes nothing yet");
+
+        let second = adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            stdout_frame(1, 0, "def", false),
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(summarize(&second[0]), (0, 2, "message"));
+        match &second[0] {
+            HarnessFrame::Event {
+                event: AdapterEventDto::Message { text },
+                ..
+            } => assert_eq!(text, "abcdef"),
+            other => panic!("expected the assembled message, got {other:?}"),
+        }
+    }
+
+    /// R3-004 at the wire: one line yielding two events becomes two wire
+    /// frames, `seq` contiguous per launch (never duplicated -- the
+    /// renderer keys entries by it), `droppedBefore` on the first only;
+    /// stderr and state frames continue the same sequence.
+    #[test]
+    fn adapter_forwarder_emits_one_wire_frame_per_event_with_a_contiguous_seq() {
+        let mut assembler = LineAssembler::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let mut emitted = adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            stdout_frame(0, 1, "two", false),
+        );
+        emitted.extend(adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            stderr_frame(1, 3, "diagnostic: hello"),
+        ));
+        emitted.extend(adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            state_frame(2, 0),
+        ));
+
+        let summary: Vec<_> = emitted.iter().map(summarize).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, 1, "message"),
+                (1, 0, "tool-call"),
+                (2, 3, "diagnostic"),
+                (3, 0, "terminal"),
+            ]
+        );
+    }
+
+    /// A partial line still pending when the process reaches its terminal
+    /// state is flushed as `Unknown{truncated: true}` before the `state`
+    /// frame, never silently dropped.
+    #[test]
+    fn adapter_forwarder_flushes_a_pending_partial_line_before_the_state_frame() {
+        use crate::ipc::dto::AdapterEventDto;
+        let mut assembler = LineAssembler::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let pending = adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            stdout_frame(0, 0, "head", true),
+        );
+        assert!(pending.is_empty());
+
+        let emitted = adapter_wire_frames(
+            &TwoEventAdapter,
+            &mut assembler,
+            &mut sequencer,
+            state_frame(1, 0),
+        );
+        let summary: Vec<_> = emitted.iter().map(summarize).collect();
+        assert_eq!(summary, vec![(0, 0, "unknown"), (1, 0, "terminal")]);
+        match &emitted[0] {
+            HarnessFrame::Event {
+                event: AdapterEventDto::Unknown { raw, truncated },
+                ..
+            } => {
+                assert_eq!(raw, "head");
+                assert!(truncated);
+            }
+            other => panic!("expected the flushed partial line, got {other:?}"),
+        }
     }
 
     #[test]

@@ -5,15 +5,18 @@
 //! coordinators`). Nothing depends on this crate
 //! (docs/repository-layout.md § Crate map).
 
+mod adapter_state;
 mod executable_state;
 mod health;
 mod ipc;
 
+use adapter_state::AdapterState;
 use executable_state::ExecutableState;
 use health::ShellHealth;
 use ipc::commands::{
-    approvals_list, executable_approve, executable_pick_and_probe, executable_revoke,
-    harness_observe, harness_spawn, harness_stop,
+    adapters_list, approvals_list, executable_approve, executable_pick_and_probe,
+    executable_revoke, harness_observe, harness_spawn, harness_stop, workspace_current,
+    workspace_pick,
 };
 use omnifrons_supervisor::TokioProcessSupervisor;
 use tauri::Manager as _;
@@ -71,6 +74,10 @@ pub fn run() {
             let store_dir = app.path().app_local_data_dir()?;
             tracing::debug!(store_dir = %store_dir.display(), "opening the approval store");
             app.manage(ExecutableState::open(store_dir)?);
+
+            // The closed, built-in adapter catalog and the single active-
+            // workspace slot (`docs/spike-log.md` § Slice 3).
+            app.manage(AdapterState::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -82,6 +89,9 @@ pub fn run() {
             executable_approve,
             executable_revoke,
             approvals_list,
+            workspace_pick,
+            workspace_current,
+            adapters_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

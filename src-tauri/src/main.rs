@@ -30,7 +30,7 @@ fn try_run_demo_harness() -> Option<std::process::ExitCode> {
         .next()
         .and_then(|value| value.parse().ok())
         .expect("--demo-harness requires a valid lines argument");
-    Some(omnifrons_supervisor::demo::run(kind, rate_hz, lines))
+    Some(omnifrons_supervisor::demo::run(&kind, rate_hz, lines))
 }
 
 fn main() -> std::process::ExitCode {

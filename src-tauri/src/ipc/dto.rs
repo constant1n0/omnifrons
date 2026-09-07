@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 /// the tagged shape makes an invalid combination (e.g. `approved` with a
 /// `rateHz`) inexpressible on the wire, instead of merely rejected after
 /// the fact (`docs/spike-log.md` § Slice 2 records this choice).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// Not `Copy` as of the spike slice-3 spike: `Adapter`'s `adapter_id` and
+/// `prompt` fields are both `String`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "kebab-case",
@@ -41,6 +44,130 @@ pub enum HarnessKindDto {
     Approved {
         approval_id: ApprovalIdDto,
     },
+    /// Launch the built-in adapter named by `adapter_id` against the
+    /// executable behind `approval_id`, delivering `prompt` -- added in
+    /// the spike slice-3 spike (`docs/spike-log.md` § Slice 3).
+    /// `adapter_id` is validated into a closed
+    /// `omnifrons_domain::adapter::AdapterId` (-> `unknown-adapter` if
+    /// unrecognized) and `prompt` into a size-capped `AgentPrompt` (->
+    /// `prompt-too-large`/`invalid-request`) before either ever reaches
+    /// the launch gate or an adapter's own `build_launch`.
+    Adapter {
+        adapter_id: String,
+        approval_id: ApprovalIdDto,
+        prompt: String,
+    },
+}
+
+/// A workspace directory, as it crosses IPC. `display_path` is the
+/// workspace's canonical filesystem path -- the second explicit exception
+/// to RCS-001-R14's no-raw-path rule, alongside
+/// [`EvidenceDto::canonical_path`] (`docs/spike-log.md` § Slice 3): both
+/// are identity evidence flowing core -> renderer for display only (where
+/// the agent actually runs), never a reference the renderer sends back,
+/// and never sent to the harness process (which receives the workspace
+/// only as its own working directory).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDto {
+    pub display_path: String,
+}
+
+impl WorkspaceDto {
+    #[must_use]
+    pub fn from_workspace(workspace: &omnifrons_app::WorkspaceRoot) -> Self {
+        Self {
+            display_path: workspace.path().to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// [`omnifrons_domain::adapter::TransportClass`], as it crosses IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportClassDto {
+    StructuredStreamingCli,
+    Pty,
+}
+
+impl From<omnifrons_domain::adapter::TransportClass> for TransportClassDto {
+    fn from(value: omnifrons_domain::adapter::TransportClass) -> Self {
+        match value {
+            omnifrons_domain::adapter::TransportClass::StructuredStreamingCli => {
+                Self::StructuredStreamingCli
+            }
+            omnifrons_domain::adapter::TransportClass::Pty => Self::Pty,
+        }
+    }
+}
+
+/// [`omnifrons_domain::adapter::PromptChannel`], as it crosses IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptChannelDto {
+    StdinThenClose,
+    Argv,
+}
+
+impl From<omnifrons_domain::adapter::PromptChannel> for PromptChannelDto {
+    fn from(value: omnifrons_domain::adapter::PromptChannel) -> Self {
+        match value {
+            omnifrons_domain::adapter::PromptChannel::StdinThenClose => Self::StdinThenClose,
+            omnifrons_domain::adapter::PromptChannel::Argv => Self::Argv,
+        }
+    }
+}
+
+/// [`omnifrons_domain::scope::ScopeMode`], as it crosses IPC -- the scope
+/// badge data `docs/spike-log.md` § Slice 3 keeps as `advisory` for every
+/// built-in adapter in this slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScopeModeDto {
+    SandboxEnforced,
+    HarnessEnforced,
+    Advisory,
+}
+
+impl From<omnifrons_domain::scope::ScopeMode> for ScopeModeDto {
+    fn from(value: omnifrons_domain::scope::ScopeMode) -> Self {
+        match value {
+            omnifrons_domain::scope::ScopeMode::SandboxEnforced => Self::SandboxEnforced,
+            omnifrons_domain::scope::ScopeMode::HarnessEnforced => Self::HarnessEnforced,
+            omnifrons_domain::scope::ScopeMode::Advisory => Self::Advisory,
+        }
+    }
+}
+
+/// One built-in adapter's descriptor, as it crosses IPC -- metadata only:
+/// deliberately never `argvTemplate` or `declaredEnv`'s resolved values,
+/// which are this shell's own launch-time concern, never the renderer's
+/// (`docs/spike-log.md` § Slice 3, mirroring the no-argv/no-path
+/// discipline `docs/spike-log.md` § IPC contract already established for
+/// every other command).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterDescriptorDto {
+    pub id: String,
+    pub display_name: String,
+    pub transport_class: TransportClassDto,
+    pub prompt_channel: PromptChannelDto,
+    pub scope_mode: ScopeModeDto,
+    pub notes: String,
+}
+
+impl AdapterDescriptorDto {
+    #[must_use]
+    pub fn from_descriptor(descriptor: &omnifrons_app::AdapterDescriptor) -> Self {
+        Self {
+            id: descriptor.id.as_str().to_string(),
+            display_name: descriptor.display_name.clone(),
+            transport_class: descriptor.transport_class.into(),
+            prompt_channel: descriptor.prompt_channel.into(),
+            scope_mode: descriptor.scope_mode.into(),
+            notes: descriptor.notes.clone(),
+        }
+    }
 }
 
 /// A process identifier crossing IPC: transparently the platform process
@@ -135,12 +262,119 @@ impl From<omnifrons_app::ProcessStatus> for ProcessStatusDto {
     }
 }
 
+/// [`omnifrons_domain::adapter::AgentPhase`]'s tag, as it crosses IPC --
+/// paired with [`AdapterEventDto::State`]'s own `subtype` as an
+/// always-present (`null` unless `finished`) sibling field, mirroring
+/// [`ProcessTerminalStateDto`]'s own flat, always-present-`code` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPhaseTag {
+    Init,
+    Finished,
+    Exited,
+}
+
+/// One named text observation accompanying an
+/// [`AdapterEventDto::State`] event, as it crosses IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationDto {
+    pub key: String,
+    pub value: String,
+}
+
+/// [`omnifrons_domain::adapter::AdapterEvent`], as it crosses IPC.
+/// Adjacently tagged (`kind` + `payload`), matching
+/// [`HarnessFrame`]'s own outer `stream`/`body` shape one level down: the
+/// literal `kind`/`payload` field names [`HarnessFrame::Event`] flattens
+/// this into come from here.
+///
+/// `Unknown::raw` is rendered as a plain (lossily decoded) string, never
+/// base64 or a byte array: every `raw` this slice's own adapters ever
+/// produce originates from text that was already valid UTF-8 (a captured
+/// line, or `LineAssembler`'s own buffer of concatenated valid-UTF-8
+/// frames) -- lossy decoding is a defensive fallback, not the expected
+/// path (`docs/spike-log.md` § Slice 3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AdapterEventDto {
+    State {
+        phase: AgentPhaseTag,
+        subtype: Option<String>,
+        observations: Vec<ObservationDto>,
+    },
+    Message {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        arguments_text: String,
+    },
+    Diagnostic {
+        text: String,
+    },
+    Unknown {
+        raw: String,
+        truncated: bool,
+    },
+}
+
+impl AdapterEventDto {
+    #[must_use]
+    pub fn from_domain(event: omnifrons_domain::adapter::AdapterEvent) -> Self {
+        use omnifrons_domain::adapter::{AdapterEvent, AgentPhase};
+        match event {
+            AdapterEvent::State {
+                phase,
+                observations,
+            } => {
+                let (phase_tag, subtype) = match phase {
+                    AgentPhase::Init => (AgentPhaseTag::Init, None),
+                    AgentPhase::Finished { subtype } => (AgentPhaseTag::Finished, Some(subtype)),
+                    AgentPhase::Exited => (AgentPhaseTag::Exited, None),
+                };
+                Self::State {
+                    phase: phase_tag,
+                    subtype,
+                    observations: observations
+                        .into_iter()
+                        .map(|(key, value)| ObservationDto { key, value })
+                        .collect(),
+                }
+            }
+            AdapterEvent::Message { text } => Self::Message { text },
+            AdapterEvent::ToolCall(proposal) => Self::ToolCall {
+                name: proposal.name,
+                arguments_text: proposal.arguments_text,
+            },
+            AdapterEvent::Diagnostic { text } => Self::Diagnostic { text },
+            AdapterEvent::Unknown { raw, truncated } => Self::Unknown {
+                raw: String::from_utf8_lossy(&raw).into_owned(),
+                truncated,
+            },
+        }
+    }
+}
+
 /// One streamed frame delivered over `harness_spawn`'s `onFrame` channel.
 ///
-/// Adjacently tagged: `{"stream": "stdout" | "stderr" | "state", "body":
-/// {...}}`. `stdout`/`stderr` carry decoded text; `state` carries the same
+/// Adjacently tagged: `{"stream": "stdout" | "stderr" | "state" | "event",
+/// "body": {...}}`. `stdout`/`stderr` carry decoded text (never emitted
+/// for an adapter launch -- see [`Self::event`]) plus `continued`, the
+/// capturing side's own statement of whether more of the same logical
+/// line follows in the next frame (a forced split at the 8 KiB per-frame
+/// cap) -- additive as of spike slice 3, so a consumer that ignores it
+/// keeps working (`docs/spike-log.md` § Slice 3); `state` carries the same
 /// flat terminal-state shape as [`ProcessTerminalStateDto`], flattened in
-/// alongside `id`/`seq`/`droppedBefore` rather than nested.
+/// alongside `id`/`seq`/`droppedBefore` rather than nested; `event`
+/// (spike slice 3) carries an [`AdapterEventDto`], flattened the same way
+/// -- its own `kind`/`payload` fields land directly on `event`'s body,
+/// alongside `id`/`seq`/`droppedBefore`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "stream",
@@ -154,12 +388,14 @@ pub enum HarnessFrame {
         seq: u64,
         dropped_before: u64,
         text: String,
+        continued: bool,
     },
     Stderr {
         id: ProcessIdDto,
         seq: u64,
         dropped_before: u64,
         text: String,
+        continued: bool,
     },
     State {
         id: ProcessIdDto,
@@ -168,31 +404,44 @@ pub enum HarnessFrame {
         #[serde(flatten)]
         terminal: ProcessTerminalStateDto,
     },
+    Event {
+        id: ProcessIdDto,
+        seq: u64,
+        dropped_before: u64,
+        #[serde(flatten)]
+        event: AdapterEventDto,
+    },
 }
 
 impl HarnessFrame {
     /// Build the wire frame for `id` from a captured
-    /// [`omnifrons_app::OutputFrame`].
+    /// [`omnifrons_app::OutputFrame`]. Used for a demo or approved-plain
+    /// (non-adapter) launch, whose stdout/stderr are always sent raw,
+    /// never parsed.
     #[must_use]
     pub fn from_domain(id: ProcessIdDto, frame: omnifrons_app::OutputFrame) -> Self {
         match frame.payload {
             omnifrons_app::FramePayload::Text {
                 stream: omnifrons_app::OutputStream::Stdout,
                 text,
+                continued,
             } => Self::Stdout {
                 id,
                 seq: frame.seq,
                 dropped_before: frame.dropped_before,
                 text,
+                continued,
             },
             omnifrons_app::FramePayload::Text {
                 stream: omnifrons_app::OutputStream::Stderr,
                 text,
+                continued,
             } => Self::Stderr {
                 id,
                 seq: frame.seq,
                 dropped_before: frame.dropped_before,
                 text,
+                continued,
             },
             omnifrons_app::FramePayload::State(state) => Self::State {
                 id,
@@ -200,6 +449,25 @@ impl HarnessFrame {
                 dropped_before: frame.dropped_before,
                 terminal: state.into(),
             },
+        }
+    }
+
+    /// Build an `event` wire frame for `id` from an
+    /// [`omnifrons_domain::adapter::AdapterEvent`] an adapter's
+    /// `parse_line` (or the shell's own stderr-to-`Diagnostic` mapping)
+    /// produced. Used only for an adapter launch.
+    #[must_use]
+    pub fn event(
+        id: ProcessIdDto,
+        seq: u64,
+        dropped_before: u64,
+        event: omnifrons_domain::adapter::AdapterEvent,
+    ) -> Self {
+        Self::Event {
+            id,
+            seq,
+            dropped_before,
+            event: AdapterEventDto::from_domain(event),
         }
     }
 }
@@ -236,6 +504,21 @@ pub enum ShellErrorCode {
     Revoked,
     /// The approval store itself could not be read or written.
     ApprovalStoreUnavailable,
+    /// `harness_spawn`'s `kind: "adapter"` named an `adapterId` outside
+    /// the closed, built-in adapter set (spike slice 3).
+    UnknownAdapter,
+    /// An adapter launch's prompt exceeds the 16 KiB size cap.
+    PromptTooLarge,
+    /// An adapter launch was requested with no active workspace picked
+    /// (`workspace_pick`), or an adapter's own `build_launch` reported the
+    /// cwd it was given resolves outside the workspace.
+    WorkspaceUnavailable,
+    /// An adapter's own declared (or otherwise requested) environment
+    /// variable name looks secret-shaped and was refused.
+    SecretShapedEnv,
+    /// `workspace_pick`'s folder dialog was canceled (no folder was
+    /// selected).
+    NoWorkspace,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -382,10 +665,14 @@ fn system_time_to_millis(time: std::time::SystemTime) -> u64 {
 
 /// An executable identity's evidence, as it crosses IPC.
 ///
-/// `canonical_path` is the *one* place a filesystem path reaches the
-/// renderer at all in this surface (`docs/spike-log.md` § Slice 2,
-/// TM-001-R7 display): the raw path a user picked in the OS file dialog
-/// (which may differ, e.g. a symlink) is never returned.
+/// `canonical_path` is one of exactly two places a filesystem path
+/// reaches the renderer in this surface, both identity evidence shown to
+/// the user, never a reference the renderer could send back: this one
+/// (the executable's canonical path, `docs/spike-log.md` § Slice 2,
+/// TM-001-R7 display) and [`WorkspaceDto::display_path`] (the workspace
+/// the agent runs in, `docs/spike-log.md` § Slice 3). The raw path a user
+/// picked in the OS file dialog (which may differ, e.g. a symlink) is
+/// never returned.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceDto {
@@ -464,10 +751,11 @@ impl ApprovalDto {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalDto, ApprovalIdDto, ApprovalStatusTag, CandidateIdDto, EvidenceDto, HarnessFrame,
-        HarnessKindDto, PlatformEvidenceDto, ProbeResultDto, ProcessIdDto, ProcessStatusDto,
-        ProcessTerminalStateDto, ProcessTerminalStateTag, ShellError, ShellErrorCode,
-        ShellErrorDetail,
+        AdapterDescriptorDto, ApprovalDto, ApprovalIdDto, ApprovalStatusTag, CandidateIdDto,
+        EvidenceDto, HarnessFrame, HarnessKindDto, PlatformEvidenceDto, ProbeResultDto,
+        ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto, ProcessTerminalStateTag,
+        PromptChannelDto, ScopeModeDto, ShellError, ShellErrorCode, ShellErrorDetail,
+        TransportClassDto, WorkspaceDto,
     };
 
     fn json(value: &impl serde::Serialize) -> serde_json::Value {
@@ -548,6 +836,43 @@ mod tests {
     }
 
     #[test]
+    fn harness_kind_dto_deserializes_the_adapter_variant() {
+        let adapter: HarnessKindDto = serde_json::from_str(
+            r#"{"type":"adapter","adapterId":"claude-code","approvalId":42,"prompt":"do the thing"}"#,
+        )
+        .expect("adapter must deserialize");
+        assert_eq!(
+            adapter,
+            HarnessKindDto::Adapter {
+                adapter_id: "claude-code".to_string(),
+                approval_id: ApprovalIdDto(42),
+                prompt: "do the thing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn harness_kind_dto_rejects_an_extra_field_on_adapter() {
+        let result: Result<HarnessKindDto, _> = serde_json::from_str(
+            r#"{"type":"adapter","adapterId":"claude-code","approvalId":42,"prompt":"x","rateHz":10}"#,
+        );
+        assert!(
+            result.is_err(),
+            "an extra field on adapter must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn harness_kind_dto_rejects_adapter_missing_prompt() {
+        let result: Result<HarnessKindDto, _> =
+            serde_json::from_str(r#"{"type":"adapter","adapterId":"claude-code","approvalId":42}"#);
+        assert!(
+            result.is_err(),
+            "adapter missing its required prompt field must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
     fn process_id_dto_serializes_as_a_bare_number() {
         assert_eq!(json(&ProcessIdDto(42)), serde_json::json!(42));
     }
@@ -595,6 +920,8 @@ mod tests {
         );
     }
 
+    /// R3-003: a text frame carries `continued` on the wire (camelCase,
+    /// additive), `false` for a frame ending at a genuine line end.
     #[test]
     fn harness_frame_stdout_json_shape() {
         let frame = HarnessFrame::Stdout {
@@ -602,12 +929,13 @@ mod tests {
             seq: 3,
             dropped_before: 0,
             text: "line 1 out".to_string(),
+            continued: false,
         };
         assert_eq!(
             json(&frame),
             serde_json::json!({
                 "stream": "stdout",
-                "body": {"id": 7, "seq": 3, "droppedBefore": 0, "text": "line 1 out"}
+                "body": {"id": 7, "seq": 3, "droppedBefore": 0, "text": "line 1 out", "continued": false}
             })
         );
     }
@@ -619,14 +947,34 @@ mod tests {
             seq: 41,
             dropped_before: 12,
             text: "line 205 err".to_string(),
+            continued: false,
         };
         assert_eq!(
             json(&frame),
             serde_json::json!({
                 "stream": "stderr",
-                "body": {"id": 7, "seq": 41, "droppedBefore": 12, "text": "line 205 err"}
+                "body": {"id": 7, "seq": 41, "droppedBefore": 12, "text": "line 205 err", "continued": false}
             })
         );
+    }
+
+    /// R3-003: a forced-split domain frame's `continued: true` reaches the
+    /// raw (demo/approved) wire shape unchanged via `from_domain`.
+    #[test]
+    fn harness_frame_from_domain_carries_a_split_frames_continued_flag() {
+        let frame = HarnessFrame::from_domain(
+            ProcessIdDto(7),
+            omnifrons_app::OutputFrame::new(
+                4,
+                omnifrons_app::FramePayload::Text {
+                    stream: omnifrons_app::OutputStream::Stdout,
+                    text: "first half of a long line".to_string(),
+                    continued: true,
+                },
+            ),
+        );
+        assert_eq!(json(&frame)["body"]["continued"], serde_json::json!(true));
+        assert_eq!(json(&frame)["stream"], serde_json::json!("stdout"));
     }
 
     #[test]
@@ -809,5 +1157,187 @@ mod tests {
         };
         assert_eq!(json(&revoked)["status"], serde_json::json!("revoked"));
         assert_eq!(json(&revoked)["revokedAt"], serde_json::json!(600));
+    }
+
+    // -- Slice 3: workspace, adapters, and the "event" harness frame --
+
+    #[test]
+    fn workspace_dto_json_shape() {
+        let dto = WorkspaceDto {
+            display_path: "/home/user/project".to_string(),
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({"displayPath": "/home/user/project"})
+        );
+    }
+
+    #[test]
+    fn adapter_descriptor_dto_json_shape_has_no_argv_or_env() {
+        let dto = AdapterDescriptorDto {
+            id: "claude-code".to_string(),
+            display_name: "Claude Code".to_string(),
+            transport_class: TransportClassDto::StructuredStreamingCli,
+            prompt_channel: PromptChannelDto::StdinThenClose,
+            scope_mode: ScopeModeDto::Advisory,
+            notes: "credentials are harness-owned; not exercised in CI".to_string(),
+        };
+        let value = json(&dto);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "claude-code",
+                "displayName": "Claude Code",
+                "transportClass": "structured-streaming-cli",
+                "promptChannel": "stdin-then-close",
+                "scopeMode": "advisory",
+                "notes": "credentials are harness-owned; not exercised in CI",
+            })
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            !keys.contains("argvTemplate") && !keys.contains("declaredEnv"),
+            "adapters_list's DTO must never carry argv or declared-env values, got keys {keys:?}"
+        );
+    }
+
+    #[test]
+    fn harness_frame_event_state_json_shape() {
+        let event = super::AdapterEventDto::State {
+            phase: super::AgentPhaseTag::Finished,
+            subtype: Some("success".to_string()),
+            observations: vec![],
+        };
+        let frame = HarnessFrame::Event {
+            id: ProcessIdDto(7),
+            seq: 3,
+            dropped_before: 0,
+            event,
+        };
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 7,
+                    "seq": 3,
+                    "droppedBefore": 0,
+                    "kind": "state",
+                    "payload": {"phase": "finished", "subtype": "success", "observations": []},
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn harness_frame_event_via_constructor_from_domain_adapter_event() {
+        let frame = HarnessFrame::event(
+            ProcessIdDto(1),
+            0,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::Diagnostic {
+                text: "hello".to_string(),
+            },
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {"id": 1, "seq": 0, "droppedBefore": 0, "kind": "diagnostic", "payload": {"text": "hello"}}
+            })
+        );
+    }
+
+    /// R3-006: the `message` event's documented wire shape.
+    #[test]
+    fn harness_frame_event_message_json_shape() {
+        let frame = HarnessFrame::event(
+            ProcessIdDto(42),
+            4,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::Message {
+                text: "hello".to_string(),
+            },
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 4, "droppedBefore": 0,
+                    "kind": "message", "payload": {"text": "hello"}
+                }
+            })
+        );
+    }
+
+    /// R3-006: the `tool-call` event's documented wire shape, including
+    /// the camelCase `argumentsText` and the kebab-case `kind` token.
+    #[test]
+    fn harness_frame_event_tool_call_json_shape() {
+        let frame = HarnessFrame::event(
+            ProcessIdDto(42),
+            5,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::ToolCall(
+                omnifrons_domain::adapter::ToolCallProposal {
+                    name: "write_file".to_string(),
+                    arguments_text: r#"{"path":"notes.md"}"#.to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 5, "droppedBefore": 0,
+                    "kind": "tool-call",
+                    "payload": {"name": "write_file", "argumentsText": "{\"path\":\"notes.md\"}"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn harness_frame_event_unknown_carries_truncated_flag() {
+        let frame = HarnessFrame::event(
+            ProcessIdDto(1),
+            0,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::Unknown {
+                raw: b"not json".to_vec(),
+                truncated: true,
+            },
+        );
+        assert_eq!(
+            json(&frame)["body"]["payload"],
+            serde_json::json!({"raw": "not json", "truncated": true})
+        );
+    }
+
+    /// The five new slice-3 error codes each render as their documented
+    /// kebab-case token.
+    #[test]
+    fn slice_3_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::UnknownAdapter, "unknown-adapter"),
+            (ShellErrorCode::PromptTooLarge, "prompt-too-large"),
+            (
+                ShellErrorCode::WorkspaceUnavailable,
+                "workspace-unavailable",
+            ),
+            (ShellErrorCode::SecretShapedEnv, "secret-shaped-env"),
+            (ShellErrorCode::NoWorkspace, "no-workspace"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+        }
     }
 }
