@@ -55,14 +55,27 @@ function defaultHandlers(onCommand?: (cmd: string, args: Record<string, unknown>
   }
 }
 
+/**
+ * Selects `value` in the labelled select only once that option exists.
+ * Both option lists are populated by a mount-time IPC fetch, so changing
+ * the select before its list has arrived silently selects nothing (the
+ * value falls back to "") and leaves Start disabled -- the race behind an
+ * intermittent CI failure in the deferred-spawn tests.
+ */
+async function selectOption(labelText: string, value: string): Promise<void> {
+  const select = (await screen.findByLabelText(labelText)) as HTMLSelectElement
+  await waitFor(() => {
+    expect(Array.from(select.options).map((option) => option.value)).toContain(value)
+  })
+  fireEvent.change(select, { target: { value } })
+  expect(select.value).toBe(value)
+}
+
 async function renderReady(onCommand?: (cmd: string, args: Record<string, unknown>) => unknown) {
   mockIPC(defaultHandlers(onCommand))
   render(<AgentPanel />)
-  await screen.findByLabelText('Adapter')
-  const adapterSelect = screen.getByLabelText('Adapter') as HTMLSelectElement
-  fireEvent.change(adapterSelect, { target: { value: 'claude-code' } })
-  const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-  fireEvent.change(approvalSelect, { target: { value: '42' } })
+  await selectOption('Adapter', 'claude-code')
+  await selectOption('Approval', '42')
   fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
 }
 
@@ -81,6 +94,9 @@ async function startAndCaptureChannel(
   })
 
   fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+  await waitFor(() => {
+    expect(channelRef).toBeDefined()
+  })
   await screen.findByText('running')
 
   if (!channelRef) throw new Error('harness_spawn was not called')
@@ -168,12 +184,13 @@ describe('AgentPanel', () => {
     })
 
     render(<AgentPanel />)
-    await screen.findByLabelText('Adapter')
-    fireEvent.change(screen.getByLabelText('Adapter'), { target: { value: 'claude-code' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
     fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => {
+      expect(channelRef).toBeDefined()
+    })
     await screen.findByText('running')
     if (!channelRef) throw new Error('harness_spawn was not called')
 
@@ -513,11 +530,12 @@ describe('AgentPanel', () => {
     )
 
     const { unmount } = render(<AgentPanel />)
-    await screen.findByLabelText('Adapter')
-    fireEvent.change(screen.getByLabelText('Adapter'), { target: { value: 'claude-code' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => {
+      expect(channelRef).toBeDefined()
+    })
     await screen.findByText('running')
     if (!channelRef) throw new Error('harness_spawn was not called')
 
@@ -542,10 +560,12 @@ describe('AgentPanel', () => {
   })
 
   it('the workspace-pick continuation no-ops after unmount', async () => {
+    let pickCalled = false
     let resolvePick: (value: unknown) => void = () => {}
     mockIPC(
       defaultHandlers((cmd) => {
         if (cmd === 'workspace_pick') {
+          pickCalled = true
           return new Promise((resolve) => {
             resolvePick = resolve
           })
@@ -556,6 +576,9 @@ describe('AgentPanel', () => {
 
     const { unmount } = render(<AgentPanel />)
     fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await waitFor(() => {
+      expect(pickCalled).toBe(true)
+    })
     unmount()
 
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -824,12 +847,22 @@ async function settleSpawn(resolveSpawn: (id: number) => void, id: number): Prom
   })
 }
 
+/** Clicks Start and waits until the mocked `harness_spawn` has handed over run number `expectedRuns`'s Channel. */
+async function clickStartAndAwaitChannel(
+  channels: LiveChannel[],
+  expectedRuns: number,
+): Promise<void> {
+  fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+  await waitFor(() => {
+    expect(channels).toHaveLength(expectedRuns)
+  })
+}
+
 describe('AgentPanel spawn generation: frames before harness_spawn resolves, and old channels', () => {
   it('applies a terminal state frame delivered before the spawn resolves: Start ends enabled, Stop disabled, state line in the transcript', async () => {
     const { channels, resolveSpawn } = await renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
-    expect(channels).toHaveLength(1)
+    await clickStartAndAwaitChannel(channels, 1)
 
     act(() => {
       channels[0]!.onmessage({
@@ -858,7 +891,7 @@ describe('AgentPanel spawn generation: frames before harness_spawn resolves, and
   it('applies a non-terminal frame delivered before the spawn resolves, then runs normally and still drops a foreign id once the id is known', async () => {
     const { channels, resolveSpawn } = await renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await clickStartAndAwaitChannel(channels, 1)
     act(() => {
       channels[0]!.onmessage({
         stream: 'event',
@@ -913,14 +946,13 @@ describe('AgentPanel spawn generation: frames before harness_spawn resolves, and
   it('rejects a frame from a previous run\'s channel while the next spawn is still pending, even with the new id unknown', async () => {
     const { channels, resolveSpawn } = await renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await clickStartAndAwaitChannel(channels, 1)
     await settleSpawn(resolveSpawn, 7)
     await screen.findByText('running')
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     await screen.findByText('killed')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
-    expect(channels).toHaveLength(2)
+    await clickStartAndAwaitChannel(channels, 2)
 
     // Run A's channel speaks up while run B's id is still unknown: a
     // frame carrying A's own id, and one carrying the id B will get.
@@ -968,7 +1000,7 @@ describe('AgentPanel spawn generation: frames before harness_spawn resolves, and
   it('chained: an early terminal frame, then the spawn resolves, then a same-channel foreign id is dropped with the badge held, then the run id is applied', async () => {
     const { channels, resolveSpawn } = await renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await clickStartAndAwaitChannel(channels, 1)
     act(() => {
       channels[0]!.onmessage({
         stream: 'state',
@@ -1156,6 +1188,9 @@ describe('AgentPanel rejected spawn and the echoed prompt (R1-012 / R3-012)', ()
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => {
+      expect(channelRef).toBeDefined()
+    })
     if (!channelRef) throw new Error('harness_spawn was not called')
     act(() => {
       channelRef!.onmessage({
@@ -1380,13 +1415,8 @@ describe('AgentPanel failure paths (R3-006)', () => {
     const banner = await screen.findByRole('alert')
     expect(banner.textContent).toBe('invalid-request: bad request')
 
-    await screen.findByLabelText('Adapter')
-    fireEvent.change(screen.getByLabelText('Adapter'), { target: { value: 'claude-code' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    await waitFor(() => {
-      expect(Array.from(approvalSelect.options).map((option) => option.value)).toContain('42')
-    })
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
     fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'still usable' } })
     expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
       false,
@@ -1648,7 +1678,9 @@ describe('AgentPanel double-click before spawn resolves (R3-010)', () => {
     expect(startButton.disabled).toBe(true)
 
     fireEvent.click(startButton)
-    expect(spawnCount).toBe(1)
+    await waitFor(() => {
+      expect(spawnCount).toBe(1)
+    })
 
     await act(async () => {
       resolveSpawn(7)

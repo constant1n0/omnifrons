@@ -56,11 +56,29 @@ async function startAndCaptureChannel(
 
   render(<HarnessPanel />)
   fireEvent.click(screen.getByRole('button', { name: 'Start' }))
-
+  await waitFor(() => {
+    expect(channelRef).toBeDefined()
+  })
   await screen.findByText('running')
 
   if (!channelRef) throw new Error('harness_spawn was not called')
   return channelRef
+}
+
+/**
+ * Switches Kind to `approved` and selects approval `value` only once its
+ * option exists -- the approvals list is fetched lazily on that switch, so
+ * changing the select before it arrives silently selects nothing (the
+ * value falls back to "") and leaves Start disabled.
+ */
+async function selectApprovedKindWithApproval(value: string): Promise<void> {
+  fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
+  const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+  await waitFor(() => {
+    expect(Array.from(approvalSelect.options).map((option) => option.value)).toContain(value)
+  })
+  fireEvent.change(approvalSelect, { target: { value } })
+  expect(approvalSelect.value).toBe(value)
 }
 
 describe('HarnessPanel', () => {
@@ -303,7 +321,9 @@ describe('HarnessPanel', () => {
     expect(startButton.disabled).toBe(true)
 
     fireEvent.click(startButton)
-    expect(spawnCount).toBe(1)
+    await waitFor(() => {
+      expect(spawnCount).toBe(1)
+    })
 
     await act(async () => {
       resolveSpawn(7)
@@ -510,10 +530,12 @@ describe('HarnessPanel', () => {
 
   it('the mount-time observe effect no-ops after unmount: no sessionStorage write once the component is gone', async () => {
     window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify([99]))
+    let observeCalled = false
     let resolveObserve: (value: unknown) => void = () => {}
     mockIPC((cmd, args) => {
       if (cmd === 'harness_observe') {
         expect(args).toEqual({ id: 99 })
+        observeCalled = true
         return new Promise((resolve) => {
           resolveObserve = resolve
         })
@@ -522,6 +544,9 @@ describe('HarnessPanel', () => {
     })
 
     const { unmount } = render(<HarnessPanel />)
+    await waitFor(() => {
+      expect(observeCalled).toBe(true)
+    })
     unmount()
 
     resolveObserve({ status: 'terminal', state: 'killed', code: null })
@@ -608,9 +633,7 @@ describe('HarnessPanel', () => {
     })
 
     render(<HarnessPanel />)
-    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectApprovedKindWithApproval('42')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
     await screen.findByText('running')
@@ -635,9 +658,7 @@ describe('HarnessPanel', () => {
     })
 
     render(<HarnessPanel />)
-    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectApprovedKindWithApproval('42')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
 
@@ -662,9 +683,7 @@ describe('HarnessPanel', () => {
     })
 
     render(<HarnessPanel />)
-    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectApprovedKindWithApproval('42')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
 
@@ -689,9 +708,7 @@ describe('HarnessPanel', () => {
     })
 
     render(<HarnessPanel />)
-    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectApprovedKindWithApproval('42')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
 
@@ -717,9 +734,7 @@ describe('HarnessPanel', () => {
     })
 
     render(<HarnessPanel />)
-    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectApprovedKindWithApproval('42')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
 
@@ -742,9 +757,7 @@ describe('HarnessPanel', () => {
     })
 
     render(<HarnessPanel />)
-    fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'approved' } })
-    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
-    fireEvent.change(approvalSelect, { target: { value: '42' } })
+    await selectApprovedKindWithApproval('42')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
     await screen.findByRole('alert')
@@ -1080,12 +1093,22 @@ async function settleSpawn(resolveSpawn: (id: number) => void, id: number): Prom
   })
 }
 
+/** Clicks Start and waits until the mocked `harness_spawn` has handed over run number `expectedRuns`'s Channel. */
+async function clickStartAndAwaitChannel(
+  channels: LiveChannel[],
+  expectedRuns: number,
+): Promise<void> {
+  fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+  await waitFor(() => {
+    expect(channels).toHaveLength(expectedRuns)
+  })
+}
+
 describe('HarnessPanel spawn generation: frames before harness_spawn resolves, and old channels', () => {
   it('applies a terminal state frame delivered before the spawn resolves: Start ends enabled, Stop disabled, state line in the log, id never persisted', async () => {
     const { channels, resolveSpawn } = renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
-    expect(channels).toHaveLength(1)
+    await clickStartAndAwaitChannel(channels, 1)
 
     act(() => {
       channels[0]!.onmessage({
@@ -1111,7 +1134,7 @@ describe('HarnessPanel spawn generation: frames before harness_spawn resolves, a
   it('applies a text frame delivered before the spawn resolves, then runs normally and still drops a foreign id once the id is known', async () => {
     const { channels, resolveSpawn } = renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await clickStartAndAwaitChannel(channels, 1)
     act(() => {
       channels[0]!.onmessage({
         stream: 'stdout',
@@ -1146,14 +1169,13 @@ describe('HarnessPanel spawn generation: frames before harness_spawn resolves, a
   it('rejects a frame from a previous run\'s channel while the next spawn is still pending, even with the new id unknown', async () => {
     const { channels, resolveSpawn } = renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await clickStartAndAwaitChannel(channels, 1)
     await settleSpawn(resolveSpawn, 7)
     await screen.findByText('running')
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     await screen.findByText('killed')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
-    expect(channels).toHaveLength(2)
+    await clickStartAndAwaitChannel(channels, 2)
 
     act(() => {
       channels[0]!.onmessage({
@@ -1181,7 +1203,7 @@ describe('HarnessPanel spawn generation: frames before harness_spawn resolves, a
   it('chained: an early terminal frame, then the spawn resolves, then a same-channel foreign id is dropped with the badge held, then the run id is applied', async () => {
     const { channels, resolveSpawn } = renderWithDeferredSpawn()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await clickStartAndAwaitChannel(channels, 1)
     act(() => {
       channels[0]!.onmessage({
         stream: 'state',
