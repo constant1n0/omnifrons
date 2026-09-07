@@ -18,19 +18,23 @@ use std::path::{Path, PathBuf};
 const STREAM_JSON_CLI_TOKEN: &str = "stream-json-cli";
 /// The wire/API token for the `claude-code` built-in adapter.
 const CLAUDE_CODE_TOKEN: &str = "claude-code";
+/// The wire/API token for the `pty-cli` built-in adapter (spike slice 4):
+/// the degraded pseudo-terminal fallback, structurally different from the
+/// two line-oriented adapters above (`docs/spike-log.md` § Slice 4).
+const PTY_CLI_TOKEN: &str = "pty-cli";
 
 /// The closed set of tokens [`AdapterId::parse`] accepts.
-const KNOWN_ADAPTER_IDS: [&str; 2] = [STREAM_JSON_CLI_TOKEN, CLAUDE_CODE_TOKEN];
+const KNOWN_ADAPTER_IDS: [&str; 3] = [STREAM_JSON_CLI_TOKEN, CLAUDE_CODE_TOKEN, PTY_CLI_TOKEN];
 
 /// A built-in harness adapter's identifier.
 ///
 /// Wraps a `String` for cheap comparison/hashing/display, but is
-/// constructible only through [`Self::stream_json_cli`], [`Self::claude_code`],
-/// or [`Self::parse`] (which itself only ever accepts one of those two
-/// tokens) -- never from an arbitrary caller-supplied string. This is what
-/// "closed to a built-in set" means: the field is a plain `String`, but no
-/// public constructor can ever produce an `AdapterId` outside the built-in
-/// set.
+/// constructible only through [`Self::stream_json_cli`],
+/// [`Self::claude_code`], [`Self::pty_cli`], or [`Self::parse`] (which
+/// itself only ever accepts one of those three tokens) -- never from an
+/// arbitrary caller-supplied string. This is what "closed to a built-in
+/// set" means: the field is a plain `String`, but no public constructor
+/// can ever produce an `AdapterId` outside the built-in set.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdapterId(String);
 
@@ -45,6 +49,12 @@ impl AdapterId {
     #[must_use]
     pub fn claude_code() -> Self {
         Self(CLAUDE_CODE_TOKEN.to_string())
+    }
+
+    /// The `pty-cli` built-in adapter's id (spike slice 4).
+    #[must_use]
+    pub fn pty_cli() -> Self {
+        Self(PTY_CLI_TOKEN.to_string())
     }
 
     /// Parse `token` into an `AdapterId`, or `None` if it does not name one
@@ -72,16 +82,19 @@ impl std::fmt::Display for AdapterId {
 }
 
 /// How an adapter's underlying process communicates with the harness: a
-/// line-oriented structured stream (the only transport class a built-in
-/// adapter uses as of slice 3), or a pseudo-terminal (named here so the
-/// closed set is stated up front, even though no built-in adapter uses it
-/// yet).
+/// line-oriented structured stream (the two slice-3 built-in adapters), or
+/// a pseudo-terminal (the slice-4 `pty-cli` built-in adapter, the declared
+/// degraded fallback of `docs/target-architecture.md`'s invariant 6:
+/// the child runs as the session leader of a controlling terminal, and its
+/// output is an untrusted byte stream with no structured events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportClass {
     /// A structured, line-delimited streaming CLI (e.g. `stream-json`).
     StructuredStreamingCli,
-    /// A pseudo-terminal. Not exercised by any built-in adapter in this
-    /// slice.
+    /// A pseudo-terminal: the child's stdin, stdout, and stderr are one
+    /// terminal, and its output is normalized byte-wise under RCS-001's
+    /// terminal policy rather than parsed line-wise. Never a sandbox and
+    /// never authorization (`docs/threat-model.md` HAR-5, PRC-2).
     Pty,
 }
 
@@ -94,6 +107,11 @@ pub enum PromptChannel {
     /// The prompt is passed as one of the child's arguments. Not exercised
     /// by any built-in adapter in this slice.
     Argv,
+    /// The prompt is typed into the child's controlling terminal, followed
+    /// by a carriage return; nothing is closed afterward (spike slice 4,
+    /// the `pty-cli` adapter). Only meaningful with
+    /// [`TransportClass::Pty`].
+    PtyTyped,
 }
 
 /// How a launched process's stdin is configured.
@@ -242,6 +260,22 @@ pub enum AdapterEvent {
         /// before this event was produced.
         truncated: bool,
     },
+    /// Normalized plain text from a pseudo-terminal launch (spike slice 4):
+    /// every recognized control sequence already dropped or turned into a
+    /// [`Self::TerminalAction`], newlines kept, lossily decoded. Proposed
+    /// AEC-001 kind `terminal-text`.
+    TerminalText {
+        /// The normalized text.
+        text: String,
+    },
+    /// A sanitized title or notification a pseudo-terminal launch asked
+    /// for -- data to show as text, never applied anywhere. Proposed
+    /// AEC-001 kind `terminal-action`.
+    TerminalAction(crate::terminal::TerminalAction),
+    /// How many recognized sequences were dropped, per family, since the
+    /// previous `TerminalDrops` event of the same launch. Proposed AEC-001
+    /// kind `terminal-drops`.
+    TerminalDrops(crate::terminal::DropCounts),
 }
 
 /// Why [`WorkspaceRoot::new`] rejected a candidate path.
@@ -381,5 +415,59 @@ mod tests {
             AdapterId::parse(AdapterId::claude_code().as_str()),
             Some(AdapterId::claude_code())
         );
+    }
+
+    // -- Slice 4: the pty-cli adapter id, the PtyTyped prompt channel, and
+    // the terminal event variants --
+
+    /// Slice 4: `pty-cli` joins the closed set; its named constructor
+    /// round-trips through `parse`, and the wire token is exactly
+    /// `pty-cli`.
+    #[test]
+    fn adapter_id_closed_set_accepts_pty_cli() {
+        assert_eq!(AdapterId::parse("pty-cli"), Some(AdapterId::pty_cli()));
+        assert_eq!(AdapterId::pty_cli().as_str(), "pty-cli");
+        assert!(
+            AdapterId::parse("pty").is_none(),
+            "only the exact pty-cli token is accepted"
+        );
+    }
+
+    /// Slice 4: the prompt channel closed set gains `PtyTyped`, distinct
+    /// from the two slice-3 channels.
+    #[test]
+    fn prompt_channel_pty_typed_is_a_distinct_variant() {
+        use super::PromptChannel;
+        assert_ne!(PromptChannel::PtyTyped, PromptChannel::StdinThenClose);
+        assert_ne!(PromptChannel::PtyTyped, PromptChannel::Argv);
+    }
+
+    /// Slice 4: the three terminal event variants construct and compare;
+    /// `TerminalDrops` carries the domain `DropCounts`.
+    #[test]
+    fn terminal_event_variants_are_distinct_and_carry_their_payloads() {
+        use crate::terminal::{DropCounts, TerminalAction};
+
+        let text = AdapterEvent::TerminalText {
+            text: "hello\n".to_string(),
+        };
+        let title = AdapterEvent::TerminalAction(TerminalAction::Title("t".to_string()));
+        let notification =
+            AdapterEvent::TerminalAction(TerminalAction::Notification("n".to_string()));
+        let drops = AdapterEvent::TerminalDrops(DropCounts {
+            layout: 1,
+            ..DropCounts::default()
+        });
+
+        assert_ne!(text, title);
+        assert_ne!(title, notification);
+        assert_ne!(drops, text);
+        match drops {
+            AdapterEvent::TerminalDrops(counts) => {
+                assert_eq!(counts.layout, 1);
+                assert!(!counts.is_zero());
+            }
+            other => panic!("expected TerminalDrops, got {other:?}"),
+        }
     }
 }

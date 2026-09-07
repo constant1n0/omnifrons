@@ -9,3 +9,4 @@ pub mod adapter;
 pub mod executable;
 pub mod output;
 pub mod scope;
+pub mod terminal;
