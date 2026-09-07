@@ -106,6 +106,12 @@ pub enum SupervisorError {
     /// requests a caller issues (`docs/spike-log.md` § IPC contract).
     #[error("too many processes are already running")]
     TooManyProcesses,
+    /// A pseudo-terminal launch (`TransportClass::Pty`) was requested on a
+    /// platform where this slice implements none (Windows; `ConPTY` is
+    /// recorded as debt). Returned before anything is spawned or tracked
+    /// (`docs/spike-log.md` § Slice 4).
+    #[error("pseudo-terminal launches are not available on this platform")]
+    PtyUnsupported,
 }
 
 /// A port for supervising a single external process end-to-end: spawn,

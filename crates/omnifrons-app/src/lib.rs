@@ -12,6 +12,7 @@ mod harness_catalog;
 pub mod launch_gate;
 mod process_output;
 mod process_supervisor;
+pub mod terminal_normalizer;
 
 pub use approval_store::{ApprovalStore, ApprovalStoreError};
 pub use clock::Clock;
@@ -29,6 +30,7 @@ pub use process_output::{FramePayload, OutputFrame, OutputStream, ProcessOutput}
 pub use process_supervisor::{
     ProcessId, ProcessSpec, ProcessStatus, ProcessSupervisor, ProcessTerminalState, SupervisorError,
 };
+pub use terminal_normalizer::{TerminalChunk, TerminalNormalizer};
 
 /// Reusable contract tests for any `ProcessSupervisor` implementation.
 ///

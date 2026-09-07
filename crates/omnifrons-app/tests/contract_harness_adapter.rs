@@ -42,6 +42,7 @@ impl HarnessAdapter for FakeAdapter {
             stdin: StdinPlan::PipePromptThenClose,
             prompt: Some(request.prompt.clone()),
             scope_mode: ScopeMode::Advisory,
+            transport: TransportClass::StructuredStreamingCli,
         })
     }
 

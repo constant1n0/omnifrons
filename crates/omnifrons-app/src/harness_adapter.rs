@@ -171,6 +171,12 @@ pub enum LaunchPlanError {
     /// The adapter's declared [`PromptChannel`] is not one this
     /// implementation can build a plan for.
     PromptChannelUnsupported,
+    /// The prompt would be typed into a terminal
+    /// ([`PromptChannel::PtyTyped`]) and contains control characters the
+    /// terminal's line discipline would interpret rather than type -- a C0
+    /// control other than newline and tab, or DEL (spike slice 4,
+    /// `docs/spike-log.md` § Slice 4).
+    PromptNotTypeable,
 }
 
 impl std::fmt::Display for LaunchPlanError {
@@ -187,6 +193,9 @@ impl std::fmt::Display for LaunchPlanError {
             }
             Self::PromptChannelUnsupported => {
                 f.write_str("this adapter's prompt channel is not supported")
+            }
+            Self::PromptNotTypeable => {
+                f.write_str("the prompt contains control characters a terminal would interpret")
             }
         }
     }
@@ -208,11 +217,19 @@ pub struct LaunchPlan {
     pub cwd: WorkspaceRoot,
     /// How the spawned process's stdin is configured.
     pub stdin: StdinPlan,
-    /// The prompt to deliver, when `stdin` is
-    /// [`StdinPlan::PipePromptThenClose`].
+    /// The prompt to deliver: over stdin when `stdin` is
+    /// [`StdinPlan::PipePromptThenClose`], or typed into the terminal
+    /// followed by a carriage return when `transport` is
+    /// [`TransportClass::Pty`].
     pub prompt: Option<AgentPrompt>,
     /// The scope-enforcement mode this launch runs under.
     pub scope_mode: ScopeMode,
+    /// Which transport the launch uses (spike slice 4):
+    /// [`TransportClass::StructuredStreamingCli`] wires stdio pipes with
+    /// stdin per `stdin`; [`TransportClass::Pty`] gives the child one
+    /// pseudo-terminal as stdin, stdout, and stderr, types `prompt` into
+    /// it, and leaves `stdin` unused.
+    pub transport: TransportClass,
 }
 
 /// Validate that `candidate_cwd`, once canonicalized, is exactly
@@ -735,6 +752,7 @@ mod tests {
                 stdin: StdinPlan::PipePromptThenClose,
                 prompt: Some(request.prompt.clone()),
                 scope_mode: ScopeMode::Advisory,
+                transport: TransportClass::StructuredStreamingCli,
             })
         }
 

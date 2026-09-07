@@ -9,7 +9,7 @@
 use omnifrons_app::{
     EnvPlan, LaunchPlan, LaunchPlanError, WorkspaceRoot, validate_cwd_within_workspace,
 };
-use omnifrons_domain::adapter::StdinPlan;
+use omnifrons_domain::adapter::{StdinPlan, TransportClass};
 use omnifrons_domain::scope::ScopeMode;
 
 fn temp_subdir(label: &str) -> std::path::PathBuf {
@@ -99,6 +99,7 @@ fn a_launch_plan_built_from_an_accepted_cwd_is_advisory() {
         stdin: StdinPlan::Null,
         prompt: None,
         scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::StructuredStreamingCli,
     };
 
     assert_eq!(plan.scope_mode, ScopeMode::Advisory);
