@@ -8,6 +8,18 @@
 
 use crate::scope::ProcessTerminalState;
 
+/// The maximum text bytes a single captured [`OutputFrame`] carries:
+/// `omnifrons-supervisor`'s own output-capture framing splits a line
+/// longer than this into consecutive frames at a UTF-8 character boundary,
+/// marking every frame but the last of such a split
+/// [`FramePayload::Text::continued`]. Defined once, here, so the capturing
+/// side and any consumer bounding its own reassembly buffer
+/// (`omnifrons-app`'s `harness_adapter::LineAssembler`) can never drift
+/// onto different values for what is, structurally, one shared framing
+/// contract (`docs/spike-log.md` § Slice 3). A frame's length alone says
+/// nothing about whether the line continues -- only the flag does.
+pub const MAX_TEXT_FRAME_BYTES: usize = 8192;
+
 /// Which standard stream a decoded text frame came from.
 ///
 /// Closed and exhaustive: a process has exactly two output streams.
@@ -33,6 +45,14 @@ pub enum FramePayload {
         stream: OutputStream,
         /// The decoded text.
         text: String,
+        /// `true` if this frame ends because the capturing adapter's
+        /// per-frame cap ([`MAX_TEXT_FRAME_BYTES`]) forced a split and more
+        /// of the *same* logical line follows in the next frame of this
+        /// stream; `false` if this frame ends at a genuine line end (a
+        /// newline, or EOF). Set explicitly by the capturing side, never
+        /// inferred by a consumer from the frame's length: a genuine line
+        /// of exactly the cap's length is `false`.
+        continued: bool,
     },
     /// The process reached this terminal state. Sent once, after every
     /// text frame for this process has been sent.
@@ -89,6 +109,7 @@ mod tests {
             FramePayload::Text {
                 stream: OutputStream::Stdout,
                 text: "line 1 out".to_string(),
+                continued: false,
             },
         );
 
@@ -113,11 +134,33 @@ mod tests {
         assert_ne!(OutputStream::Stdout, OutputStream::Stderr);
     }
 
+    /// A text frame says explicitly whether more of the same logical line
+    /// follows in the next frame (`continued: true`, a forced split at
+    /// the per-frame cap) or not -- never inferred from its length.
+    #[test]
+    fn text_frame_carries_its_continued_flag() {
+        let split = FramePayload::Text {
+            stream: OutputStream::Stdout,
+            text: "a".repeat(8),
+            continued: true,
+        };
+        let whole = FramePayload::Text {
+            stream: OutputStream::Stdout,
+            text: "a".repeat(8),
+            continued: false,
+        };
+        assert_ne!(
+            split, whole,
+            "the same text with a different continued flag must be a different payload"
+        );
+    }
+
     #[test]
     fn frame_payload_variants_are_distinct() {
         let text = FramePayload::Text {
             stream: OutputStream::Stdout,
             text: "hi".to_string(),
+            continued: false,
         };
         let state = FramePayload::State(ProcessTerminalState::Killed);
         assert_ne!(text, state);
@@ -125,10 +168,12 @@ mod tests {
         let stdout_text = FramePayload::Text {
             stream: OutputStream::Stdout,
             text: "hi".to_string(),
+            continued: false,
         };
         let stderr_text = FramePayload::Text {
             stream: OutputStream::Stderr,
             text: "hi".to_string(),
+            continued: false,
         };
         assert_ne!(stdout_text, stderr_text);
     }

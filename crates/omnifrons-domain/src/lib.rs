@@ -5,6 +5,7 @@
 //! Tokio, or any adapter, so that domain, scope, and process-terminal-state
 //! contracts run and test without a desktop shell or an async runtime.
 
+pub mod adapter;
 pub mod executable;
 pub mod output;
 pub mod scope;
