@@ -13,9 +13,12 @@ import {
   isShellError,
   workspaceCurrent,
   workspacePick,
+  type AdapterDescriptor,
+  type AgentEvent,
   type Approval,
   type Evidence,
   type HarnessFrame,
+  type ShellError,
 } from './harness'
 
 // The jsdom crypto polyfill is installed once for every test file by
@@ -459,6 +462,226 @@ describe('HarnessFrame event stream', () => {
     channelRef!.onmessage(frame)
 
     expect(received).toEqual([frame])
+  })
+})
+
+// -- Slice 4: the pty-cli descriptor, the three terminal event kinds, and
+// the pty-unsupported error code (`docs/spike-log.md` § Slice 4) --
+
+type LiveChannel = { onmessage: (frame: HarnessFrame) => void }
+
+/**
+ * Spawns the `pty-cli` adapter kind through a mock that hands back the
+ * live Channel, collecting every frame delivered to `onFrame`.
+ */
+async function spawnPtyAndCapture(): Promise<{ channel: LiveChannel; received: HarnessFrame[] }> {
+  let channelRef: LiveChannel | undefined
+  mockIPC((cmd, args) => {
+    if (cmd === 'harness_spawn') {
+      channelRef = (args as Record<string, unknown>).onFrame as LiveChannel
+      return 42
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+
+  const received: HarnessFrame[] = []
+  await harnessSpawn(
+    { type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: 'hi' },
+    (frame) => {
+      received.push(frame)
+    },
+  )
+  if (!channelRef) throw new Error('harness_spawn was not called')
+  return { channel: channelRef, received }
+}
+
+describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
+  it('delivers a terminal-text event frame verbatim, its newline kept', async () => {
+    const { channel, received } = await spawnPtyAndCapture()
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 8,
+        droppedBefore: 0,
+        kind: 'terminal-text',
+        payload: { text: 'hello\n' },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    expect(
+      delivered?.stream === 'event' &&
+        delivered.body.kind === 'terminal-text' &&
+        delivered.body.payload.text,
+    ).toBe('hello\n')
+  })
+
+  it('delivers terminal-action event frames for both closed actions, title and notification, verbatim', async () => {
+    const { channel, received } = await spawnPtyAndCapture()
+
+    const title: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 9,
+        droppedBefore: 0,
+        kind: 'terminal-action',
+        payload: { action: 'title', text: 'build ok' },
+      },
+    }
+    const notification: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 10,
+        droppedBefore: 2,
+        kind: 'terminal-action',
+        payload: { action: 'notification', text: 'done' },
+      },
+    }
+    channel.onmessage(title)
+    channel.onmessage(notification)
+
+    expect(received).toEqual([title, notification])
+  })
+
+  it('delivers a terminal-drops event frame with exactly the seven camelCase counts verbatim', async () => {
+    const { channel, received } = await spawnPtyAndCapture()
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 11,
+        droppedBefore: 0,
+        kind: 'terminal-drops',
+        payload: {
+          layout: 21,
+          hyperlink: 2,
+          clipboard: 2,
+          fileTransfer: 3,
+          string: 3,
+          unknown: 1,
+          malformed: 3,
+        },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    if (delivered?.stream !== 'event' || delivered.body.kind !== 'terminal-drops') {
+      throw new Error('expected a terminal-drops event frame')
+    }
+    expect(Object.keys(delivered.body.payload).sort()).toEqual([
+      'clipboard',
+      'fileTransfer',
+      'hyperlink',
+      'layout',
+      'malformed',
+      'string',
+      'unknown',
+    ])
+  })
+
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the eight kinds to itself', () => {
+    function kindLabel(kind: AgentEvent['kind']): string {
+      switch (kind) {
+        case 'state':
+        case 'message':
+        case 'tool-call':
+        case 'diagnostic':
+        case 'unknown':
+        case 'terminal-text':
+        case 'terminal-action':
+        case 'terminal-drops':
+          return kind
+        default: {
+          const unreachable: never = kind
+          return unreachable
+        }
+      }
+    }
+
+    const kinds: AgentEvent['kind'][] = [
+      'state',
+      'message',
+      'tool-call',
+      'diagnostic',
+      'unknown',
+      'terminal-text',
+      'terminal-action',
+      'terminal-drops',
+    ]
+    expect(kinds.map(kindLabel)).toEqual(kinds)
+  })
+})
+
+describe('adaptersList pty-cli descriptor (slice 4)', () => {
+  it('returns the pty-cli descriptor with transportClass pty and promptChannel pty-typed verbatim, with no argv or env keys', async () => {
+    const ptyCli: AdapterDescriptor = {
+      id: 'pty-cli',
+      displayName: 'PTY CLI',
+      transportClass: 'pty',
+      promptChannel: 'pty-typed',
+      scopeMode: 'advisory',
+      notes: 'degraded fallback with no structured events',
+    }
+    mockIPC((cmd, args) => {
+      if (cmd === 'adapters_list') {
+        expect(args).toEqual({})
+        return [ptyCli]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await adaptersList()
+
+    expect(result).toEqual([ptyCli])
+    expect(Object.keys(result[0]!)).not.toContain('argvTemplate')
+    expect(Object.keys(result[0]!)).not.toContain('declaredEnv')
+  })
+})
+
+describe('ShellErrorCode pty-unsupported (slice 4)', () => {
+  it('harnessSpawn rejects with the typed pty-unsupported ShellError for a pty-cli launch on an unsupported platform', async () => {
+    const error: ShellError = {
+      code: 'pty-unsupported',
+      message: 'pseudo-terminal launches are not available on this platform',
+    }
+    mockIPC((cmd) => {
+      if (cmd === 'harness_spawn') return Promise.reject(error)
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    await expect(
+      harnessSpawn({ type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: 'hi' }, () => {}),
+    ).rejects.toMatchObject(error)
+    expect(isShellError(error)).toBe(true)
+  })
+
+  it('harnessSpawn rejects with the typed prompt-not-typeable ShellError for a pty-cli prompt carrying a C0 control a terminal would interpret', async () => {
+    const error: ShellError = {
+      code: 'prompt-not-typeable',
+      message: 'prompt contains control characters a terminal would interpret',
+    }
+    mockIPC((cmd) => {
+      if (cmd === 'harness_spawn') return Promise.reject(error)
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const esc = String.fromCharCode(0x1b)
+    await expect(
+      harnessSpawn(
+        { type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: `hi${esc}[2J` },
+        () => {},
+      ),
+    ).rejects.toMatchObject(error)
+    expect(isShellError(error)).toBe(true)
   })
 })
 

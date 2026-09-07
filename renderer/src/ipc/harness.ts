@@ -111,6 +111,34 @@ export interface Observation {
 }
 
 /**
+ * The closed set of typed terminal actions a `pty-cli` launch's output may
+ * produce (spike slice 4), mirroring `dto.rs`'s `TerminalActionKindDto`:
+ * the only two sequence families RCS-001's terminal policy turns into a
+ * value (an OSC 0/2 title, an OSC 9 notification), both already sanitized
+ * by core -- control and bidirectional-override characters stripped, at
+ * most 256 characters. Data to show as text only: never applied to any
+ * chrome, `document.title`, or a notification surface.
+ */
+export type TerminalActionKind = 'title' | 'notification'
+
+/**
+ * [`omnifrons_domain::terminal::DropCounts`], as it crosses IPC: per-family
+ * counts of terminal control sequences core's normalizer dropped since the
+ * previous `terminal-drops` event of the same launch, one field per row of
+ * RCS-001's policy table (`fileTransfer` is `file_transfer` in camelCase,
+ * like every other wire field).
+ */
+export interface TerminalDropCounts {
+  layout: number
+  hyperlink: number
+  clipboard: number
+  fileTransfer: number
+  string: number
+  unknown: number
+  malformed: number
+}
+
+/**
  * [`omnifrons_domain::adapter::AdapterEvent`], as it crosses IPC.
  * Adjacently tagged (`kind` + `payload`), mirroring
  * `src-tauri/src/ipc/dto.rs`'s `AdapterEventDto` verbatim -- added in the
@@ -120,6 +148,14 @@ export interface Observation {
  * base64 or a byte array -- see `AdapterEventDto::Unknown`'s own doc
  * comment for why lossy decoding is the expected shape here, not a
  * defensive escape hatch this type needs to represent separately.
+ *
+ * The three `terminal-*` kinds (spike slice 4, `docs/spike-log.md` § Slice
+ * 4) are proposed AEC-001 kinds a `pty-cli` launch emits: `terminal-text`
+ * is normalized plain text whose `text` keeps a `\n` per framed line end
+ * and may end without one (a continued chunk), so a consumer splits lines
+ * itself; `terminal-action` is a sanitized title or notification, data to
+ * show as text only; `terminal-drops` is the per-family count of dropped
+ * control sequences since the previous `terminal-drops` of the same launch.
  */
 export type AgentEvent =
   | {
@@ -130,6 +166,9 @@ export type AgentEvent =
   | { kind: 'tool-call'; payload: { name: string; argumentsText: string } }
   | { kind: 'diagnostic'; payload: { text: string } }
   | { kind: 'unknown'; payload: { raw: string; truncated: boolean } }
+  | { kind: 'terminal-text'; payload: { text: string } }
+  | { kind: 'terminal-action'; payload: { action: TerminalActionKind; text: string } }
+  | { kind: 'terminal-drops'; payload: TerminalDropCounts }
 
 interface HarnessEventFrameBody {
   id: ProcessId
@@ -170,6 +209,19 @@ export type ShellErrorCode =
   | 'secret-shaped-env'
   /** `workspace_pick`'s folder dialog was canceled (no folder was selected). */
   | 'no-workspace'
+  /**
+   * `harness_spawn`'s `kind: "adapter"` named the `pty-cli` adapter on a
+   * platform where spike slice 4 implements no pseudo-terminal launch
+   * (Windows). Nothing was spawned.
+   */
+  | 'pty-unsupported'
+  /**
+   * A `pty-cli` launch's prompt contains a C0 control character other than
+   * newline and tab (or DEL) -- something a terminal's line discipline would
+   * interpret rather than type; refused at plan-building time, nothing was
+   * spawned (spike slice 4).
+   */
+  | 'prompt-not-typeable'
 
 /**
  * Structured detail for a {@link ShellError}, carrying values a fixed
@@ -259,8 +311,13 @@ export interface Workspace {
 /** [`omnifrons_domain::adapter::TransportClass`], as it crosses IPC. */
 export type TransportClass = 'structured-streaming-cli' | 'pty'
 
-/** [`omnifrons_domain::adapter::PromptChannel`], as it crosses IPC. */
-export type PromptChannel = 'stdin-then-close' | 'argv'
+/**
+ * [`omnifrons_domain::adapter::PromptChannel`], as it crosses IPC.
+ * `pty-typed` (spike slice 4) is the `pty-cli` adapter's channel: the
+ * prompt is typed into the child's controlling terminal followed by a
+ * carriage return; nothing is closed.
+ */
+export type PromptChannel = 'stdin-then-close' | 'argv' | 'pty-typed'
 
 /**
  * [`omnifrons_domain::scope::ScopeMode`], as it crosses IPC -- every

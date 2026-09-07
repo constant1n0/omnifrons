@@ -41,14 +41,30 @@ const SAMPLE_ADAPTER: AdapterDescriptor = {
 }
 
 /**
- * The default mock: no active workspace, one adapter, one active approval.
+ * The spike slice-4 pseudo-terminal fallback adapter, mirroring the
+ * `pty-cli` descriptor `adapters_list` returns (`docs/spike-log.md` § Slice
+ * 4, IPC shapes); `notes` is the Rust side's own disclosure text verbatim.
+ */
+const PTY_ADAPTER: AdapterDescriptor = {
+  id: 'pty-cli',
+  displayName: 'PTY CLI',
+  transportClass: 'pty',
+  promptChannel: 'pty-typed',
+  scopeMode: 'advisory',
+  notes:
+    'degraded fallback with no structured events: the executable runs inside a pseudo-terminal and its output is rendered as plain text with layout controls dropped and counted; a title or notification it asks for is sanitized and shown as text only; hyperlinks, clipboard access and file transfer are disabled; the terminal is not a sandbox and grants no authority; not available on Windows in this slice',
+}
+
+/**
+ * The default mock: no active workspace, two adapters (the slice 3 line
+ * agent and the slice 4 pseudo-terminal fallback), one active approval.
  * Individual tests override `onCommand` to add `harness_spawn`/
  * `workspace_pick` handling.
  */
 function defaultHandlers(onCommand?: (cmd: string, args: Record<string, unknown>) => unknown) {
   return (cmd: string, args: unknown) => {
     if (cmd === 'workspace_current') return null
-    if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+    if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
     throw new Error(`unexpected command: ${cmd}`)
@@ -71,10 +87,13 @@ async function selectOption(labelText: string, value: string): Promise<void> {
   expect(select.value).toBe(value)
 }
 
-async function renderReady(onCommand?: (cmd: string, args: Record<string, unknown>) => unknown) {
+async function renderReady(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  adapterId: 'claude-code' | 'pty-cli' = 'claude-code',
+) {
   mockIPC(defaultHandlers(onCommand))
   render(<AgentPanel />)
-  await selectOption('Adapter', 'claude-code')
+  await selectOption('Adapter', adapterId)
   await selectOption('Approval', '42')
   fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
 }
@@ -82,6 +101,7 @@ async function renderReady(onCommand?: (cmd: string, args: Record<string, unknow
 /** Fills in the required selects, starts a run, and returns the live Channel. */
 async function startAndCaptureChannel(
   onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  adapterId: 'claude-code' | 'pty-cli' = 'claude-code',
 ): Promise<{ onmessage: (frame: HarnessFrame) => void }> {
   let channelRef: { onmessage: (frame: HarnessFrame) => void } | undefined
   await renderReady((cmd, args) => {
@@ -91,7 +111,7 @@ async function startAndCaptureChannel(
     }
     if (onCommand) return onCommand(cmd, args)
     throw new Error(`unexpected command: ${cmd}`)
-  })
+  }, adapterId)
 
   fireEvent.click(screen.getByRole('button', { name: 'Start' }))
   await waitFor(() => {
@@ -682,6 +702,7 @@ type LiveChannel = { onmessage: (frame: HarnessFrame) => void }
  */
 async function renderMultiRun(
   onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  adapterId: 'claude-code' | 'pty-cli' = 'claude-code',
 ): Promise<{ channels: LiveChannel[]; spawnCount: () => number }> {
   const channels: LiveChannel[] = []
   let nextId = 7
@@ -695,7 +716,7 @@ async function renderMultiRun(
     if (onCommand) return onCommand(cmd, args)
     if (cmd === 'harness_stop') return { state: 'killed', code: null }
     throw new Error(`unexpected command: ${cmd}`)
-  })
+  }, adapterId)
   return { channels, spawnCount: () => channels.length }
 }
 
@@ -1691,5 +1712,763 @@ describe('AgentPanel double-click before spawn resolves (R3-010)', () => {
     // One active run per panel: Start stays disabled once running, not
     // just while the spawn itself is pending.
     expect(startButton.disabled).toBe(true)
+  })
+})
+
+// -- Slice 4: the pty-cli adapter's transport disclosure and the three
+// terminal event kinds (`docs/spike-log.md` § Slice 4) --
+
+const PTY_DISCLOSURE = 'transport: pty — degraded fallback; plain text, layout controls dropped'
+
+/** Leaf elements anywhere in the document whose text contains `needle`. */
+function leavesContaining(needle: string): Element[] {
+  return Array.from(document.body.querySelectorAll('*')).filter(
+    (el) => el.children.length === 0 && (el.textContent ?? '').includes(needle),
+  )
+}
+
+/** Delivers one `terminal-text` event carrying `text` on `channel`, as run 7's frame `seq`. */
+function deliverTerminalText(
+  channel: { onmessage: (frame: HarnessFrame) => void },
+  text: string,
+  seq = 0,
+) {
+  act(() => {
+    channel.onmessage({
+      stream: 'event',
+      body: { id: 7, seq, droppedBefore: 0, kind: 'terminal-text', payload: { text } },
+    })
+  })
+}
+
+/** The rendered lines of the single `terminal-text` entry in the transcript, as text. */
+function terminalLines(): string[] {
+  const transcript = screen.getByLabelText('Agent transcript')
+  const entries = transcript.querySelectorAll('[data-testid="terminal-text"]')
+  expect(entries.length).toBe(1)
+  return Array.from(entries[0]!.querySelectorAll('[data-testid="terminal-line"]')).map(
+    (line) => line.textContent ?? '',
+  )
+}
+
+describe('AgentPanel pty transport disclosure (slice 4)', () => {
+  it('shows the fixed transport disclosure line once the selected adapter\'s transportClass is pty, and "pty" appears nowhere else in the panel', async () => {
+    await renderReady(undefined, 'pty-cli')
+
+    const disclosure = screen.getByTestId('agent-transport-disclosure')
+    expect(disclosure.textContent).toBe(PTY_DISCLOSURE)
+    expect(leavesContaining('pty')).toEqual([disclosure])
+  })
+
+  it('never shows the transport disclosure for a non-pty adapter, and removes it when the selection moves off pty-cli', async () => {
+    await renderReady()
+    expect(screen.queryByTestId('agent-transport-disclosure')).toBeNull()
+    expect(document.body.textContent).not.toContain('transport: pty')
+
+    await selectOption('Adapter', 'pty-cli')
+    expect(screen.getByTestId('agent-transport-disclosure').textContent).toBe(PTY_DISCLOSURE)
+
+    await selectOption('Adapter', 'claude-code')
+    expect(screen.queryByTestId('agent-transport-disclosure')).toBeNull()
+    expect(document.body.textContent).not.toContain('transport: pty')
+  })
+})
+
+describe('AgentPanel terminal-text (slice 4)', () => {
+  it('renders one transcript entry per terminal-text event, one line per newline-separated segment, a trailing newline adding no empty line', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'first\nsecond\n')
+
+    // Two separate line elements, each holding exactly one segment: the
+    // newline was split before PlainTextLine, never stripped inside it (a
+    // single span would read "firstsecond"). Asserted per element rather
+    // than on `textContent`, which concatenates adjacent blocks unseparated.
+    expect(terminalLines()).toEqual(['first', 'second'])
+    const transcript = screen.getByLabelText('Agent transcript')
+    // The echoed prompt row plus exactly one row for the event.
+    expect(transcript.querySelectorAll('li').length).toBe(2)
+  })
+
+  it('renders a terminal-text with no newline (a continued chunk) as exactly one line', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'partial')
+
+    expect(terminalLines()).toEqual(['partial'])
+  })
+
+  it('keeps an interior empty line: "a\\n\\nb\\n" renders three lines with the middle one empty', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'a\n\nb\n')
+
+    expect(terminalLines()).toEqual(['a', '', 'b'])
+  })
+
+  it('labels the entry visually as terminal output, plain text', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'hello\n')
+
+    const entry = screen.getByLabelText('Agent transcript').querySelector(
+      '[data-testid="terminal-text"]',
+    )
+    expect(entry?.textContent).toContain('terminal output, plain text')
+  })
+
+  it('renders two terminal-text events as two separate entries, in order', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'one\n', 0)
+    deliverTerminalText(channel, 'two\n', 1)
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    const entries = transcript.querySelectorAll('[data-testid="terminal-text"]')
+    expect(entries.length).toBe(2)
+    expect(entries[0]?.textContent).toContain('one')
+    expect(entries[1]?.textContent).toContain('two')
+    expect(transcript.textContent?.indexOf('one')).toBeLessThan(
+      transcript.textContent?.indexOf('two') ?? -1,
+    )
+  })
+})
+
+describe('AgentPanel terminal-action (slice 4)', () => {
+  // The title test sets `document.title` as its oracle; restore whatever
+  // was there so no later test inherits it (slice 4 review, R3-007).
+  let previousTitle = ''
+  beforeEach(() => {
+    previousTitle = document.title
+  })
+  afterEach(() => {
+    document.title = previousTitle
+  })
+
+  it('renders a title action as a "title:" transcript line and never touches document.title, the header, or anything outside the transcript', async () => {
+    document.title = 'Omnifrons test'
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 9,
+          droppedBefore: 0,
+          kind: 'terminal-action',
+          payload: { action: 'title', text: 'build ok' },
+        },
+      })
+    })
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.textContent).toContain('title: build ok')
+    expect(document.title).toBe('Omnifrons test')
+    expect(document.head.textContent).not.toContain('build ok')
+    const outside = leavesContaining('build ok').filter((el) => !transcript.contains(el))
+    expect(outside).toEqual([])
+    expect(screen.getByRole('heading', { name: 'Agent' }).textContent).toBe('Agent')
+  })
+
+  it('renders a notification action as a "notification:" transcript line, calling no Notification API, no IPC, and moving no focus', async () => {
+    const notificationCtor = vi.fn()
+    const requestPermission = vi.fn()
+    Object.assign(notificationCtor, { requestPermission })
+    vi.stubGlobal('Notification', notificationCtor)
+    try {
+      let invokeCount = 0
+      let channelRef: { onmessage: (frame: HarnessFrame) => void } | undefined
+      const handlers = defaultHandlers((cmd, args) => {
+        if (cmd === 'harness_spawn') {
+          channelRef = (args as { onFrame: { onmessage: (frame: HarnessFrame) => void } }).onFrame
+          return 7
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+      mockIPC((cmd, args) => {
+        invokeCount += 1
+        return handlers(cmd, args)
+      })
+
+      render(<AgentPanel />)
+      await selectOption('Adapter', 'pty-cli')
+      await selectOption('Approval', '42')
+      fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+      await waitFor(() => {
+        expect(channelRef).toBeDefined()
+      })
+      await screen.findByText('running')
+      if (!channelRef) throw new Error('harness_spawn was not called')
+
+      const focusedBefore = document.activeElement
+      const invokesBefore = invokeCount
+      act(() => {
+        channelRef!.onmessage({
+          stream: 'event',
+          body: {
+            id: 7,
+            seq: 10,
+            droppedBefore: 2,
+            kind: 'terminal-action',
+            payload: { action: 'notification', text: 'done' },
+          },
+        })
+      })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+
+      const transcript = screen.getByLabelText('Agent transcript')
+      expect(transcript.textContent).toContain('notification: done')
+      expect(
+        screen.getByText('2 frames dropped before this entry — degraded, restart to replay'),
+      ).toBeTruthy()
+      expect(notificationCtor).not.toHaveBeenCalled()
+      expect(requestPermission).not.toHaveBeenCalled()
+      expect(invokeCount).toBe(invokesBefore)
+      expect(document.activeElement).toBe(focusedBefore)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('AgentPanel terminal-drops (slice 4)', () => {
+  it('renders a degraded marker line with all seven counts in the fixed order', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 11,
+          droppedBefore: 0,
+          kind: 'terminal-drops',
+          payload: {
+            layout: 21,
+            hyperlink: 2,
+            clipboard: 2,
+            fileTransfer: 3,
+            string: 3,
+            unknown: 1,
+            malformed: 3,
+          },
+        },
+      })
+    })
+
+    const marker = screen.getByText(
+      'dropped terminal controls: layout 21, hyperlink 2, clipboard 2, file transfer 3, string 3, unknown 1, malformed 3',
+    )
+    expect(marker.tagName).toBe('MARK')
+    expect(screen.getByLabelText('Agent transcript').contains(marker)).toBe(true)
+  })
+
+  it('still renders every zero count as 0', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 11,
+          droppedBefore: 0,
+          kind: 'terminal-drops',
+          payload: {
+            layout: 0,
+            hyperlink: 0,
+            clipboard: 0,
+            fileTransfer: 0,
+            string: 0,
+            unknown: 0,
+            malformed: 0,
+          },
+        },
+      })
+    })
+
+    expect(
+      screen.getByText(
+        'dropped terminal controls: layout 0, hyperlink 0, clipboard 0, file transfer 0, string 0, unknown 0, malformed 0',
+      ),
+    ).toBeTruthy()
+  })
+})
+
+describe('AgentPanel pty-unsupported banner (slice 4, R3-013 analogue)', () => {
+  it('renders pty-unsupported as a plain catalogue code with its fixed message, no "untrusted" and no stray detail', async () => {
+    await renderReady((cmd) => {
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'pty-unsupported',
+          message: 'pseudo-terminal launches are not available on this platform',
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      'pty-unsupported: pseudo-terminal launches are not available on this platform',
+    )
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(banner.textContent).not.toContain('bbbbbbbb')
+  })
+
+  it('renders prompt-not-typeable as a plain catalogue code with its fixed message, no "untrusted" and no stray detail', async () => {
+    await renderReady((cmd) => {
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'prompt-not-typeable',
+          message: 'prompt contains control characters a terminal would interpret',
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      'prompt-not-typeable: prompt contains control characters a terminal would interpret',
+    )
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(banner.textContent).not.toContain('bbbbbbbb')
+  })
+})
+
+describe('AgentPanel content security on the pty path (slice 4, RCS-001)', () => {
+  const esc = String.fromCharCode(0x1b)
+  const bel = String.fromCharCode(0x07)
+  /** U+202E RIGHT-TO-LEFT OVERRIDE, built from its code point so no bidi control sits in this source file. */
+  const rlo = String.fromCodePoint(0x202e)
+
+  it('renders a terminal-text carrying a literal OSC 8 hyperlink residue as text with no anchor and no ESC/BEL', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, `${esc}]8;;https://example.invalid${bel}label\n`)
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.querySelector('a')).toBeNull()
+    expect(transcript.querySelector('[href]')).toBeNull()
+    expect(transcript.textContent).toContain(']8;;https://example.invalidlabel')
+    expect(transcript.textContent).not.toContain(esc)
+    expect(transcript.textContent).not.toContain(bel)
+  })
+
+  it('renders a terminal-text containing a <b> tag literally, producing no <b> element', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, '<b>bold</b>\n')
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.querySelector('b')).toBeNull()
+    expect(terminalLines()).toEqual(['<b>bold</b>'])
+  })
+
+  it('renders a title text carrying a C0 byte and a bidi override stripped of both', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 9,
+          droppedBefore: 0,
+          kind: 'terminal-action',
+          payload: { action: 'title', text: `Ti${esc}tle ${rlo}rev` },
+        },
+      })
+    })
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.textContent).toContain('title: Title rev')
+    expect(transcript.textContent).not.toContain(esc)
+    expect(transcript.textContent).not.toContain(rlo)
+  })
+
+  it('renders a terminal-text containing SENTINEL-CLIPBOARD as text: the renderer never filters content, core\'s normalizer is what keeps a real OSC 52 payload off the wire', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'SENTINEL-CLIPBOARD\n')
+
+    expect(terminalLines()).toEqual(['SENTINEL-CLIPBOARD'])
+  })
+})
+
+// -- Slice 4 review (reliability lens) --
+
+describe('AgentPanel bare CR on the pty path (slice 4 review, R3-001; recorded debt)', () => {
+  const cr = String.fromCharCode(0x0d)
+
+  it('debt: a bare CR is a C0 control PlainTextLine strips, so "a\\rb\\n" renders as one line "ab" -- a CR-updated progress bar renders concatenated', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, `a${cr}b\n`)
+
+    expect(terminalLines()).toEqual(['ab'])
+    expect(screen.getByLabelText('Agent transcript').textContent).not.toContain(cr)
+  })
+
+  it('a CRLF line end "a\\r\\nb\\n" renders as two lines "a" and "b" with no CR residue', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, `a${cr}\nb\n`)
+
+    expect(terminalLines()).toEqual(['a', 'b'])
+    expect(screen.getByLabelText('Agent transcript').textContent).not.toContain(cr)
+  })
+})
+
+describe('AgentPanel terminal-drops count magnitude (slice 4 review, R3-002)', () => {
+  /** Delivers one `terminal-drops` event whose counts are `counts`, on run 7's channel. */
+  function deliverDrops(
+    channel: LiveChannel,
+    counts: {
+      layout: number
+      hyperlink: number
+      clipboard: number
+      fileTransfer: number
+      string: number
+      unknown: number
+      malformed: number
+    },
+  ) {
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: { id: 7, seq: 11, droppedBefore: 0, kind: 'terminal-drops', payload: counts },
+      })
+    })
+  }
+
+  it('renders a count of Number.MAX_SAFE_INTEGER as plain digits, never an exponent', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverDrops(channel, {
+      layout: Number.MAX_SAFE_INTEGER,
+      hyperlink: 0,
+      clipboard: 0,
+      fileTransfer: 0,
+      string: 0,
+      unknown: 0,
+      malformed: 0,
+    })
+
+    const marker = screen.getByText(/^dropped terminal controls: /)
+    expect(marker.textContent).toContain('layout 9007199254740991,')
+    expect(marker.textContent).not.toContain('e+')
+  })
+
+  it('renders a u64-max count (18446744073709551615 on the wire, 2^64 after JSON.parse) as plain digits: precision above 2^53 is lost in the renderer and accepted', async () => {
+    // The literal never appears in source (eslint's no-loss-of-precision
+    // would flag it); it reaches the renderer the way the wire does, by
+    // parsing JSON, and lands on the nearest double, exactly 2^64.
+    const wire = JSON.parse('{"hyperlink":18446744073709551615}') as { hyperlink: number }
+    expect(wire.hyperlink).toBe(2 ** 64)
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverDrops(channel, {
+      layout: 0,
+      hyperlink: wire.hyperlink,
+      clipboard: 0,
+      fileTransfer: 0,
+      string: 0,
+      unknown: 0,
+      malformed: 0,
+    })
+
+    const marker = screen.getByText(/^dropped terminal controls: /)
+    expect(marker.textContent).toContain('hyperlink 18446744073709552000,')
+    expect(marker.textContent).not.toContain('e+')
+  })
+})
+
+describe('AgentPanel terminal events under the run guards (slice 4 review, R3-004)', () => {
+  it('drops a terminal-text frame from a previous run\'s channel once a second run has started, while the new run\'s own terminal-text is applied', async () => {
+    const { channels } = await renderMultiRun(undefined, 'pty-cli')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await screen.findByText('killed')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(channels).toHaveLength(2)
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 5,
+          droppedBefore: 0,
+          kind: 'terminal-text',
+          payload: { text: 'late from run A\n' },
+        },
+      })
+      channels[1]!.onmessage({
+        stream: 'event',
+        body: {
+          id: 8,
+          seq: 0,
+          droppedBefore: 0,
+          kind: 'terminal-text',
+          payload: { text: 'fresh from run B\n' },
+        },
+      })
+    })
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.textContent).not.toContain('late from run A')
+    expect(transcript.textContent).toContain('fresh from run B')
+    expect(transcript.querySelectorAll('[data-testid="terminal-text"]').length).toBe(1)
+  })
+
+  it('drops terminal-text and terminal-drops frames carrying a foreign run id: nothing appended, badge unchanged', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 99,
+          seq: 0,
+          droppedBefore: 0,
+          kind: 'terminal-text',
+          payload: { text: 'foreign text\n' },
+        },
+      })
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 99,
+          seq: 1,
+          droppedBefore: 0,
+          kind: 'terminal-drops',
+          payload: {
+            layout: 5,
+            hyperlink: 0,
+            clipboard: 0,
+            fileTransfer: 0,
+            string: 0,
+            unknown: 0,
+            malformed: 0,
+          },
+        },
+      })
+    })
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.textContent).not.toContain('foreign text')
+    expect(screen.queryByText(/^dropped terminal controls: /)).toBeNull()
+    // The echoed prompt row only.
+    expect(transcript.querySelectorAll('li').length).toBe(1)
+    expect(screen.getByText('running')).toBeTruthy()
+  })
+
+  it('a terminal state frame after terminal-text and terminal-drops events ends the run, with the state line last in the transcript', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, 'out\n', 0)
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 1,
+          droppedBefore: 0,
+          kind: 'terminal-drops',
+          payload: {
+            layout: 1,
+            hyperlink: 0,
+            clipboard: 0,
+            fileTransfer: 0,
+            string: 0,
+            unknown: 0,
+            malformed: 0,
+          },
+        },
+      })
+      channel.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 2, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+
+    await screen.findByText('exited (code 0)')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    const transcript = screen.getByLabelText('Agent transcript')
+    const rows = Array.from(transcript.querySelectorAll('li'))
+    // prompt, terminal-text, terminal-drops, state -- in delivery order.
+    expect(rows.length).toBe(4)
+    expect(rows[1]?.textContent).toContain('out')
+    expect(rows[2]?.textContent).toContain('dropped terminal controls: layout 1,')
+    expect(rows[3]?.textContent).toBe('state: exited (code 0)')
+  })
+})
+
+/** The three selection controls a run must freeze: workspace pick, adapter, approval. */
+function selectionControls() {
+  return {
+    pick: screen.getByRole('button', { name: 'Pick workspace' }) as HTMLButtonElement,
+    adapter: screen.getByLabelText('Adapter') as HTMLSelectElement,
+    approval: screen.getByLabelText('Approval') as HTMLSelectElement,
+  }
+}
+
+function expectSelectionControlsDisabled(disabled: boolean) {
+  const { pick, adapter, approval } = selectionControls()
+  expect([pick.disabled, adapter.disabled, approval.disabled]).toEqual([
+    disabled,
+    disabled,
+    disabled,
+  ])
+}
+
+describe('AgentPanel selection controls frozen during a run (slice 4 review, R3-005)', () => {
+  it('disables the workspace, adapter and approval controls while a run is active and re-enables them once the terminal state frame ends it', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+    expectSelectionControlsDisabled(true)
+
+    act(() => {
+      channel.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 1, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+
+    expectSelectionControlsDisabled(false)
+  })
+
+  it('disables the selection controls from the Start click on, while the spawn is still pending, and keeps them disabled once running', async () => {
+    const { channels, resolveSpawn } = await renderWithDeferredSpawn()
+    expectSelectionControlsDisabled(false)
+
+    await clickStartAndAwaitChannel(channels, 1)
+    expectSelectionControlsDisabled(true)
+
+    await settleSpawn(resolveSpawn, 7)
+    await screen.findByText('running')
+    expectSelectionControlsDisabled(true)
+  })
+
+  it('re-enables the selection controls after a successful Stop', async () => {
+    const channel = await startAndCaptureChannel((cmd) => {
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+    void channel
+    expectSelectionControlsDisabled(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await screen.findByText('killed')
+
+    expectSelectionControlsDisabled(false)
+  })
+
+  it('keeps the selection controls disabled after a rejected Stop, since the run is still active', async () => {
+    const channel = await startAndCaptureChannel((cmd) => {
+      if (cmd === 'harness_stop') {
+        return Promise.reject({ code: 'invalid-request', message: 'stop was rejected' })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+    void channel
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await screen.findByRole('alert')
+
+    expect(screen.getByText('running')).toBeTruthy()
+    expectSelectionControlsDisabled(true)
+  })
+
+  it('re-enables the selection controls after a rejected spawn, since no run started', async () => {
+    await renderReady((cmd) => {
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({ code: 'spawn-failed', message: 'failed to start the requested process' })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByRole('alert')
+
+    expectSelectionControlsDisabled(false)
+  })
+
+  it('keeps the pty transport disclosure through a run started with pty-cli: a change fired at the disabled adapter select is ignored while output streams, and takes effect only after the run ends', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+    deliverTerminalText(channel, 'streaming\n', 0)
+    expect(screen.getByTestId('agent-transport-disclosure').textContent).toBe(PTY_DISCLOSURE)
+
+    const adapterSelect = screen.getByLabelText('Adapter') as HTMLSelectElement
+    fireEvent.change(adapterSelect, { target: { value: 'claude-code' } })
+
+    expect(adapterSelect.value).toBe('pty-cli')
+    expect(screen.getByTestId('agent-transport-disclosure').textContent).toBe(PTY_DISCLOSURE)
+    deliverTerminalText(channel, 'still streaming\n', 1)
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.querySelectorAll('[data-testid="terminal-text"]').length).toBe(2)
+    expect(screen.getByTestId('agent-transport-disclosure').textContent).toBe(PTY_DISCLOSURE)
+
+    act(() => {
+      channel.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 2, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+
+    await selectOption('Adapter', 'claude-code')
+    expect(screen.queryByTestId('agent-transport-disclosure')).toBeNull()
+  })
+})
+
+describe('AgentPanel empty terminal-text (slice 4 review, R3-006)', () => {
+  it('renders no transcript entry for an empty terminal-text payload with nothing dropped before it', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    deliverTerminalText(channel, '')
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.querySelectorAll('[data-testid="terminal-text"]').length).toBe(0)
+    // The echoed prompt row only.
+    expect(transcript.querySelectorAll('li').length).toBe(1)
+  })
+
+  it('keeps the degraded marker of an empty terminal-text carrying a nonzero droppedBefore, rendering no line for it', async () => {
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: { id: 7, seq: 0, droppedBefore: 3, kind: 'terminal-text', payload: { text: '' } },
+      })
+    })
+
+    expect(
+      screen.getByText('3 frames dropped before this entry — degraded, restart to replay'),
+    ).toBeTruthy()
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.querySelectorAll('[data-testid="terminal-line"]').length).toBe(0)
   })
 })

@@ -3,6 +3,42 @@ import { render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import App, { DEFAULT_UNTRUSTED_CONTENT } from './App'
+import type { AdapterDescriptor } from './ipc/harness'
+
+/**
+ * The three built-in adapter descriptors `adapters_list` returns as of
+ * spike slice 4 -- the two slice 3 line agents and the pseudo-terminal
+ * fallback (`docs/spike-log.md` § Slice 4, IPC shapes) -- so `App`'s mount
+ * exercises the real list shape, `pty-typed` channel included, rather than
+ * an empty list. Metadata only, exactly as the wire carries it: no argv,
+ * no env.
+ */
+const BUILT_IN_ADAPTERS: AdapterDescriptor[] = [
+  {
+    id: 'stream-json-cli',
+    displayName: 'Stream-JSON CLI',
+    transportClass: 'structured-streaming-cli',
+    promptChannel: 'stdin-then-close',
+    scopeMode: 'advisory',
+    notes: 'generic stream-json CLI harness',
+  },
+  {
+    id: 'claude-code',
+    displayName: 'Claude Code',
+    transportClass: 'structured-streaming-cli',
+    promptChannel: 'stdin-then-close',
+    scopeMode: 'advisory',
+    notes: 'credentials are harness-owned; not exercised in CI',
+  },
+  {
+    id: 'pty-cli',
+    displayName: 'PTY CLI',
+    transportClass: 'pty',
+    promptChannel: 'pty-typed',
+    scopeMode: 'advisory',
+    notes: 'degraded fallback with no structured events',
+  },
+]
 
 // `ApprovalSurface` and `AgentPanel` (both mounted by `App`) each call
 // `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`
@@ -16,7 +52,7 @@ beforeEach(() => {
   mockIPC((cmd) => {
     if (cmd === 'approvals_list') return []
     if (cmd === 'workspace_current') return null
-    if (cmd === 'adapters_list') return []
+    if (cmd === 'adapters_list') return BUILT_IN_ADAPTERS
     return Promise.reject({ code: 'invalid-request', message: 'unexpected command in test' })
   })
 })

@@ -20,6 +20,8 @@ import {
   type ProcessTerminalState,
   type ShellError,
   type ShellErrorCode,
+  type TerminalActionKind,
+  type TerminalDropCounts,
   type Workspace,
 } from './ipc/harness'
 import { PlainTextLine } from './PlainTextLine'
@@ -88,6 +90,71 @@ function formatStateEventLine(payload: {
   return segments.join(', ')
 }
 
+/**
+ * The fixed disclosure shown while the selected adapter's `transportClass`
+ * is `pty` (`docs/spike-log.md` § Slice 4): a pseudo-terminal launch is an
+ * explicit degraded fallback (`docs/target-architecture.md` invariant 6),
+ * rendered here as plain text with every layout control already dropped by
+ * core's normalizer -- the strictest RCS-001 mode, not a terminal pane.
+ * Fixed copy, never wire text.
+ */
+const PTY_TRANSPORT_DISCLOSURE =
+  'transport: pty — degraded fallback; plain text, layout controls dropped'
+
+/** The visible label on every `terminal-text` transcript entry. */
+const TERMINAL_TEXT_LABEL = 'terminal output, plain text'
+
+/**
+ * Splits one `terminal-text` payload into the lines it carries, *before*
+ * any of it reaches {@link PlainTextLine}: core keeps a `\n` per framed
+ * line end, and `PlainTextLine` strips every C0 control including `\n`, so
+ * a newline passed through it would silently join two lines into one. A
+ * trailing `\n` ends the last line rather than opening an empty one; a
+ * text with no `\n` (a continued chunk) is one line; an interior empty
+ * line is kept, since it is one; an empty text is no line at all (slice 4
+ * review, R3-006).
+ */
+function splitTerminalLines(text: string): string[] {
+  if (text === '') return []
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+/**
+ * The label of a `terminal-action` line: fixed copy chosen per closed
+ * action token, never the wire token echoed -- the switch is exhaustive, so
+ * a new action kind cannot render unlabelled.
+ */
+function formatTerminalActionLabel(action: TerminalActionKind): string {
+  switch (action) {
+    case 'title':
+      return 'title'
+    case 'notification':
+      return 'notification'
+  }
+}
+
+/**
+ * The degraded marker for a `terminal-drops` event: the seven per-family
+ * counts core's normalizer dropped since the previous marker, in RCS-001's
+ * table order, zero counts included -- every family is always accounted
+ * for, so a reader never has to guess whether an absent family meant zero
+ * or unreported.
+ */
+function formatTerminalDrops(counts: TerminalDropCounts): string {
+  const families = [
+    `layout ${counts.layout}`,
+    `hyperlink ${counts.hyperlink}`,
+    `clipboard ${counts.clipboard}`,
+    `file transfer ${counts.fileTransfer}`,
+    `string ${counts.string}`,
+    `unknown ${counts.unknown}`,
+    `malformed ${counts.malformed}`,
+  ]
+  return `dropped terminal controls: ${families.join(', ')}`
+}
+
 type TranscriptItem =
   | { type: 'prompt'; key: string; text: string }
   | { type: 'agent-event'; key: string; droppedBefore: number; event: AgentEvent }
@@ -153,6 +220,16 @@ function DroppedFramesMarker({ droppedBefore }: { droppedBefore: number }) {
  * containing zero interactive elements -- nothing this slice ships ever
  * executes a proposed tool call (`docs/spike-log.md` § Slice 3, VP-S18
  * notes).
+ *
+ * The three `terminal-*` kinds a `pty-cli` launch emits (`docs/spike-log.md`
+ * § Slice 4) render as text too, and only text: `terminal-text` as one
+ * labelled entry with a {@link PlainTextLine} per newline-split line,
+ * `terminal-action` as a `title:`/`notification:` line that touches nothing
+ * outside the transcript (never `document.title`, never a Notification
+ * API, never focus), and `terminal-drops` as a `<mark>` marker line of the
+ * seven drop counts. No terminal pane exists in this slice: plain text is
+ * the strictest RCS-001 mode, and every layout control was dropped by core
+ * before any of this reached the wire.
  */
 function TranscriptEntryView({ item }: { item: TranscriptItem }) {
   if (item.type === 'prompt') {
@@ -198,6 +275,24 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
           </p>
         </div>
       )}
+      {event.kind === 'terminal-text' && (
+        <div data-testid="terminal-text">
+          <span>{TERMINAL_TEXT_LABEL}</span>
+          {splitTerminalLines(event.payload.text).map((line, index) => (
+            // An index key is sound here: the list is derived once from an
+            // immutable payload and is never reordered or edited.
+            <div key={index} data-testid="terminal-line">
+              <PlainTextLine text={line} />
+            </div>
+          ))}
+        </div>
+      )}
+      {event.kind === 'terminal-action' && (
+        <PlainTextLine
+          text={`${formatTerminalActionLabel(event.payload.action)}: ${event.payload.text}`}
+        />
+      )}
+      {event.kind === 'terminal-drops' && <mark>{formatTerminalDrops(event.payload)}</mark>}
     </li>
   )
 }
@@ -215,6 +310,11 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
  * guarantee; a `tool-call` proposal is rendered as inert data only, never
  * as anything a click could execute (RCS-001-R6/R16/R18,
  * `docs/renderer-content-security.md`).
+ *
+ * Spike slice 4 adds the `pty-cli` adapter's degraded-fallback path on the
+ * same surface: a fixed transport disclosure while a `pty` adapter is
+ * selected, and the three `terminal-*` event kinds rendered as plain text
+ * in the same transcript (`docs/spike-log.md` § Slice 4).
  */
 export function AgentPanel() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null)
@@ -234,6 +334,17 @@ export function AgentPanel() {
   const [badge, setBadge] = useState('idle')
   const [transcript, setTranscript] = useState<TranscriptState>(EMPTY_TRANSCRIPT)
   const [error, setError] = useState<PanelError | null>(null)
+
+  /**
+   * True from the Start click until the run ends (its terminal `state`
+   * frame, or a successful stop) or the spawn is rejected. While true, the
+   * workspace, adapter and approval controls are disabled and their
+   * handlers ignore input: the transport disclosure derives from the
+   * selected adapter, so a selection change under a streaming run would
+   * hide the disclosure while pty output keeps arriving (slice 4 review,
+   * R3-005). A rejected stop leaves the run -- and this -- as it was.
+   */
+  const runActive = isSpawning || activeId !== null
 
   /**
    * Tracks whether this component instance is still mounted, guarding
@@ -365,6 +476,17 @@ export function AgentPanel() {
       return
     }
     if (frame.stream === 'event') {
+      // An empty `terminal-text` with nothing dropped before it carries
+      // nothing to show: no entry, so it neither occupies a transcript row
+      // nor a slot under the cap (slice 4 review, R3-006). One riding a
+      // nonzero `droppedBefore` is kept for its degraded marker alone.
+      if (
+        frame.body.kind === 'terminal-text' &&
+        frame.body.payload.text === '' &&
+        frame.body.droppedBefore === 0
+      ) {
+        return
+      }
       setTranscript((previous) =>
         appendTranscriptEntry(previous, {
           type: 'agent-event',
@@ -382,6 +504,9 @@ export function AgentPanel() {
   }, [])
 
   async function handlePickWorkspace() {
+    // Belt and braces with the button's own `disabled`: never move the
+    // workspace under an active run.
+    if (runActive) return
     setError(null)
     setWorkspaceStatus(null)
     setIsPickingWorkspace(true)
@@ -473,9 +598,9 @@ export function AgentPanel() {
   }
 
   const activeApprovals = approvals.filter((approval) => approval.status === 'active')
+  const selectedAdapter = adapters.find((adapter) => adapter.id === adapterId) ?? null
   const promptTooLarge = promptByteLength(prompt) > PROMPT_MAX_BYTES
-  const startDisabled =
-    isSpawning || activeId !== null || adapterId === null || approvalId === null || promptTooLarge
+  const startDisabled = runActive || adapterId === null || approvalId === null || promptTooLarge
 
   return (
     <section aria-label="Agent">
@@ -514,7 +639,11 @@ export function AgentPanel() {
       )}
 
       <div>
-        <button type="button" onClick={handlePickWorkspace} disabled={isPickingWorkspace}>
+        <button
+          type="button"
+          onClick={handlePickWorkspace}
+          disabled={isPickingWorkspace || runActive}
+        >
           Pick workspace
         </button>
         {workspace && (
@@ -530,7 +659,13 @@ export function AgentPanel() {
         <select
           id="agent-adapter"
           value={adapterId ?? ''}
-          onChange={(event) => setAdapterId(event.target.value === '' ? null : event.target.value)}
+          disabled={runActive}
+          onChange={(event) => {
+            // A `change` dispatched at a disabled select still reaches
+            // React; the guard keeps the selection frozen regardless.
+            if (runActive) return
+            setAdapterId(event.target.value === '' ? null : event.target.value)
+          }}
         >
           <option value="">Select an adapter</option>
           {adapters.map((adapter) => (
@@ -539,21 +674,24 @@ export function AgentPanel() {
             </option>
           ))}
         </select>
-        {adapters
-          .filter((adapter) => adapter.id === adapterId)
-          .map((adapter) => (
-            <p key={adapter.id}>
-              <PlainTextLine text={adapter.notes} />
-            </p>
-          ))}
+        {selectedAdapter && (
+          <p>
+            <PlainTextLine text={selectedAdapter.notes} />
+          </p>
+        )}
+        {selectedAdapter?.transportClass === 'pty' && (
+          <p data-testid="agent-transport-disclosure">{PTY_TRANSPORT_DISCLOSURE}</p>
+        )}
 
         <label htmlFor="agent-approval">Approval</label>
         <select
           id="agent-approval"
           value={approvalId === null ? '' : String(approvalId)}
-          onChange={(event) =>
+          disabled={runActive}
+          onChange={(event) => {
+            if (runActive) return
             setApprovalId(event.target.value === '' ? null : Number(event.target.value))
-          }
+          }}
         >
           <option value="">Select an approval</option>
           {activeApprovals.map((approval) => (
