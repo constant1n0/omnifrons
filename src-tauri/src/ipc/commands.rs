@@ -26,9 +26,11 @@ use omnifrons_app::{
     ApprovalStore, ApprovalStoreError, EnvPlan, ExecutableProber, GateDecision, HarnessKind,
     HarnessRequest, InvalidRequest, LaunchPlan, LaunchPlanError, LaunchRequest, LineAssembler,
     OutputFrame, ProcessId, ProcessOutput, ProcessSupervisor, ProcessTerminalState, StdinPlan,
-    SupervisorError, WorkspaceRoot,
+    SupervisorError, TerminalChunk, TerminalNormalizer, WorkspaceRoot,
 };
-use omnifrons_domain::adapter::{AdapterEvent, AdapterId, AgentPrompt, PromptError};
+use omnifrons_domain::adapter::{
+    AdapterEvent, AdapterId, AgentPrompt, PromptError, TransportClass,
+};
 use omnifrons_domain::executable::{ApprovalId, DenialReason};
 use omnifrons_domain::scope::ScopeMode;
 use omnifrons_supervisor::TokioProcessSupervisor;
@@ -66,6 +68,10 @@ impl From<SupervisorError> for ShellError {
             SupervisorError::TooManyProcesses => (
                 ShellErrorCode::TooManyProcesses,
                 "too many processes are already running",
+            ),
+            SupervisorError::PtyUnsupported => (
+                ShellErrorCode::PtyUnsupported,
+                "pseudo-terminal launches are not available on this platform",
             ),
         };
         Self::new(code, message)
@@ -134,9 +140,12 @@ impl From<LaunchPlanError> for ShellError {
     /// error (`docs/spike-log.md` § Slice 3). `CwdOutsideWorkspace` and
     /// `PromptChannelUnsupported` are both structurally unreachable in
     /// this slice's own wired flow (every built-in adapter always uses
-    /// the workspace's own path as cwd, and declares
-    /// `PromptChannel::StdinThenClose`) -- mapped defensively rather than
-    /// left a `todo!()`, so this stays total.
+    /// the workspace's own path as cwd, and each declares exactly the
+    /// prompt channel its own `build_launch` implements) -- mapped
+    /// defensively rather than left a `todo!()`, so this stays total.
+    /// `PromptNotTypeable` is reachable: a `pty-cli` launch whose prompt
+    /// carries a control character the terminal's line discipline would
+    /// interpret is refused by `PtyCli::build_launch` (spike slice 4).
     fn from(error: LaunchPlanError) -> Self {
         match error {
             LaunchPlanError::SecretShapedEnvKey(_) => Self::new(
@@ -150,6 +159,10 @@ impl From<LaunchPlanError> for ShellError {
             LaunchPlanError::PromptChannelUnsupported => Self::new(
                 ShellErrorCode::InvalidRequest,
                 "this adapter's prompt channel is not supported",
+            ),
+            LaunchPlanError::PromptNotTypeable => Self::new(
+                ShellErrorCode::PromptNotTypeable,
+                "prompt contains control characters a terminal would interpret",
             ),
         }
     }
@@ -257,10 +270,14 @@ fn forward_output(id: ProcessId, receiver: Receiver<OutputFrame>, on_frame: Chan
 }
 
 /// Start a detached forwarder thread for an adapter launch: every captured
-/// raw frame is mapped by [`adapter_wire_frames`] to the zero, one, or
-/// several `event`/`state` wire frames it produces, which are then relayed
-/// onto `on_frame` in order (`docs/spike-log.md` § Slice 3: `stdout`/
-/// `stderr` raw frames are never emitted for an adapter launch).
+/// raw frame is mapped to the zero, one, or several `event`/`state` wire
+/// frames it produces, which are then relayed onto `on_frame` in order
+/// (`docs/spike-log.md` § Slice 3: `stdout`/`stderr` raw frames are never
+/// emitted for an adapter launch). The mapping is chosen by the adapter's
+/// transport class: [`adapter_wire_frames`] (a `LineAssembler` plus the
+/// adapter's own `parse_line`) for `StructuredStreamingCli`, or
+/// [`pty_wire_frames`] (a `TerminalNormalizer` over the raw text) for `Pty`
+/// (`docs/spike-log.md` § Slice 4).
 ///
 /// `adapter_id` is looked up in the managed [`AdapterState`] catalog
 /// inside this thread (via a cloned `app`), never carried in as a
@@ -286,25 +303,173 @@ fn forward_adapter_output(
             "adapter_id must already have been validated against the catalog before spawning",
         );
 
-        let mut assembler = LineAssembler::new();
         let mut sequencer = AdapterWireSequencer::new(id_dto);
-        let mut send_failures = 0u32;
-        'frames: for frame in receiver {
-            for wire_frame in adapter_wire_frames(adapter, &mut assembler, &mut sequencer, frame) {
-                if on_frame.send(wire_frame).is_err() {
-                    send_failures += 1;
-                    break 'frames;
-                }
+        match forwarder_for(adapter.describe().transport_class) {
+            ForwarderKind::Line => {
+                let mut assembler = LineAssembler::new();
+                relay_wire_frames(id_dto, receiver, &on_frame, |frame| {
+                    adapter_wire_frames(adapter, &mut assembler, &mut sequencer, frame)
+                });
+            }
+            ForwarderKind::Pty => {
+                let mut forwarder = PtyForwarder::new();
+                relay_wire_frames(id_dto, receiver, &on_frame, |frame| {
+                    pty_wire_frames(&mut forwarder, &mut sequencer, frame)
+                });
             }
         }
-        if send_failures > 0 {
-            tracing::warn!(
-                pid = id_dto.0,
-                send_failures,
-                "adapter output forwarder stopped after a channel send failure"
-            );
-        }
     });
+}
+
+/// The two ways [`forward_adapter_output`] can map a launch's raw frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwarderKind {
+    /// Slice 3's line assembler plus the adapter's own `parse_line`.
+    Line,
+    /// Slice 4's byte normalizer over a [`PtyForwarder`].
+    Pty,
+}
+
+/// Which forwarder a launch gets, decided by the adapter's transport class
+/// alone -- pure, so the dispatch [`forward_adapter_output`] performs is
+/// testable without Tauri state or a live process.
+const fn forwarder_for(transport: TransportClass) -> ForwarderKind {
+    match transport {
+        TransportClass::StructuredStreamingCli => ForwarderKind::Line,
+        TransportClass::Pty => ForwarderKind::Pty,
+    }
+}
+
+/// Relay every raw frame of `receiver` through `map` onto `on_frame`, in
+/// order, until the receiver closes (the process is confirmed terminal and
+/// fully drained) or a send fails (the frontend navigated away or dropped
+/// the channel).
+fn relay_wire_frames(
+    id_dto: ProcessIdDto,
+    receiver: Receiver<OutputFrame>,
+    on_frame: &Channel<HarnessFrame>,
+    mut map: impl FnMut(OutputFrame) -> Vec<HarnessFrame>,
+) {
+    let mut send_failures = 0u32;
+    'frames: for frame in receiver {
+        for wire_frame in map(frame) {
+            if on_frame.send(wire_frame).is_err() {
+                send_failures += 1;
+                break 'frames;
+            }
+        }
+    }
+    if send_failures > 0 {
+        tracing::warn!(
+            pid = id_dto.0,
+            send_failures,
+            "adapter output forwarder stopped after a channel send failure"
+        );
+    }
+}
+
+/// The per-launch state of the PTY forwarder (`docs/spike-log.md` §
+/// Slice 4): the normalizer whose state persists across raw frames (a
+/// sequence or a multi-byte character may straddle two frames), and the
+/// `dropped_before` accumulated from raw frames that produced no wire
+/// frame yet, so a drop count is never lost to a silent frame.
+struct PtyForwarder {
+    normalizer: TerminalNormalizer,
+    pending_dropped_before: u64,
+}
+
+impl PtyForwarder {
+    fn new() -> Self {
+        Self {
+            normalizer: TerminalNormalizer::new(),
+            pending_dropped_before: 0,
+        }
+    }
+
+    /// The `dropped_before` for the next wire frame: everything pending,
+    /// then zero for the frames after it.
+    fn take_dropped_before(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_dropped_before)
+    }
+}
+
+/// Map one captured raw frame of a PTY launch to the wire frames it
+/// produces, in order -- pure over `forwarder`/`sequencer`, so the
+/// forwarder's behavior is unit-testable without a live process:
+///
+/// - a `stdout` text frame's text (plus a trailing `\n` unless
+///   `continued`, restoring the line end the supervisor's framing
+///   consumed) is pushed through the normalizer; each `Text` chunk becomes
+///   a `terminal-text` event (adjacent text chunks coalesced), each action
+///   a `terminal-action` event, and, when the drop counts changed, exactly
+///   one `terminal-drops` event closes the frame;
+/// - a `stderr` text frame becomes one `Diagnostic` event exactly as on the
+///   line path (a terminal has no stderr: the only such frame is the
+///   supervisor's own synthetic `stdin write failed`);
+/// - a `State` frame first finishes the normalizer (a sequence still open
+///   is malformed and reported as drops), then becomes the `state` frame.
+///
+/// The raw frame's `dropped_before` (summed with whatever earlier frames
+/// left pending) rides on the first wire frame produced, `0` on the rest.
+fn pty_wire_frames(
+    forwarder: &mut PtyForwarder,
+    sequencer: &mut AdapterWireSequencer,
+    frame: OutputFrame,
+) -> Vec<HarnessFrame> {
+    forwarder.pending_dropped_before = forwarder
+        .pending_dropped_before
+        .saturating_add(frame.dropped_before);
+
+    let (chunks, terminal) = match frame.payload {
+        omnifrons_app::FramePayload::Text {
+            stream: omnifrons_app::OutputStream::Stdout,
+            text,
+            continued,
+        } => {
+            let mut bytes = text.into_bytes();
+            if !continued {
+                bytes.push(b'\n');
+            }
+            (forwarder.normalizer.push(&bytes), None)
+        }
+        omnifrons_app::FramePayload::Text {
+            stream: omnifrons_app::OutputStream::Stderr,
+            text,
+            continued: _,
+        } => {
+            let dropped_before = forwarder.take_dropped_before();
+            return vec![sequencer.event(dropped_before, AdapterEvent::Diagnostic { text })];
+        }
+        omnifrons_app::FramePayload::State(state) => (forwarder.normalizer.finish(), Some(state)),
+    };
+
+    let mut events: Vec<AdapterEvent> = Vec::new();
+    for chunk in chunks {
+        match chunk {
+            TerminalChunk::Text(text) => match events.last_mut() {
+                Some(AdapterEvent::TerminalText { text: previous }) => previous.push_str(&text),
+                _ => events.push(AdapterEvent::TerminalText { text }),
+            },
+            TerminalChunk::Action(action) => events.push(AdapterEvent::TerminalAction(action)),
+        }
+    }
+    let drops = forwarder.normalizer.take_drops();
+    if !drops.is_zero() {
+        events.push(AdapterEvent::TerminalDrops(drops));
+    }
+
+    let mut frames: Vec<HarnessFrame> = events
+        .into_iter()
+        .map(|event| {
+            let dropped_before = forwarder.take_dropped_before();
+            sequencer.event(dropped_before, event)
+        })
+        .collect();
+    if let Some(state) = terminal {
+        let dropped_before = forwarder.take_dropped_before();
+        frames.push(sequencer.state(dropped_before, state));
+    }
+    frames
 }
 
 /// The shell's own `seq` for one adapter launch's wire frames: a
@@ -589,6 +754,7 @@ fn default_approved_plan() -> Result<LaunchPlan, ShellError> {
         stdin: StdinPlan::Null,
         prompt: None,
         scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::StructuredStreamingCli,
     })
 }
 
@@ -965,7 +1131,10 @@ pub async fn harness_observe(
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterWireSequencer, ShellError, adapter_wire_frames, find_candidate};
+    use super::{
+        AdapterWireSequencer, PtyForwarder, ShellError, adapter_wire_frames, find_candidate,
+        pty_wire_frames,
+    };
     use crate::executable_state::CandidateTable;
     use crate::ipc::dto::{CandidateIdDto, HarnessFrame, ProcessIdDto, ShellErrorCode};
     use omnifrons_app::{EnvPlan, LineAssembler, StdinPlan, SupervisorError};
@@ -1027,6 +1196,82 @@ mod tests {
     fn too_many_processes_maps_to_its_own_code() {
         let mapped = ShellError::from(SupervisorError::TooManyProcesses);
         assert_eq!(mapped.code, ShellErrorCode::TooManyProcesses);
+    }
+
+    /// Slice 4: the typed Windows refusal of a PTY launch maps to its own
+    /// closed code with a fixed, slash-free catalogue message.
+    #[test]
+    fn pty_unsupported_maps_to_its_own_code() {
+        let mapped = ShellError::from(SupervisorError::PtyUnsupported);
+        assert_eq!(mapped.code, ShellErrorCode::PtyUnsupported);
+        assert!(!mapped.message.contains('/'));
+    }
+
+    /// A `pty-cli` prompt the line discipline would interpret maps to its
+    /// own closed code with a fixed, slash-free catalogue message.
+    #[test]
+    fn prompt_not_typeable_maps_to_its_own_code() {
+        let mapped = ShellError::from(omnifrons_app::LaunchPlanError::PromptNotTypeable);
+        assert_eq!(mapped.code, ShellErrorCode::PromptNotTypeable);
+        assert_eq!(
+            mapped.message,
+            "prompt contains control characters a terminal would interpret"
+        );
+        assert!(!mapped.message.contains('/'));
+    }
+
+    /// The live forwarder branches on the adapter's transport class alone:
+    /// `pty` takes the PTY branch, the structured transport the line
+    /// branch.
+    #[test]
+    fn forwarder_kind_follows_the_transport_class() {
+        use omnifrons_domain::adapter::TransportClass;
+        assert_eq!(
+            super::forwarder_for(TransportClass::Pty),
+            super::ForwarderKind::Pty
+        );
+        assert_eq!(
+            super::forwarder_for(TransportClass::StructuredStreamingCli),
+            super::ForwarderKind::Line
+        );
+    }
+
+    /// The catalog the live forwarder consults yields the expected
+    /// transport class for each built-in id, so a `pty-cli` launch takes
+    /// the PTY branch and a `stream-json-cli` launch the line branch.
+    #[test]
+    fn catalog_lookup_yields_the_expected_transport_class_per_adapter_id() {
+        use omnifrons_domain::adapter::{AdapterId, TransportClass};
+        let state = crate::adapter_state::AdapterState::new();
+        for (id, transport, kind) in [
+            (
+                AdapterId::pty_cli(),
+                TransportClass::Pty,
+                super::ForwarderKind::Pty,
+            ),
+            (
+                AdapterId::stream_json_cli(),
+                TransportClass::StructuredStreamingCli,
+                super::ForwarderKind::Line,
+            ),
+            (
+                AdapterId::claude_code(),
+                TransportClass::StructuredStreamingCli,
+                super::ForwarderKind::Line,
+            ),
+        ] {
+            let descriptor = state
+                .catalog
+                .get(&id)
+                .unwrap_or_else(|| panic!("{id} must be in the catalog"))
+                .describe();
+            assert_eq!(descriptor.transport_class, transport, "for {id}");
+            assert_eq!(
+                super::forwarder_for(descriptor.transport_class),
+                kind,
+                "for {id}"
+            );
+        }
     }
 
     #[test]
@@ -1119,6 +1364,7 @@ mod tests {
                 stdin: omnifrons_app::StdinPlan::PipePromptThenClose,
                 prompt: Some(request.prompt.clone()),
                 scope_mode: omnifrons_domain::scope::ScopeMode::Advisory,
+                transport: omnifrons_domain::adapter::TransportClass::StructuredStreamingCli,
             })
         }
 
@@ -1197,6 +1443,9 @@ mod tests {
                     AdapterEventDto::ToolCall { .. } => "tool-call",
                     AdapterEventDto::Diagnostic { .. } => "diagnostic",
                     AdapterEventDto::Unknown { .. } => "unknown",
+                    AdapterEventDto::TerminalText { .. } => "terminal-text",
+                    AdapterEventDto::TerminalAction { .. } => "terminal-action",
+                    AdapterEventDto::TerminalDrops { .. } => "terminal-drops",
                 };
                 (*seq, *dropped_before, kind)
             }
@@ -1319,6 +1568,277 @@ mod tests {
             }
             other => panic!("expected the flushed partial line, got {other:?}"),
         }
+    }
+
+    // -- Slice 4: the PTY forwarder's pure frame mapping --
+
+    /// Simulate the supervisor's own line framing over `bytes` -- one raw
+    /// `stdout` frame per line, a `\r` immediately before the `\n`
+    /// stripped, a final unterminated line still delivered -- so the
+    /// forwarder is driven exactly as it is by a real PTY launch (no
+    /// corpus line reaches the 8 KiB cap, so nothing is `continued`).
+    fn framed_lines(bytes: &[u8]) -> Vec<omnifrons_app::OutputFrame> {
+        let mut frames = Vec::new();
+        let mut seq = 0;
+        let mut push = |line: &[u8]| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            frames.push(stdout_frame(seq, 0, &String::from_utf8_lossy(line), false));
+            seq += 1;
+        };
+        let mut rest = bytes;
+        while let Some(index) = rest.iter().position(|&b| b == b'\n') {
+            push(&rest[..index]);
+            rest = &rest[index + 1..];
+        }
+        if !rest.is_empty() {
+            push(rest);
+        }
+        frames
+    }
+
+    /// The `(kind, payload)` of every emitted `event` frame plus the
+    /// terminal `state`, as JSON, for exact sequence assertions.
+    fn pty_kinds(frames: &[HarnessFrame]) -> Vec<&'static str> {
+        frames.iter().map(|frame| summarize(frame).2).collect()
+    }
+
+    fn terminal_texts(frames: &[HarnessFrame]) -> String {
+        use crate::ipc::dto::AdapterEventDto;
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                HarnessFrame::Event {
+                    event: AdapterEventDto::TerminalText { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn terminal_actions(frames: &[HarnessFrame]) -> Vec<(String, String)> {
+        use crate::ipc::dto::AdapterEventDto;
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                HarnessFrame::Event {
+                    event: AdapterEventDto::TerminalAction { action, text },
+                    ..
+                } => Some((
+                    serde_json::to_value(action)
+                        .expect("serializes")
+                        .as_str()
+                        .expect("a string token")
+                        .to_string(),
+                    text.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn summed_drops(frames: &[HarnessFrame]) -> omnifrons_domain::terminal::DropCounts {
+        use crate::ipc::dto::AdapterEventDto;
+        let mut total = omnifrons_domain::terminal::DropCounts::default();
+        for frame in frames {
+            if let HarnessFrame::Event {
+                event:
+                    AdapterEventDto::TerminalDrops {
+                        layout,
+                        hyperlink,
+                        clipboard,
+                        file_transfer,
+                        string,
+                        unknown,
+                        malformed,
+                    },
+                ..
+            } = frame
+            {
+                total += omnifrons_domain::terminal::DropCounts {
+                    layout: *layout,
+                    hyperlink: *hyperlink,
+                    clipboard: *clipboard,
+                    file_transfer: *file_transfer,
+                    string: *string,
+                    unknown: *unknown,
+                    malformed: *malformed,
+                };
+            }
+        }
+        total
+    }
+
+    /// The shared corpus, framed as the supervisor frames a PTY launch's
+    /// output and driven through the forwarder, yields exactly the
+    /// expected text (CRLF normalized by the framing, plus the newline the
+    /// forwarder appends after the trailing bare ESC), exactly the expected
+    /// actions in order, exactly the expected drop totals, a contiguous
+    /// per-launch `seq`, and never the clipboard sentinel anywhere in the
+    /// serialized wire frames.
+    #[test]
+    fn pty_forwarder_maps_the_corpus_to_the_expected_chunks_actions_and_drops() {
+        use omnifrons_app::terminal_normalizer::corpus;
+        let mut forwarder = PtyForwarder::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let mut emitted = Vec::new();
+        for frame in framed_lines(&corpus::bytes()) {
+            emitted.extend(pty_wire_frames(&mut forwarder, &mut sequencer, frame));
+        }
+        emitted.extend(pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            state_frame(999, 0),
+        ));
+
+        let mut expected_text = corpus::expected_text().replace("\r\n", "\n");
+        expected_text.push('\n');
+        assert_eq!(terminal_texts(&emitted), expected_text);
+
+        let expected_actions: Vec<(String, String)> = corpus::expected_actions()
+            .into_iter()
+            .map(|action| match action {
+                omnifrons_domain::terminal::TerminalAction::Title(text) => {
+                    ("title".to_string(), text)
+                }
+                omnifrons_domain::terminal::TerminalAction::Notification(text) => {
+                    ("notification".to_string(), text)
+                }
+            })
+            .collect();
+        assert_eq!(terminal_actions(&emitted), expected_actions);
+
+        assert_eq!(summed_drops(&emitted), corpus::expected_drops());
+
+        let seqs: Vec<u64> = emitted.iter().map(|frame| summarize(frame).0).collect();
+        assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+        assert_eq!(pty_kinds(&emitted).last(), Some(&"terminal"));
+
+        let wire = serde_json::to_string(&emitted).expect("frames serialize");
+        assert!(!wire.contains(corpus::CLIPBOARD_SENTINEL));
+        assert!(!wire.contains('\u{1b}'));
+        assert!(!wire.contains("example.invalid"));
+    }
+
+    /// One raw frame yields, in order: its text (adjacent text chunks
+    /// coalesced into one `terminal-text`), each action where it occurred,
+    /// and at most one `terminal-drops` -- only when the counts changed.
+    #[test]
+    fn pty_forwarder_emits_text_then_actions_then_at_most_one_drops_per_raw_frame() {
+        let mut forwarder = PtyForwarder::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let plain = pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            stdout_frame(0, 0, "plain", false),
+        );
+        assert_eq!(pty_kinds(&plain), vec!["terminal-text"]);
+        assert_eq!(terminal_texts(&plain), "plain\n");
+
+        let mixed = pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            stdout_frame(1, 0, "a\x1b[1mb\x1b]0;t\x07c\x1b]8;;x\x07d", false),
+        );
+        assert_eq!(
+            pty_kinds(&mixed),
+            vec![
+                "terminal-text",
+                "terminal-action",
+                "terminal-text",
+                "terminal-drops"
+            ]
+        );
+        assert_eq!(terminal_texts(&mixed), "abcd\n");
+        assert_eq!(
+            summed_drops(&mixed),
+            omnifrons_domain::terminal::DropCounts {
+                layout: 1,
+                hyperlink: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// `droppedBefore` rides on the first wire frame a raw frame produces,
+    /// `0` on the rest; a raw frame that produces no wire frame at all (an
+    /// escape sequence still being collected) carries its count forward to
+    /// the next wire frame, never losing it.
+    #[test]
+    fn pty_forwarder_carries_dropped_before_onto_the_first_wire_frame_and_across_silent_frames() {
+        let mut forwarder = PtyForwarder::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        // A frame that only opens an OSC (the newline the forwarder appends
+        // aborts it -- but drops are reported, so this frame is not silent;
+        // use a continued frame to keep the sequence open).
+        let silent = pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            stdout_frame(0, 3, "\x1b]0;pending", true),
+        );
+        assert!(silent.is_empty(), "nothing completes yet, got {silent:?}");
+
+        let completed = pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            stdout_frame(1, 4, " title\x07after", false),
+        );
+        let summary: Vec<_> = completed.iter().map(summarize).collect();
+        assert_eq!(
+            summary,
+            vec![(0, 7, "terminal-action"), (1, 0, "terminal-text")],
+            "the summed count lands on the first wire frame only"
+        );
+    }
+
+    /// A `State` frame first finishes the normalizer (a sequence still
+    /// open is malformed and reported as drops) and then becomes the
+    /// terminal `state` frame -- always last.
+    #[test]
+    fn pty_forwarder_finishes_the_normalizer_before_the_state_frame() {
+        let mut forwarder = PtyForwarder::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let pending = pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            stdout_frame(0, 0, "tail\x1b]0;never terminated", true),
+        );
+        assert_eq!(pty_kinds(&pending), vec!["terminal-text"]);
+        assert_eq!(terminal_texts(&pending), "tail");
+
+        let ended = pty_wire_frames(&mut forwarder, &mut sequencer, state_frame(1, 5));
+        let summary: Vec<_> = ended.iter().map(summarize).collect();
+        assert_eq!(summary, vec![(1, 5, "terminal-drops"), (2, 0, "terminal")]);
+        assert_eq!(
+            summed_drops(&ended),
+            omnifrons_domain::terminal::DropCounts {
+                malformed: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// The supervisor's synthetic `stderr` frame (`stdin write failed`) on
+    /// the PTY path maps to a `diagnostic` event exactly as on the line
+    /// path: a terminal has no stderr, so this is the only stderr text a
+    /// PTY launch can ever carry.
+    #[test]
+    fn pty_forwarder_maps_a_stderr_frame_to_a_diagnostic_event() {
+        let mut forwarder = PtyForwarder::new();
+        let mut sequencer = AdapterWireSequencer::new(ProcessIdDto(7));
+        let emitted = pty_wire_frames(
+            &mut forwarder,
+            &mut sequencer,
+            stderr_frame(0, 1, "stdin write failed"),
+        );
+        assert_eq!(
+            emitted.iter().map(summarize).collect::<Vec<_>>(),
+            vec![(0, 1, "diagnostic")]
+        );
     }
 
     #[test]

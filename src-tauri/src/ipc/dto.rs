@@ -102,11 +102,14 @@ impl From<omnifrons_domain::adapter::TransportClass> for TransportClassDto {
 }
 
 /// [`omnifrons_domain::adapter::PromptChannel`], as it crosses IPC.
+/// `pty-typed` (spike slice 4) is the `pty-cli` adapter's channel: the
+/// prompt is typed into the child's controlling terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptChannelDto {
     StdinThenClose,
     Argv,
+    PtyTyped,
 }
 
 impl From<omnifrons_domain::adapter::PromptChannel> for PromptChannelDto {
@@ -114,6 +117,7 @@ impl From<omnifrons_domain::adapter::PromptChannel> for PromptChannelDto {
         match value {
             omnifrons_domain::adapter::PromptChannel::StdinThenClose => Self::StdinThenClose,
             omnifrons_domain::adapter::PromptChannel::Argv => Self::Argv,
+            omnifrons_domain::adapter::PromptChannel::PtyTyped => Self::PtyTyped,
         }
     }
 }
@@ -283,6 +287,16 @@ pub struct ObservationDto {
     pub value: String,
 }
 
+/// The closed set of typed terminal actions a PTY launch's output may
+/// produce (spike slice 4): the only two sequence families RCS-001's
+/// terminal policy turns into a value, both already sanitized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalActionKindDto {
+    Title,
+    Notification,
+}
+
 /// [`omnifrons_domain::adapter::AdapterEvent`], as it crosses IPC.
 /// Adjacently tagged (`kind` + `payload`), matching
 /// [`HarnessFrame`]'s own outer `stream`/`body` shape one level down: the
@@ -295,6 +309,13 @@ pub struct ObservationDto {
 /// line, or `LineAssembler`'s own buffer of concatenated valid-UTF-8
 /// frames) -- lossy decoding is a defensive fallback, not the expected
 /// path (`docs/spike-log.md` § Slice 3).
+///
+/// The three `terminal-*` kinds (spike slice 4) are proposed AEC-001 kinds
+/// for a PTY launch, emitted only by the shell's PTY forwarder: normalized
+/// plain text (newlines kept), a sanitized title/notification shown as
+/// text only, and the per-family counts of dropped sequences since the
+/// previous `terminal-drops` of the same launch (`docs/spike-log.md` §
+/// Slice 4).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -321,6 +342,22 @@ pub enum AdapterEventDto {
     Unknown {
         raw: String,
         truncated: bool,
+    },
+    TerminalText {
+        text: String,
+    },
+    TerminalAction {
+        action: TerminalActionKindDto,
+        text: String,
+    },
+    TerminalDrops {
+        layout: u64,
+        hyperlink: u64,
+        clipboard: u64,
+        file_transfer: u64,
+        string: u64,
+        unknown: u64,
+        malformed: u64,
     },
 }
 
@@ -356,6 +393,26 @@ impl AdapterEventDto {
             AdapterEvent::Unknown { raw, truncated } => Self::Unknown {
                 raw: String::from_utf8_lossy(&raw).into_owned(),
                 truncated,
+            },
+            AdapterEvent::TerminalText { text } => Self::TerminalText { text },
+            AdapterEvent::TerminalAction(action) => {
+                use omnifrons_domain::terminal::TerminalAction;
+                let (action, text) = match action {
+                    TerminalAction::Title(text) => (TerminalActionKindDto::Title, text),
+                    TerminalAction::Notification(text) => {
+                        (TerminalActionKindDto::Notification, text)
+                    }
+                };
+                Self::TerminalAction { action, text }
+            }
+            AdapterEvent::TerminalDrops(counts) => Self::TerminalDrops {
+                layout: counts.layout,
+                hyperlink: counts.hyperlink,
+                clipboard: counts.clipboard,
+                file_transfer: counts.file_transfer,
+                string: counts.string,
+                unknown: counts.unknown,
+                malformed: counts.malformed,
             },
         }
     }
@@ -519,6 +576,15 @@ pub enum ShellErrorCode {
     /// `workspace_pick`'s folder dialog was canceled (no folder was
     /// selected).
     NoWorkspace,
+    /// `harness_spawn`'s `kind: "adapter"` named the `pty-cli` adapter on
+    /// a platform where this slice implements no pseudo-terminal launch
+    /// (Windows; spike slice 4). Nothing was spawned.
+    PtyUnsupported,
+    /// A `pty-cli` launch's prompt contains control characters the
+    /// terminal's line discipline would interpret rather than type (a C0
+    /// control other than newline and tab, or DEL); refused at
+    /// plan-building time, nothing was spawned (spike slice 4).
+    PromptNotTypeable,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -1319,6 +1385,176 @@ mod tests {
             json(&frame)["body"]["payload"],
             serde_json::json!({"raw": "not json", "truncated": true})
         );
+    }
+
+    // -- Slice 4: the pty-cli descriptor, the three terminal event kinds,
+    // and the pty-unsupported error code --
+
+    #[test]
+    fn prompt_channel_dto_pty_typed_and_transport_pty_serialize_as_kebab_case() {
+        let dto = AdapterDescriptorDto {
+            id: "pty-cli".to_string(),
+            display_name: "PTY CLI".to_string(),
+            transport_class: TransportClassDto::Pty,
+            prompt_channel: PromptChannelDto::PtyTyped,
+            scope_mode: ScopeModeDto::Advisory,
+            notes: "degraded fallback".to_string(),
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "id": "pty-cli",
+                "displayName": "PTY CLI",
+                "transportClass": "pty",
+                "promptChannel": "pty-typed",
+                "scopeMode": "advisory",
+                "notes": "degraded fallback",
+            })
+        );
+    }
+
+    /// Proposed AEC-001 kind `terminal-text`: the normalized text, newlines
+    /// included.
+    #[test]
+    fn harness_frame_event_terminal_text_json_shape() {
+        let frame = HarnessFrame::event(
+            ProcessIdDto(42),
+            8,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::TerminalText {
+                text: "hello\n".to_string(),
+            },
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 8, "droppedBefore": 0,
+                    "kind": "terminal-text", "payload": {"text": "hello\n"}
+                }
+            })
+        );
+    }
+
+    /// Proposed AEC-001 kind `terminal-action`: `action` is one of the two
+    /// closed tokens, `text` the already-sanitized text.
+    #[test]
+    fn harness_frame_event_terminal_action_json_shapes() {
+        use omnifrons_domain::terminal::TerminalAction;
+        let title = HarnessFrame::event(
+            ProcessIdDto(42),
+            9,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::TerminalAction(TerminalAction::Title(
+                "build ok".to_string(),
+            )),
+        );
+        assert_eq!(
+            json(&title)["body"],
+            serde_json::json!({
+                "id": 42, "seq": 9, "droppedBefore": 0,
+                "kind": "terminal-action", "payload": {"action": "title", "text": "build ok"}
+            })
+        );
+        let notification = HarnessFrame::event(
+            ProcessIdDto(42),
+            10,
+            2,
+            omnifrons_domain::adapter::AdapterEvent::TerminalAction(TerminalAction::Notification(
+                "done".to_string(),
+            )),
+        );
+        assert_eq!(
+            json(&notification)["body"],
+            serde_json::json!({
+                "id": 42, "seq": 10, "droppedBefore": 2,
+                "kind": "terminal-action", "payload": {"action": "notification", "text": "done"}
+            })
+        );
+    }
+
+    /// Proposed AEC-001 kind `terminal-drops`: the seven per-family counts,
+    /// camelCase on the wire.
+    #[test]
+    fn harness_frame_event_terminal_drops_json_shape() {
+        let frame = HarnessFrame::event(
+            ProcessIdDto(42),
+            11,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::TerminalDrops(
+                omnifrons_domain::terminal::DropCounts {
+                    layout: 21,
+                    hyperlink: 2,
+                    clipboard: 2,
+                    file_transfer: 3,
+                    string: 3,
+                    unknown: 1,
+                    malformed: 3,
+                },
+            ),
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 11, "droppedBefore": 0,
+                    "kind": "terminal-drops",
+                    "payload": {
+                        "layout": 21, "hyperlink": 2, "clipboard": 2, "fileTransfer": 3,
+                        "string": 3, "unknown": 1, "malformed": 3
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pty_unsupported_code_serializes_as_kebab_case_with_a_slash_free_message() {
+        let error = ShellError::new(
+            ShellErrorCode::PtyUnsupported,
+            "pseudo-terminal launches are not available on this platform",
+        );
+        assert_eq!(
+            json(&error),
+            serde_json::json!({
+                "code": "pty-unsupported",
+                "message": "pseudo-terminal launches are not available on this platform"
+            })
+        );
+        assert!(!error.message.contains('/'));
+    }
+
+    #[test]
+    fn prompt_not_typeable_code_serializes_as_kebab_case_with_a_slash_free_message() {
+        let error = ShellError::new(
+            ShellErrorCode::PromptNotTypeable,
+            "prompt contains control characters a terminal would interpret",
+        );
+        assert_eq!(
+            json(&error),
+            serde_json::json!({
+                "code": "prompt-not-typeable",
+                "message": "prompt contains control characters a terminal would interpret"
+            })
+        );
+        assert!(!error.message.contains('/'));
+    }
+
+    /// The two slice-4 error codes each render as their documented
+    /// kebab-case token: the closed set the renderer's `ShellErrorCode`
+    /// union mirrors.
+    #[test]
+    fn slice_4_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::PtyUnsupported, "pty-unsupported"),
+            (ShellErrorCode::PromptNotTypeable, "prompt-not-typeable"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+        }
     }
 
     /// The five new slice-3 error codes each render as their documented

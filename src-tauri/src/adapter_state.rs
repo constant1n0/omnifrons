@@ -1,6 +1,8 @@
 //! Managed state for the built-in harness adapter surface
-//! (`docs/spike-log.md` § Slice 3): the closed, built-in `AdapterCatalog`,
-//! and the single active workspace a caller has picked, if any.
+//! (`docs/spike-log.md` §§ Slice 3, Slice 4): the closed, built-in
+//! `AdapterCatalog` -- the two line agents plus the `pty-cli` fallback,
+//! exactly `omnifrons_adapters::catalog()` -- and the single active
+//! workspace a caller has picked, if any.
 
 use std::sync::Mutex;
 
@@ -22,7 +24,7 @@ impl AdapterState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            catalog: AdapterCatalog::new(omnifrons_adapters::line_agent::catalog()),
+            catalog: AdapterCatalog::new(omnifrons_adapters::catalog()),
             active_workspace: Mutex::new(None),
         }
     }
