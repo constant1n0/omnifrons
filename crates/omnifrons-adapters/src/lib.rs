@@ -27,7 +27,21 @@
 pub mod fs_prober;
 pub mod jsonl_approval_store;
 pub mod line_agent;
+pub mod pty_cli;
 
 pub use fs_prober::FsExecutableProber;
 pub use jsonl_approval_store::JsonlApprovalStore;
 pub use line_agent::LineAgent;
+pub use omnifrons_app::harness_adapter::HarnessAdapter;
+pub use pty_cli::PtyCli;
+
+/// Every built-in adapter this crate provides: the two `stream-json`-shaped
+/// line agents (`line_agent::catalog`, spike slice 3) plus the
+/// pseudo-terminal fallback (`PtyCli`, spike slice 4). The shell builds its
+/// closed `AdapterCatalog` from exactly this list.
+#[must_use]
+pub fn catalog() -> Vec<Box<dyn HarnessAdapter + Send + Sync>> {
+    let mut adapters = line_agent::catalog();
+    adapters.push(Box::new(PtyCli::new()));
+    adapters
+}

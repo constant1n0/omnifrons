@@ -89,6 +89,11 @@ impl HarnessAdapter for LineAgent {
             stdin: StdinPlan::PipePromptThenClose,
             prompt: Some(request.prompt.clone()),
             scope_mode: self.descriptor.scope_mode,
+            // A line agent is a pipe-and-parser adapter by construction,
+            // whatever its descriptor says: the supervisor branches on
+            // this field to pick the pipe wiring (`docs/spike-log.md` §
+            // Slice 4).
+            transport: TransportClass::StructuredStreamingCli,
         })
     }
 
