@@ -56,9 +56,11 @@ use crate::ipc::dto::{
     AdapterDescriptorDto, AdapterEventDto, ApprovalDto, CandidateDto, CandidateIdDto, EvidenceDto,
     HarnessFrame, HarnessKindDto, OutboxReasonTag, OutboxStateTag, OutboxStatusDto, ProbeResultDto,
     ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto, ShellError, ShellErrorCode,
-    ShellErrorDetail, WorkspaceDto,
+    ShellErrorDetail, WorkAreaStateTag, WorkspaceDto,
 };
 use crate::outbox_state::{MAX_PROPOSED_ENTRIES, OutboxState, RunRecord, RunTable};
+use crate::publication_state::PublicationState;
+use omnifrons_app::work_area::WorkAreaRoot;
 
 impl From<SupervisorError> for ShellError {
     /// Maps every `SupervisorError` to a fixed catalogue message. Never
@@ -139,7 +141,7 @@ impl From<DenialReason> for ShellError {
             DenialReason::ChangedSinceApproval { recorded, observed } => Self::with_detail(
                 ShellErrorCode::ChangedSinceApproval,
                 "the executable's content has changed since it was approved",
-                ShellErrorDetail {
+                ShellErrorDetail::ChangedSinceApproval {
                     recorded_sha256_short: recorded.short_hex(),
                     observed_sha256_short: observed.short_hex(),
                 },
@@ -1165,11 +1167,22 @@ async fn spawn_adapter_harness(
     .await?;
 
     let id = launched.id;
+    // The record keeps the launch's provenance -- the adapter and the
+    // executable approval that governed it -- for the Catalog record of an
+    // attributed entry (HAP-001-R11, R36; spike slice 5b).
     app.state::<OutboxState>()
         .runs
         .lock()
         .expect("run table mutex poisoned by a prior panic")
-        .insert(id, RunRecord::new(launched.subdirectory, launched.policy));
+        .insert(
+            id,
+            RunRecord::with_provenance(
+                launched.subdirectory,
+                launched.policy,
+                Some(adapter_id.clone()),
+                Some(approval_id),
+            ),
+        );
 
     forward_adapter_output(id, adapter_id, receiver, on_frame, app);
     Ok(ProcessIdDto::from(id))
@@ -1275,10 +1288,14 @@ fn outbox_status_for(project: &WorkspaceRoot, store: JsonOutboxPolicyStore) -> O
                     | PolicyError::TooLarge => OutboxReasonTag::PolicyInvalid,
                 }),
                 policy_path,
+                asset_root_id: None,
             };
         }
     };
     let declared = Some(policy.outbox().to_string());
+    // The destination shown before the decision (HAP-001-R22): the asset
+    // root identity token, never a path.
+    let asset_root_id = policy.asset_root_id().map(|id| id.as_str().to_string());
     match validate_outbox_declaration(project, policy.outbox()) {
         Ok(OutboxLocation::Present(canonical)) => OutboxStatusDto {
             declared,
@@ -1287,6 +1304,7 @@ fn outbox_status_for(project: &WorkspaceRoot, store: JsonOutboxPolicyStore) -> O
             state: OutboxStateTag::Valid,
             reason: None,
             policy_path,
+            asset_root_id,
         },
         Ok(OutboxLocation::Missing(_)) => OutboxStatusDto {
             declared,
@@ -1295,6 +1313,7 @@ fn outbox_status_for(project: &WorkspaceRoot, store: JsonOutboxPolicyStore) -> O
             state: OutboxStateTag::Valid,
             reason: None,
             policy_path,
+            asset_root_id,
         },
         Err(error) => OutboxStatusDto {
             declared,
@@ -1311,6 +1330,7 @@ fn outbox_status_for(project: &WorkspaceRoot, store: JsonOutboxPolicyStore) -> O
                 OutboxDeclarationError::Unreadable => OutboxReasonTag::Unreadable,
             }),
             policy_path,
+            asset_root_id,
         },
     }
 }
@@ -1418,7 +1438,7 @@ fn candidates_for_run(table: &RunTable, token: &str) -> Result<Vec<CandidateDto>
 }
 
 /// The active workspace, or `workspace-unavailable`.
-fn active_workspace(app: &AppHandle) -> Result<WorkspaceRoot, ShellError> {
+pub(crate) fn active_workspace(app: &AppHandle) -> Result<WorkspaceRoot, ShellError> {
     app.state::<AdapterState>()
         .active_workspace
         .lock()
@@ -1716,8 +1736,28 @@ pub async fn workspace_pick(app: AppHandle) -> Result<WorkspaceDto, ShellError> 
     Ok(activate_workspace(
         &app.state::<AdapterState>(),
         &app.state::<OutboxState>(),
+        &app.state::<PublicationState>(),
         workspace,
     ))
+}
+
+/// The product work area's state against `workspace` (HAP-001-R7): checked
+/// without creating anything, on every registration and on every
+/// `workspace_current` read.
+pub(crate) fn work_area_state(
+    publication: &PublicationState,
+    workspace: &WorkspaceRoot,
+) -> WorkAreaStateTag {
+    match WorkAreaRoot::check_configured(&publication.work_area, &[workspace]) {
+        Ok(()) => WorkAreaStateTag::Valid,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "the product work area fails its check against the active workspace"
+            );
+            WorkAreaStateTag::WorkAreaInvalid
+        }
+    }
 }
 
 /// Make `workspace` the single active workspace. When it differs from the
@@ -1726,13 +1766,17 @@ pub async fn workspace_pick(app: AppHandle) -> Result<WorkspaceDto, ShellError> 
 /// outbox run table is per active workspace within a shell session, so one
 /// project's runs never count against the next project's handle and
 /// record budget. Picking the workspace that is already active keeps its
-/// runs.
+/// runs. The product work area is re-checked against the workspace being
+/// registered (HAP-001-R7; spike slice 5b) and the outcome rides the DTO:
+/// the registration itself proceeds -- the operation R7 refuses is the
+/// work area's use, and every publication command re-checks it again.
 fn activate_workspace(
     adapter_state: &AdapterState,
     outbox_state: &OutboxState,
+    publication_state: &PublicationState,
     workspace: WorkspaceRoot,
 ) -> WorkspaceDto {
-    let dto = WorkspaceDto::from_workspace(&workspace);
+    let dto = WorkspaceDto::new(&workspace, work_area_state(publication_state, &workspace));
     let mut slot = adapter_state
         .active_workspace
         .lock()
@@ -1758,12 +1802,13 @@ fn activate_workspace(
 #[tauri::command]
 pub fn workspace_current(app: AppHandle) -> Option<WorkspaceDto> {
     let state = app.state::<AdapterState>();
+    let publication = app.state::<PublicationState>();
     state
         .active_workspace
         .lock()
         .expect("active workspace mutex poisoned by a prior panic")
         .as_ref()
-        .map(WorkspaceDto::from_workspace)
+        .map(|workspace| WorkspaceDto::new(workspace, work_area_state(&publication, workspace)))
 }
 
 /// List every built-in adapter's descriptor -- metadata only, never argv
@@ -1835,7 +1880,9 @@ mod tests {
         pty_wire_frames,
     };
     use crate::executable_state::CandidateTable;
-    use crate::ipc::dto::{CandidateIdDto, HarnessFrame, ProcessIdDto, ShellErrorCode};
+    use crate::ipc::dto::{
+        CandidateIdDto, HarnessFrame, ProcessIdDto, ShellErrorCode, ShellErrorDetail,
+    };
     use omnifrons_app::{EnvPlan, LineAssembler, StdinPlan, SupervisorError};
 
     /// R1-001: a `kind: "approved"` launch must never inherit this shell's
@@ -2693,6 +2740,37 @@ mod tests {
         assert!(status.outbox.is_none());
     }
 
+    /// R1-002 (renderer risk review; HAP-001-R22): `outbox_status` carries
+    /// the policy's asset root identity -- the destination shown before the
+    /// decision -- as a token, never a path, and `null` when the policy
+    /// declares none or cannot be loaded.
+    #[test]
+    fn outbox_status_reports_the_policys_asset_root_identity() {
+        let project = TempProject::new("status-asset-root");
+        let store = omnifrons_adapters::JsonOutboxPolicyStore::new();
+        let status = super::outbox_status_for(&project.workspace(), store);
+        assert_eq!(
+            status.asset_root_id, None,
+            "the default policy declares none"
+        );
+
+        let policy_path = project
+            .0
+            .join(omnifrons_app::outbox_policy::POLICY_FILE_PATH);
+        std::fs::create_dir_all(policy_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&policy_path, r#"{"schema": 1, "assetRootId": "main"}"#).expect("policy");
+        let status = super::outbox_status_for(&project.workspace(), store);
+        assert_eq!(status.asset_root_id.as_deref(), Some("main"));
+        assert_eq!(status.state, crate::ipc::dto::OutboxStateTag::Valid);
+
+        std::fs::write(&policy_path, "not json").expect("corrupt the policy");
+        let status = super::outbox_status_for(&project.workspace(), store);
+        assert_eq!(
+            status.asset_root_id, None,
+            "a policy that cannot be loaded declares nothing"
+        );
+    }
+
     /// Write `content` as `name` inside `dir` and return its digest as the
     /// prober computes it -- the shell has no hashing dependency of its
     /// own, and the prober is what the inventory uses anyway.
@@ -2736,9 +2814,11 @@ mod tests {
         let mut table = crate::outbox_state::RunTable::default();
         table.insert(
             id,
-            crate::outbox_state::RunRecord::new(
+            crate::outbox_state::RunRecord::with_provenance(
                 prepared,
                 omnifrons_app::outbox_policy::OutboxPolicy::default_policy(),
+                None,
+                None,
             ),
         );
         (std::sync::Arc::new(std::sync::Mutex::new(table)), path)
@@ -3074,8 +3154,13 @@ mod tests {
         let detail = mapped
             .detail
             .expect("changed-since-approval must carry a structured detail");
-        assert_eq!(detail.recorded_sha256_short, recorded.short_hex());
-        assert_eq!(detail.observed_sha256_short, observed.short_hex());
+        assert_eq!(
+            detail,
+            ShellErrorDetail::ChangedSinceApproval {
+                recorded_sha256_short: recorded.short_hex(),
+                observed_sha256_short: observed.short_hex(),
+            }
+        );
     }
 
     // -- Review fixes: the project-wide handle cap (R1-001), the extracted
@@ -3102,9 +3187,11 @@ mod tests {
         let clone = prepared.try_clone().expect("clone the held handle");
         runs.lock().expect("table").insert(
             id,
-            crate::outbox_state::RunRecord::new(
+            crate::outbox_state::RunRecord::with_provenance(
                 prepared,
                 omnifrons_app::outbox_policy::OutboxPolicy::default_policy(),
+                None,
+                None,
             ),
         );
         clone
@@ -3565,10 +3652,17 @@ mod tests {
     fn picking_a_different_workspace_forgets_the_previous_workspaces_runs() {
         let project_a = TempProject::new("activate-a");
         let project_b = TempProject::new("activate-b");
+        let device = TempProject::new("activate-device");
         let adapter_state = crate::adapter_state::AdapterState::new();
         let outbox_state = crate::outbox_state::OutboxState::new();
+        let publication_state = crate::publication_state::PublicationState::under(&device.0);
 
-        let dto = super::activate_workspace(&adapter_state, &outbox_state, project_a.workspace());
+        let dto = super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &publication_state,
+            project_a.workspace(),
+        );
         assert_eq!(
             dto.display_path,
             project_a.workspace().path().to_string_lossy()
@@ -3585,7 +3679,12 @@ mod tests {
         let _ = tracker_for(&outbox_state.runs, id).finish();
         assert_eq!(outbox_state.runs.lock().expect("table").held_handles(), 3);
 
-        super::activate_workspace(&adapter_state, &outbox_state, project_b.workspace());
+        super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &publication_state,
+            project_b.workspace(),
+        );
 
         let table = outbox_state.runs.lock().expect("table");
         assert_eq!(
@@ -3615,20 +3714,66 @@ mod tests {
     #[test]
     fn re_picking_the_active_workspace_keeps_its_runs() {
         let project = TempProject::new("activate-same");
+        let device = TempProject::new("activate-same-device");
         let adapter_state = crate::adapter_state::AdapterState::new();
         let outbox_state = crate::outbox_state::OutboxState::new();
-        super::activate_workspace(&adapter_state, &outbox_state, project.workspace());
+        let publication_state = crate::publication_state::PublicationState::under(&device.0);
+        super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &publication_state,
+            project.workspace(),
+        );
         let id = omnifrons_app::ProcessId(33);
         let handle = register_run(&outbox_state.runs, &project, id, "run-kept");
         write_and_digest(&handle, "kept.pdf", b"%PDF-1.7\nkept");
         let _ = tracker_for(&outbox_state.runs, id).finish();
         assert_eq!(outbox_state.runs.lock().expect("table").held_handles(), 1);
 
-        super::activate_workspace(&adapter_state, &outbox_state, project.workspace());
+        super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &publication_state,
+            project.workspace(),
+        );
 
         let table = outbox_state.runs.lock().expect("table");
         assert_eq!(table.held_handles(), 1, "a re-pick keeps the held handle");
         assert!(table.get(id).is_some(), "and the record");
+    }
+
+    /// R1-002 (HAP-001-R7 on every workspace registration): activating a
+    /// workspace re-checks the configured work area against it and reports
+    /// the outcome on the `WorkspaceDto`, so the next publication command
+    /// is not the first to notice; the check creates nothing.
+    #[test]
+    fn activating_a_workspace_over_the_work_area_reports_work_area_invalid() {
+        let project = TempProject::new("activate-work-area");
+        let device = TempProject::new("activate-work-area-device");
+        let adapter_state = crate::adapter_state::AdapterState::new();
+        let outbox_state = crate::outbox_state::OutboxState::new();
+
+        let inside =
+            crate::publication_state::PublicationState::under(&project.0.join(".omnifrons"));
+        let dto =
+            super::activate_workspace(&adapter_state, &outbox_state, &inside, project.workspace());
+        assert_eq!(
+            dto.work_area,
+            crate::ipc::dto::WorkAreaStateTag::WorkAreaInvalid
+        );
+        assert!(
+            !project.0.join(".omnifrons/work-area").exists(),
+            "the check creates nothing"
+        );
+
+        let outside = crate::publication_state::PublicationState::under(&device.0);
+        let dto =
+            super::activate_workspace(&adapter_state, &outbox_state, &outside, project.workspace());
+        assert_eq!(dto.work_area, crate::ipc::dto::WorkAreaStateTag::Valid);
+        assert!(
+            !device.0.join("work-area").exists(),
+            "a valid check creates nothing either"
+        );
     }
 
     /// R1-011: a run record evicted between the inventory's two phases --

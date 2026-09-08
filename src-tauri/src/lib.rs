@@ -10,6 +10,7 @@ mod executable_state;
 mod health;
 mod ipc;
 mod outbox_state;
+mod publication_state;
 
 use adapter_state::AdapterState;
 use executable_state::ExecutableState;
@@ -19,8 +20,10 @@ use ipc::commands::{
     executable_revoke, harness_observe, harness_spawn, harness_stop, outbox_status,
     workspace_current, workspace_pick,
 };
+use ipc::publication::{artifact_approve, artifact_publish, publications_list};
 use omnifrons_supervisor::TokioProcessSupervisor;
 use outbox_state::OutboxState;
+use publication_state::PublicationState;
 use tauri::Manager as _;
 
 /// Typed IPC command: the renderer's only way to read this shell's
@@ -75,6 +78,11 @@ pub fn run() {
             // print it any louder than that.
             let store_dir = app.path().app_local_data_dir()?;
             tracing::debug!(store_dir = %store_dir.display(), "opening the approval store");
+            // The publication surface's device paths -- the product work
+            // area and the asset roots -- sit under the same directory
+            // (HAP-001 D1, D8; `docs/spike-log.md` § Slice 5b) and are
+            // re-checked at every use, never opened here.
+            app.manage(PublicationState::under(&store_dir));
             app.manage(ExecutableState::open(store_dir)?);
 
             // The closed, built-in adapter catalog and the single active-
@@ -101,6 +109,9 @@ pub fn run() {
             adapters_list,
             outbox_status,
             candidates_list,
+            artifact_approve,
+            artifact_publish,
+            publications_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

@@ -71,15 +71,31 @@ pub enum HarnessKindDto {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceDto {
     pub display_path: String,
+    /// Whether the product work area still resolves outside this
+    /// workspace: re-checked on every workspace registration (HAP-001-R7;
+    /// spike slice 5b), so the next publication command is not the first
+    /// to notice a workspace registered over it.
+    pub work_area: WorkAreaStateTag,
 }
 
 impl WorkspaceDto {
     #[must_use]
-    pub fn from_workspace(workspace: &omnifrons_app::WorkspaceRoot) -> Self {
+    pub fn new(workspace: &omnifrons_app::WorkspaceRoot, work_area: WorkAreaStateTag) -> Self {
         Self {
             display_path: workspace.path().to_string_lossy().into_owned(),
+            work_area,
         }
     }
+}
+
+/// The product work area's state against the active workspace, as it
+/// crosses IPC (spike slice 5b): HAP-001's `work-area-invalid` token, or
+/// `valid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkAreaStateTag {
+    Valid,
+    WorkAreaInvalid,
 }
 
 /// [`omnifrons_domain::adapter::TransportClass`], as it crosses IPC.
@@ -634,6 +650,10 @@ pub struct OutboxStatusDto {
     pub state: OutboxStateTag,
     pub reason: Option<OutboxReasonTag>,
     pub policy_path: String,
+    /// The policy's asset root identity token (spike slice 5b): the
+    /// destination HAP-001-R22 shows before the decision, never a path;
+    /// `null` when the policy declares none or could not be loaded.
+    pub asset_root_id: Option<String>,
 }
 
 /// [`omnifrons_domain::outbox::CandidateState`], as it crosses IPC.
@@ -679,6 +699,13 @@ pub enum AttributionDto {
 pub struct CandidateDto {
     pub name: String,
     pub size: Option<u64>,
+    /// The full 64-hex content digest (spike slice 5b): the identity fact
+    /// `artifact_approve` names the candidate by, so an approval is made
+    /// from the row itself. Identity evidence, not a secret -- the
+    /// executable evidence (`EvidenceDto::sha256`) already carries its own
+    /// under the same TM-001-R7 display precedent -- and `null` for a
+    /// refused entry, where nothing was digested.
+    pub sha256: Option<String>,
     pub sha256_short: Option<String>,
     pub detected_type: Option<String>,
     pub class: Option<String>,
@@ -697,6 +724,7 @@ impl CandidateDto {
         Self {
             name: entry.name.clone(),
             size: digested.then_some(entry.size),
+            sha256: digested.then(|| entry.digest.to_hex()),
             sha256_short: digested.then(|| entry.digest.short_hex()),
             detected_type: digested.then(|| entry.detected_type.as_str().to_string()),
             class: digested.then(|| entry.class.as_str().to_string()),
@@ -707,6 +735,268 @@ impl CandidateDto {
                 Attribution::Unattributed => AttributionDto::Unattributed,
             },
             state: state.into(),
+        }
+    }
+}
+
+/// [`omnifrons_domain::publication::ArtifactState`], as it crosses IPC
+/// (spike slice 5b): the closed state tokens HAP-001's signal mapping
+/// spells, exactly (HAP-001-R26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactStateTag {
+    Candidate,
+    PublishedLocal,
+    Registered,
+    ProviderSynced,
+    RegistrationPending,
+    Refused,
+    IntegrityMismatch,
+    DuplicatePublication,
+    OutboxEscape,
+    OutboxLinked,
+}
+
+impl From<omnifrons_domain::publication::ArtifactState> for ArtifactStateTag {
+    fn from(state: omnifrons_domain::publication::ArtifactState) -> Self {
+        use omnifrons_domain::publication::ArtifactState;
+        match state {
+            ArtifactState::Candidate => Self::Candidate,
+            ArtifactState::PublishedLocal => Self::PublishedLocal,
+            ArtifactState::Registered => Self::Registered,
+            ArtifactState::ProviderSynced => Self::ProviderSynced,
+            ArtifactState::RegistrationPending => Self::RegistrationPending,
+            ArtifactState::Refused => Self::Refused,
+            ArtifactState::IntegrityMismatch => Self::IntegrityMismatch,
+            ArtifactState::DuplicatePublication => Self::DuplicatePublication,
+            ArtifactState::OutboxEscape => Self::OutboxEscape,
+            ArtifactState::OutboxLinked => Self::OutboxLinked,
+        }
+    }
+}
+
+/// [`omnifrons_domain::publication::ProviderState`], as it crosses IPC:
+/// the record's `provider_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderStateTag {
+    Pending,
+    Synced,
+    Failed,
+    Unavailable,
+}
+
+impl From<omnifrons_domain::publication::ProviderState> for ProviderStateTag {
+    fn from(state: omnifrons_domain::publication::ProviderState) -> Self {
+        use omnifrons_domain::publication::ProviderState;
+        match state {
+            ProviderState::Pending => Self::Pending,
+            ProviderState::Synced => Self::Synced,
+            ProviderState::Failed => Self::Failed,
+            ProviderState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// This device's own availability observation for a publication
+/// (HAP-001-R27): `local` when this device's journal shows the bytes
+/// verified here, `unknown` otherwise. Never inferred from the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AvailabilityTag {
+    Local,
+    Unknown,
+}
+
+/// The act-as identity an approval binds (HAP-001-R22): the device-local
+/// user, opaquely -- `omnifrons_domain::executable::DeviceLocalUser` as a
+/// wire token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActAsTag {
+    DeviceLocalUser,
+}
+
+/// The `kind` of an AEC-001 `ref` this shell issues: `artifact` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceKindTag {
+    Artifact,
+}
+
+/// AEC-001's `ref` shape for an artifact (HAP-001 § Definitions,
+/// "Portable reference"): `{ kind: "artifact", id: <publication identity>,
+/// locator: <artifact Catalog identity> }`. Never a device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableReferenceDto {
+    pub kind: ReferenceKindTag,
+    pub id: String,
+    pub locator: String,
+}
+
+impl PortableReferenceDto {
+    #[must_use]
+    pub fn from_reference(reference: &omnifrons_domain::publication::PortableReference) -> Self {
+        Self {
+            kind: ReferenceKindTag::Artifact,
+            id: reference.id().to_hex(),
+            locator: reference.locator().to_string(),
+        }
+    }
+}
+
+/// `artifact_approve`'s payload (spike slice 5b): the identity-bound facts
+/// the approval surface showed (HAP-001-R22), the destination asset root
+/// identity, the act-as identity, and the derived ids -- the approval id
+/// as 16 lowercase hex characters (a `u64` does not survive a JSON
+/// number's 53-bit mantissa), the publication identity as 64. Never a
+/// device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactApprovalDto {
+    pub approval_id: String,
+    pub publication_id: String,
+    pub run_id: String,
+    pub name: String,
+    pub display_name: String,
+    pub sha256_short: String,
+    pub size: u64,
+    pub detected_type: String,
+    pub class: String,
+    pub attribution: AttributionDto,
+    pub asset_root_id: String,
+    pub act_as: ActAsTag,
+    pub approved_at: u64,
+}
+
+impl ArtifactApprovalDto {
+    #[must_use]
+    pub fn from_approval(approval: &omnifrons_domain::publication::ArtifactApproval) -> Self {
+        use omnifrons_domain::outbox::Attribution;
+        Self {
+            approval_id: approval.approval_id.to_hex(),
+            publication_id: approval.publication_id.to_hex(),
+            run_id: approval.run_id.as_str().to_string(),
+            name: approval.name.clone(),
+            display_name: approval.display_name.as_str().to_string(),
+            sha256_short: approval.digest.short_hex(),
+            size: approval.size,
+            detected_type: approval.detected_type.as_str().to_string(),
+            class: approval.class.as_str().to_string(),
+            attribution: match &approval.attribution {
+                Attribution::Run(run_id) => AttributionDto::Run {
+                    run_id: run_id.as_str().to_string(),
+                },
+                Attribution::Unattributed => AttributionDto::Unattributed,
+            },
+            asset_root_id: approval.asset_root_id.as_str().to_string(),
+            act_as: ActAsTag::DeviceLocalUser,
+            approved_at: system_time_to_millis(approval.approved_at),
+        }
+    }
+}
+
+/// One publication, as `artifact_publish` returns it and
+/// `publications_list` lists it (spike slice 5b): the publication
+/// identity, its state, the portable reference once `registered`
+/// (HAP-001-R24; `null` before), the record's `provider_state` and Catalog
+/// identity once a record exists, the sanitized display names, and this
+/// device's own availability observation. Never a device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationDto {
+    pub publication_id: String,
+    pub state: ArtifactStateTag,
+    pub reference: Option<PortableReferenceDto>,
+    pub provider_state: Option<ProviderStateTag>,
+    pub catalog_id: Option<String>,
+    pub names: Vec<String>,
+    pub availability: AvailabilityTag,
+}
+
+impl PublicationDto {
+    /// A registered record, as listed.
+    #[must_use]
+    pub fn from_record(
+        record: &omnifrons_domain::publication::CatalogRecord,
+        availability: AvailabilityTag,
+    ) -> Self {
+        Self {
+            publication_id: record.publication_id.to_hex(),
+            state: record.state.into(),
+            reference: record
+                .reference()
+                .as_ref()
+                .map(PortableReferenceDto::from_reference),
+            provider_state: Some(record.provider.state.into()),
+            catalog_id: Some(record.catalog_id.to_string()),
+            names: record
+                .names
+                .iter()
+                .map(|name| name.as_str().to_string())
+                .collect(),
+            availability,
+        }
+    }
+
+    /// A publication as the transaction left it: `registered` with its
+    /// record's facts, or `registration-pending` with no reference, no
+    /// provider state, and no Catalog identity yet.
+    #[must_use]
+    pub fn from_published(
+        published: &omnifrons_app::publication::Published,
+        availability: AvailabilityTag,
+    ) -> Self {
+        use omnifrons_domain::publication::ArtifactState;
+        let registered = published.state == ArtifactState::Registered;
+        Self {
+            publication_id: published.record.publication_id.to_hex(),
+            state: published.state.into(),
+            reference: published
+                .reference
+                .as_ref()
+                .map(PortableReferenceDto::from_reference),
+            provider_state: registered.then(|| published.record.provider.state.into()),
+            catalog_id: registered.then(|| published.record.catalog_id.to_string()),
+            names: published
+                .record
+                .names
+                .iter()
+                .map(|name| name.as_str().to_string())
+                .collect(),
+            availability,
+        }
+    }
+}
+
+/// The proposed AEC-001 kind `artifact.state`, as `artifact_publish`'s
+/// `onState` channel carries it on every transition (HAP-001-R35):
+/// adjacently tagged like [`AdapterEventDto`], `{ kind: "artifact-state",
+/// payload: { publicationId, state, providerState } }`. Never a path; the
+/// event observes and controls nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ArtifactStateFrame {
+    ArtifactState {
+        publication_id: String,
+        state: ArtifactStateTag,
+        provider_state: Option<ProviderStateTag>,
+    },
+}
+
+impl ArtifactStateFrame {
+    #[must_use]
+    pub fn from_event(event: &omnifrons_app::publication::StateEvent) -> Self {
+        Self::ArtifactState {
+            publication_id: event.publication_id.to_hex(),
+            state: event.state.into(),
+            provider_state: event.provider_state.map(Into::into),
         }
     }
 }
@@ -777,17 +1067,65 @@ pub enum ShellErrorCode {
     /// subdirectory's path, or handle verification failed; nothing was
     /// spawned (HAP-001-R10, D14; spike slice 5).
     OutboxUnavailable,
+    /// The published copy's digest did not verify, or the held handle's
+    /// bytes changed since they were digested; the copy is discarded and
+    /// the entry preserved (HAP-001-R21; spike slice 5b).
+    IntegrityMismatch,
+    /// The publication identity is already registered; the existing record
+    /// is acknowledged in [`ShellErrorDetail::DuplicatePublication`] and
+    /// nothing new was published (HAP-001-R23; spike slice 5b).
+    DuplicatePublication,
+    /// The product work area resolves inside a registered workspace root,
+    /// or its journal cannot be used; the operation is refused
+    /// (HAP-001-R7; spike slice 5b).
+    WorkAreaInvalid,
+    /// The project declares no asset root, or its device asset path
+    /// resolves inside a registered workspace root or cannot be written;
+    /// nothing is copied (HAP-001-R6, R14; spike slice 5b).
+    DestinationInvalid,
+    /// At publish time the entry's path no longer names the held handle's
+    /// file, or the handle is not a regular file; nothing is published and
+    /// the held bytes are kept as a recovery entry (HAP-001-R18; spike
+    /// slice 5b).
+    OutboxEscape,
+    /// The held handle's link count is greater than one at publish time
+    /// (HAP-001-R20; spike slice 5b).
+    OutboxLinked,
+    /// The candidate cannot be approved in its state or class, its digest
+    /// does not match the request, or the re-opened entry's identity facts
+    /// changed since approval (HAP-001-R22; spike slice 5b).
+    Refused,
+    /// The project's Catalog could not be read or written (spike slice
+    /// 5b).
+    CatalogUnavailable,
+    /// `artifact_approve` or `artifact_publish` was called while a
+    /// supervised process is running: the publication surface is frozen
+    /// until every run has reached its terminal state -- a spike default
+    /// mirroring the renderer's own guard so direct IPC cannot bypass it
+    /// (spike slice 5b, renderer risk review R1-001).
+    RunActive,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
 /// catalogue `message` string must not (a full digest is not a secret,
-/// but it does not belong interpolated into free text either) --
-/// currently only [`ShellErrorCode::ChangedSinceApproval`] populates this.
+/// but it does not belong interpolated into free text either). Untagged:
+/// each carrying code has its own field set, and the wire shape of the
+/// slice-2 `changed-since-approval` detail is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShellErrorDetail {
-    pub recorded_sha256_short: String,
-    pub observed_sha256_short: String,
+#[serde(untagged, rename_all_fields = "camelCase")]
+pub enum ShellErrorDetail {
+    /// [`ShellErrorCode::ChangedSinceApproval`]: both digests as short hex
+    /// prefixes.
+    ChangedSinceApproval {
+        recorded_sha256_short: String,
+        observed_sha256_short: String,
+    },
+    /// [`ShellErrorCode::DuplicatePublication`]: the existing record's
+    /// logical identities (HAP-001-R23 "acknowledge the existing record").
+    DuplicatePublication {
+        publication_id: String,
+        catalog_id: String,
+    },
 }
 
 /// A failed IPC command's error payload. `message` is always a catalogue
@@ -1289,7 +1627,7 @@ mod tests {
         let error = ShellError::with_detail(
             ShellErrorCode::ChangedSinceApproval,
             "the executable's content has changed since it was approved",
-            ShellErrorDetail {
+            ShellErrorDetail::ChangedSinceApproval {
                 recorded_sha256_short: "aaaaaaaa".to_string(),
                 observed_sha256_short: "bbbbbbbb".to_string(),
             },
@@ -1425,10 +1763,19 @@ mod tests {
     fn workspace_dto_json_shape() {
         let dto = WorkspaceDto {
             display_path: "/home/user/project".to_string(),
+            work_area: super::WorkAreaStateTag::Valid,
         };
         assert_eq!(
             json(&dto),
-            serde_json::json!({"displayPath": "/home/user/project"})
+            serde_json::json!({"displayPath": "/home/user/project", "workArea": "valid"})
+        );
+        let invalid = WorkspaceDto {
+            display_path: "/home/user/project".to_string(),
+            work_area: super::WorkAreaStateTag::WorkAreaInvalid,
+        };
+        assert_eq!(
+            json(&invalid)["workArea"],
+            serde_json::json!("work-area-invalid")
         );
     }
 
@@ -1766,6 +2113,7 @@ mod tests {
             state: super::OutboxStateTag::Valid,
             reason: None,
             policy_path: ".omnifrons/asset-policy.json".to_string(),
+            asset_root_id: Some("main".to_string()),
         };
         assert_eq!(
             json(&dto),
@@ -1776,6 +2124,7 @@ mod tests {
                 "state": "valid",
                 "reason": null,
                 "policyPath": ".omnifrons/asset-policy.json",
+                "assetRootId": "main",
             })
         );
     }
@@ -1791,6 +2140,7 @@ mod tests {
             state: super::OutboxStateTag::OutboxInvalid,
             reason: Some(super::OutboxReasonTag::Link),
             policy_path: ".omnifrons/asset-policy.json".to_string(),
+            asset_root_id: None,
         };
         assert_eq!(
             json(&dto),
@@ -1801,6 +2151,7 @@ mod tests {
                 "state": "outbox-invalid",
                 "reason": "link",
                 "policyPath": ".omnifrons/asset-policy.json",
+                "assetRootId": null,
             })
         );
         let unavailable = super::OutboxStatusDto {
@@ -1810,6 +2161,7 @@ mod tests {
             state: super::OutboxStateTag::OutboxUnavailable,
             reason: Some(super::OutboxReasonTag::PolicyCorrupt),
             policy_path: ".omnifrons/asset-policy.json".to_string(),
+            asset_root_id: None,
         };
         assert_eq!(
             json(&unavailable)["state"],
@@ -1863,12 +2215,36 @@ mod tests {
             serde_json::json!({
                 "name": "run-1/report.pdf",
                 "size": 4096,
+                "sha256": "ab".repeat(32),
                 "sha256Short": "abababab",
                 "detectedType": "pdf",
                 "class": "generated-heavy",
                 "attribution": {"kind": "run", "runId": "run-1"},
                 "state": "candidate",
             })
+        );
+        // The full digest is identity evidence the approval names the
+        // candidate by (HAP-001-R22), never a device path; the row's keys are
+        // exactly these seven plus `sha256`, and none is a path.
+        let value = json(&dto);
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec![
+                "attribution",
+                "class",
+                "detectedType",
+                "name",
+                "sha256",
+                "sha256Short",
+                "size",
+                "state"
+            ]
         );
     }
 
@@ -1893,6 +2269,7 @@ mod tests {
             serde_json::json!({
                 "name": "run-1/linked.bin",
                 "size": null,
+                "sha256": null,
                 "sha256Short": null,
                 "detectedType": null,
                 "class": null,
@@ -2003,5 +2380,209 @@ mod tests {
             let error = ShellError::new(code, "message");
             assert_eq!(json(&error)["code"], serde_json::json!(token));
         }
+    }
+
+    // -- Slice 5b: the artifact approval, the publication, the
+    // artifact-state frame, and the publication error codes --
+
+    /// `artifact_approve`'s payload: every identity-bound fact the approval
+    /// surface showed (HAP-001-R22), the act-as identity, and the derived
+    /// ids as hex strings -- never a device path.
+    #[test]
+    fn artifact_approval_dto_json_shape() {
+        let dto = super::ArtifactApprovalDto {
+            approval_id: "0123456789abcdef".to_string(),
+            publication_id: "ab".repeat(32),
+            run_id: "run-1".to_string(),
+            name: "run-1/report.pdf".to_string(),
+            display_name: "report.pdf".to_string(),
+            sha256_short: "abababab".to_string(),
+            size: 4096,
+            detected_type: "pdf".to_string(),
+            class: "generated-heavy".to_string(),
+            attribution: super::AttributionDto::Run {
+                run_id: "run-1".to_string(),
+            },
+            asset_root_id: "main".to_string(),
+            act_as: super::ActAsTag::DeviceLocalUser,
+            approved_at: 1_725_782_401_000,
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "approvalId": "0123456789abcdef",
+                "publicationId": "ab".repeat(32),
+                "runId": "run-1",
+                "name": "run-1/report.pdf",
+                "displayName": "report.pdf",
+                "sha256Short": "abababab",
+                "size": 4096,
+                "detectedType": "pdf",
+                "class": "generated-heavy",
+                "attribution": {"kind": "run", "runId": "run-1"},
+                "assetRootId": "main",
+                "actAs": "device-local-user",
+                "approvedAt": 1_725_782_401_000u64,
+            })
+        );
+    }
+
+    /// `artifact_publish`'s and `publications_list`'s payload: a registered
+    /// publication carries AEC-001's `ref` shape `{ kind, id, locator }`
+    /// with the Catalog identity as `locator`; a pending one carries no
+    /// reference (HAP-001-R24). Never a device path.
+    #[test]
+    fn publication_dto_json_shapes_registered_and_pending() {
+        let registered = super::PublicationDto {
+            publication_id: "ab".repeat(32),
+            state: super::ArtifactStateTag::Registered,
+            reference: Some(super::PortableReferenceDto {
+                kind: super::ReferenceKindTag::Artifact,
+                id: "ab".repeat(32),
+                locator: format!("main/{}", "ab".repeat(32)),
+            }),
+            provider_state: Some(super::ProviderStateTag::Pending),
+            catalog_id: Some(format!("main/{}", "ab".repeat(32))),
+            names: vec!["report.pdf".to_string()],
+            availability: super::AvailabilityTag::Local,
+        };
+        assert_eq!(
+            json(&registered),
+            serde_json::json!({
+                "publicationId": "ab".repeat(32),
+                "state": "registered",
+                "reference": {"kind": "artifact", "id": "ab".repeat(32), "locator": format!("main/{}", "ab".repeat(32))},
+                "providerState": "pending",
+                "catalogId": format!("main/{}", "ab".repeat(32)),
+                "names": ["report.pdf"],
+                "availability": "local",
+            })
+        );
+        let pending = super::PublicationDto {
+            publication_id: "cd".repeat(32),
+            state: super::ArtifactStateTag::RegistrationPending,
+            reference: None,
+            provider_state: None,
+            catalog_id: None,
+            names: vec!["report.pdf".to_string()],
+            availability: super::AvailabilityTag::Unknown,
+        };
+        assert_eq!(
+            json(&pending)["state"],
+            serde_json::json!("registration-pending")
+        );
+        assert_eq!(json(&pending)["reference"], serde_json::json!(null));
+        assert_eq!(json(&pending)["providerState"], serde_json::json!(null));
+        assert_eq!(json(&pending)["catalogId"], serde_json::json!(null));
+        assert_eq!(json(&pending)["availability"], serde_json::json!("unknown"));
+    }
+
+    /// Every artifact state token the shell can put on the wire is spelled
+    /// as HAP-001's signal mapping spells it (HAP-001-R26).
+    #[test]
+    fn artifact_state_and_provider_state_tags_serialize_as_kebab_case() {
+        use omnifrons_domain::publication::{ArtifactState, ProviderState};
+        for state in ArtifactState::ALL {
+            assert_eq!(
+                json(&super::ArtifactStateTag::from(state)),
+                serde_json::json!(state.as_str())
+            );
+        }
+        for state in ProviderState::ALL {
+            assert_eq!(
+                json(&super::ProviderStateTag::from(state)),
+                serde_json::json!(state.as_str())
+            );
+        }
+    }
+
+    /// The proposed AEC-001 kind `artifact.state`, as `artifact_publish`'s
+    /// `onState` channel carries it: `{ kind: "artifact-state", payload:
+    /// { publicationId, state, providerState } }` on every transition.
+    #[test]
+    fn artifact_state_frame_json_shape() {
+        let frame = super::ArtifactStateFrame::ArtifactState {
+            publication_id: "ab".repeat(32),
+            state: super::ArtifactStateTag::PublishedLocal,
+            provider_state: None,
+        };
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "kind": "artifact-state",
+                "payload": {"publicationId": "ab".repeat(32), "state": "published-local", "providerState": null}
+            })
+        );
+        let registered = super::ArtifactStateFrame::ArtifactState {
+            publication_id: "ab".repeat(32),
+            state: super::ArtifactStateTag::Registered,
+            provider_state: Some(super::ProviderStateTag::Pending),
+        };
+        assert_eq!(
+            json(&registered)["payload"]["providerState"],
+            serde_json::json!("pending")
+        );
+    }
+
+    /// The nine slice-5b error codes each render as their documented
+    /// kebab-case token, with slash-free messages.
+    #[test]
+    fn slice_5b_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::IntegrityMismatch, "integrity-mismatch"),
+            (
+                ShellErrorCode::DuplicatePublication,
+                "duplicate-publication",
+            ),
+            (ShellErrorCode::WorkAreaInvalid, "work-area-invalid"),
+            (ShellErrorCode::DestinationInvalid, "destination-invalid"),
+            (ShellErrorCode::OutboxEscape, "outbox-escape"),
+            (ShellErrorCode::OutboxLinked, "outbox-linked"),
+            (ShellErrorCode::Refused, "refused"),
+            (ShellErrorCode::CatalogUnavailable, "catalog-unavailable"),
+            (ShellErrorCode::RunActive, "run-active"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+        }
+    }
+
+    /// `duplicate-publication` acknowledges the existing record in
+    /// `detail`: its publication identity and Catalog identity (logical
+    /// ids, never a path); the slice-2 `changed-since-approval` detail
+    /// keeps its exact shape.
+    #[test]
+    fn shell_error_detail_shapes_for_both_carrying_codes() {
+        let duplicate = ShellError::with_detail(
+            ShellErrorCode::DuplicatePublication,
+            "an artifact with this content is already registered for this project",
+            ShellErrorDetail::DuplicatePublication {
+                publication_id: "ab".repeat(32),
+                catalog_id: format!("main/{}", "ab".repeat(32)),
+            },
+        );
+        assert_eq!(
+            json(&duplicate)["detail"],
+            serde_json::json!({
+                "publicationId": "ab".repeat(32),
+                "catalogId": format!("main/{}", "ab".repeat(32)),
+            })
+        );
+        let changed = ShellError::with_detail(
+            ShellErrorCode::ChangedSinceApproval,
+            "the executable's content has changed since it was approved",
+            ShellErrorDetail::ChangedSinceApproval {
+                recorded_sha256_short: "aaaaaaaa".to_string(),
+                observed_sha256_short: "bbbbbbbb".to_string(),
+            },
+        );
+        assert_eq!(
+            json(&changed)["detail"],
+            serde_json::json!({
+                "recordedSha256Short": "aaaaaaaa",
+                "observedSha256Short": "bbbbbbbb",
+            })
+        );
     }
 }

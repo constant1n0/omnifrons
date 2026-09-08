@@ -19,6 +19,8 @@ use omnifrons_app::outbox_policy::OutboxPolicy;
 use omnifrons_app::run_outbox::{
     Candidate, MAX_HELD_HANDLES, PreparedRunSubdirectory, cap_held_handles,
 };
+use omnifrons_domain::adapter::AdapterId;
+use omnifrons_domain::executable::ApprovalId;
 use omnifrons_domain::outbox::{PublishProposal, RunId};
 
 /// The maximum number of run records remembered at once. Bounded so a
@@ -85,6 +87,8 @@ pub fn mint_run_id(now: SystemTime, sequence: u64) -> RunId {
 pub struct RunRecord {
     subdirectory: PreparedRunSubdirectory,
     policy: OutboxPolicy,
+    adapter_id: Option<AdapterId>,
+    executable_approval: Option<ApprovalId>,
     proposals: Vec<PublishProposal>,
     recorded_entries: usize,
     dropped_entries: u64,
@@ -93,12 +97,22 @@ pub struct RunRecord {
 
 impl RunRecord {
     /// A record for a freshly prepared run subdirectory under the policy
-    /// in force at launch.
+    /// in force at launch, keeping the launch's provenance -- the adapter
+    /// that ran and the executable approval that governed the launch, when
+    /// known -- for the Catalog record of an attributed entry (HAP-001-R36;
+    /// spike slice 5b).
     #[must_use]
-    pub const fn new(subdirectory: PreparedRunSubdirectory, policy: OutboxPolicy) -> Self {
+    pub const fn with_provenance(
+        subdirectory: PreparedRunSubdirectory,
+        policy: OutboxPolicy,
+        adapter_id: Option<AdapterId>,
+        executable_approval: Option<ApprovalId>,
+    ) -> Self {
         Self {
             subdirectory,
             policy,
+            adapter_id,
+            executable_approval,
             proposals: Vec::new(),
             recorded_entries: 0,
             dropped_entries: 0,
@@ -110,6 +124,30 @@ impl RunRecord {
     #[must_use]
     pub const fn run_id(&self) -> &RunId {
         &self.subdirectory.run_id
+    }
+
+    /// The adapter that ran this launch, when kept.
+    #[must_use]
+    pub const fn adapter_id(&self) -> Option<&AdapterId> {
+        self.adapter_id.as_ref()
+    }
+
+    /// The executable approval that governed this launch, when kept.
+    #[must_use]
+    pub const fn executable_approval(&self) -> Option<ApprovalId> {
+        self.executable_approval
+    }
+
+    /// Take the held handle of the candidate named `name` (relative to the
+    /// outbox), if the run-end inventory listed it and still holds one:
+    /// the publication transaction becomes the handle's owner, and the
+    /// entry stays `candidate` in the record without one (spike slice 5b).
+    pub fn take_candidate_handle(&mut self, name: &str) -> Option<std::fs::File> {
+        self.candidates
+            .as_mut()?
+            .iter_mut()
+            .find(|candidate| candidate.entry.name == name)
+            .and_then(|candidate| candidate.handle.take())
     }
 
     /// The policy in force when the run was launched.
@@ -228,6 +266,13 @@ impl RunTable {
     pub fn find_by_run_id(&self, run_id: &RunId) -> Option<&RunRecord> {
         self.entries
             .values()
+            .find(|record| record.run_id() == run_id)
+    }
+
+    /// The record whose run id is `run_id`, mutably, if remembered.
+    pub fn find_by_run_id_mut(&mut self, run_id: &RunId) -> Option<&mut RunRecord> {
+        self.entries
+            .values_mut()
             .find(|record| record.run_id() == run_id)
     }
 
@@ -386,9 +431,11 @@ mod tests {
                 &omnifrons_domain::outbox::RunId::new(token).expect("valid"),
             )
             .expect("prepare");
-        RunRecord::new(
+        RunRecord::with_provenance(
             prepared,
             omnifrons_app::outbox_policy::OutboxPolicy::default_policy(),
+            None,
+            None,
         )
     }
 
