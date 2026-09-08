@@ -276,6 +276,16 @@ pub enum AdapterEvent {
     /// previous `TerminalDrops` event of the same launch. Proposed AEC-001
     /// kind `terminal-drops`.
     TerminalDrops(crate::terminal::DropCounts),
+    /// The agent proposed publication of entries it wrote into its run
+    /// subdirectory, naming each by content digest (spike slice 5,
+    /// HAP-001-R12): a `tool_use` block named
+    /// [`crate::outbox::PUBLISH_PROPOSAL_TOOL_NAME`] whose arguments parsed
+    /// into a [`crate::outbox::PublishProposal`]. A proposal only, exactly
+    /// like [`Self::ToolCall`]: nothing in this repository executes it, and
+    /// the digests it names attribute an entry to the run only once
+    /// Omnifrons's own digest from the entry's handle matches
+    /// (HAP-001-R11). Proposed AEC-001 kind `artifact-publish`.
+    ArtifactPublish(crate::outbox::PublishProposal),
 }
 
 /// Why [`WorkspaceRoot::new`] rejected a candidate path.

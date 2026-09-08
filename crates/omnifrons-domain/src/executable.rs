@@ -42,6 +42,22 @@ impl Sha256Digest {
     pub fn short_hex(&self) -> String {
         self.to_hex()[..Self::SHORT_HEX_CHARS].to_string()
     }
+
+    /// Parse the 64-character hex form [`Self::to_hex`] renders (either
+    /// case), or `None` if `text` is not exactly 64 hex characters. Added
+    /// in spike slice 5 for the digests an `artifact.publish` proposal
+    /// names (`crate::outbox::ProposedEntry`).
+    #[must_use]
+    pub fn from_hex(text: &str) -> Option<Self> {
+        if text.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(text.get(index * 2..index * 2 + 2)?, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
 }
 
 impl fmt::Display for Sha256Digest {
