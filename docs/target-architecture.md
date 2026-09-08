@@ -126,6 +126,8 @@ Portable references use logical artifact IDs and workspace-relative identity whe
 
 Knowledge, OpenSpec, or metadata outside `ActiveProjectRoot` is supplied through mediated, bounded, read-only retrieval. A harness receives selected content plus provenance, not an unrestricted raw path. Direct access outside the project requires separate itemized elevation.
 
+Write access is symmetric. A harness never writes into the heavy-asset tier, another project, or the vault directly: it writes generated artifacts into the project's declared outbox — a run subdirectory of it, for a run Omnifrons launched — and requests publication, and Omnifrons validates, publishes, and registers the artifact in the Context Catalog. Mediated, bounded publication is the only write path into the heavy-asset tier; only a registered artifact has a portable reference, and direct write access outside the project requires the same separate itemized elevation as direct read access (HAP-001).
+
 Canonical paths resolve symlinks/junctions before Omnifrons authorization. In advisory mode this validates Omnifrons operations, not arbitrary harness behavior.
 
 ## Initial portable-work contract
@@ -146,6 +148,7 @@ A later source change does not alter the approved tree. It remains local and is 
 ### Initial exclusions and blocks
 
 - Ignored files are excluded and cannot be opted in until a dedicated secret/data policy supports them.
+- The outbox a project's asset policy declares, including every run subdirectory under it, is excluded from handoff candidacy regardless of ignore status; its content reaches another device only as a registered artifact through the heavy-asset tier (HAP-001).
 - Known credential locations and detected high-risk secret material block inclusion. Detection cannot prove absence; residual risk is disclosed before approval.
 - Special files, devices, sockets, and unsupported permissions/metadata are excluded.
 - Symlink target content is never followed implicitly. Links escaping `ActiveProjectRoot` are blocked; an internal target must be independently tracked/selected.
@@ -265,6 +268,8 @@ Other provider adapters may use native placeholder and hydration APIs on Windows
 | Checkpoint authenticity/replay unproven | Unverified; fresh human review |
 | Renderer/voice unavailable | Preserve full text and recovery control |
 | Migration/update trust unavailable | Block automatic mutation; retain recovery evidence |
+| Artifact publication incomplete | Candidate or publication-pending; never registered until the published copy is verified; entry retained; retry idempotent |
+| Artifact outside its declared destination | Misplaced; reported with a remedy choice; never auto-moved, deleted, or published |
 
 ## Planned assurance artifacts
 
@@ -282,6 +287,7 @@ These are placeholders, not existing files or implemented guarantees.
 | RCS-001 | Renderer content-security contract | Plain/rich/terminal content, CSP, constrained URLs/navigation, OSC clipboard/link/file actions, attachments/downloads, and redacted scrollback/support exports; the content classes, sanitization, CSP, navigation, terminal control policy, and export redaction are drafted in [renderer-content-security](renderer-content-security.md) |
 | VOC-001 | Voice interaction contract | Consent, visibility, processing, retention, accessibility, text fallback; the consent model, capture and transmission indicators, processing and retention rules, text fallback, and approval semantics are drafted in [voice interaction contract](voice-interaction-contract.md) |
 | VP-001 | Desktop stack verification plan | Pinned multi-OS executable evidence for ADR-0002; the baseline fields, scenario catalog, evidence record, exception rule, and cadence are drafted in [desktop stack verification plan](desktop-stack-verification-plan.md) |
+| HAP-001 | Heavy-asset publication contract | Artifact classification policy and its owner, per-project and per-device destination mapping, write-side discovery, outbox publication with Context Catalog registration, wrong-root handling, unmediated producers, and the storage plane's failure states; the classification, destination, publication, and registration contract is drafted in [heavy-asset-publication](heavy-asset-publication.md) |
 
 A feature cannot claim the guarantee owned by a placeholder until its artifact is accepted and its tests pass.
 

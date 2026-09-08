@@ -54,7 +54,7 @@ A cross-reference into another document never cites a line number. Line numbers 
 | Handoff transaction protocol (HTP-001) | Draft |
 | Threat model (TM-001) | Draft |
 | Renderer content-security contract (RCS-001) | Draft |
-| Heavy-asset publication contract (HAP-001) | Draft |
+| Heavy-asset publication contract (HAP-001) | Accepted |
 | Update trust architecture (UTA-001) | Draft |
 | Voice interaction contract (VOC-001) | Draft |
 | Desktop stack verification plan (VP-001) | Draft |

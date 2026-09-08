@@ -1,13 +1,15 @@
 # Heavy-Asset Publication Contract
 
 **Document role:** Heavy-asset publication contract: artifact classification policy and its owner, per-project and per-device destination mapping, write-side discovery, outbox publication with Context Catalog registration, wrong-root handling, unmediated producers, and storage-plane failure states (HAP-001)  
-**Status:** Draft  
+**Status:** Accepted  
 **Normative force:** Non-binding target direction; requirements are acceptance gates, not current guarantees  
 **Accountable role:** Project Maintainer  
-**Named person:** Unassigned  
+**Named person:** constant1n0  
 **Approver role:** Project Owner  
-**Approver named person:** Unassigned  
-**Effective date:** None  
+**Approver named person:** constant1n0  
+**Accepted on:** 2026-09-08  
+**Last status change:** 2026-09-08 — accepted by the Project Owner  
+**Effective date:** 2026-09-08  
 **Supersedes:** None  
 **Name status:** Selected public name; preliminary screening complete, formal trademark clearance pending
 
@@ -497,6 +499,8 @@ Debt, not drafted here:
 
 The documents below are not edited by this draft. Each amendment is proposed here as exact text and is applied only after HAP-001 is accepted, under the change-control rule that governs the target: the target architecture's planned assurance artifacts table changes only through a `Proposed` revision carrying a signed acceptance tag (GOV-001-R16; governance.md § Change control ("Some sections are frozen regardless")); GOV-001 is an Accepted artifact, and which path admits a new role into its catalog — an Owner-approved commit by analogy with GOV-001-R2, or a new ADR — is the owner's decision (D21), not this document's assertion; the remaining targets are Draft documents whose Maintainer may edit them freely (governance.md § Status workflow and evidence per transition ("Maintainer edits freely")), deferred here so that no document points at a contract that has not been accepted. Every proposed row keeps the target table's own column order. One amendment is required rather than merely proposed: the exclusion bullet for § Initial exclusions and blocks, without which every mediated run's output is eligible for a handoff candidate except through the user's ignore rule (HAP-001-R44).
 
+HAP-001 was accepted on 2026-09-08 (`accept/HAP-001/2026-09-08`). Each item below carries an **Applied on 2026-09-08** or **Pending D21** line; the quoted blocks remain the record of the exact text.
+
 ### target-architecture.md
 
 **§ Planned assurance artifacts** — append after the VP-001 row (frozen table; signed revision under GOV-001-R16):
@@ -505,11 +509,15 @@ The documents below are not edited by this draft. Each amendment is proposed her
 | HAP-001 | Heavy-asset publication contract | Artifact classification policy and its owner, per-project and per-device destination mapping, write-side discovery, outbox publication with Context Catalog registration, wrong-root handling, unmediated producers, and the storage plane's failure states; the classification, destination, publication, and registration contract is drafted in [heavy-asset-publication](heavy-asset-publication.md) |
 ```
 
+**Applied on 2026-09-08** — row present in target-architecture.md § Planned assurance artifacts, under the signed revision `accept/target-architecture/2026-09-08` and its approvals row.
+
 **§ Workspace and artifact access** — insert as a new paragraph immediately after the paragraph ending "Direct access outside the project requires separate itemized elevation.":
 
 ```markdown
 Write access is symmetric. A harness never writes into the heavy-asset tier, another project, or the vault directly: it writes generated artifacts into the project's declared outbox — a run subdirectory of it, for a run Omnifrons launched — and requests publication, and Omnifrons validates, publishes, and registers the artifact in the Context Catalog. Mediated, bounded publication is the only write path into the heavy-asset tier; only a registered artifact has a portable reference, and direct write access outside the project requires the same separate itemized elevation as direct read access (HAP-001).
 ```
+
+**Applied on 2026-09-08** — paragraph present in target-architecture.md § Workspace and artifact access.
 
 **§ Initial exclusions and blocks** — insert as a new bullet immediately after the bullet beginning "Ignored files are excluded" (required for HAP-001 to hold):
 
@@ -517,12 +525,16 @@ Write access is symmetric. A harness never writes into the heavy-asset tier, ano
 - The outbox a project's asset policy declares, including every run subdirectory under it, is excluded from handoff candidacy regardless of ignore status; its content reaches another device only as a registered artifact through the heavy-asset tier (HAP-001).
 ```
 
+**Applied on 2026-09-08** — bullet present in target-architecture.md § Initial exclusions and blocks.
+
 **§ Required failure states** — append two rows after the "Migration/update trust unavailable" row (the owner may collapse them into one):
 
 ```markdown
 | Artifact publication incomplete | Candidate or publication-pending; never registered until the published copy is verified; entry retained; retry idempotent |
 | Artifact outside its declared destination | Misplaced; reported with a remedy choice; never auto-moved, deleted, or published |
 ```
+
+**Applied on 2026-09-08** — both rows present in target-architecture.md § Required failure states, not collapsed.
 
 ### threat-model.md
 
@@ -532,11 +544,15 @@ Write access is symmetric. A harness never writes into the heavy-asset tier, ano
 | Heavy-asset tier, Context Catalog records, and provider locators | Device asset paths and the product work area, device-local and outside every workspace; the outbox and its run subdirectories inside the project; Catalog records as small portable state; provider objects under the provider's own custody (ADR-0003); provider credentials in the OS secret store | Holds generated deliverables and the provenance that makes them referenceable; a stray write into a tracked path or another project, a record naming bytes no device verified, or a file placed in a run subdirectory that the run never claimed, is the difference between a registered artifact and a file the product cannot vouch for (HAP-001) |
 ```
 
+**Applied on 2026-09-08** — row present in threat-model.md § Assets.
+
 **§ Trust boundaries** — append after the B8 row:
 
 ```markdown
 | B9 | Harness ↔ heavy-asset tier | Per-run outbox subdirectory created exclusively, verified by handle, and declared to the harness inside the project it may already write to; publication only through Omnifrons's validate–publish–register transaction on a single opened handle; attribution only by the run's own digest-naming proposal; provider credentials held by the BlobStorePort adapter, harness-invisible | HAP-001 |
 ```
+
+**Applied on 2026-09-08** — row B9 present in threat-model.md § Trust boundaries.
 
 **§ Harness** — append to the threat table after the HAR-6 row, one technique per row:
 
@@ -547,6 +563,8 @@ Write access is symmetric. A harness never writes into the heavy-asset tier, ano
 | HAR-10 | A2/A6/A9 a same-user process drops a file into another run's subdirectory, or pre-plants a link at a run subdirectory's path before creation, to borrow that run's provenance or redirect its output | Provenance attributed to a run that did not produce the file; a harness pointed at a directory it did not get | Attribution requires the run's own digest-naming proposal, location alone is a recorded fact and never provenance, and the run subdirectory is created exclusively and verified by handle before the harness is pointed at it (HAP-001-R10, HAP-001-R11) | A manipulated harness that names a file it did not produce still attributes it, bounded by the harness's own integrity; a same-user process can still write into the subdirectory after creation (TM-001 A6) |
 ```
 
+**Applied on 2026-09-08** — rows HAR-7 to HAR-10 present in threat-model.md § Harness.
+
 ### versioning-and-compatibility.md
 
 **§ Version domains** — append after the "Persisted interaction preferences" row:
@@ -554,6 +572,8 @@ Write access is symmetric. A harness never writes into the heavy-asset tier, ano
 ```markdown
 | Context Catalog record and asset locator | Planned heavy-asset publication contract (HAP-001) | Record schema integer plus an adapter-scoped locator version | Unknown required record fields block registration and hydration; a locator whose adapter version is unsupported renders `unresolved`, never guessed; record migrations operate only inside `.omnifrons/`. |
 ```
+
+**Applied on 2026-09-08** — row present in versioning-and-compatibility.md § Version domains.
 
 ### governance.md
 
@@ -563,17 +583,23 @@ Write access is symmetric. A harness never writes into the heavy-asset tier, ano
 | Asset Policy Owner | Owns each project's artifact classification policy and publication policy, and the reclassification of catalogued assets (HAP-001) | Approves a classification policy and its changes; classifies an `unclassified` artifact; decides a wrong-root remedy where policy does not; while vacant, the Project Owner exercises the role | Any role | Unfilled; exercised by the Project Owner as fallback |
 ```
 
+**Pending D21** — not applied on 2026-09-08; governance.md is unchanged until the Project Owner selects the change-control path, an Owner-approved commit or a new ADR.
+
 **§ Role catalog** — replace the sentence beginning "Role names above are identical to the ADR convention's interim role glossary" with (same path as the row):
 
 ```markdown
 Role names above are identical to the ADR convention's interim role glossary wherever the two overlap; Root Key Holder, App Registry Curator, and Contributor are new because the interim glossary predates UTA-001 and never named a contribution pathway, and Asset Policy Owner is new because the glossary predates HAP-001 and named no storage-plane decision right.
 ```
 
+**Pending D21** — not applied on 2026-09-08; the sentence follows the same path as the row above.
+
 **§ Assignments register** — append after the "App Registry Curator" row (an Owner-approved commit, the path GOV-001-R2 states for the register):
 
 ```markdown
 | Asset Policy Owner | Unassigned (fallback: Project Owner) | — | Role activates when HAP-001 is accepted; until then no classification policy is binding |
 ```
+
+**Pending D21** — not applied on 2026-09-08; the register row follows the role row it names and waits on the same decision.
 
 ### desktop-stack-verification-plan.md
 
@@ -589,12 +615,16 @@ Role names above are identical to the ADR convention's interim role glossary whe
 | VP-S28 | Unmediated producer, attribution, and handoff candidacy exclusion | W/M/L | With the product closed, an external process writes a PDF into the outbox root, a second into an existing run subdirectory, and a third into a tracked path; build a handoff candidate; start a session for the project; approve the proposed ingestions; plant a symbolic link in the outbox before inventory; swap a further outbox entry's path between digest and copy; synchronize a policy that names a raw path and one that declares an auto-approval | The outbox-root entry is registered as unattributed with `producer: unattributed` and no run id, adapter id, or approval reference; the run-subdirectory entry, named by no proposal from that run, is also unattributed, its run subdirectory recorded and shown as a location fact only; neither is approved under a standing policy; both are removed only after publication and registration are verified; the tracked-path file renders `misplaced` and no outbox entry does; the handoff candidate excludes every outbox entry by the product's rule, or preflight discloses which existing rule excluded each and previews any that would enter; the offered note equals the template with only the path substituted; both synchronized policies are rejected at load; the planted link is never dereferenced by the inventory; the swapped entry renders `outbox-escape` with its recovery entry in the product work area, outside the project | Ingestion journal, record dump, approval-surface capture, handoff candidate manifest, policy-load log, handle-identity traces, and scan output, hashed | HAP-001-R11, R12, R15, R18, R22, R36, R40, R42, R43, R44 |
 ```
 
+**Applied on 2026-09-08** — rows VP-S22 to VP-S28 present in desktop-stack-verification-plan.md § Scenario catalog.
+
 **Scenario count** — the catalog grows from 21 to 28 scenarios, so four sentences change; each is an exact replacement, old and new phrases shown verbatim in code spans:
 
 - § Definitions, the "Full rerun" row: replace `Executing all 21 scenarios against every pinned baseline` with `Executing all 28 scenarios against every pinned baseline`.
 - § Cadence and ownership: replace `a "full" rerun executes all 21 scenarios against every pinned baseline` with `a "full" rerun executes all 28 scenarios against every pinned baseline`.
 - § Acceptance evidence and follow-up: replace `all 21 scenarios in the catalog` with `all 28 scenarios in the catalog`.
 - § Evidence record, the `scenario_id` row: replace `(VP-S1…VP-S21)` with `(VP-S1…VP-S28)`.
+
+**Applied on 2026-09-08** — all four replacements made in desktop-stack-verification-plan.md; the phrases above stay as the record.
 
 ## Proposals carried to other drafts
 

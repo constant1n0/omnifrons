@@ -39,6 +39,7 @@ A product release contains several independently versioned domains.
 | Sync state/envelope | Planned roaming protocol | Protocol major/minor | Both sides negotiate; unknown major blocks claim. |
 | Built-in adapter/event interoperability | Planned adapter/event contract | Internal contract major/minor plus capabilities | Core and built-in adapter negotiate; stable 1.0 behavior is not a public extension SDK. |
 | Persisted interaction preferences | Compatibility policy and planned voice contract | Schema integer | Unknown required fields block; safe defaults only for documented optional fields. |
+| Context Catalog record and asset locator | Planned heavy-asset publication contract (HAP-001) | Record schema integer plus an adapter-scoped locator version | Unknown required record fields block registration and hydration; a locator whose adapter version is unsupported renders `unresolved`, never guessed; record migrations operate only inside `.omnifrons/`. |
 | External Git, Engram, harness, OS, and WebView versions | Support matrix | Tested ranges | Range plus capability probe; detection alone grants no support. |
 
 Schema changes do not automatically change product `MAJOR`. A product major is required when no supported migration can preserve a public contract.
