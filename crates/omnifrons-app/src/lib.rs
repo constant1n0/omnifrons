@@ -5,16 +5,23 @@
 //! it sits on must run and test without Tauri, Tokio, or any adapter.
 
 pub mod approval_store;
+pub mod blob_store;
+pub mod catalog_store;
 pub mod clock;
+pub mod content_hasher;
 pub mod executable_prober;
 pub mod harness_adapter;
 mod harness_catalog;
 pub mod launch_gate;
+pub mod outbox_entry_ops;
 pub mod outbox_policy;
 mod process_output;
 mod process_supervisor;
+pub mod publication;
+pub mod publication_journal;
 pub mod run_outbox;
 pub mod terminal_normalizer;
+pub mod work_area;
 
 pub use approval_store::{ApprovalStore, ApprovalStoreError};
 pub use clock::Clock;

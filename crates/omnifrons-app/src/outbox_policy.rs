@@ -20,6 +20,7 @@
 use omnifrons_domain::outbox::{
     ArtifactClass, DetectedType, OutboxPath, OutboxPathError, has_extension,
 };
+use omnifrons_domain::publication::AssetRootId;
 
 use crate::harness_adapter::WorkspaceRoot;
 
@@ -127,23 +128,43 @@ impl std::fmt::Display for PolicyViolation {
 
 impl std::error::Error for PolicyViolation {}
 
-/// A project's classification policy: the declared outbox path and the
-/// rows -- the project's own first, then the shipped defaults.
+/// A project's classification policy: the declared outbox path, the rows
+/// -- the project's own first, then the shipped defaults -- and, as of
+/// spike slice 5b, the asset root identity publications are destined for
+/// (a spike default standing in for the scope's asset binding, HAP-001 §
+/// Asset binding; the shipped default declares none, and a project without
+/// one has no destination, HAP-001-R6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxPolicy {
     outbox: OutboxPath,
     rows: Vec<PolicyRow>,
+    asset_root_id: Option<AssetRootId>,
 }
 
 impl OutboxPolicy {
     /// The policy the product ships: the default outbox path and the
-    /// default rows alone.
+    /// default rows alone, no asset root.
     #[must_use]
     pub fn default_policy() -> Self {
         Self {
             outbox: OutboxPath::default_path(),
             rows: default_rows(),
+            asset_root_id: None,
         }
+    }
+
+    /// This policy with `asset_root_id` as its destination asset root.
+    #[must_use]
+    pub fn with_asset_root(mut self, asset_root_id: Option<AssetRootId>) -> Self {
+        self.asset_root_id = asset_root_id;
+        self
+    }
+
+    /// The asset root identity publications are destined for, if the
+    /// policy declares one.
+    #[must_use]
+    pub fn asset_root_id(&self) -> Option<&AssetRootId> {
+        self.asset_root_id.as_ref()
     }
 
     /// Build a policy from a declared outbox path and the project's own
@@ -168,7 +189,11 @@ impl OutboxPolicy {
         }
         let mut rows = project_rows;
         rows.extend(default_rows());
-        Ok(Self { outbox, rows })
+        Ok(Self {
+            outbox,
+            rows,
+            asset_root_id: None,
+        })
     }
 
     /// The declared outbox path.
