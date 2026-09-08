@@ -469,6 +469,33 @@ impl TokioProcessSupervisor {
 }
 
 impl TokioProcessSupervisor {
+    /// The ids of every child currently `Running`, each refreshed through
+    /// the same reap check [`ProcessSupervisor::observe`] performs, so a
+    /// child that exited but was never observed is not reported as running.
+    /// Spike slice 5b: the one source the shell's publication surface
+    /// consults to stay frozen while a run is live, exactly as
+    /// `harness_stop` and `harness_observe` consult this supervisor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the children mutex was poisoned by a prior panic while
+    /// held, as every other accessor of it does.
+    #[must_use]
+    pub fn running_ids(&self) -> Vec<ProcessId> {
+        let mut ids: Vec<ProcessId> = self
+            .inner
+            .children
+            .lock()
+            .expect("children mutex poisoned by a prior panic")
+            .keys()
+            .copied()
+            .collect();
+        ids.sort_by_key(|id| id.0);
+        ids.into_iter()
+            .filter(|id| matches!(self.observe(*id), Some(ProcessStatus::Running)))
+            .collect()
+    }
+
     /// Refuse now, with [`SupervisorError::TooManyProcesses`], if
     /// [`MAX_RUNNING_CHILDREN`] children are already `Running`.
     ///
