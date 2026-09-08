@@ -1150,7 +1150,7 @@ async fn spawn_adapter_harness(
         (
             outbox_state.policy_store,
             outbox_state.preparer,
-            outbox_state.mint_run_id(),
+            crate::outbox_state::mint_next_run_id(),
         )
     };
     let display_path = executable.identity.canonical_path.clone();

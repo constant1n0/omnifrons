@@ -35,9 +35,31 @@ pub const MAX_RUN_RECORDS: usize = 64;
 /// the shell's memory without bound by proposing endlessly.
 pub const MAX_PROPOSED_ENTRIES: usize = 1024;
 
-/// Mint a run id from an instant and a per-process sequence number:
+/// The process-wide run sequence: every run id minted in this process
+/// takes the next value, whichever state or table asked, so two ids minted
+/// in one process differ even when the clock reports the same instant --
+/// Windows's `SystemTime` has 100 ns resolution and no sub-second
+/// guarantee, and two shells' worth of state in one process would
+/// otherwise restart the count.
+static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The next value of [`RUN_SEQUENCE`].
+fn next_run_sequence() -> u64 {
+    RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Mint a fresh run id from the wall clock and the process-wide sequence
+/// ([`next_run_sequence`]); see [`mint_run_id`] for the shape.
+#[must_use]
+pub fn mint_next_run_id() -> RunId {
+    mint_run_id(SystemTime::now(), next_run_sequence())
+}
+
+/// Mint a run id from an instant and a sequence number:
 /// `run-<seconds>-<nanoseconds>-<sequence>`, unique on this device for
-/// the product's lifetime and a valid single path component by
+/// the product's lifetime -- the sequence part, taken from
+/// [`RUN_SEQUENCE`] by [`mint_next_run_id`], keeps two ids apart even when
+/// their instants are equal -- and a valid single path component by
 /// construction (`omnifrons_domain::outbox::RunId`).
 ///
 /// # Panics
@@ -268,7 +290,6 @@ pub struct OutboxState {
     pub inventory: FsOutboxInventory,
     /// The per-run records, shared with each launch's forwarder thread.
     pub runs: Arc<Mutex<RunTable>>,
-    sequence: AtomicU64,
 }
 
 impl OutboxState {
@@ -280,15 +301,7 @@ impl OutboxState {
             preparer: FsRunOutboxPreparer::new(),
             inventory: FsOutboxInventory::new(),
             runs: Arc::new(Mutex::new(RunTable::default())),
-            sequence: AtomicU64::new(0),
         }
-    }
-
-    /// Mint a fresh run id from the wall clock and this state's sequence.
-    #[must_use]
-    pub fn mint_run_id(&self) -> RunId {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        mint_run_id(SystemTime::now(), sequence)
     }
 
     /// The active workspace changed: forget every remembered run and
@@ -309,7 +322,9 @@ impl Default for OutboxState {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PROPOSED_ENTRIES, MAX_RUN_RECORDS, RunRecord, RunTable, mint_run_id};
+    use super::{
+        MAX_PROPOSED_ENTRIES, MAX_RUN_RECORDS, RunRecord, RunTable, mint_next_run_id, mint_run_id,
+    };
     use omnifrons_app::ProcessId;
     use std::time::{Duration, SystemTime};
 
@@ -322,7 +337,11 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_725_782_401);
         let a = mint_run_id(t0, 1);
         let b = mint_run_id(t0, 2);
-        let c = mint_run_id(t0 + Duration::from_nanos(1), 1);
+        // A whole second apart, deliberately: `SystemTime` has 100 ns
+        // resolution on Windows, so a 1 ns step rounds back onto `t0` and
+        // once produced two identical ids on CI. Keeping ids apart at equal
+        // instants is the process-wide sequence's job, tested separately.
+        let c = mint_run_id(t0 + Duration::from_secs(1), 1);
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert!(a.as_str().starts_with("run-1725782401-"), "got {a}");
@@ -596,5 +615,31 @@ mod tests {
         assert!(table.get(ProcessId(1)).is_none());
         assert!(table.get(ProcessId(2)).is_none());
         assert_eq!(table.clear(), 0, "clearing an empty table forgets nothing");
+    }
+
+    /// The sequence part of a run id is process-wide, never per state or
+    /// table: two ids minted back to back -- here with a fresh `OutboxState`
+    /// constructed in between, which must not reset anything -- carry
+    /// distinct, increasing sequence numbers, so they differ even when the
+    /// clock reports the same instant (Windows's clock offers no sub-second
+    /// resolution the ids could rely on).
+    #[test]
+    fn ids_minted_back_to_back_carry_distinct_sequence_numbers() {
+        let first = mint_next_run_id();
+        let _another_state = super::OutboxState::new();
+        let second = mint_next_run_id();
+        let sequence = |id: &omnifrons_domain::outbox::RunId| -> u64 {
+            id.as_str()
+                .rsplit('-')
+                .next()
+                .expect("a run id ends in its sequence number")
+                .parse()
+                .expect("the sequence is a number")
+        };
+        assert!(
+            sequence(&second) > sequence(&first),
+            "the sequence must advance across states, got {first} then {second}"
+        );
+        assert_ne!(first, second);
     }
 }
