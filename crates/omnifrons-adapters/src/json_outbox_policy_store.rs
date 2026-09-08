@@ -12,11 +12,16 @@
 //! {
 //!   "schema": 1,
 //!   "outbox": ".omnifrons/outbox",
+//!   "assetRootId": "main",
 //!   "rows": [
 //!     {"types": ["plain-text"], "extensions": ["csv"], "maxSize": 1048576, "class": "generated-heavy"}
 //!   ]
 //! }
 //! ```
+//!
+//! `assetRootId` (spike slice 5b) names the asset root publications are
+//! destined for: one `[A-Za-z0-9_-]{1,64}` token, never a path; a project
+//! that declares none has no destination (HAP-001-R6).
 
 use omnifrons_app::WorkspaceRoot;
 use std::io::Read as _;
@@ -26,6 +31,7 @@ use omnifrons_app::outbox_policy::{
     PolicyError, PolicyRow,
 };
 use omnifrons_domain::outbox::{ArtifactClass, DetectedType, OutboxPath};
+use omnifrons_domain::publication::AssetRootId;
 use serde::Deserialize;
 
 /// The policy file's shape. `deny_unknown_fields` on both levels: an
@@ -38,6 +44,11 @@ struct PolicyFile {
     outbox: Option<String>,
     #[serde(default)]
     rows: Vec<RowFile>,
+    /// The asset root publications are destined for (spike slice 5b): one
+    /// token, never a path; absent leaves the project without a
+    /// destination (HAP-001-R6).
+    #[serde(default)]
+    asset_root_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +135,12 @@ impl OutboxPolicyStore for JsonOutboxPolicyStore {
             .into_iter()
             .map(RowFile::into_row)
             .collect::<Result<Vec<_>, _>>()?;
-        OutboxPolicy::new(outbox, rows).map_err(PolicyError::Invalid)
+        let asset_root_id = match file.asset_root_id {
+            Some(token) => Some(AssetRootId::new(token).map_err(|_| PolicyError::Corrupt)?),
+            None => None,
+        };
+        OutboxPolicy::new(outbox, rows)
+            .map(|policy| policy.with_asset_root(asset_root_id))
+            .map_err(PolicyError::Invalid)
     }
 }

@@ -34,25 +34,48 @@
 //! are all gated by `nix`'s `fs` feature this crate already enables
 //! (verified against the vendored 0.31.3 source); no feature and no
 //! dependency was added.
+//!
+//! As of spike slice 5b (HAP-001's publication side) this crate also
+//! implements the publication ports over the same dependency set:
+//! [`Sha2Hasher`] (`omnifrons_app::content_hasher::ContentHasher`),
+//! [`LocalDirBlobStore`] (`omnifrons_app::blob_store::BlobStorePort`; the
+//! dev-mode local-directory provider, the only adapter in this slice),
+//! [`JsonlCatalogStore`] (`omnifrons_app::catalog_store::CatalogStore`,
+//! `.omnifrons/catalog.jsonl`), [`JsonlPublicationJournal`]
+//! (`omnifrons_app::publication_journal::PublicationJournal`, the work
+//! area's `journal/publications.jsonl`), and [`FsOutboxEntryOps`]
+//! (`omnifrons_app::outbox_entry_ops::OutboxEntryOps`; `fstat`/`fstatat`/
+//! `unlinkat`, all under the `fs` feature). Dependency tables unchanged.
 
+mod catalog_record_dto;
 pub mod fs_candidate_prober;
+pub mod fs_outbox_entry_ops;
 pub mod fs_outbox_inventory;
 pub mod fs_prober;
 pub mod fs_run_outbox_preparer;
 pub mod json_outbox_policy_store;
 pub mod jsonl_approval_store;
+pub mod jsonl_catalog_store;
+pub mod jsonl_publication_journal;
 pub mod line_agent;
+pub mod local_dir_blob_store;
 pub mod pty_cli;
+pub mod sha2_hasher;
 
 pub use fs_candidate_prober::FsCandidateProber;
+pub use fs_outbox_entry_ops::FsOutboxEntryOps;
 pub use fs_outbox_inventory::FsOutboxInventory;
 pub use fs_prober::FsExecutableProber;
 pub use fs_run_outbox_preparer::FsRunOutboxPreparer;
 pub use json_outbox_policy_store::JsonOutboxPolicyStore;
 pub use jsonl_approval_store::JsonlApprovalStore;
+pub use jsonl_catalog_store::JsonlCatalogStore;
+pub use jsonl_publication_journal::JsonlPublicationJournal;
 pub use line_agent::LineAgent;
+pub use local_dir_blob_store::LocalDirBlobStore;
 pub use omnifrons_app::harness_adapter::HarnessAdapter;
 pub use pty_cli::PtyCli;
+pub use sha2_hasher::Sha2Hasher;
 
 /// Every built-in adapter this crate provides: the two `stream-json`-shaped
 /// line agents (`line_agent::catalog`, spike slice 3) plus the
