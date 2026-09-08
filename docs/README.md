@@ -16,13 +16,14 @@ Omnifrons is currently in the design phase. These documents describe target dire
 10. [Handoff transaction protocol](handoff-transaction-protocol.md) — the handoff lifecycle, state vector, claim, authenticity, and cleanup.
 11. [Threat model](threat-model.md) — attacker classes, protected assets, trust boundaries, and the harness/Git/remote-content/secrets/process/prompt-injection threat catalog.
 12. [Renderer content-security contract](renderer-content-security.md) — content classes, sanitization, CSP, navigation, terminal control policy, clipboard, attachments and downloads, and redacted exports (RCS-001).
-13. [Update trust architecture](update-trust-architecture.md) — trust roots and online roles, release metadata, freshness, anti-rollback, platform signing, compromise recovery, and app bundle signing (UTA-001).
-14. [Voice interaction contract](voice-interaction-contract.md) — consent, visibility, processing, retention, accessibility, and text fallback for voice interaction (VOC-001).
-15. [Desktop stack verification plan](desktop-stack-verification-plan.md) — pinned per-OS baselines, the scenario catalog, evidence record, exception rule, and cadence for ADR-0002's acceptance gate (VP-001).
-16. [Repository layout](repository-layout.md) — repository skeleton, planned crate map, renderer package, toolchain pins, and CI overview.
-17. [Spike log](spike-log.md) — ADR-0002 implementation spikes: what each slice proves, defers, its IPC contract, and its relationship to VP-001 acceptance evidence.
-18. [ADR index and convention](adr/README.md) — decision status and governance.
-19. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
+13. [Heavy-asset publication contract](heavy-asset-publication.md) — artifact classification policy and its owner, per-project and per-device destination mapping, write-side discovery, outbox publication with Context Catalog registration, wrong-root handling, unmediated producers, and storage-plane failure states (HAP-001).
+14. [Update trust architecture](update-trust-architecture.md) — trust roots and online roles, release metadata, freshness, anti-rollback, platform signing, compromise recovery, and app bundle signing (UTA-001).
+15. [Voice interaction contract](voice-interaction-contract.md) — consent, visibility, processing, retention, accessibility, and text fallback for voice interaction (VOC-001).
+16. [Desktop stack verification plan](desktop-stack-verification-plan.md) — pinned per-OS baselines, the scenario catalog, evidence record, exception rule, and cadence for ADR-0002's acceptance gate (VP-001).
+17. [Repository layout](repository-layout.md) — repository skeleton, planned crate map, renderer package, toolchain pins, and CI overview.
+18. [Spike log](spike-log.md) — ADR-0002 implementation spikes: what each slice proves, defers, its IPC contract, and its relationship to VP-001 acceptance evidence.
+19. [ADR index and convention](adr/README.md) — decision status and governance.
+20. [Product naming and trademark clearance](product-naming.md) — selected name and remaining clearance work.
 
 ## Citation convention
 
@@ -44,7 +45,7 @@ A cross-reference into another document never cites a line number. Line numbers 
 | Target architecture | Draft |
 | Roadmap | Draft |
 | Versioning and compatibility | Draft |
-| Governance (GOV-001) | Draft |
+| Governance (GOV-001) | Accepted |
 | Context Orb presentation specification | Draft |
 | Adapter feed event schema (AEC-001 feed profile) | Draft |
 | Workspace roaming and Engram sync protocol (RSP-001) | Draft |
@@ -53,6 +54,7 @@ A cross-reference into another document never cites a line number. Line numbers 
 | Handoff transaction protocol (HTP-001) | Draft |
 | Threat model (TM-001) | Draft |
 | Renderer content-security contract (RCS-001) | Draft |
+| Heavy-asset publication contract (HAP-001) | Draft |
 | Update trust architecture (UTA-001) | Draft |
 | Voice interaction contract (VOC-001) | Draft |
 | Desktop stack verification plan (VP-001) | Draft |
