@@ -9,5 +9,6 @@ pub mod adapter;
 pub mod executable;
 pub mod outbox;
 pub mod output;
+pub mod publication;
 pub mod scope;
 pub mod terminal;
