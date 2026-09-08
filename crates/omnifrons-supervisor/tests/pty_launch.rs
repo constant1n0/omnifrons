@@ -79,6 +79,7 @@ fn pty_plan(workspace: WorkspaceRoot, argv: &[&str], prompt: Option<&str>) -> La
         prompt: prompt.map(|text| AgentPrompt::new(text).expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::Pty,
+        output_dir: None,
     }
 }
 

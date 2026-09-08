@@ -179,6 +179,7 @@ fn observed_env_equals_the_allowlist_excluding_a_planted_secret_shaped_key() {
         prompt: Some(AgentPrompt::new("hello\nworld").expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::StructuredStreamingCli,
+        output_dir: None,
     };
 
     let mut supervisor = TokioProcessSupervisor::new();
@@ -291,6 +292,7 @@ fn no_eof_with_a_custom_exit_code_terminates_without_hanging() {
         prompt: Some(AgentPrompt::new("ignored by --no-eof").expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::StructuredStreamingCli,
+        output_dir: None,
     };
 
     let mut supervisor = TokioProcessSupervisor::new();

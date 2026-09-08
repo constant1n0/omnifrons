@@ -32,6 +32,13 @@ nix = { version = "0.31.3", default-features = false, features = ["signal", "fs"
 
 [dev-dependencies]
 omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }
+# Added for spike slice 5's `tests/outbox_launch.rs`, which checks the
+# `fake-agent` fixture's hand-rolled SHA-256 (the fixture itself has no
+# hashing dependency, keeping this crate's normal dependency set
+# unchanged) against the real hasher. A dev-dependency only: `cargo tree
+# -p omnifrons-supervisor -e normal` is unchanged, and `sha2` was already
+# in `Cargo.lock` through `omnifrons-adapters`.
+sha2.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 # "resource" (added for the spike slice-4 review fixes) for

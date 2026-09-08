@@ -83,6 +83,7 @@ fn pty_plan(workspace: WorkspaceRoot) -> LaunchPlan {
         prompt: None,
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::Pty,
+        output_dir: None,
     }
 }
 

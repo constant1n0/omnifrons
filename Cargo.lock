@@ -2179,6 +2179,7 @@ dependencies = [
  "nix",
  "omnifrons-app",
  "omnifrons-domain",
+ "sha2",
  "tokio",
  "tracing",
 ]

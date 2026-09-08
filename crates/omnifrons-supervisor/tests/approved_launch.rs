@@ -38,6 +38,7 @@ fn default_plan() -> LaunchPlan {
         prompt: None,
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::StructuredStreamingCli,
+        output_dir: None,
     }
 }
 

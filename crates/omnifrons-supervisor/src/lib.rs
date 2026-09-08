@@ -111,18 +111,28 @@ fn plan_stdio(plan: &LaunchPlan) -> Result<(StdioPlan, Option<Vec<u8>>), Supervi
 /// [`is_secret_shaped`] immediately before it would be set on a real
 /// child, regardless of what the caller's own `EnvPlan` claims. The one
 /// place in this crate that ever sets an environment variable on a child.
+///
+/// A key the plan itself assigned (`EnvPlan::assign`; spike slice 5's
+/// `OMNIFRONS_OUTPUT_DIR`, HAP-001 D4) is set from that assignment and
+/// never resolved from this process's environment, so a value of the same
+/// name in the parent can never reach the child; every other allowlisted
+/// key is resolved from the parent at spawn time, as before.
 fn apply_env(command: &mut Command, env: &EnvPlan) {
     match env {
         EnvPlan::Inherit => {}
-        EnvPlan::Allowlist(keys) => {
+        EnvPlan::Allowlist(_) => {
             command.env_clear();
-            for key in keys {
+            for key in env.allowed_keys() {
                 if is_secret_shaped(key) {
                     tracing::warn!(
                         key,
                         "refusing to set a secret-shaped environment variable on a spawned \
                          child, even though it was allowlisted"
                     );
+                    continue;
+                }
+                if let Some(assignment) = env.assignment_for(key) {
+                    command.env(key, &assignment.value);
                     continue;
                 }
                 if let Ok(value) = std::env::var(key) {

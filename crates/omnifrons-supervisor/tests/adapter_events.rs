@@ -62,6 +62,7 @@ fn base_plan(workspace: WorkspaceRoot, argv: Vec<String>) -> LaunchPlan {
         prompt: Some(AgentPrompt::new("unused").expect("valid prompt")),
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::StructuredStreamingCli,
+        output_dir: None,
     }
 }
 
