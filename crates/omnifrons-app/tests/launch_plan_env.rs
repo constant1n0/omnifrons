@@ -87,3 +87,72 @@ fn declaring_the_same_key_twice_does_not_duplicate_it() {
 fn inherit_carries_no_closed_key_list() {
     assert_eq!(EnvPlan::Inherit.allowed_keys(), &[] as &[String]);
 }
+
+// -- Slice 5: product-set assignments alongside the allowlist --
+
+/// A product-set key/value pair (spike slice 5, HAP-001 D4) joins the
+/// allowlist's keys and is exposed as an assignment; the same key assigned
+/// twice keeps the latest value and appears once.
+#[test]
+fn assign_adds_the_key_once_and_exposes_the_latest_value() {
+    let mut plan = EnvPlan::new(&[]).expect("empty declared keys must be accepted");
+    plan.assign("OMNIFRONS_OUTPUT_DIR", "/first")
+        .expect("an ordinary key must be assignable");
+    plan.assign("OMNIFRONS_OUTPUT_DIR", "/second")
+        .expect("re-assigning the same key must be accepted");
+
+    let occurrences = plan
+        .allowed_keys()
+        .iter()
+        .filter(|key| key.as_str() == "OMNIFRONS_OUTPUT_DIR")
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "an assigned key appears once in the allowlist"
+    );
+    assert_eq!(plan.assignments().len(), 1);
+    assert_eq!(plan.assignments()[0].key, "OMNIFRONS_OUTPUT_DIR");
+    assert_eq!(
+        plan.assignments()[0].value,
+        std::ffi::OsString::from("/second")
+    );
+    assert_eq!(
+        plan.assignment_for("OMNIFRONS_OUTPUT_DIR")
+            .map(|assignment| assignment.value.clone()),
+        Some(std::ffi::OsString::from("/second"))
+    );
+    assert!(plan.assignment_for("PATH").is_none());
+}
+
+/// The secret-shape refusal applies to an assigned key's name exactly as
+/// to a declared one (HAP-001-R37: the only key this contract adds is
+/// non-secret).
+#[test]
+fn assign_refuses_a_secret_shaped_key() {
+    let mut plan = EnvPlan::new(&[]).expect("empty declared keys must be accepted");
+    let error = plan.assign("OMNIFRONS_SECRET", "x").unwrap_err();
+    assert_eq!(
+        error,
+        LaunchPlanError::SecretShapedEnvKey("OMNIFRONS_SECRET".to_string())
+    );
+    assert!(
+        plan.assignments().is_empty(),
+        "a refused assignment leaves nothing behind"
+    );
+}
+
+/// An inherited environment has no closed key list to assign into.
+#[test]
+fn assign_on_an_inherited_plan_is_refused() {
+    let mut plan = EnvPlan::Inherit;
+    assert_eq!(
+        plan.assign("OMNIFRONS_OUTPUT_DIR", "/x").unwrap_err(),
+        LaunchPlanError::AssignmentOnInheritedEnv
+    );
+}
+
+#[test]
+fn a_fresh_allowlist_has_no_assignments() {
+    let plan = EnvPlan::new(&[]).expect("empty declared keys must be accepted");
+    assert!(plan.assignments().is_empty());
+}

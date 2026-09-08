@@ -103,6 +103,38 @@ pub fn is_secret_shaped(key: &str) -> bool {
         || upper == "GITHUB_TOKEN"
 }
 
+/// The one environment key HAP-001 adds to a launch (HAP-001-R9, spike
+/// slice 5): the run subdirectory of the project's outbox, declared to the
+/// harness as its output location. Non-secret by name -- it matches none
+/// of [`is_secret_shaped`]'s patterns -- and set only through
+/// [`LaunchPlan::declare_output_dir`], so its value is always the
+/// product's, never the parent environment's.
+pub const OUTPUT_DIR_ENV_KEY: &str = "OMNIFRONS_OUTPUT_DIR";
+
+/// One environment variable the product itself sets on a child (spike
+/// slice 5): an explicit key/value pair, distinct from an allowlisted key
+/// whose value is resolved from the parent environment at spawn time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvAssignment {
+    /// The variable's name; never secret-shaped ([`EnvPlan::assign`]
+    /// refuses one).
+    pub key: String,
+    /// The value the product sets, verbatim.
+    pub value: std::ffi::OsString,
+}
+
+/// The closed key list of an [`EnvPlan::Allowlist`]: the allowlisted key
+/// names, plus the product-set assignments among them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Allowlist {
+    /// Every key the child may receive, sorted and deduplicated; a key
+    /// with an assignment is set from that assignment, every other key
+    /// from the parent environment.
+    keys: Vec<String>,
+    /// The product-set pairs, at most one per key.
+    assignments: Vec<EnvAssignment>,
+}
+
 /// How a spawned process's environment is built.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EnvPlan {
@@ -114,19 +146,21 @@ pub enum EnvPlan {
     /// adapter's process would.
     #[default]
     Inherit,
-    /// Clear the child's environment, then set only these allowlisted key
-    /// names, each resolved from the parent process's own environment at
-    /// spawn time (never a value captured earlier). Built only via
-    /// [`EnvPlan::new`], which merges the fixed base allowlist
-    /// ([`base_env_keys`]) with an adapter's own declared keys and refuses
-    /// any secret-shaped name outright.
-    Allowlist(Vec<String>),
+    /// Clear the child's environment, then set only the allowlisted key
+    /// names: each resolved from the parent process's own environment at
+    /// spawn time (never a value captured earlier), except a key the
+    /// product itself assigned ([`Self::assign`]), which is set from that
+    /// assignment and never from the parent (spike slice 5, HAP-001 D4).
+    /// Built only via [`EnvPlan::new`], which merges the fixed base
+    /// allowlist ([`base_env_keys`]) with an adapter's own declared keys
+    /// and refuses any secret-shaped name outright.
+    Allowlist(Allowlist),
 }
 
 impl EnvPlan {
     /// Build an allowlist plan from `declared` extra keys, merged with the
     /// fixed base allowlist ([`base_env_keys`]), deduplicated and sorted
-    /// for a stable, comparable shape.
+    /// for a stable, comparable shape, with no assignments.
     ///
     /// # Errors
     ///
@@ -143,7 +177,10 @@ impl EnvPlan {
         }
         keys.sort();
         keys.dedup();
-        Ok(Self::Allowlist(keys))
+        Ok(Self::Allowlist(Allowlist {
+            keys,
+            assignments: Vec::new(),
+        }))
     }
 
     /// The allowlisted key names this plan carries, or an empty slice for
@@ -153,8 +190,63 @@ impl EnvPlan {
     pub fn allowed_keys(&self) -> &[String] {
         match self {
             Self::Inherit => &[],
-            Self::Allowlist(keys) => keys,
+            Self::Allowlist(allowlist) => &allowlist.keys,
         }
+    }
+
+    /// The product-set assignments this plan carries, or an empty slice
+    /// for [`Self::Inherit`].
+    #[must_use]
+    pub fn assignments(&self) -> &[EnvAssignment] {
+        match self {
+            Self::Inherit => &[],
+            Self::Allowlist(allowlist) => &allowlist.assignments,
+        }
+    }
+
+    /// The assignment for `key`, if the product set one.
+    #[must_use]
+    pub fn assignment_for(&self, key: &str) -> Option<&EnvAssignment> {
+        self.assignments()
+            .iter()
+            .find(|assignment| assignment.key == key)
+    }
+
+    /// Set `key` to `value` on the child from the product's own value:
+    /// the key joins the allowlist (once) and its assignment replaces any
+    /// earlier one for the same key. The supervisor's single choke point
+    /// sets an assigned key from the assignment only, never from the
+    /// parent environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchPlanError::SecretShapedEnvKey`] if `key` looks
+    /// secret-shaped ([`is_secret_shaped`]), or
+    /// [`LaunchPlanError::AssignmentOnInheritedEnv`] on
+    /// [`Self::Inherit`], which has no closed key list to assign into.
+    pub fn assign(
+        &mut self,
+        key: &str,
+        value: impl Into<std::ffi::OsString>,
+    ) -> Result<(), LaunchPlanError> {
+        if is_secret_shaped(key) {
+            return Err(LaunchPlanError::SecretShapedEnvKey(key.to_string()));
+        }
+        let Self::Allowlist(allowlist) = self else {
+            return Err(LaunchPlanError::AssignmentOnInheritedEnv);
+        };
+        if !allowlist.keys.iter().any(|existing| existing == key) {
+            allowlist.keys.push(key.to_string());
+            allowlist.keys.sort();
+        }
+        allowlist
+            .assignments
+            .retain(|assignment| assignment.key != key);
+        allowlist.assignments.push(EnvAssignment {
+            key: key.to_string(),
+            value: value.into(),
+        });
+        Ok(())
     }
 }
 
@@ -177,6 +269,11 @@ pub enum LaunchPlanError {
     /// control other than newline and tab, or DEL (spike slice 4,
     /// `docs/spike-log.md` § Slice 4).
     PromptNotTypeable,
+    /// A product-set environment assignment ([`EnvPlan::assign`]) was
+    /// requested on [`EnvPlan::Inherit`], which has no closed key list to
+    /// assign into (spike slice 5). Structurally unreachable in the wired
+    /// flow, where every adapter plan is an allowlist.
+    AssignmentOnInheritedEnv,
 }
 
 impl std::fmt::Display for LaunchPlanError {
@@ -196,6 +293,9 @@ impl std::fmt::Display for LaunchPlanError {
             }
             Self::PromptNotTypeable => {
                 f.write_str("the prompt contains control characters a terminal would interpret")
+            }
+            Self::AssignmentOnInheritedEnv => {
+                f.write_str("an inherited environment has no allowlist to assign into")
             }
         }
     }
@@ -230,6 +330,36 @@ pub struct LaunchPlan {
     /// pseudo-terminal as stdin, stdout, and stderr, types `prompt` into
     /// it, and leaves `stdin` unused.
     pub transport: TransportClass,
+    /// The run subdirectory of the project's outbox this launch declares
+    /// to the harness as its output location (spike slice 5,
+    /// HAP-001-R9), or `None` for a launch that declares none (a demo or
+    /// plain approved launch). Set together with the
+    /// [`OUTPUT_DIR_ENV_KEY`] assignment on `env` by
+    /// [`Self::declare_output_dir`], never by hand: the field is the
+    /// shell's record of what was declared, the assignment is what the
+    /// supervisor's choke point actually sets on the child.
+    pub output_dir: Option<PathBuf>,
+}
+
+impl LaunchPlan {
+    /// Declare `run_subdirectory` -- an already prepared, canonical run
+    /// subdirectory under the project's outbox -- as this launch's output
+    /// location: records it on [`Self::output_dir`] and assigns
+    /// [`OUTPUT_DIR_ENV_KEY`] to it on [`Self::env`], so the child receives
+    /// exactly that path through exactly one declared, non-secret key
+    /// (HAP-001-R9). The value is the product's own, never read from the
+    /// parent environment (HAP-001 D4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchPlanError::AssignmentOnInheritedEnv`] if `env` is
+    /// [`EnvPlan::Inherit`]; the field is left unset in that case.
+    pub fn declare_output_dir(&mut self, run_subdirectory: PathBuf) -> Result<(), LaunchPlanError> {
+        self.env
+            .assign(OUTPUT_DIR_ENV_KEY, run_subdirectory.as_os_str())?;
+        self.output_dir = Some(run_subdirectory);
+        Ok(())
+    }
 }
 
 /// Validate that `candidate_cwd`, once canonicalized, is exactly
@@ -753,6 +883,7 @@ mod tests {
                 prompt: Some(request.prompt.clone()),
                 scope_mode: ScopeMode::Advisory,
                 transport: TransportClass::StructuredStreamingCli,
+                output_dir: None,
             })
         }
 

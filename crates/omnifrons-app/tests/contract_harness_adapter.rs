@@ -43,6 +43,7 @@ impl HarnessAdapter for FakeAdapter {
             prompt: Some(request.prompt.clone()),
             scope_mode: ScopeMode::Advisory,
             transport: TransportClass::StructuredStreamingCli,
+            output_dir: None,
         })
     }
 

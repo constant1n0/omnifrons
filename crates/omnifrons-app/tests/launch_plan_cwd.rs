@@ -100,6 +100,7 @@ fn a_launch_plan_built_from_an_accepted_cwd_is_advisory() {
         prompt: None,
         scope_mode: ScopeMode::Advisory,
         transport: TransportClass::StructuredStreamingCli,
+        output_dir: None,
     };
 
     assert_eq!(plan.scope_mode, ScopeMode::Advisory);
