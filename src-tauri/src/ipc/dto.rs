@@ -297,11 +297,28 @@ pub enum TerminalActionKindDto {
     Notification,
 }
 
+/// One entry an `artifact.publish` proposal names, as it crosses IPC: the
+/// harness's own claim -- a name and the full digest it asserts -- never
+/// a fact Omnifrons verified (spike slice 5, HAP-001-R12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposedEntryDto {
+    pub name: String,
+    pub sha256: String,
+}
+
 /// [`omnifrons_domain::adapter::AdapterEvent`], as it crosses IPC.
 /// Adjacently tagged (`kind` + `payload`), matching
 /// [`HarnessFrame`]'s own outer `stream`/`body` shape one level down: the
 /// literal `kind`/`payload` field names [`HarnessFrame::Event`] flattens
 /// this into come from here.
+///
+/// Two kinds are the shell's own rather than an adapter's (spike slice 5):
+/// `artifact-publish` is the typed proposal a line agent recognized, and
+/// `candidates` is emitted once per adapter launch at run end, before the
+/// terminal `state` frame, summarizing the run subdirectory's inventory
+/// by state and attribution -- counts only, never a path
+/// (`docs/spike-log.md` § Slice 5).
 ///
 /// `Unknown::raw` is rendered as a plain (lossily decoded) string, never
 /// base64 or a byte array: every `raw` this slice's own adapters ever
@@ -359,6 +376,20 @@ pub enum AdapterEventDto {
         unknown: u64,
         malformed: u64,
     },
+    ArtifactPublish {
+        entries: Vec<ProposedEntryDto>,
+    },
+    Candidates {
+        run_id: String,
+        total: u32,
+        candidate: u32,
+        outbox_escape: u32,
+        outbox_linked: u32,
+        attributed: u32,
+        unattributed: u32,
+        unreadable: u32,
+        unmatched_proposals: u32,
+    },
 }
 
 impl AdapterEventDto {
@@ -366,6 +397,16 @@ impl AdapterEventDto {
     pub fn from_domain(event: omnifrons_domain::adapter::AdapterEvent) -> Self {
         use omnifrons_domain::adapter::{AdapterEvent, AgentPhase};
         match event {
+            AdapterEvent::ArtifactPublish(proposal) => Self::ArtifactPublish {
+                entries: proposal
+                    .entries
+                    .into_iter()
+                    .map(|entry| ProposedEntryDto {
+                        name: entry.name,
+                        sha256: entry.sha256.to_hex(),
+                    })
+                    .collect(),
+            },
             AdapterEvent::State {
                 phase,
                 observations,
@@ -520,11 +561,152 @@ impl HarnessFrame {
         dropped_before: u64,
         event: omnifrons_domain::adapter::AdapterEvent,
     ) -> Self {
+        Self::event_dto(id, seq, dropped_before, AdapterEventDto::from_domain(event))
+    }
+
+    /// Build an `event` wire frame for `id` from an already-shaped
+    /// [`AdapterEventDto`] -- the shell's own `candidates` summary and
+    /// the diagnostics it emits at run end (spike slice 5), which have no
+    /// domain `AdapterEvent` because no adapter produced them.
+    #[must_use]
+    pub fn event_dto(
+        id: ProcessIdDto,
+        seq: u64,
+        dropped_before: u64,
+        event: AdapterEventDto,
+    ) -> Self {
         Self::Event {
             id,
             seq,
             dropped_before,
-            event: AdapterEventDto::from_domain(event),
+            event,
+        }
+    }
+}
+
+/// The outbox's state for the active workspace, as it crosses IPC
+/// (`outbox_status`, spike slice 5): the three tokens HAP-001's signal
+/// mapping assigns to the declaration and the pre-creation check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutboxStateTag {
+    /// The declaration is valid; the outbox exists as a real directory
+    /// inside the project, or does not exist yet and the first adapter
+    /// launch creates it.
+    Valid,
+    /// The declared path resolves outside the project root or is a link,
+    /// or the policy declaring it could not be loaded (HAP-001-R8).
+    OutboxInvalid,
+    /// Something that is not a directory sits at the declared path, or
+    /// its metadata could not be read (HAP-001-R10).
+    OutboxUnavailable,
+}
+
+/// Why `outbox_status` reports a non-`valid` state: a fixed token, never
+/// the underlying error's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutboxReasonTag {
+    OutsideProject,
+    Link,
+    NotADirectory,
+    Unreadable,
+    PolicyUnreadable,
+    PolicyCorrupt,
+    PolicyInvalid,
+}
+
+/// `outbox_status`'s payload. `outbox` is the outbox's canonical
+/// filesystem path, present only when the declaration is valid and the
+/// directory exists: identity evidence flowing core -> renderer for
+/// display (where a run's output lands), the third explicit exception to
+/// RCS-001-R14's no-raw-path rule alongside [`EvidenceDto::canonical_path`]
+/// and [`WorkspaceDto::display_path`] -- never a reference the renderer
+/// sends back, and never shown for a directory that failed validation.
+/// `declared` and `policy_path` are project-relative names, not device
+/// paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxStatusDto {
+    pub declared: Option<String>,
+    pub outbox: Option<String>,
+    pub exists: bool,
+    pub state: OutboxStateTag,
+    pub reason: Option<OutboxReasonTag>,
+    pub policy_path: String,
+}
+
+/// [`omnifrons_domain::outbox::CandidateState`], as it crosses IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CandidateStateTag {
+    Candidate,
+    OutboxEscape,
+    OutboxLinked,
+}
+
+impl From<omnifrons_domain::outbox::CandidateState> for CandidateStateTag {
+    fn from(state: omnifrons_domain::outbox::CandidateState) -> Self {
+        use omnifrons_domain::outbox::CandidateState;
+        match state {
+            CandidateState::Candidate => Self::Candidate,
+            CandidateState::OutboxEscape => Self::OutboxEscape,
+            CandidateState::OutboxLinked => Self::OutboxLinked,
+        }
+    }
+}
+
+/// [`omnifrons_domain::outbox::Attribution`], as it crosses IPC:
+/// `{"kind": "run", "runId": ...}` or `{"kind": "unattributed"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AttributionDto {
+    Run { run_id: String },
+    Unattributed,
+}
+
+/// One candidate entry, as `candidates_list` returns it (spike slice 5):
+/// its name relative to the outbox (a producer-supplied name, plain text
+/// only), the facts taken from its handle -- `null` for a refused entry,
+/// where nothing was digested (HAP-001-R20) -- its attribution, and its
+/// state. Never a device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateDto {
+    pub name: String,
+    pub size: Option<u64>,
+    pub sha256_short: Option<String>,
+    pub detected_type: Option<String>,
+    pub class: Option<String>,
+    pub attribution: AttributionDto,
+    pub state: CandidateStateTag,
+}
+
+impl CandidateDto {
+    #[must_use]
+    pub fn from_candidate(
+        entry: &omnifrons_domain::outbox::CandidateEntry,
+        state: omnifrons_domain::outbox::CandidateState,
+    ) -> Self {
+        use omnifrons_domain::outbox::{Attribution, CandidateState};
+        let digested = state == CandidateState::Candidate;
+        Self {
+            name: entry.name.clone(),
+            size: digested.then_some(entry.size),
+            sha256_short: digested.then(|| entry.digest.short_hex()),
+            detected_type: digested.then(|| entry.detected_type.as_str().to_string()),
+            class: digested.then(|| entry.class.as_str().to_string()),
+            attribution: match &entry.attribution {
+                Attribution::Run(run_id) => AttributionDto::Run {
+                    run_id: run_id.as_str().to_string(),
+                },
+                Attribution::Unattributed => AttributionDto::Unattributed,
+            },
+            state: state.into(),
         }
     }
 }
@@ -585,6 +767,16 @@ pub enum ShellErrorCode {
     /// control other than newline and tab, or DEL); refused at
     /// plan-building time, nothing was spawned (spike slice 4).
     PromptNotTypeable,
+    /// The project's outbox declaration is invalid -- the classification
+    /// policy could not be loaded, or the declared path resolves outside
+    /// the project or is a link -- so ingestion is blocked
+    /// (`candidates_list`; HAP-001-R8, spike slice 5).
+    OutboxInvalid,
+    /// An adapter launch could not prepare its run subdirectory: the
+    /// outbox failed its pre-creation check, something already sits at the
+    /// subdirectory's path, or handle verification failed; nothing was
+    /// spawned (HAP-001-R10, D14; spike slice 5).
+    OutboxUnavailable,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -823,6 +1015,8 @@ mod tests {
         PromptChannelDto, ScopeModeDto, ShellError, ShellErrorCode, ShellErrorDetail,
         TransportClassDto, WorkspaceDto,
     };
+
+    use omnifrons_domain::executable::Sha256Digest;
 
     fn json(value: &impl serde::Serialize) -> serde_json::Value {
         serde_json::to_value(value).expect("serialization must succeed")
@@ -1550,6 +1744,240 @@ mod tests {
         let cases = [
             (ShellErrorCode::PtyUnsupported, "pty-unsupported"),
             (ShellErrorCode::PromptNotTypeable, "prompt-not-typeable"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+        }
+    }
+
+    // -- Slice 5: the outbox status, candidates, the artifact-publish and
+    // candidates event kinds, and the two outbox error codes --
+
+    /// `outbox_status` for a valid, existing outbox: the canonical outbox
+    /// path is identity evidence for display (the third RCS-001-R14
+    /// exception), never a reference the renderer sends back.
+    #[test]
+    fn outbox_status_dto_json_shape_when_valid() {
+        let dto = super::OutboxStatusDto {
+            declared: Some(".omnifrons/outbox".to_string()),
+            outbox: Some("/home/user/project/.omnifrons/outbox".to_string()),
+            exists: true,
+            state: super::OutboxStateTag::Valid,
+            reason: None,
+            policy_path: ".omnifrons/asset-policy.json".to_string(),
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "declared": ".omnifrons/outbox",
+                "outbox": "/home/user/project/.omnifrons/outbox",
+                "exists": true,
+                "state": "valid",
+                "reason": null,
+                "policyPath": ".omnifrons/asset-policy.json",
+            })
+        );
+    }
+
+    /// An invalid declaration carries the declared project-relative name
+    /// (shown as invalid) and a fixed reason token, never a device path.
+    #[test]
+    fn outbox_status_dto_json_shape_when_invalid_carries_no_device_path() {
+        let dto = super::OutboxStatusDto {
+            declared: Some("elsewhere/outbox".to_string()),
+            outbox: None,
+            exists: true,
+            state: super::OutboxStateTag::OutboxInvalid,
+            reason: Some(super::OutboxReasonTag::Link),
+            policy_path: ".omnifrons/asset-policy.json".to_string(),
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "declared": "elsewhere/outbox",
+                "outbox": null,
+                "exists": true,
+                "state": "outbox-invalid",
+                "reason": "link",
+                "policyPath": ".omnifrons/asset-policy.json",
+            })
+        );
+        let unavailable = super::OutboxStatusDto {
+            declared: None,
+            outbox: None,
+            exists: false,
+            state: super::OutboxStateTag::OutboxUnavailable,
+            reason: Some(super::OutboxReasonTag::PolicyCorrupt),
+            policy_path: ".omnifrons/asset-policy.json".to_string(),
+        };
+        assert_eq!(
+            json(&unavailable)["state"],
+            serde_json::json!("outbox-unavailable")
+        );
+        assert_eq!(
+            json(&unavailable)["reason"],
+            serde_json::json!("policy-corrupt")
+        );
+    }
+
+    /// Every reason token is kebab-case and slash-free.
+    #[test]
+    fn outbox_reason_tags_serialize_as_kebab_case() {
+        let cases = [
+            (super::OutboxReasonTag::OutsideProject, "outside-project"),
+            (super::OutboxReasonTag::Link, "link"),
+            (super::OutboxReasonTag::NotADirectory, "not-a-directory"),
+            (super::OutboxReasonTag::Unreadable, "unreadable"),
+            (
+                super::OutboxReasonTag::PolicyUnreadable,
+                "policy-unreadable",
+            ),
+            (super::OutboxReasonTag::PolicyCorrupt, "policy-corrupt"),
+            (super::OutboxReasonTag::PolicyInvalid, "policy-invalid"),
+        ];
+        for (tag, token) in cases {
+            assert_eq!(json(&tag), serde_json::json!(token));
+        }
+    }
+
+    /// A `candidates_list` item for an attributed, validated candidate:
+    /// the name relative to the outbox, the facts from its handle, the run
+    /// that named it, and the `candidate` state -- never a device path.
+    #[test]
+    fn candidate_dto_json_shape_for_an_attributed_candidate() {
+        use omnifrons_domain::outbox::{
+            ArtifactClass, Attribution, CandidateEntry, CandidateState, DetectedType, RunId,
+        };
+        let entry = CandidateEntry {
+            name: "run-1/report.pdf".to_string(),
+            size: 4096,
+            digest: Sha256Digest([0xab; 32]),
+            detected_type: DetectedType::Pdf,
+            attribution: Attribution::Run(RunId::new("run-1").expect("valid")),
+            class: ArtifactClass::GeneratedHeavy,
+        };
+        let dto = super::CandidateDto::from_candidate(&entry, CandidateState::Candidate);
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "name": "run-1/report.pdf",
+                "size": 4096,
+                "sha256Short": "abababab",
+                "detectedType": "pdf",
+                "class": "generated-heavy",
+                "attribution": {"kind": "run", "runId": "run-1"},
+                "state": "candidate",
+            })
+        );
+    }
+
+    /// A refused entry (`outbox-escape`, `outbox-linked`) carries no digest
+    /// facts at all: nothing was digested (HAP-001-R20).
+    #[test]
+    fn candidate_dto_json_shape_for_a_refused_entry_has_no_digest_facts() {
+        use omnifrons_domain::outbox::{
+            ArtifactClass, Attribution, CandidateEntry, CandidateState, DetectedType,
+        };
+        let entry = CandidateEntry {
+            name: "run-1/linked.bin".to_string(),
+            size: 0,
+            digest: Sha256Digest([0; 32]),
+            detected_type: DetectedType::Unknown,
+            attribution: Attribution::Unattributed,
+            class: ArtifactClass::Unclassified,
+        };
+        let dto = super::CandidateDto::from_candidate(&entry, CandidateState::OutboxLinked);
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "name": "run-1/linked.bin",
+                "size": null,
+                "sha256Short": null,
+                "detectedType": null,
+                "class": null,
+                "attribution": {"kind": "unattributed"},
+                "state": "outbox-linked",
+            })
+        );
+        let escape = super::CandidateDto::from_candidate(&entry, CandidateState::OutboxEscape);
+        assert_eq!(json(&escape)["state"], serde_json::json!("outbox-escape"));
+    }
+
+    /// Proposed AEC-001 kind `artifact-publish`: the harness's own claim,
+    /// entries named by full digest -- a proposal only.
+    #[test]
+    fn harness_frame_event_artifact_publish_json_shape() {
+        use omnifrons_domain::outbox::{ProposedEntry, PublishProposal};
+        let frame = HarnessFrame::event(
+            ProcessIdDto(42),
+            6,
+            0,
+            omnifrons_domain::adapter::AdapterEvent::ArtifactPublish(PublishProposal {
+                entries: vec![ProposedEntry {
+                    name: "report.pdf".to_string(),
+                    sha256: Sha256Digest([0xab; 32]),
+                }],
+            }),
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 6, "droppedBefore": 0,
+                    "kind": "artifact-publish",
+                    "payload": {"entries": [{"name": "report.pdf", "sha256": "ab".repeat(32)}]}
+                }
+            })
+        );
+    }
+
+    /// The `candidates` event the shell emits once at run end, before the
+    /// terminal `state` frame: the inventory summary, counts per state and
+    /// attribution, no path.
+    #[test]
+    fn harness_frame_event_candidates_json_shape() {
+        let frame = HarnessFrame::event_dto(
+            ProcessIdDto(42),
+            9,
+            0,
+            super::AdapterEventDto::Candidates {
+                run_id: "run-1".to_string(),
+                total: 5,
+                candidate: 3,
+                outbox_escape: 1,
+                outbox_linked: 1,
+                attributed: 2,
+                unattributed: 3,
+                unreadable: 0,
+                unmatched_proposals: 1,
+            },
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 9, "droppedBefore": 0,
+                    "kind": "candidates",
+                    "payload": {
+                        "runId": "run-1", "total": 5, "candidate": 3, "outboxEscape": 1,
+                        "outboxLinked": 1, "attributed": 2, "unattributed": 3,
+                        "unreadable": 0, "unmatchedProposals": 1
+                    }
+                }
+            })
+        );
+    }
+
+    /// The two slice-5 error codes each render as their documented
+    /// kebab-case token with slash-free messages.
+    #[test]
+    fn slice_5_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::OutboxInvalid, "outbox-invalid"),
+            (ShellErrorCode::OutboxUnavailable, "outbox-unavailable"),
         ];
         for (code, token) in cases {
             let error = ShellError::new(code, "message");

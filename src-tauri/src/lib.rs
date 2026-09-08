@@ -9,16 +9,18 @@ mod adapter_state;
 mod executable_state;
 mod health;
 mod ipc;
+mod outbox_state;
 
 use adapter_state::AdapterState;
 use executable_state::ExecutableState;
 use health::ShellHealth;
 use ipc::commands::{
-    adapters_list, approvals_list, executable_approve, executable_pick_and_probe,
-    executable_revoke, harness_observe, harness_spawn, harness_stop, workspace_current,
-    workspace_pick,
+    adapters_list, approvals_list, candidates_list, executable_approve, executable_pick_and_probe,
+    executable_revoke, harness_observe, harness_spawn, harness_stop, outbox_status,
+    workspace_current, workspace_pick,
 };
 use omnifrons_supervisor::TokioProcessSupervisor;
+use outbox_state::OutboxState;
 use tauri::Manager as _;
 
 /// Typed IPC command: the renderer's only way to read this shell's
@@ -78,6 +80,11 @@ pub fn run() {
             // The closed, built-in adapter catalog and the single active-
             // workspace slot (`docs/spike-log.md` § Slice 3).
             app.manage(AdapterState::new());
+
+            // The outbox surface: policy store, run-subdirectory preparer,
+            // inventory, and the bounded per-run table
+            // (`docs/spike-log.md` § Slice 5).
+            app.manage(OutboxState::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -92,6 +99,8 @@ pub fn run() {
             workspace_pick,
             workspace_current,
             adapters_list,
+            outbox_status,
+            candidates_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");
