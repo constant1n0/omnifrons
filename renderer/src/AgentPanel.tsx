@@ -4,9 +4,11 @@ import { stripControlCharacters } from './controlCharacters'
 import {
   adaptersList,
   approvalsList,
+  candidatesList,
   harnessSpawn,
   harnessStop,
   isShellError,
+  outboxStatus,
   workspaceCurrent,
   workspacePick,
   type AdapterDescriptor,
@@ -14,8 +16,14 @@ import {
   type AgentPhaseTag,
   type Approval,
   type ApprovalId,
+  type Attribution,
+  type Candidate,
+  type CandidateState,
+  type CandidatesSummary,
   type HarnessFrame,
   type Observation,
+  type OutboxReason,
+  type OutboxStatus,
   type ProcessId,
   type ProcessTerminalState,
   type ShellError,
@@ -155,6 +163,192 @@ function formatTerminalDrops(counts: TerminalDropCounts): string {
   return `dropped terminal controls: ${families.join(', ')}`
 }
 
+/**
+ * The fixed English for an `outbox_status` reason token (`docs/spike-log.md`
+ * § Slice 5): chosen by an exhaustive switch over the closed token set,
+ * never the raw payload echoed. `null` -- a non-`valid` state with no
+ * reason, which the shell never produces -- reads as unreported rather
+ * than as an empty line.
+ */
+function formatOutboxReason(reason: OutboxReason | null): string {
+  switch (reason) {
+    case 'outside-project':
+      return 'the declared path resolves outside the project'
+    case 'link':
+      return 'the declared path is a link'
+    case 'not-a-directory':
+      return 'the declared path is not a directory'
+    case 'unreadable':
+      return 'the declared path could not be read'
+    case 'policy-unreadable':
+      return 'the classification policy could not be read'
+    case 'policy-corrupt':
+      return 'the classification policy is corrupt'
+    case 'policy-invalid':
+      return 'the classification policy is invalid'
+    case null:
+      return 'reason unreported'
+  }
+}
+
+/** The cell text for a fact the wire carries as `null` (a refused entry was never digested). */
+const NULL_FACT = '—'
+
+/**
+ * The tail of a non-`valid` status line: the declared project-relative
+ * name shown as the thing that is invalid, with the reason in parentheses
+ * (HAP-001's visible state for `outbox-invalid` is "the declared path shown
+ * as invalid"; slice 5 review, R3-017), or the reason alone when the policy
+ * itself could not be loaded and nothing was declared.
+ */
+function formatDeclaredReason(status: OutboxStatus): string {
+  const reason = formatOutboxReason(status.reason)
+  return status.declared === null ? reason : `${status.declared} (${reason})`
+}
+
+/**
+ * The outbox status line's text, fixed copy per closed state token
+ * (`docs/spike-log.md` § Slice 5): a valid, existing outbox shows its
+ * canonical path (the third explicit RCS-001-R14 exception -- identity
+ * evidence of where a run's output lands, display-only) beside the
+ * declared project-relative name; a valid declaration whose directory does
+ * not exist yet shows only the declared name, since the first adapter
+ * launch creates it; an invalid or unavailable declaration shows the
+ * declared name (when the policy declared one) and its reason in fixed
+ * English, never a device path. The whole line renders through
+ * {@link PlainTextLine}: the path and the declared name are
+ * project-originated text.
+ */
+function formatOutboxStatusLine(status: OutboxStatus): string {
+  switch (status.state) {
+    case 'valid':
+      return status.exists && status.outbox !== null
+        ? `outbox: ${status.outbox} (declared ${status.declared ?? NULL_FACT})`
+        : `outbox: ${status.declared ?? NULL_FACT} (created at the first launch)`
+    case 'outbox-invalid':
+      return `outbox invalid: ${formatDeclaredReason(status)}`
+    case 'outbox-unavailable':
+      return `outbox unavailable: ${formatDeclaredReason(status)}`
+  }
+}
+
+/** The visible label on every `artifact-publish` transcript entry. */
+const PUBLISH_PROPOSAL_LABEL = 'publish proposal:'
+
+/**
+ * The first eight characters of a proposal's full digest -- the same short
+ * form `sha256Short` carries elsewhere on the wire -- taken by code point,
+ * so a digest that is not the 64 hex characters the contract promises is
+ * still cut cleanly and rendered as the text it is.
+ */
+function shortDigest(sha256: string): string {
+  return Array.from(sha256).slice(0, 8).join('')
+}
+
+/**
+ * The `candidates` summary line: the eight counts of the shell's run-end
+ * inventory in a fixed order, zero counts included -- every count is always
+ * accounted for, like {@link formatTerminalDrops}' families. The run id the
+ * payload carries is the key of the follow-up `candidatesList` fetch, not
+ * part of the line.
+ */
+function formatCandidatesSummary(summary: CandidatesSummary): string {
+  const counts = [
+    `${summary.total} total`,
+    `${summary.candidate} candidate`,
+    `${summary.outboxEscape} escape`,
+    `${summary.outboxLinked} linked`,
+    `${summary.attributed} attributed`,
+    `${summary.unattributed} unattributed`,
+    `${summary.unreadable} unreadable`,
+    `${summary.unmatchedProposals} unmatched proposals`,
+  ]
+  return `candidates: ${counts.join(', ')}`
+}
+
+/**
+ * The attribution cell: fixed copy chosen per closed kind, never the wire
+ * token echoed -- the switch is exhaustive, so a new kind cannot render
+ * unlabelled. The run id of an attributed entry is not repeated per row:
+ * the table is one run's inventory, and location alone never attributes
+ * (HAP-001-R11), so `run` here means the run's own proposal named the entry.
+ */
+function formatAttribution(attribution: Attribution): string {
+  switch (attribution.kind) {
+    case 'run':
+      return 'run'
+    case 'unattributed':
+      return 'unattributed'
+  }
+}
+
+/**
+ * The state cell: each closed wire token transcribed verbatim
+ * (`docs/target-architecture.md` invariant 8, as `formatTerminalToken`
+ * does), through an exhaustive switch so a new state cannot render
+ * unlabelled.
+ */
+function formatCandidateState(state: CandidateState): string {
+  switch (state) {
+    case 'candidate':
+      return 'candidate'
+    case 'outbox-escape':
+      return 'outbox-escape'
+    case 'outbox-linked':
+      return 'outbox-linked'
+  }
+}
+
+/**
+ * The fixed line above the candidates table: no approval, no publication
+ * and no ingestion exists in this slice (HAP-001's publication transaction
+ * is slice 5b), so the table is inert data and says so.
+ */
+const PUBLICATION_UNAVAILABLE = 'publication not available in this slice'
+
+/**
+ * One row of the candidates table, every cell through {@link PlainTextLine}:
+ * the name is producer-supplied text -- HAP-001-R24's display-name
+ * sanitization is slice 5b, so a traversal sequence in it is data here and
+ * never resolved -- the facts come from the entry's handle and are `null`
+ * for a refused entry, where nothing was digested (rendered as `—`), and a
+ * refused row (`outbox-escape`, `outbox-linked`) is marked `refused` beside
+ * its state token. Nothing in a row is interactive.
+ */
+function CandidateRow({ candidate }: { candidate: Candidate }) {
+  return (
+    <tr>
+      <td>
+        <PlainTextLine text={candidate.name} />
+      </td>
+      <td>
+        <PlainTextLine text={candidate.size === null ? NULL_FACT : String(candidate.size)} />
+      </td>
+      <td>
+        <PlainTextLine text={candidate.sha256Short ?? NULL_FACT} />
+      </td>
+      <td>
+        <PlainTextLine text={candidate.detectedType ?? NULL_FACT} />
+      </td>
+      <td>
+        <PlainTextLine text={candidate.class ?? NULL_FACT} />
+      </td>
+      <td>
+        <PlainTextLine text={formatAttribution(candidate.attribution)} />
+      </td>
+      <td>
+        <PlainTextLine text={formatCandidateState(candidate.state)} />
+        {candidate.state !== 'candidate' && (
+          <>
+            {' '}
+            <mark>refused</mark>
+          </>
+        )}
+      </td>
+    </tr>
+  )
+}
+
 type TranscriptItem =
   | { type: 'prompt'; key: string; text: string }
   | { type: 'agent-event'; key: string; droppedBefore: number; event: AgentEvent }
@@ -230,6 +424,14 @@ function DroppedFramesMarker({ droppedBefore }: { droppedBefore: number }) {
  * seven drop counts. No terminal pane exists in this slice: plain text is
  * the strictest RCS-001 mode, and every layout control was dropped by core
  * before any of this reached the wire.
+ *
+ * The two outbox kinds (`docs/spike-log.md` § Slice 5) render as inert data
+ * too: `artifact-publish` as a labelled `publish proposal:` block listing
+ * each entry as its name and the first eight characters of its digest --
+ * a proposal the harness made and nothing here executes, held to the same
+ * zero-interactive-elements bar as the tool-call block -- and `candidates`
+ * as one fixed summary line of the eight counts (the table it announces is
+ * rendered beside the transcript by the panel, not inside it).
  */
 function TranscriptEntryView({ item }: { item: TranscriptItem }) {
   if (item.type === 'prompt') {
@@ -293,6 +495,21 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
         />
       )}
       {event.kind === 'terminal-drops' && <mark>{formatTerminalDrops(event.payload)}</mark>}
+      {event.kind === 'candidates' && (
+        <PlainTextLine text={formatCandidatesSummary(event.payload)} />
+      )}
+      {event.kind === 'artifact-publish' && (
+        <div data-testid="publish-proposal">
+          <p>{PUBLISH_PROPOSAL_LABEL}</p>
+          {event.payload.entries.map((entry, index) => (
+            // An index key is sound here: the list is derived once from an
+            // immutable payload and is never reordered or edited.
+            <p key={index} data-testid="publish-entry">
+              <PlainTextLine text={`${entry.name} ${shortDigest(entry.sha256)}`} />
+            </p>
+          ))}
+        </div>
+      )}
     </li>
   )
 }
@@ -371,6 +588,52 @@ export function AgentPanel() {
       })
   }, [])
 
+  /**
+   * The outbox's status for the active workspace (`docs/spike-log.md` §
+   * Slice 5), or `null` while unknown or while no workspace is active.
+   */
+  const [outbox, setOutbox] = useState<OutboxStatus | null>(null)
+
+  /**
+   * The sequence number of the most recently *started* `outbox_status`
+   * fetch -- the same sequenced-fetch pattern as `approvals_list` below
+   * (R3-008): the mount-time fetch and a pick-time fetch can be in flight
+   * together, and only the latest one's response is applied.
+   */
+  const latestOutboxStatusRequestRef = useRef(0)
+
+  /**
+   * Fetches the outbox status: on mount, and again after a successful
+   * workspace pick. A `workspace-unavailable` rejection is the shell's
+   * answer while no workspace is active -- the panel already shows that no
+   * workspace is picked, so it clears the line and raises no alert; any
+   * other rejection reaches the banner like every other mount-time fetch.
+   * A stable callback, so the mount effect below can list it as its one
+   * dependency.
+   */
+  const refreshOutboxStatus = useCallback(() => {
+    const requestId = (latestOutboxStatusRequestRef.current += 1)
+    outboxStatus()
+      .then((status) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestOutboxStatusRequestRef.current) return
+        setOutbox(status)
+      })
+      .catch((statusError: unknown) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestOutboxStatusRequestRef.current) return
+        if (isShellError(statusError) && statusError.code === 'workspace-unavailable') {
+          setOutbox(null)
+          return
+        }
+        setError(isShellError(statusError) ? statusError : 'unexpected')
+      })
+  }, [])
+
+  useEffect(() => {
+    refreshOutboxStatus()
+  }, [refreshOutboxStatus])
+
   useEffect(() => {
     adaptersList()
       .then((list) => {
@@ -440,6 +703,21 @@ export function AgentPanel() {
    */
   const runEndedRef = useRef(true)
 
+  /**
+   * The current run's candidates table (`docs/spike-log.md` § Slice 5):
+   * the rows `candidates_list` returned for the run id the run's own
+   * `candidates` event named, or `null` until then. Cleared by the next
+   * Start along with the transcript, so a new run never shows the previous
+   * run's inventory beside its own output.
+   */
+  const [candidates, setCandidates] = useState<Candidate[] | null>(null)
+
+  /**
+   * The sequence number of the most recently *started* `candidates_list`
+   * fetch (R3-008 pattern): only the latest fetch's response is applied.
+   */
+  const latestCandidatesRequestRef = useRef(0)
+
   const handleFrame = useCallback((generation: number, frame: HarnessFrame) => {
     if (!mountedRef.current) return
     // Stale-channel guard (R1-001/R3-001): every `harnessSpawn` wires a
@@ -487,6 +765,28 @@ export function AgentPanel() {
       ) {
         return
       }
+      if (frame.body.kind === 'candidates') {
+        // The run's subdirectory has been inventoried: fetch the rows behind
+        // the summary, by the run id the shell minted (never a path).
+        // Sequenced like every other fetch here, and gated on the generation
+        // this channel's closure captured, so a response landing after the
+        // next Start never dresses a new run in an old run's candidates.
+        const { runId } = frame.body.payload
+        const requestId = (latestCandidatesRequestRef.current += 1)
+        candidatesList(runId)
+          .then((rows) => {
+            if (!mountedRef.current) return
+            if (generation !== spawnGenerationRef.current) return
+            if (requestId !== latestCandidatesRequestRef.current) return
+            setCandidates(rows)
+          })
+          .catch((listError: unknown) => {
+            if (!mountedRef.current) return
+            if (generation !== spawnGenerationRef.current) return
+            if (requestId !== latestCandidatesRequestRef.current) return
+            setError(isShellError(listError) ? listError : 'unexpected')
+          })
+      }
       setTranscript((previous) =>
         appendTranscriptEntry(previous, {
           type: 'agent-event',
@@ -514,6 +814,9 @@ export function AgentPanel() {
       const picked = await workspacePick()
       if (!mountedRef.current) return
       setWorkspace(picked)
+      // The outbox is declared per project: a new workspace means a new
+      // status, fetched afresh rather than carried over.
+      refreshOutboxStatus()
     } catch (pickError: unknown) {
       if (!mountedRef.current) return
       if (isShellError(pickError) && pickError.code === 'no-workspace') {
@@ -534,6 +837,10 @@ export function AgentPanel() {
     if (promptByteLength(prompt) > PROMPT_MAX_BYTES) return
 
     const sentPrompt = prompt
+    // The previous run's candidates table, kept aside so a rejected spawn
+    // can put it back (R3-019): the table is cleared below on the premise
+    // that a new run replaces it, and a rejection means none did.
+    const previousCandidates = candidates
     const generation = (spawnGenerationRef.current += 1)
     runEndedRef.current = false
     runIdRef.current = null
@@ -545,6 +852,7 @@ export function AgentPanel() {
       entries: [{ type: 'prompt', key: `prompt-${generation}`, text: sentPrompt }],
       trimmedCount: 0,
     })
+    setCandidates(null)
     setIsSpawning(true)
     try {
       const id = await harnessSpawn(
@@ -573,6 +881,12 @@ export function AgentPanel() {
         ...previous,
         entries: previous.entries.filter((entry) => entry.key !== `prompt-${generation}`),
       }))
+      // Likewise the candidates table: no run replaced the previous run's
+      // inventory, so the table this Start cleared comes back -- unless a
+      // frame that reached the current channel before the rejection already
+      // produced a new one, which is kept, like such a frame's transcript
+      // entry is (R3-019, R1-012 analogue).
+      setCandidates((current) => current ?? previousCandidates)
       setError(isShellError(spawnError) ? spawnError : 'unexpected')
     } finally {
       if (mountedRef.current) setIsSpawning(false)
@@ -652,6 +966,13 @@ export function AgentPanel() {
           </p>
         )}
         {workspaceStatus && <p role="status">{workspaceStatus}</p>}
+        {outbox && (
+          // A status line like the workspace-pick status beside it, named
+          // so the two live regions stay distinguishable (R3-018).
+          <p role="status" aria-label="Outbox">
+            <PlainTextLine text={formatOutboxStatusLine(outbox)} />
+          </p>
+        )}
       </div>
 
       <div>
@@ -738,6 +1059,32 @@ export function AgentPanel() {
           <TranscriptEntryView key={item.key} item={item} />
         ))}
       </ul>
+
+      {candidates && (
+        <section aria-label="Candidates">
+          <p>{PUBLICATION_UNAVAILABLE}</p>
+          <table>
+            <thead>
+              <tr>
+                <th>name</th>
+                <th>size</th>
+                <th>sha256</th>
+                <th>type</th>
+                <th>class</th>
+                <th>attribution</th>
+                <th>state</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.map((candidate, index) => (
+                // An index key is sound here: the list is replaced whole by
+                // each fetch and is never reordered or edited in place.
+                <CandidateRow key={index} candidate={candidate} />
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
     </section>
   )
 }

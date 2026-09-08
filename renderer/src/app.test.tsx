@@ -41,18 +41,29 @@ const BUILT_IN_ADAPTERS: AdapterDescriptor[] = [
 ]
 
 // `ApprovalSurface` and `AgentPanel` (both mounted by `App`) each call
-// `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`
-// and `adapters_list` -- mock all four here, for every test, so this
-// module's IPC surface is deterministic rather than leaving `invoke`
-// unmocked, which throws a bare `TypeError` (no `__TAURI_INTERNALS__` in
-// this jsdom environment) instead of a proper `ShellError` rejection
-// (R3-003). Any other command is a real error in this file's tests, so
-// it rejects with a fixed, catalogue `ShellError` rather than throwing.
+// `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`,
+// `adapters_list` and `outbox_status` -- mock all five here, for every
+// test, so this module's IPC surface is deterministic rather than leaving
+// `invoke` unmocked, which throws a bare `TypeError` (no
+// `__TAURI_INTERNALS__` in this jsdom environment) instead of a proper
+// `ShellError` rejection (R3-003). Any other command is a real error in
+// this file's tests, so it rejects with a fixed, catalogue `ShellError`
+// rather than throwing.
 beforeEach(() => {
   mockIPC((cmd) => {
     if (cmd === 'approvals_list') return []
     if (cmd === 'workspace_current') return null
     if (cmd === 'adapters_list') return BUILT_IN_ADAPTERS
+    // No workspace is active in this mock, so `outbox_status` answers the
+    // way the shell does (`docs/spike-log.md` § Slice 5, IPC shapes): the
+    // same `workspace-unavailable` rejection an adapter launch gets, which
+    // `AgentPanel` meets with no status line and no alert.
+    if (cmd === 'outbox_status') {
+      return Promise.reject({
+        code: 'workspace-unavailable',
+        message: 'no workspace has been picked yet',
+      })
+    }
     return Promise.reject({ code: 'invalid-request', message: 'unexpected command in test' })
   })
 })

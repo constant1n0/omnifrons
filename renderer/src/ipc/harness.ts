@@ -139,6 +139,38 @@ export interface TerminalDropCounts {
 }
 
 /**
+ * One entry an `artifact.publish` proposal names, as it crosses IPC
+ * (spike slice 5, HAP-001-R12): the harness's own claim -- a name and the
+ * full 64-hex digest it asserts -- never a fact Omnifrons verified. Both
+ * are harness-originated text: plain text only, `name` never resolved as
+ * a path by the renderer.
+ */
+export interface ProposedEntry {
+  name: string
+  sha256: string
+}
+
+/**
+ * The shell's own run-end inventory summary of a run's subdirectory, as
+ * the `candidates` event carries it (spike slice 5): counts by state and
+ * attribution, plus the run id `candidatesList` takes -- never a path.
+ * `unreadable` counts entries that could not be opened at all (excluded
+ * from the candidates), `unmatchedProposals` the proposal entries whose
+ * digest no entry carried.
+ */
+export interface CandidatesSummary {
+  runId: string
+  total: number
+  candidate: number
+  outboxEscape: number
+  outboxLinked: number
+  attributed: number
+  unattributed: number
+  unreadable: number
+  unmatchedProposals: number
+}
+
+/**
  * [`omnifrons_domain::adapter::AdapterEvent`], as it crosses IPC.
  * Adjacently tagged (`kind` + `payload`), mirroring
  * `src-tauri/src/ipc/dto.rs`'s `AdapterEventDto` verbatim -- added in the
@@ -156,6 +188,13 @@ export interface TerminalDropCounts {
  * itself; `terminal-action` is a sanitized title or notification, data to
  * show as text only; `terminal-drops` is the per-family count of dropped
  * control sequences since the previous `terminal-drops` of the same launch.
+ *
+ * Two kinds (spike slice 5, `docs/spike-log.md` § Slice 5) are the outbox's:
+ * `artifact-publish` is the typed publish proposal a line agent recognized
+ * -- the harness's claim, entries named by full digest, a proposal the
+ * renderer only ever shows and never executes -- and `candidates` is the
+ * shell's own run-end inventory summary, emitted once per adapter launch
+ * before the terminal `state` frame.
  */
 export type AgentEvent =
   | {
@@ -169,6 +208,8 @@ export type AgentEvent =
   | { kind: 'terminal-text'; payload: { text: string } }
   | { kind: 'terminal-action'; payload: { action: TerminalActionKind; text: string } }
   | { kind: 'terminal-drops'; payload: TerminalDropCounts }
+  | { kind: 'artifact-publish'; payload: { entries: ProposedEntry[] } }
+  | { kind: 'candidates'; payload: CandidatesSummary }
 
 interface HarnessEventFrameBody {
   id: ProcessId
@@ -222,6 +263,20 @@ export type ShellErrorCode =
    * spawned (spike slice 4).
    */
   | 'prompt-not-typeable'
+  /**
+   * The project's outbox declaration is invalid -- the classification
+   * policy could not be loaded, or the declared path resolves outside the
+   * project or is a link -- so ingestion is blocked (`candidates_list`;
+   * HAP-001-R8, spike slice 5).
+   */
+  | 'outbox-invalid'
+  /**
+   * An adapter launch could not prepare its run subdirectory: the outbox
+   * failed its pre-creation check, something already sits at the
+   * subdirectory's path, or handle verification failed; nothing was spawned
+   * (HAP-001-R10, D14; spike slice 5).
+   */
+  | 'outbox-unavailable'
 
 /**
  * Structured detail for a {@link ShellError}, carrying values a fixed
@@ -421,4 +476,121 @@ export async function workspaceCurrent(): Promise<Workspace | null> {
  */
 export async function adaptersList(): Promise<AdapterDescriptor[]> {
   return invoke('adapters_list')
+}
+
+// -- Slice 5: the outbox status and the candidates inventory --
+
+/**
+ * The outbox's state for the active workspace, mirroring `dto.rs`'s
+ * `OutboxStateTag`: `valid` (the declaration is valid; the outbox exists,
+ * or does not exist yet and the first adapter launch creates it),
+ * `outbox-invalid` (the declared path resolves outside the project or is a
+ * link, or the policy declaring it could not be loaded; HAP-001-R8), or
+ * `outbox-unavailable` (something that is not a directory sits at the
+ * declared path, or it could not be read; HAP-001-R10).
+ */
+export type OutboxState = 'valid' | 'outbox-invalid' | 'outbox-unavailable'
+
+/**
+ * Why `outboxStatus` reports a non-`valid` state: a fixed token, never the
+ * underlying error's text, mirroring `dto.rs`'s `OutboxReasonTag`.
+ */
+export type OutboxReason =
+  | 'outside-project'
+  | 'link'
+  | 'not-a-directory'
+  | 'unreadable'
+  | 'policy-unreadable'
+  | 'policy-corrupt'
+  | 'policy-invalid'
+
+/**
+ * `outbox_status`'s payload. `outbox` is the outbox's canonical
+ * filesystem path, present only when the declaration is valid and the
+ * directory exists: identity evidence flowing core -> renderer for display
+ * (where a run's output lands) -- the third explicit exception to
+ * RCS-001-R14's no-raw-path rule alongside `Evidence.canonicalPath` and
+ * `Workspace.displayPath` (`docs/spike-log.md` § Slice 5). Display-only:
+ * never sent back in any command, and never shown for a directory that
+ * failed validation. `declared` and `policyPath` are project-relative
+ * names, not device paths; `declared` is `null` when the policy itself
+ * could not be loaded.
+ */
+export interface OutboxStatus {
+  declared: string | null
+  outbox: string | null
+  exists: boolean
+  state: OutboxState
+  reason: OutboxReason | null
+  policyPath: string
+}
+
+/**
+ * [`omnifrons_domain::outbox::CandidateState`], as it crosses IPC: a
+ * validated `candidate`, or a refused entry -- `outbox-escape` (a link or a
+ * non-regular file, never dereferenced) or `outbox-linked` (a link count
+ * above one) -- carrying no digest facts (HAP-001-R20).
+ */
+export type CandidateState = 'candidate' | 'outbox-escape' | 'outbox-linked'
+
+/** [`omnifrons_domain::outbox::ArtifactClass`], as it crosses IPC. */
+export type ArtifactClass =
+  | 'generated-heavy'
+  | 'git-tracked'
+  | 'portable-text'
+  | 'executable'
+  | 'unclassified'
+
+/**
+ * [`omnifrons_domain::outbox::Attribution`], as it crosses IPC: attributed
+ * to the run whose own publish proposal named the entry by digest, or
+ * unattributed -- location alone never attributes (HAP-001-R11).
+ */
+export type Attribution = { kind: 'run'; runId: string } | { kind: 'unattributed' }
+
+/**
+ * One candidate entry, as `candidates_list` returns it: its name relative
+ * to the outbox (a producer-supplied name -- plain text only, never
+ * resolved as a path by the renderer), the facts taken from its handle --
+ * every one `null` for a refused entry, where nothing was digested -- its
+ * attribution, and its state. `detectedType` is a `DetectedType` token
+ * (`pdf`, `png`, `markdown`, `plain-text`, `unknown`, ...), shown as text.
+ * Never a device path.
+ */
+export interface Candidate {
+  name: string
+  size: number | null
+  sha256Short: string | null
+  detectedType: string | null
+  class: ArtifactClass | null
+  attribution: Attribution
+  state: CandidateState
+}
+
+/**
+ * The outbox's status for the active workspace (`docs/spike-log.md` §
+ * Slice 5). Read-only: a status query never creates the outbox.
+ *
+ * # Errors
+ * Rejects with `workspace-unavailable` if no workspace is active.
+ */
+export async function outboxStatus(): Promise<OutboxStatus> {
+  return invoke('outbox_status')
+}
+
+/**
+ * The candidate entries of one run (`runId` given: the inventory taken at
+ * that run's end, attributed by the run's own proposals) or of the whole
+ * outbox (`runId` omitted: every entry, unattributed, as a proposal only).
+ * The argument object carries a `runId` key only when one was given, so
+ * the whole-outbox request crosses IPC as exactly `{}`.
+ *
+ * # Errors
+ * Rejects with `invalid-request` if `runId` names no remembered run or a
+ * run that has not ended; `outbox-invalid`/`outbox-unavailable` if the
+ * whole-outbox inventory cannot run; `workspace-unavailable` if no
+ * workspace is active for a whole-outbox request.
+ */
+export async function candidatesList(runId?: string): Promise<Candidate[]> {
+  return invoke('candidates_list', runId === undefined ? {} : { runId })
 }

@@ -5,7 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentPanel } from './AgentPanel'
 import { ApprovalSurface } from './ApprovalSurface'
 import { HarnessPanel } from './HarnessPanel'
-import type { AdapterDescriptor, Approval, Evidence, HarnessFrame } from './ipc/harness'
+import type {
+  AdapterDescriptor,
+  Approval,
+  Candidate,
+  Evidence,
+  HarnessFrame,
+  OutboxReason,
+  OutboxStatus,
+} from './ipc/harness'
 
 // The jsdom crypto polyfill and React Testing Library's `cleanup()` are
 // installed once for every test file by `testSupport/setup.ts` -- not
@@ -56,14 +64,42 @@ const PTY_ADAPTER: AdapterDescriptor = {
 }
 
 /**
- * The default mock: no active workspace, two adapters (the slice 3 line
- * agent and the slice 4 pseudo-terminal fallback), one active approval.
- * Individual tests override `onCommand` to add `harness_spawn`/
+ * `outbox_status` for a valid, existing outbox under the sample workspace
+ * (`docs/spike-log.md` § Slice 5, IPC shapes). `outbox` is the canonical
+ * outbox path -- the third explicit RCS-001-R14 exception: identity
+ * evidence of where a run's output lands, display-only, never sent back.
+ */
+const OUTBOX_STATUS_VALID: OutboxStatus = {
+  declared: '.omnifrons/outbox',
+  outbox: '/home/user/project/.omnifrons/outbox',
+  exists: true,
+  state: 'valid',
+  reason: null,
+  policyPath: '.omnifrons/asset-policy.json',
+}
+
+/**
+ * What `outbox_status` answers with no active workspace: the same
+ * `workspace-unavailable` rejection an adapter launch gets (`docs/spike-log.md`
+ * § Slice 5, IPC shapes), which the panel meets with no status line and no
+ * alert -- the missing workspace is already visible.
+ */
+const OUTBOX_NO_WORKSPACE = {
+  code: 'workspace-unavailable',
+  message: 'no workspace has been picked yet',
+}
+
+/**
+ * The default mock: no active workspace (so `outbox_status` rejects
+ * `workspace-unavailable`, as the shell does), two adapters (the slice 3
+ * line agent and the slice 4 pseudo-terminal fallback), one active
+ * approval. Individual tests override `onCommand` to add `harness_spawn`/
  * `workspace_pick` handling.
  */
 function defaultHandlers(onCommand?: (cmd: string, args: Record<string, unknown>) => unknown) {
   return (cmd: string, args: unknown) => {
     if (cmd === 'workspace_current') return null
+    if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
     if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
@@ -146,6 +182,7 @@ describe('AgentPanel', () => {
   it('calls workspace_current on mount and shows the display path through PlainTextLine', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return { displayPath: '/home/user/project' }
+      if (cmd === 'outbox_status') return OUTBOX_STATUS_VALID
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') return [sampleApproval()]
       throw new Error(`unexpected command: ${cmd}`)
@@ -670,6 +707,7 @@ describe('AgentPanel', () => {
   it('lists only active approvals in the approval select', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return [
@@ -1407,6 +1445,7 @@ describe('AgentPanel unexpected fallback (R3-005)', () => {
   it('shows only "unexpected error" when the mount-time adapters_list rejects with a plain Error', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return Promise.reject(new Error(LEAKY_MESSAGE))
       if (cmd === 'approvals_list') return [sampleApproval()]
       throw new Error(`unexpected command: ${cmd}`)
@@ -1426,6 +1465,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
       if (cmd === 'workspace_current') {
         return Promise.reject({ code: 'invalid-request', message: 'bad request' })
       }
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
       throw new Error(`unexpected command: ${cmd}`)
@@ -1450,6 +1490,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
   it('adapters_list rejecting with a ShellError shows the banner and leaves the panel usable', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') {
         return Promise.reject({ code: 'invalid-request', message: 'adapter catalog unavailable' })
       }
@@ -1474,6 +1515,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
   it('approvals_list rejecting with approval-store-unavailable shows the banner and leaves the panel usable', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return Promise.reject({
@@ -1619,6 +1661,7 @@ describe('AgentPanel control stripping per harness string (R3-008)', () => {
   it('strips control bytes from an adapter displayName and notes and keeps a <b> tag literal', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') {
         return [
           {
@@ -1655,6 +1698,7 @@ describe('AgentPanel control stripping per harness string (R3-008)', () => {
   it('strips control bytes from the approval option label and keeps a <b> tag literal', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return [
@@ -2470,5 +2514,1056 @@ describe('AgentPanel empty terminal-text (slice 4 review, R3-006)', () => {
     ).toBeTruthy()
     const transcript = screen.getByLabelText('Agent transcript')
     expect(transcript.querySelectorAll('[data-testid="terminal-line"]').length).toBe(0)
+  })
+})
+
+// -- Slice 5: the outbox status line, the artifact-publish proposal, the
+// candidates summary and table, and the two outbox error codes
+// (`docs/spike-log.md` § Slice 5) --
+
+const OUTBOX_LINE_VALID =
+  'outbox: /home/user/project/.omnifrons/outbox (declared .omnifrons/outbox)'
+
+/**
+ * Mounts the panel's IPC with an active workspace whose `outbox_status`
+ * answers whatever `answer` returns (a status, or a rejected promise --
+ * built lazily inside the handler, so no rejection exists before it is
+ * handled).
+ */
+function mockMountWithOutbox(answer: () => unknown) {
+  mockIPC((cmd) => {
+    if (cmd === 'workspace_current') return { displayPath: '/home/user/project' }
+    if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'outbox_status') return answer()
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+}
+
+describe('AgentPanel outbox status line (slice 5)', () => {
+  it('fetches outbox_status on mount and shows "outbox: <path> (declared <declared>)" for a valid, existing outbox', async () => {
+    mockMountWithOutbox(() => OUTBOX_STATUS_VALID)
+
+    render(<AgentPanel />)
+
+    const line = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.textContent).toBe(OUTBOX_LINE_VALID)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows "outbox: <declared> (created at the first launch)" when the declaration is valid but the directory does not exist yet, with no device path anywhere', async () => {
+    mockMountWithOutbox(() => ({ ...OUTBOX_STATUS_VALID, outbox: null, exists: false }))
+
+    render(<AgentPanel />)
+
+    const line = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.textContent).toBe('outbox: .omnifrons/outbox (created at the first launch)')
+    expect(document.body.textContent).not.toContain('/home/user/project/.omnifrons')
+  })
+
+  it('shows "outbox invalid: <declared> (<reason>)" when the policy declared a path, and "outbox invalid: <reason>" when the policy itself could not be loaded, each reason token mapped to fixed English and never rendered raw (R3-017)', async () => {
+    const cases: { reason: OutboxReason; declared: string | null; expected: string }[] = [
+      {
+        reason: 'outside-project',
+        declared: 'elsewhere/outbox',
+        expected: 'outbox invalid: elsewhere/outbox (the declared path resolves outside the project)',
+      },
+      // The declared name is project-originated text: a <b> in it stays literal.
+      {
+        reason: 'link',
+        declared: 'else<b>where</b>/outbox',
+        expected: 'outbox invalid: else<b>where</b>/outbox (the declared path is a link)',
+      },
+      {
+        reason: 'policy-unreadable',
+        declared: null,
+        expected: 'outbox invalid: the classification policy could not be read',
+      },
+      {
+        reason: 'policy-corrupt',
+        declared: null,
+        expected: 'outbox invalid: the classification policy is corrupt',
+      },
+      {
+        reason: 'policy-invalid',
+        declared: null,
+        expected: 'outbox invalid: the classification policy is invalid',
+      },
+    ]
+    for (const { reason, declared, expected } of cases) {
+      mockMountWithOutbox(() => ({
+        declared,
+        outbox: null,
+        exists: declared !== null,
+        state: 'outbox-invalid',
+        reason,
+        policyPath: '.omnifrons/asset-policy.json',
+      }))
+      const { unmount } = render(<AgentPanel />)
+
+      const line = await screen.findByRole('status', { name: 'Outbox' })
+      expect(line.textContent).toBe(expected)
+      expect(line.querySelector('b')).toBeNull()
+      // `link` is the one token that is also a word of its own English line.
+      if (reason !== 'link') expect(document.body.textContent).not.toContain(reason)
+      if (declared === null) expect(document.body.textContent).not.toContain('elsewhere')
+
+      unmount()
+      clearMocks()
+    }
+  })
+
+  it('shows "outbox unavailable: <declared> (<reason>)" for the outbox-unavailable state the DTO carries (not-a-directory, unreadable), never the raw token', async () => {
+    const cases: [OutboxReason, string][] = [
+      [
+        'not-a-directory',
+        'outbox unavailable: .omnifrons/outbox (the declared path is not a directory)',
+      ],
+      ['unreadable', 'outbox unavailable: .omnifrons/outbox (the declared path could not be read)'],
+    ]
+    for (const [reason, expected] of cases) {
+      mockMountWithOutbox(() => ({
+        declared: '.omnifrons/outbox',
+        outbox: null,
+        exists: true,
+        state: 'outbox-unavailable',
+        reason,
+        policyPath: '.omnifrons/asset-policy.json',
+      }))
+      const { unmount } = render(<AgentPanel />)
+
+      const line = await screen.findByRole('status', { name: 'Outbox' })
+      expect(line.textContent).toBe(expected)
+      expect(document.body.textContent).not.toContain(reason)
+
+      unmount()
+      clearMocks()
+    }
+  })
+
+  it('shows "outbox invalid: reason unreported" when a non-valid state carries a null reason', async () => {
+    mockMountWithOutbox(() => ({
+      declared: null,
+      outbox: null,
+      exists: false,
+      state: 'outbox-invalid',
+      reason: null,
+      policyPath: '.omnifrons/asset-policy.json',
+    }))
+
+    render(<AgentPanel />)
+
+    const line = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.textContent).toBe('outbox invalid: reason unreported')
+  })
+
+  it('calls outbox_status on mount and renders no status line and no alert when it rejects workspace-unavailable (no workspace picked)', async () => {
+    let statusCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') {
+        statusCalls += 1
+        return Promise.reject(OUTBOX_NO_WORKSPACE)
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+
+    await waitFor(() => {
+      expect(statusCalls).toBe(1)
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(screen.queryByRole('status', { name: 'Outbox' })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('fetches outbox_status again after a successful workspace pick: no line before the pick, the valid line after it', async () => {
+    let picked = false
+    let statusCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') {
+        statusCalls += 1
+        return picked ? OUTBOX_STATUS_VALID : Promise.reject(OUTBOX_NO_WORKSPACE)
+      }
+      if (cmd === 'workspace_pick') {
+        picked = true
+        return { displayPath: '/home/user/project' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    await waitFor(() => {
+      expect(statusCalls).toBe(1)
+    })
+    expect(screen.queryByRole('status', { name: 'Outbox' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+
+    await screen.findByText('/home/user/project')
+    const line = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.textContent).toBe(OUTBOX_LINE_VALID)
+    expect(statusCalls).toBe(2)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('drops a stale mount-time outbox_status response that resolves after the pick-time response (sequenced fetch)', async () => {
+    let resolveMountStatus: (status: OutboxStatus) => void = () => {}
+    let statusCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') {
+        statusCalls += 1
+        if (statusCalls === 1) {
+          return new Promise<OutboxStatus>((resolve) => {
+            resolveMountStatus = resolve
+          })
+        }
+        return OUTBOX_STATUS_VALID
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/project' }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    await waitFor(() => {
+      expect(statusCalls).toBe(1)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    const line = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.textContent).toBe(OUTBOX_LINE_VALID)
+
+    // The mount-time response arrives last, carrying a different status:
+    // it is stale and must not overwrite the pick-time line.
+    await act(async () => {
+      resolveMountStatus({ ...OUTBOX_STATUS_VALID, outbox: null, exists: false })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(screen.getByRole('status', { name: 'Outbox' }).textContent).toBe(OUTBOX_LINE_VALID)
+  })
+
+  it('renders the outbox path with a bidi override stripped, and a <b> tag in the declared name literally with no <b> element (RCS-001)', async () => {
+    /** U+202E RIGHT-TO-LEFT OVERRIDE, built from its code point so no bidi control sits in this source file. */
+    const rlo = String.fromCodePoint(0x202e)
+    mockMountWithOutbox(() => ({
+      ...OUTBOX_STATUS_VALID,
+      outbox: `/home/user/project/.omnifrons/${rlo}xobtuo`,
+      declared: '.omnifrons/<b>outbox</b>',
+    }))
+
+    render(<AgentPanel />)
+
+    const line = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.textContent).toBe(
+      'outbox: /home/user/project/.omnifrons/xobtuo (declared .omnifrons/<b>outbox</b>)',
+    )
+    expect(line.querySelector('b')).toBeNull()
+    expect(document.body.textContent).not.toContain(rlo)
+  })
+
+  it('shows the banner for a ShellError other than workspace-unavailable from outbox_status, as a plain catalogue code with its message, no "untrusted", and leaves the panel usable', async () => {
+    mockMountWithOutbox(() =>
+      Promise.reject({
+        code: 'outbox-unavailable',
+        message: 'the outbox status could not be computed',
+        detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+      }),
+    )
+
+    render(<AgentPanel />)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('outbox-unavailable: the outbox status could not be computed')
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(screen.queryByRole('status', { name: 'Outbox' })).toBeNull()
+
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'still usable' } })
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+  })
+
+  it('shows only "unexpected error" when outbox_status rejects with a plain Error, never its message (R3-005 analogue)', async () => {
+    const leaky = 'boom: /home/someone/secret/outbox'
+    mockMountWithOutbox(() => Promise.reject(new Error(leaky)))
+
+    render(<AgentPanel />)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('unexpected error')
+    expect(document.body.textContent).not.toContain(leaky)
+  })
+
+  it('the outbox_status continuation no-ops after unmount', async () => {
+    let resolveStatus: (status: OutboxStatus) => void = () => {}
+    let statusCalled = false
+    mockMountWithOutbox(() => {
+      statusCalled = true
+      return new Promise<OutboxStatus>((resolve) => {
+        resolveStatus = resolve
+      })
+    })
+
+    const { unmount } = render(<AgentPanel />)
+    await waitFor(() => {
+      expect(statusCalled).toBe(true)
+    })
+    unmount()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    resolveStatus(OUTBOX_STATUS_VALID)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+/**
+ * Asserts `block` is inert data: no interactive element, no interactive
+ * attribute on it or any descendant -- the same assertions the tool-call
+ * proposal block is held to (R3-007).
+ */
+function expectNoInteractiveElements(block: HTMLElement): HTMLElement[] {
+  expect(block.querySelectorAll('button, a, input, textarea, select, details, summary').length).toBe(
+    0,
+  )
+  expect(
+    block.querySelectorAll('[role], [tabindex], [href], [contenteditable], [onclick]').length,
+  ).toBe(0)
+  const blockAndDescendants = [block, ...Array.from(block.querySelectorAll<HTMLElement>('*'))]
+  for (const element of blockAndDescendants) {
+    expect(element.getAttribute('role')).toBeNull()
+    expect(element.getAttribute('tabindex')).toBeNull()
+    expect(element.getAttribute('href')).toBeNull()
+    expect(element.getAttribute('contenteditable')).toBeNull()
+    expect(element.getAttribute('onclick')).toBeNull()
+  }
+  return blockAndDescendants
+}
+
+/**
+ * Renders the panel with every IPC command counted, starts a run on
+ * `claude-code`, and returns the live Channel plus a reader of the count --
+ * so a test can click a block and prove no IPC command was invoked at all
+ * (React exposes no handler as a DOM attribute, so this behavioral check
+ * is the only honest one for an `onClick`).
+ */
+async function startWithCountedInvokes(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Promise<{ channel: LiveChannel; invokeCount: () => number }> {
+  let invokeCount = 0
+  let channelRef: LiveChannel | undefined
+  const handlers = defaultHandlers((cmd, args) => {
+    if (cmd === 'harness_spawn') {
+      channelRef = (args as { onFrame: LiveChannel }).onFrame
+      return 7
+    }
+    if (onCommand) return onCommand(cmd, args)
+    return null
+  })
+  mockIPC((cmd, args) => {
+    invokeCount += 1
+    return handlers(cmd, args)
+  })
+
+  render(<AgentPanel />)
+  await selectOption('Adapter', 'claude-code')
+  await selectOption('Approval', '42')
+  fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+  await waitFor(() => {
+    expect(channelRef).toBeDefined()
+  })
+  await screen.findByText('running')
+  if (!channelRef) throw new Error('harness_spawn was not called')
+  return { channel: channelRef, invokeCount: () => invokeCount }
+}
+
+/** Delivers one `artifact-publish` event naming `entries` by full digest, as run 7's frame `seq`. */
+function deliverPublishProposal(
+  channel: LiveChannel,
+  entries: { name: string; sha256: string }[],
+  seq = 6,
+) {
+  act(() => {
+    channel.onmessage({
+      stream: 'event',
+      body: { id: 7, seq, droppedBefore: 0, kind: 'artifact-publish', payload: { entries } },
+    })
+  })
+}
+
+describe('AgentPanel artifact-publish proposal (slice 5)', () => {
+  it('renders an artifact-publish event as a "publish proposal:" entry listing each entry as its name and the first 8 characters of its sha256, never the full digest', async () => {
+    const channel = await startAndCaptureChannel()
+
+    deliverPublishProposal(channel, [
+      { name: 'report.pdf', sha256: 'ab'.repeat(32) },
+      { name: 'data.zip', sha256: '0123456789abcdef'.repeat(4) },
+    ])
+
+    const proposal = screen.getByTestId('publish-proposal')
+    expect(proposal.textContent).toContain('publish proposal:')
+    const entries = Array.from(proposal.querySelectorAll('[data-testid="publish-entry"]')).map(
+      (entry) => entry.textContent,
+    )
+    expect(entries).toEqual(['report.pdf abababab', 'data.zip 01234567'])
+    expect(proposal.textContent).not.toContain('ab'.repeat(32))
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.contains(proposal)).toBe(true)
+    // The echoed prompt row plus exactly one row for the event.
+    expect(transcript.querySelectorAll('li').length).toBe(2)
+  })
+
+  it('renders an artifact-publish event with no entries as the bare label and no entry lines', async () => {
+    const channel = await startAndCaptureChannel()
+
+    deliverPublishProposal(channel, [])
+
+    const proposal = screen.getByTestId('publish-proposal')
+    expect(proposal.textContent).toBe('publish proposal:')
+    expect(proposal.querySelectorAll('[data-testid="publish-entry"]').length).toBe(0)
+  })
+
+  it('the publish proposal block has zero interactive elements, no interactive attributes, and no IPC on click (same assertions as the tool-call block)', async () => {
+    const { channel, invokeCount } = await startWithCountedInvokes()
+
+    deliverPublishProposal(channel, [{ name: 'report.pdf', sha256: 'ab'.repeat(32) }])
+
+    const proposal = screen.getByTestId('publish-proposal')
+    const blockAndDescendants = expectNoInteractiveElements(proposal)
+
+    const invokesBeforeClick = invokeCount()
+    for (const element of blockAndDescendants) {
+      fireEvent.click(element)
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(invokeCount()).toBe(invokesBeforeClick)
+  })
+
+  it('strips control bytes from a proposal entry name and keeps a <b> tag literal; a sha256 shorter than 8 characters renders whole', async () => {
+    const channel = await startAndCaptureChannel()
+    const esc = String.fromCharCode(0x1b)
+
+    deliverPublishProposal(channel, [{ name: `re${esc}port<b>.pdf`, sha256: 'abc' }])
+
+    const proposal = screen.getByTestId('publish-proposal')
+    expect(proposal.querySelector('b')).toBeNull()
+    expect(proposal.textContent).toContain('report<b>.pdf abc')
+    expect(proposal.textContent).not.toContain(esc)
+  })
+})
+
+const RUN_ID = 'run-1725782401-000000001-0'
+
+/**
+ * The `candidates` summary the shell emits once at run end for the fixture
+ * run of `docs/spike-log.md` § Slice 5 (IPC shapes): counts only, plus the
+ * run id the follow-up `candidates_list` takes.
+ */
+const CANDIDATES_SUMMARY = {
+  runId: RUN_ID,
+  total: 5,
+  candidate: 3,
+  outboxEscape: 1,
+  outboxLinked: 1,
+  attributed: 2,
+  unattributed: 3,
+  unreadable: 0,
+  unmatchedProposals: 1,
+}
+
+const CANDIDATES_LINE =
+  'candidates: 5 total, 3 candidate, 1 escape, 1 linked, 2 attributed, 3 unattributed, 0 unreadable, 1 unmatched proposals'
+
+/**
+ * `candidates_list { runId }` for that run: two validated candidates (one
+ * attributed by the run's own proposal, one not) and two refused entries
+ * carrying no digest facts at all (HAP-001-R20).
+ */
+const SAMPLE_CANDIDATES: Candidate[] = [
+  {
+    name: `${RUN_ID}/report.pdf`,
+    size: 4096,
+    sha256Short: 'abababab',
+    detectedType: 'pdf',
+    class: 'generated-heavy',
+    attribution: { kind: 'run', runId: RUN_ID },
+    state: 'candidate',
+  },
+  {
+    name: `${RUN_ID}/stray.png`,
+    size: 8,
+    sha256Short: '11111111',
+    detectedType: 'png',
+    class: 'generated-heavy',
+    attribution: { kind: 'unattributed' },
+    state: 'candidate',
+  },
+  {
+    name: `${RUN_ID}/linked.bin`,
+    size: null,
+    sha256Short: null,
+    detectedType: null,
+    class: null,
+    attribution: { kind: 'unattributed' },
+    state: 'outbox-linked',
+  },
+  {
+    name: `${RUN_ID}/escape-link`,
+    size: null,
+    sha256Short: null,
+    detectedType: null,
+    class: null,
+    attribution: { kind: 'unattributed' },
+    state: 'outbox-escape',
+  },
+]
+
+const ZERO_SUMMARY = {
+  runId: RUN_ID,
+  total: 0,
+  candidate: 0,
+  outboxEscape: 0,
+  outboxLinked: 0,
+  attributed: 0,
+  unattributed: 0,
+  unreadable: 0,
+  unmatchedProposals: 0,
+}
+
+/** Delivers one `candidates` event carrying `payload`, as run 7's frame `seq`. */
+function deliverCandidates(channel: LiveChannel, payload = CANDIDATES_SUMMARY, seq = 9) {
+  act(() => {
+    channel.onmessage({
+      stream: 'event',
+      body: { id: 7, seq, droppedBefore: 0, kind: 'candidates', payload },
+    })
+  })
+}
+
+/**
+ * Starts a run whose `candidates_list` answers whatever `answer` returns
+ * (rows, or a rejection built lazily inside the handler), recording every
+ * args object it was called with.
+ */
+async function startWithCandidatesList(
+  answer: () => unknown,
+): Promise<{ channel: LiveChannel; calls: Record<string, unknown>[] }> {
+  const calls: Record<string, unknown>[] = []
+  const channel = await startAndCaptureChannel((cmd, args) => {
+    if (cmd === 'candidates_list') {
+      calls.push(args)
+      return answer()
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  return { channel, calls }
+}
+
+/** The candidates table's data rows, each as its cells' text. */
+function candidateRows(): string[][] {
+  const region = screen.getByRole('region', { name: 'Candidates' })
+  return Array.from(region.querySelectorAll('tbody tr')).map((row) =>
+    Array.from(row.querySelectorAll('td')).map((cell) => cell.textContent ?? ''),
+  )
+}
+
+describe('AgentPanel candidates summary line (slice 5)', () => {
+  it('renders a candidates event as the fixed summary line with all eight counts in order, in its own transcript row', async () => {
+    const { channel } = await startWithCandidatesList(() => [])
+
+    deliverCandidates(channel)
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    const rows = Array.from(transcript.querySelectorAll('li'))
+    // The echoed prompt row plus exactly one row for the event.
+    expect(rows.length).toBe(2)
+    expect(rows[1]?.textContent).toBe(CANDIDATES_LINE)
+  })
+
+  it('renders every zero count as 0', async () => {
+    const { channel } = await startWithCandidatesList(() => [])
+
+    deliverCandidates(channel, ZERO_SUMMARY)
+
+    expect(screen.getByLabelText('Agent transcript').textContent).toContain(
+      'candidates: 0 total, 0 candidate, 0 escape, 0 linked, 0 attributed, 0 unattributed, 0 unreadable, 0 unmatched proposals',
+    )
+  })
+})
+
+describe('AgentPanel candidates count magnitude (slice 5 review, R3-015)', () => {
+  it('renders a count of Number.MAX_SAFE_INTEGER as plain digits, never an exponent', async () => {
+    const { channel } = await startWithCandidatesList(() => [])
+
+    deliverCandidates(channel, { ...ZERO_SUMMARY, total: Number.MAX_SAFE_INTEGER })
+
+    const line = screen.getByText(/^candidates: /)
+    expect(line.textContent).toContain('candidates: 9007199254740991 total,')
+    expect(line.textContent).not.toContain('e+')
+  })
+
+  it('renders a u32-max count (4294967295, the wire type of every count) and a u64-shaped 2^64 (parsed from JSON the way the wire arrives) as plain digits, never an exponent', async () => {
+    // The u64 literal never appears in source (eslint's no-loss-of-precision
+    // would flag it); parsed from JSON it lands on the nearest double, 2^64.
+    const wire = JSON.parse('{"total":18446744073709551615}') as { total: number }
+    expect(wire.total).toBe(2 ** 64)
+    const { channel } = await startWithCandidatesList(() => [])
+
+    deliverCandidates(channel, { ...ZERO_SUMMARY, total: 4_294_967_295, candidate: wire.total })
+
+    const line = screen.getByText(/^candidates: /)
+    expect(line.textContent).toContain('candidates: 4294967295 total, 18446744073709552000 candidate,')
+    expect(line.textContent).not.toContain('e+')
+  })
+})
+
+describe('AgentPanel candidates table (slice 5)', () => {
+  it('after a candidates event, calls candidates_list with exactly { runId } and renders the table -- name, size, sha256, type, class, attribution, state -- with nulls as "—" and every refused row marked', async () => {
+    const { channel, calls } = await startWithCandidatesList(() => SAMPLE_CANDIDATES)
+
+    deliverCandidates(channel)
+
+    const region = await screen.findByRole('region', { name: 'Candidates' })
+    expect(calls).toEqual([{ runId: RUN_ID }])
+    expect(Array.from(region.querySelectorAll('th')).map((header) => header.textContent)).toEqual([
+      'name',
+      'size',
+      'sha256',
+      'type',
+      'class',
+      'attribution',
+      'state',
+    ])
+    expect(candidateRows()).toEqual([
+      [`${RUN_ID}/report.pdf`, '4096', 'abababab', 'pdf', 'generated-heavy', 'run', 'candidate'],
+      [`${RUN_ID}/stray.png`, '8', '11111111', 'png', 'generated-heavy', 'unattributed', 'candidate'],
+      [`${RUN_ID}/linked.bin`, '—', '—', '—', '—', 'unattributed', 'outbox-linked refused'],
+      [`${RUN_ID}/escape-link`, '—', '—', '—', '—', 'unattributed', 'outbox-escape refused'],
+    ])
+    const rows = Array.from(region.querySelectorAll('tbody tr'))
+    expect(rows.map((row) => row.querySelector('mark')?.textContent ?? null)).toEqual([
+      null,
+      null,
+      'refused',
+      'refused',
+    ])
+    // The table sits beside the transcript, never inside it.
+    expect(screen.getByLabelText('Agent transcript').contains(region)).toBe(false)
+  })
+
+  it('says, in a fixed line, that publication is not available in this slice', async () => {
+    const { channel } = await startWithCandidatesList(() => SAMPLE_CANDIDATES)
+
+    deliverCandidates(channel)
+
+    const region = await screen.findByRole('region', { name: 'Candidates' })
+    expect(screen.getByText('publication not available in this slice')).toBeTruthy()
+    expect(region.textContent).toContain('publication not available in this slice')
+  })
+
+  it('renders an empty candidates_list as the fixed line and the header row with no data rows', async () => {
+    const { channel } = await startWithCandidatesList(() => [])
+
+    deliverCandidates(channel, ZERO_SUMMARY)
+
+    const region = await screen.findByRole('region', { name: 'Candidates' })
+    expect(region.textContent).toContain('publication not available in this slice')
+    expect(region.querySelectorAll('th').length).toBe(7)
+    expect(candidateRows()).toEqual([])
+  })
+
+  it('the candidates region has zero interactive elements, no interactive attributes, and no IPC on click (same assertions as the tool-call block)', async () => {
+    const { channel, invokeCount } = await startWithCountedInvokes((cmd) => {
+      if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+      return null
+    })
+
+    deliverCandidates(channel)
+
+    const region = await screen.findByRole('region', { name: 'Candidates' })
+    const blockAndDescendants = expectNoInteractiveElements(region)
+
+    const invokesBeforeClick = invokeCount()
+    for (const element of blockAndDescendants) {
+      fireEvent.click(element)
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(invokeCount()).toBe(invokesBeforeClick)
+  })
+
+  it('renders outbox-invalid from candidates_list as a plain catalogue code with its fixed message, no "untrusted", no stray detail, and no table, while the summary line stands', async () => {
+    const { channel } = await startWithCandidatesList(() =>
+      Promise.reject({
+        code: 'outbox-invalid',
+        message: 'the classification policy could not be loaded',
+        detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+      }),
+    )
+
+    deliverCandidates(channel)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('outbox-invalid: the classification policy could not be loaded')
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(banner.textContent).not.toContain('bbbbbbbb')
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+    expect(screen.getByLabelText('Agent transcript').textContent).toContain(CANDIDATES_LINE)
+  })
+
+  it('shows only "unexpected error" when candidates_list rejects with a plain Error, never its message (R3-005 analogue)', async () => {
+    const leaky = 'boom: /home/someone/secret/outbox'
+    const { channel } = await startWithCandidatesList(() => Promise.reject(new Error(leaky)))
+
+    deliverCandidates(channel)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('unexpected error')
+    expect(document.body.textContent).not.toContain(leaky)
+  })
+
+  it('drops a candidates_list response that resolves after a new run has started (generation guard): the new run shows no table', async () => {
+    let resolveList: (rows: Candidate[]) => void = () => {}
+    let listCalls = 0
+    const { channels } = await renderMultiRun((cmd) => {
+      if (cmd === 'candidates_list') {
+        listCalls += 1
+        return new Promise<Candidate[]>((resolve) => {
+          resolveList = resolve
+        })
+      }
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    deliverCandidates(channels[0]!)
+    await waitFor(() => {
+      expect(listCalls).toBe(1)
+    })
+
+    // Run A ends and run B starts while A's candidates_list is still pending.
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 10, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(channels).toHaveLength(2)
+
+    await act(async () => {
+      resolveList(SAMPLE_CANDIDATES)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+    expect(listCalls).toBe(1)
+  })
+
+  it('a candidates event carrying a foreign run id never triggers candidates_list and appends nothing', async () => {
+    const { channel, calls } = await startWithCandidatesList(() => SAMPLE_CANDIDATES)
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: { id: 99, seq: 9, droppedBefore: 0, kind: 'candidates', payload: CANDIDATES_SUMMARY },
+      })
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(calls).toEqual([])
+    expect(screen.getByLabelText('Agent transcript').textContent).not.toContain('candidates:')
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+  })
+
+  it("keeps the previous run's candidates table when the next Start is rejected, since no run replaced it: the table returns as the echoed prompt is withdrawn (R3-019, R1-012 analogue)", async () => {
+    let spawnCount = 0
+    let channelRef: LiveChannel | undefined
+    await renderReady((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        spawnCount += 1
+        if (spawnCount === 1) {
+          channelRef = (args as { onFrame: LiveChannel }).onFrame
+          return 7
+        }
+        return Promise.reject({
+          code: 'spawn-failed',
+          message: 'failed to start the requested process',
+        })
+      }
+      if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => {
+      expect(channelRef).toBeDefined()
+    })
+    await screen.findByText('running')
+    if (!channelRef) throw new Error('harness_spawn was not called')
+    deliverCandidates(channelRef)
+    await screen.findByRole('region', { name: 'Candidates' })
+    act(() => {
+      channelRef!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 10, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('spawn-failed: failed to start the requested process')
+    expect(spawnCount).toBe(2)
+    expect(screen.getByRole('region', { name: 'Candidates' })).toBeTruthy()
+    expect(candidateRows()).toHaveLength(4)
+    expect(screen.getByLabelText('Agent transcript').textContent).not.toContain('you: do the thing')
+  })
+
+  it("a new Start whose spawn resolves clears the previous run's candidates table along with the transcript", async () => {
+    let listCalls = 0
+    const { channels } = await renderMultiRun((cmd) => {
+      if (cmd === 'candidates_list') {
+        listCalls += 1
+        return SAMPLE_CANDIDATES
+      }
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    deliverCandidates(channels[0]!)
+    await screen.findByRole('region', { name: 'Candidates' })
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 10, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+    expect(listCalls).toBe(1)
+  })
+
+  it('the candidates_list continuation no-ops after unmount', async () => {
+    let channelRef: LiveChannel | undefined
+    let resolveList: (rows: Candidate[]) => void = () => {}
+    let listCalled = false
+    mockIPC(
+      defaultHandlers((cmd, args) => {
+        if (cmd === 'harness_spawn') {
+          channelRef = (args as { onFrame: LiveChannel }).onFrame
+          return 7
+        }
+        if (cmd === 'candidates_list') {
+          listCalled = true
+          return new Promise<Candidate[]>((resolve) => {
+            resolveList = resolve
+          })
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      }),
+    )
+
+    const { unmount } = render(<AgentPanel />)
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => {
+      expect(channelRef).toBeDefined()
+    })
+    await screen.findByText('running')
+    if (!channelRef) throw new Error('harness_spawn was not called')
+    deliverCandidates(channelRef)
+    await waitFor(() => {
+      expect(listCalled).toBe(true)
+    })
+    unmount()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    resolveList(SAMPLE_CANDIDATES)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel continuations rejected after unmount (slice 5 review, R3-016)', () => {
+  it('the outbox_status continuation no-ops when the fetch rejects after unmount: nothing thrown, no console.error, no alert', async () => {
+    let rejectStatus: (reason: unknown) => void = () => {}
+    let statusCalled = false
+    mockMountWithOutbox(() => {
+      statusCalled = true
+      return new Promise<OutboxStatus>((_resolve, reject) => {
+        rejectStatus = reject
+      })
+    })
+
+    const { unmount } = render(<AgentPanel />)
+    await waitFor(() => {
+      expect(statusCalled).toBe(true)
+    })
+    unmount()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rejectStatus({ code: 'outbox-unavailable', message: 'the outbox status could not be computed' })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="alert"]')).toBeNull()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('the candidates_list continuation no-ops when the fetch rejects after unmount: nothing thrown, no console.error, no alert', async () => {
+    let channelRef: LiveChannel | undefined
+    let rejectList: (reason: unknown) => void = () => {}
+    let listCalled = false
+    mockIPC(
+      defaultHandlers((cmd, args) => {
+        if (cmd === 'harness_spawn') {
+          channelRef = (args as { onFrame: LiveChannel }).onFrame
+          return 7
+        }
+        if (cmd === 'candidates_list') {
+          listCalled = true
+          return new Promise<Candidate[]>((_resolve, reject) => {
+            rejectList = reject
+          })
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      }),
+    )
+
+    const { unmount } = render(<AgentPanel />)
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => {
+      expect(channelRef).toBeDefined()
+    })
+    await screen.findByText('running')
+    if (!channelRef) throw new Error('harness_spawn was not called')
+    deliverCandidates(channelRef)
+    await waitFor(() => {
+      expect(listCalled).toBe(true)
+    })
+    unmount()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rejectList({ code: 'invalid-request', message: 'no run with that id is remembered' })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="alert"]')).toBeNull()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel candidates content security (slice 5, RCS-001)', () => {
+  const esc = String.fromCharCode(0x1b)
+  /** U+202E RIGHT-TO-LEFT OVERRIDE, built from its code point so no bidi control sits in this source file. */
+  const rlo = String.fromCodePoint(0x202e)
+
+  it('renders a candidate name carrying a literal <b>, a C0 byte, a bidi override and a "../" traversal sequence as text: no <b> element, controls stripped, the traversal kept as data the renderer never resolves', async () => {
+    const { channel } = await startWithCandidatesList(() => [
+      { ...SAMPLE_CANDIDATES[0]!, name: `../../<b>etc</b>/pass${esc}wd${rlo}` },
+    ])
+
+    deliverCandidates(channel)
+
+    const region = await screen.findByRole('region', { name: 'Candidates' })
+    expect(candidateRows()[0]?.[0]).toBe('../../<b>etc</b>/passwd')
+    expect(region.querySelector('b')).toBeNull()
+    expect(region.querySelector('a')).toBeNull()
+    expect(region.querySelector('[href]')).toBeNull()
+    expect(region.textContent).not.toContain(esc)
+    expect(region.textContent).not.toContain(rlo)
+  })
+
+  it('renders a sha256Short with non-hex characters, and a detectedType carrying a <b> tag, as text', async () => {
+    const { channel } = await startWithCandidatesList(() => [
+      { ...SAMPLE_CANDIDATES[0]!, sha256Short: 'zz<b>!?', detectedType: '<b>pdf</b>' },
+    ])
+
+    deliverCandidates(channel)
+
+    const region = await screen.findByRole('region', { name: 'Candidates' })
+    expect(candidateRows()[0]?.[2]).toBe('zz<b>!?')
+    expect(candidateRows()[0]?.[3]).toBe('<b>pdf</b>')
+    expect(region.querySelector('b')).toBeNull()
+  })
+})
+
+describe('AgentPanel outbox error codes (slice 5, R3-013 analogue)', () => {
+  it('renders outbox-unavailable from harness_spawn as a plain catalogue code with its fixed message, no "untrusted" and no stray detail; nothing spawned, so the echoed prompt is withdrawn and Start re-enabled', async () => {
+    await renderReady((cmd) => {
+      if (cmd === 'harness_spawn') {
+        return Promise.reject({
+          code: 'outbox-unavailable',
+          message: 'something already sits at the run subdirectory path; remove it and relaunch',
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      'outbox-unavailable: something already sits at the run subdirectory path; remove it and relaunch',
+    )
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(banner.textContent).not.toContain('bbbbbbbb')
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    expect(screen.getByLabelText('Agent transcript').querySelectorAll('li').length).toBe(0)
   })
 })

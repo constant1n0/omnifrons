@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   adaptersList,
   approvalsList,
+  candidatesList,
   executableApprove,
   executablePickAndProbe,
   executableRevoke,
@@ -11,13 +12,16 @@ import {
   harnessSpawn,
   harnessStop,
   isShellError,
+  outboxStatus,
   workspaceCurrent,
   workspacePick,
   type AdapterDescriptor,
   type AgentEvent,
   type Approval,
+  type Candidate,
   type Evidence,
   type HarnessFrame,
+  type OutboxStatus,
   type ShellError,
 } from './harness'
 
@@ -471,10 +475,12 @@ describe('HarnessFrame event stream', () => {
 type LiveChannel = { onmessage: (frame: HarnessFrame) => void }
 
 /**
- * Spawns the `pty-cli` adapter kind through a mock that hands back the
- * live Channel, collecting every frame delivered to `onFrame`.
+ * Spawns the adapter kind named by `adapterId` through a mock that hands
+ * back the live Channel, collecting every frame delivered to `onFrame`.
  */
-async function spawnPtyAndCapture(): Promise<{ channel: LiveChannel; received: HarnessFrame[] }> {
+async function spawnAdapterAndCapture(
+  adapterId: 'claude-code' | 'pty-cli',
+): Promise<{ channel: LiveChannel; received: HarnessFrame[] }> {
   let channelRef: LiveChannel | undefined
   mockIPC((cmd, args) => {
     if (cmd === 'harness_spawn') {
@@ -485,14 +491,16 @@ async function spawnPtyAndCapture(): Promise<{ channel: LiveChannel; received: H
   })
 
   const received: HarnessFrame[] = []
-  await harnessSpawn(
-    { type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: 'hi' },
-    (frame) => {
-      received.push(frame)
-    },
-  )
+  await harnessSpawn({ type: 'adapter', adapterId, approvalId: 1, prompt: 'hi' }, (frame) => {
+    received.push(frame)
+  })
   if (!channelRef) throw new Error('harness_spawn was not called')
   return { channel: channelRef, received }
+}
+
+/** Spawns the `pty-cli` adapter kind (slice 4) and captures its live Channel. */
+function spawnPtyAndCapture(): Promise<{ channel: LiveChannel; received: HarnessFrame[] }> {
+  return spawnAdapterAndCapture('pty-cli')
 }
 
 describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
@@ -588,7 +596,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
     ])
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the eight kinds to itself', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the ten kinds to itself', () => {
     function kindLabel(kind: AgentEvent['kind']): string {
       switch (kind) {
         case 'state':
@@ -599,6 +607,8 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
         case 'terminal-text':
         case 'terminal-action':
         case 'terminal-drops':
+        case 'artifact-publish':
+        case 'candidates':
           return kind
         default: {
           const unreachable: never = kind
@@ -616,6 +626,8 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
       'terminal-text',
       'terminal-action',
       'terminal-drops',
+      'artifact-publish',
+      'candidates',
     ]
     expect(kinds.map(kindLabel)).toEqual(kinds)
   })
@@ -678,6 +690,236 @@ describe('ShellErrorCode pty-unsupported (slice 4)', () => {
     await expect(
       harnessSpawn(
         { type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: `hi${esc}[2J` },
+        () => {},
+      ),
+    ).rejects.toMatchObject(error)
+    expect(isShellError(error)).toBe(true)
+  })
+})
+
+// -- Slice 5: the outbox status and candidates commands, the artifact-publish
+// and candidates event kinds, and the two outbox error codes
+// (`docs/spike-log.md` § Slice 5) --
+
+/**
+ * `outbox_status` for a valid, existing outbox. `outbox` is the canonical
+ * outbox path -- the third explicit RCS-001-R14 exception: identity
+ * evidence of where a run's output lands, display-only, never sent back
+ * in any command.
+ */
+const OUTBOX_STATUS_VALID: OutboxStatus = {
+  declared: '.omnifrons/outbox',
+  outbox: '/home/user/project/.omnifrons/outbox',
+  exists: true,
+  state: 'valid',
+  reason: null,
+  policyPath: '.omnifrons/asset-policy.json',
+}
+
+const RUN_ID = 'run-1725782401-000000001-0'
+
+/**
+ * A validated, attributed candidate and a refused (`outbox-linked`) entry
+ * carrying no digest facts at all (HAP-001-R20), as `candidates_list`
+ * returns them.
+ */
+const SAMPLE_CANDIDATES: Candidate[] = [
+  {
+    name: `${RUN_ID}/report.pdf`,
+    size: 4096,
+    sha256Short: 'abababab',
+    detectedType: 'pdf',
+    class: 'generated-heavy',
+    attribution: { kind: 'run', runId: RUN_ID },
+    state: 'candidate',
+  },
+  {
+    name: `${RUN_ID}/linked.bin`,
+    size: null,
+    sha256Short: null,
+    detectedType: null,
+    class: null,
+    attribution: { kind: 'unattributed' },
+    state: 'outbox-linked',
+  },
+]
+
+describe('outboxStatus (slice 5)', () => {
+  it('invokes outbox_status with no arguments and returns the status verbatim for a valid, existing outbox', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'outbox_status') {
+        expect(args).toEqual({})
+        return OUTBOX_STATUS_VALID
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await outboxStatus()
+
+    expect(result).toEqual(OUTBOX_STATUS_VALID)
+  })
+
+  it('returns a valid, not-yet-created status and an outbox-invalid status with its reason token verbatim', async () => {
+    const notYetCreated: OutboxStatus = { ...OUTBOX_STATUS_VALID, outbox: null, exists: false }
+    const invalid: OutboxStatus = {
+      declared: 'elsewhere/outbox',
+      outbox: null,
+      exists: true,
+      state: 'outbox-invalid',
+      reason: 'link',
+      policyPath: '.omnifrons/asset-policy.json',
+    }
+    const responses: OutboxStatus[] = [notYetCreated, invalid]
+    mockIPC((cmd) => {
+      if (cmd === 'outbox_status') return responses.shift()
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    expect(await outboxStatus()).toEqual(notYetCreated)
+    expect(await outboxStatus()).toEqual(invalid)
+  })
+})
+
+describe('candidatesList (slice 5)', () => {
+  it('invokes candidates_list with exactly { runId } and returns the candidates verbatim, a refused entry carrying null facts', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'candidates_list') {
+        capturedArgs = args as Record<string, unknown>
+        return SAMPLE_CANDIDATES
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await candidatesList(RUN_ID)
+
+    expect(capturedArgs).toEqual({ runId: RUN_ID })
+    expect(Object.keys(capturedArgs!)).toEqual(['runId'])
+    expect(result).toEqual(SAMPLE_CANDIDATES)
+    expect(result[1]).toMatchObject({
+      size: null,
+      sha256Short: null,
+      detectedType: null,
+      class: null,
+      state: 'outbox-linked',
+    })
+  })
+
+  it('invokes candidates_list with exactly {} for the whole outbox when no runId is given, never a runId key', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'candidates_list') {
+        capturedArgs = args as Record<string, unknown>
+        return []
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await candidatesList()
+
+    expect(capturedArgs).toEqual({})
+    expect(Object.keys(capturedArgs!)).toEqual([])
+    expect(result).toEqual([])
+  })
+
+  it('rejects with the typed outbox-invalid ShellError when the policy cannot be loaded', async () => {
+    const error: ShellError = {
+      code: 'outbox-invalid',
+      message: 'the classification policy could not be loaded',
+    }
+    mockIPC((cmd) => {
+      if (cmd === 'candidates_list') return Promise.reject(error)
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    await expect(candidatesList()).rejects.toMatchObject(error)
+    expect(isShellError(error)).toBe(true)
+  })
+})
+
+describe('HarnessFrame outbox event kinds (slice 5)', () => {
+  it('delivers an artifact-publish event frame verbatim, its entries named by full digest', async () => {
+    const { channel, received } = await spawnAdapterAndCapture('claude-code')
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 6,
+        droppedBefore: 0,
+        kind: 'artifact-publish',
+        payload: { entries: [{ name: 'report.pdf', sha256: 'ab'.repeat(32) }] },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    if (delivered?.stream !== 'event' || delivered.body.kind !== 'artifact-publish') {
+      throw new Error('expected an artifact-publish event frame')
+    }
+    expect(delivered.body.payload.entries).toHaveLength(1)
+    expect(delivered.body.payload.entries[0]?.sha256).toHaveLength(64)
+  })
+
+  it('delivers a candidates event frame with exactly the nine camelCase fields verbatim', async () => {
+    const { channel, received } = await spawnAdapterAndCapture('claude-code')
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 9,
+        droppedBefore: 0,
+        kind: 'candidates',
+        payload: {
+          runId: RUN_ID,
+          total: 5,
+          candidate: 3,
+          outboxEscape: 1,
+          outboxLinked: 1,
+          attributed: 2,
+          unattributed: 3,
+          unreadable: 0,
+          unmatchedProposals: 1,
+        },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    if (delivered?.stream !== 'event' || delivered.body.kind !== 'candidates') {
+      throw new Error('expected a candidates event frame')
+    }
+    expect(Object.keys(delivered.body.payload).sort()).toEqual([
+      'attributed',
+      'candidate',
+      'outboxEscape',
+      'outboxLinked',
+      'runId',
+      'total',
+      'unattributed',
+      'unmatchedProposals',
+      'unreadable',
+    ])
+  })
+})
+
+describe('ShellErrorCode outbox codes (slice 5)', () => {
+  it('harnessSpawn rejects with the typed outbox-unavailable ShellError for an adapter launch whose run subdirectory could not be prepared, nothing spawned', async () => {
+    const error: ShellError = {
+      code: 'outbox-unavailable',
+      message: 'something already sits at the run subdirectory path; remove it and relaunch',
+    }
+    mockIPC((cmd) => {
+      if (cmd === 'harness_spawn') return Promise.reject(error)
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    await expect(
+      harnessSpawn(
+        { type: 'adapter', adapterId: 'claude-code', approvalId: 1, prompt: 'hi' },
         () => {},
       ),
     ).rejects.toMatchObject(error)
