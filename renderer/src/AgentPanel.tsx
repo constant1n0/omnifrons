@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import { stripControlCharacters } from './controlCharacters'
 import {
   adaptersList,
   approvalsList,
+  artifactApprove,
+  artifactPublish,
   candidatesList,
   harnessSpawn,
   harnessStop,
   isShellError,
   outboxStatus,
+  publicationsList,
   workspaceCurrent,
   workspacePick,
   type AdapterDescriptor,
@@ -16,7 +19,11 @@ import {
   type AgentPhaseTag,
   type Approval,
   type ApprovalId,
+  type ArtifactApproval,
+  type ArtifactState,
+  type ArtifactStateFrame,
   type Attribution,
+  type Availability,
   type Candidate,
   type CandidateState,
   type CandidatesSummary,
@@ -26,10 +33,14 @@ import {
   type OutboxStatus,
   type ProcessId,
   type ProcessTerminalState,
+  type ProviderState,
+  type Publication,
+  type ScopeMode,
   type ShellError,
   type ShellErrorCode,
   type TerminalActionKind,
   type TerminalDropCounts,
+  type WorkAreaState,
   type Workspace,
 } from './ipc/harness'
 import { PlainTextLine } from './PlainTextLine'
@@ -232,6 +243,23 @@ function formatOutboxStatusLine(status: OutboxStatus): string {
   }
 }
 
+/**
+ * The status line for the product work area's re-check against the active
+ * workspace (`docs/spike-log.md` § Slice 5b, HAP-001-R7): fixed copy per
+ * closed token through an exhaustive switch, never the raw token echoed --
+ * `null` for `valid`, since a valid work area renders nothing. Every
+ * publication command refuses with `work-area-invalid` until the area is
+ * reconfigured, which is what the line says.
+ */
+function formatWorkAreaLine(state: WorkAreaState): string | null {
+  switch (state) {
+    case 'valid':
+      return null
+    case 'work-area-invalid':
+      return 'work area invalid — publication refused until it is fixed'
+  }
+}
+
 /** The visible label on every `artifact-publish` transcript entry. */
 const PUBLISH_PROPOSAL_LABEL = 'publish proposal:'
 
@@ -300,22 +328,251 @@ function formatCandidateState(state: CandidateState): string {
 }
 
 /**
- * The fixed line above the candidates table: no approval, no publication
- * and no ingestion exists in this slice (HAP-001's publication transaction
- * is slice 5b), so the table is inert data and says so.
+ * An artifact state (`docs/spike-log.md` § Slice 5b): each of HAP-001's ten
+ * closed tokens transcribed verbatim (`docs/target-architecture.md`
+ * invariant 8), through an exhaustive switch so a new state cannot render
+ * unlabelled -- the same discipline as {@link formatCandidateState}.
  */
-const PUBLICATION_UNAVAILABLE = 'publication not available in this slice'
+function formatArtifactState(state: ArtifactState): string {
+  switch (state) {
+    case 'candidate':
+      return 'candidate'
+    case 'published-local':
+      return 'published-local'
+    case 'registered':
+      return 'registered'
+    case 'provider-synced':
+      return 'provider-synced'
+    case 'registration-pending':
+      return 'registration-pending'
+    case 'refused':
+      return 'refused'
+    case 'integrity-mismatch':
+      return 'integrity-mismatch'
+    case 'duplicate-publication':
+      return 'duplicate-publication'
+    case 'outbox-escape':
+      return 'outbox-escape'
+    case 'outbox-linked':
+      return 'outbox-linked'
+  }
+}
+
+/** A record's provider state, transcribed verbatim through an exhaustive switch; `null` (no record yet) is a null fact. */
+function formatProviderState(state: ProviderState | null): string {
+  switch (state) {
+    case 'pending':
+      return 'pending'
+    case 'synced':
+      return 'synced'
+    case 'failed':
+      return 'failed'
+    case 'unavailable':
+      return 'unavailable'
+    case null:
+      return NULL_FACT
+  }
+}
+
+/** This device's own availability observation (HAP-001-R27), transcribed verbatim through an exhaustive switch. */
+function formatAvailability(availability: Availability): string {
+  switch (availability) {
+    case 'local':
+      return 'local'
+    case 'unknown':
+      return 'unknown'
+  }
+}
+
+/**
+ * The short form of a Catalog identity `<asset root id>/<publication hex>`:
+ * the asset root id kept whole, the publication hex cut to its first eight
+ * characters by code point like {@link shortDigest} -- `main/2a91ea59` for
+ * the fixture record. Display-only, like the identity it abbreviates: never
+ * resolved as a path, a link, or an address. A value with no `/` (not the
+ * shape the shell issues) is cut whole, as the text it is.
+ */
+function shortCatalogId(catalogId: string): string {
+  const slash = catalogId.indexOf('/')
+  if (slash === -1) return shortDigest(catalogId)
+  return `${catalogId.slice(0, slash + 1)}${shortDigest(catalogId.slice(slash + 1))}`
+}
+
+/**
+ * One row of the publications table (`docs/spike-log.md` § Slice 5b), every
+ * cell through {@link PlainTextLine}: the sanitized display names joined
+ * (producer-supplied text re-sanitized by the shell on read, HAP-001-R24,
+ * and portable content, HAP-001-R40 -- plain text here regardless), the
+ * state token, the record's provider state, the reference's locator, the
+ * Catalog identity's short form, and this device's availability. A `null`
+ * fact -- no record before registration -- renders as `—`. The locator is
+ * display-only: nothing here builds a link, a path, or an address from it.
+ * Nothing in a row is interactive.
+ */
+function PublicationRow({ publication }: { publication: Publication }) {
+  return (
+    <tr>
+      <td>
+        <PlainTextLine text={publication.names.join(', ')} />
+      </td>
+      <td>
+        <PlainTextLine text={formatArtifactState(publication.state)} />
+      </td>
+      <td>
+        <PlainTextLine text={formatProviderState(publication.providerState)} />
+      </td>
+      <td>
+        <PlainTextLine text={publication.reference?.locator ?? NULL_FACT} />
+      </td>
+      <td>
+        <PlainTextLine
+          text={publication.catalogId === null ? NULL_FACT : shortCatalogId(publication.catalogId)}
+        />
+      </td>
+      <td>
+        <PlainTextLine text={formatAvailability(publication.availability)} />
+      </td>
+    </tr>
+  )
+}
+
+/**
+ * The attribution fact of the publication approval block (HAP-001-R22: "the
+ * producing run or the unattributed fact"): the run named by its id -- the
+ * shell's own minted token, never a path -- or the bare unattributed fact,
+ * with nothing standing in for a producer. Exhaustive over the closed kinds.
+ */
+function formatAttributionFact(attribution: Attribution): string {
+  switch (attribution.kind) {
+    case 'run':
+      return `run ${attribution.runId}`
+    case 'unattributed':
+      return 'unattributed'
+  }
+}
+
+/**
+ * The destination fact of the approval block (HAP-001-R22: "destination by
+ * display name and asset root identity"): the policy's asset root identity
+ * token from the current outbox status -- `asset root <id>`; `unconfigured`
+ * when the policy declares none, in which case the shell would refuse the
+ * approval with `destination-invalid`; `unknown` while no status is known at
+ * all. The two latter cases keep the final button disabled: no approval
+ * toward a destination the surface cannot show. One token, never a path.
+ */
+function formatDestinationFact(outbox: OutboxStatus | null): string {
+  if (outbox === null) return 'unknown'
+  return outbox.assetRootId === null ? 'unconfigured' : `asset root ${outbox.assetRootId}`
+}
+
+/**
+ * The scope fact of the approval block: the scope mode of the adapter the
+ * run was started with, from its descriptor -- no publication DTO carries a
+ * scope, so this is renderer-side, and it follows the producing launch rather
+ * than the selection at approval time. Fixed copy per closed token through an
+ * exhaustive switch; `null` (no descriptor found) reads as unreported.
+ */
+function formatScopeMode(mode: ScopeMode | null): string {
+  switch (mode) {
+    case 'sandbox-enforced':
+      return 'sandbox-enforced'
+    case 'harness-enforced':
+      return 'harness-enforced'
+    case 'advisory':
+      return 'advisory'
+    case null:
+      return 'unreported'
+  }
+}
+
+/**
+ * Whether a candidates row offers approval (spike default): a validated
+ * `candidate` of the `generated-heavy` class carrying its full digest --
+ * attributed or unattributed alike, HAP-001 admitting an unattributed entry
+ * to explicit human approval -- and the shell refuses every other state or
+ * class as `refused`, so the panel offers no button it knows the shell
+ * would refuse. A refused row (`outbox-escape`, `outbox-linked`) carries no
+ * digest at all, and a row with no `sha256` has nothing to name an approval
+ * by.
+ */
+function isApprovable(candidate: Candidate): boolean {
+  return (
+    candidate.state === 'candidate' &&
+    candidate.class === 'generated-heavy' &&
+    candidate.sha256 !== null
+  )
+}
+
+/**
+ * Whether `input` confirms `candidate`: an exact, case-sensitive match
+ * against the row's own short digest, the fact the block shows -- slice 2's
+ * shape and its R1-001 discipline (no fixed phrase accepted in its place, so
+ * the act cannot be completed without having read the evidence it stands
+ * in for). The typed value is a gate only: the request carries the row's
+ * full `sha256`, never anything typed.
+ */
+function isApprovalConfirmed(candidate: Candidate, input: string): boolean {
+  return candidate.sha256Short !== null && input === candidate.sha256Short
+}
+
+/**
+ * TM-001-R7's act-as identity, stated on the approval surface before the
+ * decision: fixed copy -- `device-local-user` is the one `ActAs` token the
+ * shell can bind (`ActAsTag` has one variant), so this is the renderer's
+ * own constant, never wire text, like `ApprovalSurface`'s "Approving as"
+ * line.
+ */
+const APPROVAL_ACT_AS_LINE = 'act as: device-local-user'
+
+/**
+ * A row's publication progress, tracked by the panel per candidate name
+ * from the approval on: approved (Publish offered), publishing (Publish in
+ * flight), or published (the transaction's own result). Reset whenever a
+ * new inventory replaces the rows.
+ */
+type RowPublication =
+  | { phase: 'approved'; approval: ArtifactApproval }
+  | { phase: 'publishing'; approval: ArtifactApproval }
+  | { phase: 'published'; publication: Publication }
+
+const EMPTY_ROW_PUBLICATIONS: ReadonlyMap<string, RowPublication> = new Map()
+
+/**
+ * The action cell once approved: the approval id, the sanitized display
+ * name (HAP-001-R24), and the destination asset root identity --
+ * HAP-001-R22's destination, which this wire contract discloses only in
+ * the approval's response, so it is shown here, once known.
+ */
+function formatApprovedCell(approval: ArtifactApproval): string {
+  return `approved ${approval.approvalId} — ${approval.displayName}, asset root ${approval.assetRootId}`
+}
+
+/**
+ * One run's inventory as the panel keeps it: the run id the shell minted
+ * (the key of an approval request, never a path) and the rows.
+ */
+interface CandidatesInventory {
+  runId: string
+  rows: Candidate[]
+  /**
+   * The adapter the run was started with, for the approval block's scope
+   * line; `null` only if the launch's adapter is unknown.
+   */
+  adapterId: string | null
+}
 
 /**
  * One row of the candidates table, every cell through {@link PlainTextLine}:
  * the name is producer-supplied text -- HAP-001-R24's display-name
- * sanitization is slice 5b, so a traversal sequence in it is data here and
- * never resolved -- the facts come from the entry's handle and are `null`
- * for a refused entry, where nothing was digested (rendered as `—`), and a
- * refused row (`outbox-escape`, `outbox-linked`) is marked `refused` beside
- * its state token. Nothing in a row is interactive.
+ * sanitization happens in the shell at approval, so a traversal sequence
+ * in it is data here and never resolved -- the facts come from the entry's
+ * handle and are `null` for a refused entry, where nothing was digested
+ * (rendered as `—`), and a refused row (`outbox-escape`, `outbox-linked`)
+ * is marked `refused` beside its state token. The data cells hold nothing
+ * interactive; `action` is the panel's own affordance for the row (slice
+ * 5b: Approve, the approval's progress and Publish, or nothing).
  */
-function CandidateRow({ candidate }: { candidate: Candidate }) {
+function CandidateRow({ candidate, action }: { candidate: Candidate; action: ReactNode }) {
   return (
     <tr>
       <td>
@@ -345,8 +602,21 @@ function CandidateRow({ candidate }: { candidate: Candidate }) {
           </>
         )}
       </td>
+      <td>{action}</td>
     </tr>
   )
+}
+
+/**
+ * The transcript line for one `artifact-state` frame of a publication
+ * (`docs/spike-log.md` § Slice 5b, HAP-001-R35): `publication <first eight
+ * characters of the publication identity>: <state token>`, the token
+ * transcribed verbatim through {@link formatArtifactState}. The provider
+ * state the frame also carries is the Publications table's column, not
+ * this line's. Fixed copy around shell-minted values; never a path.
+ */
+function formatPublicationStateLine(payload: ArtifactStateFrame['payload']): string {
+  return `publication ${shortDigest(payload.publicationId)}: ${formatArtifactState(payload.state)}`
 }
 
 type TranscriptItem =
@@ -354,6 +624,14 @@ type TranscriptItem =
   | { type: 'agent-event'; key: string; droppedBefore: number; event: AgentEvent }
   /** The run's own terminal `state` frame, recorded in the transcript like `HarnessPanel` logs it. */
   | { type: 'terminal-state'; key: string; droppedBefore: number; token: string }
+  /**
+   * One transition of a publication this panel started (slice 5b): the
+   * shell's own state frame, rendered as a fixed line -- not agent output,
+   * and not an approval (RCS-001-R6 keeps those out of any terminal pane;
+   * the transcript is a plain-text list, and the approval block lives
+   * beside the candidates table, never here).
+   */
+  | { type: 'publication-state'; key: string; text: string }
 
 /**
  * Caps the rendered transcript to the most recent entries, mirroring
@@ -447,6 +725,14 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
       <li key={item.key}>
         <DroppedFramesMarker droppedBefore={item.droppedBefore} />
         <PlainTextLine text={`state: ${item.token}`} />
+      </li>
+    )
+  }
+
+  if (item.type === 'publication-state') {
+    return (
+      <li key={item.key}>
+        <PlainTextLine text={item.text} />
       </li>
     )
   }
@@ -634,6 +920,52 @@ export function AgentPanel() {
     refreshOutboxStatus()
   }, [refreshOutboxStatus])
 
+  /**
+   * The active project's publications (`docs/spike-log.md` § Slice 5b):
+   * every record `publications_list` returned after the shell's restart
+   * replay, or `null` while unknown or while no workspace is active. A
+   * publication this panel completes is merged in directly from
+   * `artifact_publish`'s own response.
+   */
+  const [publications, setPublications] = useState<Publication[] | null>(null)
+
+  /**
+   * The sequence number of the most recently *started* `publications_list`
+   * fetch -- the same sequenced-fetch pattern as `outbox_status` above
+   * (R3-008): only the latest fetch's response is applied.
+   */
+  const latestPublicationsRequestRef = useRef(0)
+
+  /**
+   * Fetches the project's publications: on mount, and again after a
+   * successful workspace pick (a new workspace is another project's
+   * Catalog). A `workspace-unavailable` rejection is the shell's answer
+   * while no workspace is active -- no table and no alert, as for the
+   * outbox status; any other rejection reaches the banner.
+   */
+  const refreshPublications = useCallback(() => {
+    const requestId = (latestPublicationsRequestRef.current += 1)
+    publicationsList()
+      .then((records) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestPublicationsRequestRef.current) return
+        setPublications(records)
+      })
+      .catch((listError: unknown) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestPublicationsRequestRef.current) return
+        if (isShellError(listError) && listError.code === 'workspace-unavailable') {
+          setPublications(null)
+          return
+        }
+        setError(isShellError(listError) ? listError : 'unexpected')
+      })
+  }, [])
+
+  useEffect(() => {
+    refreshPublications()
+  }, [refreshPublications])
+
   useEffect(() => {
     adaptersList()
       .then((list) => {
@@ -706,17 +1038,63 @@ export function AgentPanel() {
   /**
    * The current run's candidates table (`docs/spike-log.md` § Slice 5):
    * the rows `candidates_list` returned for the run id the run's own
-   * `candidates` event named, or `null` until then. Cleared by the next
-   * Start along with the transcript, so a new run never shows the previous
-   * run's inventory beside its own output.
+   * `candidates` event named, with that run id, or `null` until then.
+   * Cleared by the next Start along with the transcript, so a new run never
+   * shows the previous run's inventory beside its own output.
    */
-  const [candidates, setCandidates] = useState<Candidate[] | null>(null)
+  const [candidates, setCandidates] = useState<CandidatesInventory | null>(null)
 
   /**
    * The sequence number of the most recently *started* `candidates_list`
    * fetch (R3-008 pattern): only the latest fetch's response is applied.
    */
   const latestCandidatesRequestRef = useRef(0)
+
+  /**
+   * Bumped every time a fetched inventory is applied (slice 5b): the
+   * identity a pending `artifact_approve` or `artifact_publish` response
+   * must still match before it touches a row -- a response that lands after
+   * a new run's inventory replaced the rows is dropped, even when the new
+   * inventory lists the same names (stale-response guard). A rejected Start
+   * restores the same inventory, so a response landing then still applies.
+   */
+  const appliedInventoryRef = useRef(0)
+
+  /**
+   * Counts the `artifact-state` frames this panel has rendered (slice 5b):
+   * the publish channel carries no sequence number, so each transcript
+   * line is keyed by this counter instead.
+   */
+  const publicationLineSeqRef = useRef(0)
+
+  /**
+   * The adapter id the current generation's run was started with (slice 5b):
+   * copied into the inventory when it is applied, so the approval block's
+   * scope line follows the producing launch rather than the selection at
+   * approval time.
+   */
+  const runAdapterIdRef = useRef<string | null>(null)
+
+  /**
+   * Each row's publication progress by candidate name (slice 5b), from the
+   * approval on; reset with every applied inventory, so a new run's rows
+   * never inherit an earlier run's approvals.
+   */
+  const [rowPublications, setRowPublications] =
+    useState<ReadonlyMap<string, RowPublication>>(EMPTY_ROW_PUBLICATIONS)
+
+  /** The name of the row whose approval block is open, or `null`. */
+  const [approvingName, setApprovingName] = useState<string | null>(null)
+
+  /**
+   * The digest the user has typed into the approval block. Only ever set
+   * from the input's own change events -- never from a candidate name, a
+   * proposal, or any other harness-originated string (TM-001-R1).
+   */
+  const [approvalInput, setApprovalInput] = useState('')
+
+  /** True while an `artifact_approve` call is in flight (one at a time). */
+  const [isApproving, setIsApproving] = useState(false)
 
   const handleFrame = useCallback((generation: number, frame: HarnessFrame) => {
     if (!mountedRef.current) return
@@ -778,7 +1156,14 @@ export function AgentPanel() {
             if (!mountedRef.current) return
             if (generation !== spawnGenerationRef.current) return
             if (requestId !== latestCandidatesRequestRef.current) return
-            setCandidates(rows)
+            // A new inventory: the rows, the run id an approval request
+            // names, and a clean slate for the rows' publication progress
+            // and the approval block (slice 5b).
+            appliedInventoryRef.current += 1
+            setCandidates({ runId, rows, adapterId: runAdapterIdRef.current })
+            setRowPublications(EMPTY_ROW_PUBLICATIONS)
+            setApprovingName(null)
+            setApprovalInput('')
           })
           .catch((listError: unknown) => {
             if (!mountedRef.current) return
@@ -815,8 +1200,10 @@ export function AgentPanel() {
       if (!mountedRef.current) return
       setWorkspace(picked)
       // The outbox is declared per project: a new workspace means a new
-      // status, fetched afresh rather than carried over.
+      // status, fetched afresh rather than carried over -- and the Catalog
+      // is the project's too, so its publications are fetched afresh.
       refreshOutboxStatus()
+      refreshPublications()
     } catch (pickError: unknown) {
       if (!mountedRef.current) return
       if (isShellError(pickError) && pickError.code === 'no-workspace') {
@@ -844,6 +1231,7 @@ export function AgentPanel() {
     const generation = (spawnGenerationRef.current += 1)
     runEndedRef.current = false
     runIdRef.current = null
+    runAdapterIdRef.current = adapterId
     setError(null)
     // The echoed prompt is entered before the spawn is even requested,
     // keyed by generation rather than by id, so a frame that beats the
@@ -911,6 +1299,192 @@ export function AgentPanel() {
     }
   }
 
+  /**
+   * Opens the approval block for the row named `name` (slice 5b): the
+   * block shows that row's identity-bound facts and an empty input --
+   * nothing pre-fills it. Frozen while a run is active or an approve is in
+   * flight, belt and braces with the buttons' own `disabled`.
+   */
+  function openApproval(name: string) {
+    if (runActive || isApproving) return
+    setApprovingName(name)
+    setApprovalInput('')
+  }
+
+  /**
+   * The approval itself (HAP-001-R22; TM-001-R1/R7): only the user's click
+   * on the final button reaches here, and only once the typed short digest
+   * confirms the row (`isApprovalConfirmed`) -- re-checked here rather than
+   * trusted to the button's `disabled`. Calls `artifact_approve` with the
+   * inventory's run id, the row's name, and the row's own full `sha256` --
+   * the identity fact the shell listed, never the typed value and never a
+   * proposal's digest; the shell verifies it against its own inventory.
+   * Both continuations are dropped once unmounted or once a new inventory
+   * replaced the rows, and the banner also holds its silence for a run that
+   * has since been replaced.
+   */
+  async function handleConfirmApproval() {
+    if (runActive || isApproving) return
+    if (candidates === null || approvingName === null) return
+    const row = candidates.rows.find((candidate) => candidate.name === approvingName)
+    if (row === undefined || row.sha256 === null) return
+    if (!isApprovalConfirmed(row, approvalInput)) return
+    // No approval toward a destination the surface could not show
+    // (HAP-001-R22): the shell would refuse it as `destination-invalid`.
+    if (destinationAssetRootId === null) return
+
+    const { runId } = candidates
+    const name = row.name
+    const sha256 = row.sha256
+    const inventory = appliedInventoryRef.current
+    const generation = spawnGenerationRef.current
+    setError(null)
+    setIsApproving(true)
+    try {
+      const approval = await artifactApprove(runId, name, sha256)
+      if (!mountedRef.current) return
+      if (inventory !== appliedInventoryRef.current) return
+      setRowPublications((previous) => new Map(previous).set(name, { phase: 'approved', approval }))
+      setApprovingName(null)
+      setApprovalInput('')
+    } catch (approveError: unknown) {
+      if (!mountedRef.current) return
+      if (inventory !== appliedInventoryRef.current) return
+      if (generation !== spawnGenerationRef.current) return
+      setError(isShellError(approveError) ? approveError : 'unexpected')
+    } finally {
+      if (mountedRef.current) setIsApproving(false)
+    }
+  }
+
+  /**
+   * Publishes an approved row (slice 5b; HAP-001-R35): calls
+   * `artifact_publish` with the approval id and a channel, renders every
+   * `artifact-state` frame as a transcript line, and applies the resolved
+   * publication -- to the Publications table always (the project's own
+   * truth, unless a `publications_list` refresh started since, whose own
+   * response then defines the table), and to the row while the same
+   * inventory is still displayed. Transcript lines and the banner are held
+   * to the run generation the click happened under, so a new run's
+   * transcript never receives an earlier publication's lines. A failure
+   * returns the row to `approved` with Publish enabled again: the shell
+   * decides whether the same approval can be retried.
+   */
+  async function handlePublish(name: string) {
+    if (runActive) return
+    const progress = rowPublications.get(name)
+    if (progress === undefined || progress.phase !== 'approved') return
+
+    const { approval } = progress
+    const inventory = appliedInventoryRef.current
+    const generation = spawnGenerationRef.current
+    const publicationsRequestId = latestPublicationsRequestRef.current
+    setError(null)
+    setRowPublications((previous) => new Map(previous).set(name, { phase: 'publishing', approval }))
+    try {
+      const publication = await artifactPublish(approval.approvalId, (frame) => {
+        if (!mountedRef.current) return
+        if (generation !== spawnGenerationRef.current) return
+        const seq = (publicationLineSeqRef.current += 1)
+        setTranscript((previous) =>
+          appendTranscriptEntry(previous, {
+            type: 'publication-state',
+            key: `publication-${seq}`,
+            text: formatPublicationStateLine(frame.payload),
+          }),
+        )
+      })
+      if (!mountedRef.current) return
+      if (publicationsRequestId === latestPublicationsRequestRef.current) {
+        setPublications((previous) => [
+          ...(previous ?? []).filter(
+            (existing) => existing.publicationId !== publication.publicationId,
+          ),
+          publication,
+        ])
+      }
+      if (inventory !== appliedInventoryRef.current) return
+      setRowPublications((previous) =>
+        new Map(previous).set(name, { phase: 'published', publication }),
+      )
+    } catch (publishError: unknown) {
+      if (!mountedRef.current) return
+      if (inventory === appliedInventoryRef.current) {
+        setRowPublications((previous) => {
+          const current = previous.get(name)
+          return current?.phase === 'publishing'
+            ? new Map(previous).set(name, { phase: 'approved', approval: current.approval })
+            : previous
+        })
+      }
+      if (generation !== spawnGenerationRef.current) return
+      setError(isShellError(publishError) ? publishError : 'unexpected')
+    }
+  }
+
+  /** The row whose approval block is open, if it is still listed. */
+  const approvingCandidate =
+    candidates !== null && approvingName !== null
+      ? (candidates.rows.find((candidate) => candidate.name === approvingName) ?? null)
+      : null
+  const approvalConfirmed =
+    approvingCandidate !== null && isApprovalConfirmed(approvingCandidate, approvalInput)
+
+  /** The asset root an approval would publish to, or `null` while unknown or unconfigured. */
+  const destinationAssetRootId = outbox?.assetRootId ?? null
+
+  /** The descriptor of the adapter the displayed inventory's run was started with, if listed. */
+  const inventoryAdapter =
+    candidates === null || candidates.adapterId === null
+      ? null
+      : (adapters.find((adapter) => adapter.id === candidates.adapterId) ?? null)
+
+  /** The work area's status line, or `null` while no workspace is active or its work area is valid. */
+  const workAreaLine = workspace === null ? null : formatWorkAreaLine(workspace.workArea)
+
+  /**
+   * A row's action cell (slice 5b): Approve for an approvable row with no
+   * progress yet; once approved, the approval's facts and Publish; once
+   * published, the transaction's own state token and the publication's
+   * short id; nothing for a row the shell would refuse. Every button is
+   * frozen while a run is active (publication of a finished run's
+   * candidates is allowed only when no run is active -- spike default).
+   */
+  function renderRowAction(candidate: Candidate): ReactNode {
+    const progress = rowPublications.get(candidate.name)
+    if (progress === undefined) {
+      if (!isApprovable(candidate)) return null
+      return (
+        <button
+          type="button"
+          onClick={() => openApproval(candidate.name)}
+          disabled={runActive || isApproving}
+        >
+          Approve
+        </button>
+      )
+    }
+    if (progress.phase === 'published') {
+      return (
+        <PlainTextLine
+          text={`${formatArtifactState(progress.publication.state)} ${shortDigest(progress.publication.publicationId)}`}
+        />
+      )
+    }
+    return (
+      <>
+        <PlainTextLine text={formatApprovedCell(progress.approval)} />{' '}
+        <button
+          type="button"
+          onClick={() => handlePublish(candidate.name)}
+          disabled={runActive || progress.phase === 'publishing'}
+        >
+          Publish
+        </button>
+      </>
+    )
+  }
+
   const activeApprovals = approvals.filter((approval) => approval.status === 'active')
   const selectedAdapter = adapters.find((adapter) => adapter.id === adapterId) ?? null
   const promptTooLarge = promptByteLength(prompt) > PROMPT_MAX_BYTES
@@ -947,6 +1521,16 @@ export function AgentPanel() {
                   <PlainTextLine text={error.detail.observedSha256Short} />)
                 </span>
               )}
+              {error.code === 'duplicate-publication' && error.detail && (
+                // HAP-001-R23's acknowledgement of the existing record: its
+                // two identities in short form, and nothing else of the
+                // detail (slice 5b).
+                <span>
+                  {' '}
+                  (publication <PlainTextLine text={shortDigest(error.detail.publicationId)} />,
+                  catalog <PlainTextLine text={shortCatalogId(error.detail.catalogId)} />)
+                </span>
+              )}
             </>
           )}
         </div>
@@ -971,6 +1555,14 @@ export function AgentPanel() {
           // so the two live regions stay distinguishable (R3-018).
           <p role="status" aria-label="Outbox">
             <PlainTextLine text={formatOutboxStatusLine(outbox)} />
+          </p>
+        )}
+        {workAreaLine !== null && (
+          // The work area's own status line (slice 5b, HAP-001-R7), a third
+          // named live region beside the outbox line: fixed copy, rendered
+          // only while the check reports the area invalid.
+          <p role="status" aria-label="Work area">
+            {workAreaLine}
           </p>
         )}
       </div>
@@ -1062,7 +1654,6 @@ export function AgentPanel() {
 
       {candidates && (
         <section aria-label="Candidates">
-          <p>{PUBLICATION_UNAVAILABLE}</p>
           <table>
             <thead>
               <tr>
@@ -1073,13 +1664,109 @@ export function AgentPanel() {
                 <th>class</th>
                 <th>attribution</th>
                 <th>state</th>
+                <th>action</th>
               </tr>
             </thead>
             <tbody>
-              {candidates.map((candidate, index) => (
+              {candidates.rows.map((candidate, index) => (
                 // An index key is sound here: the list is replaced whole by
                 // each fetch and is never reordered or edited in place.
-                <CandidateRow key={index} candidate={candidate} />
+                <CandidateRow
+                  key={index}
+                  candidate={candidate}
+                  action={renderRowAction(candidate)}
+                />
+              ))}
+            </tbody>
+          </table>
+
+          {approvingCandidate && (
+            // The publication approval surface (HAP-001-R22; TM-001-R1/R7):
+            // the row's identity-bound facts verbatim, each through
+            // PlainTextLine, the act-as identity as fixed copy, and a
+            // digest-typed confirmation the user fills -- beside the table,
+            // outside the transcript, never inside a terminal pane
+            // (RCS-001-R6). The destination asset root is not known before
+            // the shell answers, so it is shown in the row once approved.
+            <div aria-label="Publication approval" data-testid="publication-approval">
+              <p>
+                name: <PlainTextLine text={approvingCandidate.name} />
+              </p>
+              <p>
+                class: <PlainTextLine text={approvingCandidate.class ?? NULL_FACT} />
+              </p>
+              <p>
+                type: <PlainTextLine text={approvingCandidate.detectedType ?? NULL_FACT} />
+              </p>
+              <p>
+                size:{' '}
+                <PlainTextLine
+                  text={
+                    approvingCandidate.size === null ? NULL_FACT : String(approvingCandidate.size)
+                  }
+                />
+              </p>
+              <p>
+                sha256: <PlainTextLine text={approvingCandidate.sha256 ?? NULL_FACT} />
+              </p>
+              <p>
+                sha256 short: <PlainTextLine text={approvingCandidate.sha256Short ?? NULL_FACT} />
+              </p>
+              <p>
+                attribution:{' '}
+                <PlainTextLine text={formatAttributionFact(approvingCandidate.attribution)} />
+              </p>
+              <p>
+                destination: <PlainTextLine text={formatDestinationFact(outbox)} />
+              </p>
+              <p>
+                scope:{' '}
+                <PlainTextLine text={formatScopeMode(inventoryAdapter?.scopeMode ?? null)} />
+              </p>
+              <p>{APPROVAL_ACT_AS_LINE}</p>
+              <label htmlFor="agent-approval-confirm-input">
+                Type the short digest (
+                <PlainTextLine text={approvingCandidate.sha256Short ?? NULL_FACT} />) to approve
+              </label>
+              <input
+                id="agent-approval-confirm-input"
+                value={approvalInput}
+                disabled={runActive || isApproving}
+                onChange={(event) => setApprovalInput(event.target.value)}
+              />
+              <button
+                type="button"
+                onClick={handleConfirmApproval}
+                disabled={
+                  !approvalConfirmed || destinationAssetRootId === null || runActive || isApproving
+                }
+              >
+                Approve publication
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {publications && (
+        // The project's Catalog as this device sees it (`docs/spike-log.md`
+        // § Slice 5b): beside the transcript and the candidates table, never
+        // inside either. Rendered once a list was received, empty or not.
+        <section aria-label="Publications">
+          <table>
+            <thead>
+              <tr>
+                <th>names</th>
+                <th>state</th>
+                <th>provider state</th>
+                <th>reference</th>
+                <th>catalog id</th>
+                <th>availability</th>
+              </tr>
+            </thead>
+            <tbody>
+              {publications.map((publication) => (
+                <PublicationRow key={publication.publicationId} publication={publication} />
               ))}
             </tbody>
           </table>

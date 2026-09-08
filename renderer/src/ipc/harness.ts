@@ -277,27 +277,103 @@ export type ShellErrorCode =
    * (HAP-001-R10, D14; spike slice 5).
    */
   | 'outbox-unavailable'
+  /**
+   * The published copy's digest did not verify against the approved
+   * digest, or the held handle's bytes changed since they were digested;
+   * the copy is discarded and the entry preserved (`artifact_publish`;
+   * HAP-001-R21, spike slice 5b).
+   */
+  | 'integrity-mismatch'
+  /**
+   * The publication identity is already registered for this project; the
+   * existing record is acknowledged by the two ids in
+   * {@link DuplicatePublicationDetail} and nothing new was published
+   * (`artifact_publish`; HAP-001-R23, spike slice 5b).
+   */
+  | 'duplicate-publication'
+  /**
+   * The product work area resolves inside a registered workspace root, or
+   * its journal cannot be used; the operation is refused (HAP-001-R7,
+   * spike slice 5b).
+   */
+  | 'work-area-invalid'
+  /**
+   * The project declares no asset root, or its device asset path resolves
+   * inside a registered workspace root or cannot be written; nothing is
+   * copied (HAP-001-R6, R14; spike slice 5b).
+   */
+  | 'destination-invalid'
+  /**
+   * At publish time the entry's path no longer names the held handle's
+   * file, or the handle is not a regular file; nothing is published and
+   * the held bytes are kept as a recovery entry (`artifact_publish`;
+   * HAP-001-R18, spike slice 5b).
+   */
+  | 'outbox-escape'
+  /**
+   * The held handle's link count is greater than one at publish time
+   * (`artifact_publish`; HAP-001-R20, spike slice 5b).
+   */
+  | 'outbox-linked'
+  /**
+   * The candidate cannot be approved in its state or class, its digest
+   * does not match the approval request, or the re-opened entry's identity
+   * facts changed since approval (`artifact_approve`/`artifact_publish`;
+   * HAP-001-R22, spike slice 5b).
+   */
+  | 'refused'
+  /** The project's Catalog could not be read or written (spike slice 5b). */
+  | 'catalog-unavailable'
+  /**
+   * `artifact_approve` or `artifact_publish` was called while a supervised
+   * process is still running: the shell's mirror of the renderer's frozen
+   * publication surface, so a request that bypasses the renderer's guard
+   * meets the same answer (spike slice 5b, renderer risk review R1-001).
+   * Open again once every run has reached its terminal state; a wait, not
+   * a verdict on anything.
+   */
+  | 'run-active'
 
-/**
- * Structured detail for a {@link ShellError}, carrying values a fixed
- * catalogue `message` must not -- currently only populated for
- * `changed-since-approval`.
- */
-export interface ShellErrorDetail {
+/** `changed-since-approval`'s detail: both digests as short hex prefixes. */
+export interface ChangedSinceApprovalDetail {
   recordedSha256Short: string
   observedSha256Short: string
 }
 
 /**
- * A failed IPC command's error payload. `detail` is present only for the
- * handful of codes that carry structured, non-path data alongside the
- * message (see {@link ShellErrorDetail}).
+ * `duplicate-publication`'s detail (spike slice 5b): the existing record's
+ * logical identities -- HAP-001-R23's "acknowledge the existing record" --
+ * a 64-hex publication identity and the `<asset root id>/<publication
+ * hex>` Catalog identity. Display-only text, never a path.
  */
-export interface ShellError {
-  code: ShellErrorCode
-  message: string
-  detail?: ShellErrorDetail
+export interface DuplicatePublicationDetail {
+  publicationId: string
+  catalogId: string
 }
+
+/**
+ * Structured detail for a {@link ShellError}, carrying values a fixed
+ * catalogue `message` must not. Mirrors `dto.rs`'s untagged
+ * `ShellErrorDetail`: one field set per carrying code, and the wire shape
+ * of the slice-2 `changed-since-approval` detail is unchanged.
+ */
+export type ShellErrorDetail = ChangedSinceApprovalDetail | DuplicatePublicationDetail
+
+/**
+ * A failed IPC command's error payload. `detail` is present only for the
+ * two codes that carry structured, non-path data alongside the message,
+ * each with its own shape -- discriminated on `code` here, so a banner
+ * that narrows on the code sees the matching detail type and no other;
+ * every other code carries none.
+ */
+export type ShellError =
+  | {
+      code: Exclude<ShellErrorCode, 'changed-since-approval' | 'duplicate-publication'>
+      message: string
+      detail?: undefined
+    }
+  | { code: 'changed-since-approval'; message: string; detail?: ChangedSinceApprovalDetail }
+  | { code: 'duplicate-publication'; message: string; detail?: DuplicatePublicationDetail }
 
 /** Type guard for a rejected `invoke`'s error value being a {@link ShellError}. */
 export function isShellError(error: unknown): error is ShellError {
@@ -361,7 +437,23 @@ export interface Approval {
  */
 export interface Workspace {
   displayPath: string
+  /**
+   * Whether the product work area still resolves outside this workspace,
+   * re-checked on every workspace registration (HAP-001-R7; spike slice 5b)
+   * so the next publication command is not the first to notice a workspace
+   * registered over it. Mirrors `dto.rs`'s `WorkspaceDto.work_area`.
+   */
+  workArea: WorkAreaState
 }
+
+/**
+ * The product work area's state against the active workspace, as it
+ * crosses IPC (`docs/spike-log.md` § Slice 5b): `valid`, or
+ * `work-area-invalid` when the area resolves inside the workspace root --
+ * every publication command refuses with the same-named `ShellErrorCode`
+ * until it is fixed. Mirrors `dto.rs`'s `WorkAreaStateTag`.
+ */
+export type WorkAreaState = 'valid' | 'work-area-invalid'
 
 /** [`omnifrons_domain::adapter::TransportClass`], as it crosses IPC. */
 export type TransportClass = 'structured-streaming-cli' | 'pty'
@@ -523,6 +615,14 @@ export interface OutboxStatus {
   state: OutboxState
   reason: OutboxReason | null
   policyPath: string
+  /**
+   * The policy's asset root identity token (spike slice 5b): the destination
+   * HAP-001-R22 shows on the approval surface before the decision -- one
+   * token, never a path; `null` when the policy declares none or could not
+   * be loaded, in which case every approval would fail `destination-invalid`.
+   * Mirrors `OutboxStatusDto.asset_root_id`.
+   */
+  assetRootId: string | null
 }
 
 /**
@@ -560,6 +660,15 @@ export type Attribution = { kind: 'run'; runId: string } | { kind: 'unattributed
 export interface Candidate {
   name: string
   size: number | null
+  /**
+   * The full 64-hex content digest (spike slice 5b): the identity fact
+   * `artifactApprove` names the candidate by, so an approval is made from
+   * the row itself -- identity evidence, not a secret, under the same
+   * TM-001-R7 display precedent as `Evidence.sha256` -- and `null` for a
+   * refused entry, where nothing was digested. Mirrors
+   * `CandidateDto.sha256`.
+   */
+  sha256: string | null
   sha256Short: string | null
   detectedType: string | null
   class: ArtifactClass | null
@@ -593,4 +702,201 @@ export async function outboxStatus(): Promise<OutboxStatus> {
  */
 export async function candidatesList(runId?: string): Promise<Candidate[]> {
   return invoke('candidates_list', runId === undefined ? {} : { runId })
+}
+
+// -- Slice 5b: approval, publication, and the Catalog listing --
+
+/**
+ * [`omnifrons_domain::publication::ArtifactState`], as it crosses IPC
+ * (`docs/spike-log.md` § Slice 5b): the ten closed state tokens HAP-001's
+ * signal mapping spells, exactly, and nothing else (HAP-001-R26) --
+ * mirroring `dto.rs`'s `ArtifactStateTag`. Transcribed verbatim wherever a
+ * surface shows one (`docs/target-architecture.md` invariant 8).
+ */
+export type ArtifactState =
+  | 'candidate'
+  | 'published-local'
+  | 'registered'
+  | 'provider-synced'
+  | 'registration-pending'
+  | 'refused'
+  | 'integrity-mismatch'
+  | 'duplicate-publication'
+  | 'outbox-escape'
+  | 'outbox-linked'
+
+/** [`omnifrons_domain::publication::ProviderState`], as it crosses IPC: the record's `provider_state`. */
+export type ProviderState = 'pending' | 'synced' | 'failed' | 'unavailable'
+
+/**
+ * This device's own availability observation for a publication
+ * (HAP-001-R27): `local` when this device's journal shows the bytes
+ * verified here, `unknown` otherwise -- never inferred from the record.
+ */
+export type Availability = 'local' | 'unknown'
+
+/**
+ * The act-as identity an artifact approval binds (HAP-001-R22, TM-001-R7):
+ * the device-local user, as an opaque wire token -- the one actor this
+ * shell can bind an approval to.
+ */
+export type ActAs = 'device-local-user'
+
+/**
+ * An artifact approval id, as it crosses IPC: 16 lowercase hex characters
+ * (a derived `u64` does not survive a JSON number's 53-bit mantissa, so it
+ * is a string on the wire, unlike the slice-2 executable {@link ApprovalId}).
+ * Opaque: never parsed by the renderer.
+ */
+export type ArtifactApprovalId = string
+
+/** A publication identity, as it crosses IPC: 64 hex characters. Opaque. */
+export type PublicationId = string
+
+/**
+ * AEC-001's `ref` for an artifact (HAP-001 § Definitions, "Portable
+ * reference"): `{ kind: 'artifact', id: <publication identity>, locator:
+ * <artifact Catalog identity> }`. `locator` is `<asset root id>/<publication
+ * hex>` -- display-only text the renderer never resolves as a path, a link,
+ * or an address, and never a device path.
+ */
+export interface PortableReference {
+  kind: 'artifact'
+  id: PublicationId
+  locator: string
+}
+
+/**
+ * `artifact_approve`'s payload (`docs/spike-log.md` § Slice 5b): the
+ * identity-bound facts the approval surface showed (HAP-001-R22) --
+ * `name` the entry as `candidates_list` listed it, `displayName` the
+ * sanitized record name (HAP-001-R24), the digest's short form, size,
+ * detected type, class, the attribution -- plus the destination asset
+ * root identity, the act-as identity, and the derived ids. Mirrors
+ * `ArtifactApprovalDto` field-for-field. Never a device path.
+ */
+export interface ArtifactApproval {
+  approvalId: ArtifactApprovalId
+  publicationId: PublicationId
+  runId: string
+  name: string
+  displayName: string
+  sha256Short: string
+  size: number
+  detectedType: string
+  class: ArtifactClass
+  attribution: Attribution
+  assetRootId: string
+  actAs: ActAs
+  approvedAt: number
+}
+
+/**
+ * One publication, as `artifact_publish` returns it and `publications_list`
+ * lists it (`docs/spike-log.md` § Slice 5b): the publication identity, its
+ * state, the portable reference once `registered` (HAP-001-R24; `null`
+ * before), the record's provider state and Catalog identity once a record
+ * exists, the sanitized display names (the request's, plus aliases later
+ * identical publications added), and this device's own availability
+ * observation. Mirrors `PublicationDto` field-for-field. Never a device
+ * path.
+ */
+export interface Publication {
+  publicationId: PublicationId
+  state: ArtifactState
+  reference: PortableReference | null
+  providerState: ProviderState | null
+  catalogId: string | null
+  names: string[]
+  availability: Availability
+}
+
+/**
+ * The frame `artifact_publish`'s `onState` channel carries on every
+ * transition, in order (proposed AEC-001 kind `artifact.state`;
+ * HAP-001-R35): adjacently tagged like {@link AgentEvent}, mirroring
+ * `dto.rs`'s `ArtifactStateFrame` -- a separate one-kind frame on the
+ * publish command's own channel, never a member of the adapter channel's
+ * `AgentEvent` union, which the Rust side never sends it on. Never a
+ * path; the event observes and controls nothing.
+ */
+export type ArtifactStateFrame = {
+  kind: 'artifact-state'
+  payload: {
+    publicationId: PublicationId
+    state: ArtifactState
+    providerState: ProviderState | null
+  }
+}
+
+/**
+ * Approve one candidate of a remembered run for publication, by the run
+ * id, the entry name exactly as `candidatesList` listed it, and the
+ * entry's full 64-hex digest -- the row's own `Candidate.sha256`, the
+ * identity fact the shell listed, never a typed value or a proposal's
+ * digest (`docs/spike-log.md` § Slice 5b). The shell looks the entry up in
+ * its own run-end inventory and refuses a digest that does not match it,
+ * a refused entry, or a class other than `generated-heavy`; the returned
+ * approval carries the identity-bound facts the surface showed. Invokes
+ * `artifact_approve` with exactly `{ runId, name, sha256 }` -- no
+ * path-shaped key.
+ *
+ * # Errors
+ * Rejects with `refused` (an entry that cannot be approved, or a digest
+ * that does not match), `destination-invalid` (the project declares no
+ * asset root), `work-area-invalid`, `invalid-request` (an unknown run or
+ * name, or a digest that is not 64 hex characters), `outbox-invalid`,
+ * `run-active` (a supervised process is still running), or
+ * `workspace-unavailable`.
+ */
+export async function artifactApprove(
+  runId: string,
+  name: string,
+  sha256: string,
+): Promise<ArtifactApproval> {
+  return invoke('artifact_approve', { runId, name, sha256 })
+}
+
+/**
+ * Publish a previously approved candidate, streaming every state
+ * transition to `onState` (`docs/spike-log.md` § Slice 5b, HAP-001-R35).
+ *
+ * Creates a fresh `Channel<ArtifactStateFrame>`, wires its `onmessage` to
+ * `onState`, and invokes `artifact_publish` with exactly `{ approvalId,
+ * onState }` -- the `harnessSpawn` pattern. Resolves with the publication
+ * as the transaction left it: `registered` with its reference, or
+ * `registration-pending` with none.
+ *
+ * # Errors
+ * A failure emits its own state frame once, then rejects with the
+ * matching code: `integrity-mismatch`, `duplicate-publication` (its
+ * `detail` the existing record's two ids), `outbox-escape`,
+ * `outbox-linked`, `refused`, `destination-invalid`, `work-area-invalid`,
+ * `catalog-unavailable`, `invalid-request` (a malformed or unrecorded
+ * approval id), `run-active` (a supervised process is still running), or
+ * `workspace-unavailable`.
+ */
+export async function artifactPublish(
+  approvalId: ArtifactApprovalId,
+  onState: (frame: ArtifactStateFrame) => void,
+): Promise<Publication> {
+  const channel = new Channel<ArtifactStateFrame>()
+  channel.onmessage = onState
+
+  return invoke('artifact_publish', { approvalId, onState: channel })
+}
+
+/**
+ * Every publication of the active project after the shell's restart
+ * replay (`docs/spike-log.md` § Slice 5b, HAP-001-R29): the Catalog's
+ * records with this device's own availability, plus any
+ * `registration-pending` recovery could not complete. A fresh project is
+ * `[]`.
+ *
+ * # Errors
+ * Rejects with `catalog-unavailable`, `work-area-invalid`, or
+ * `workspace-unavailable` if no workspace is active.
+ */
+export async function publicationsList(): Promise<Publication[]> {
+  return invoke('publications_list')
 }

@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   adaptersList,
   approvalsList,
+  artifactApprove,
+  artifactPublish,
   candidatesList,
   executableApprove,
   executablePickAndProbe,
@@ -13,16 +15,24 @@ import {
   harnessStop,
   isShellError,
   outboxStatus,
+  publicationsList,
   workspaceCurrent,
   workspacePick,
   type AdapterDescriptor,
   type AgentEvent,
   type Approval,
+  type ArtifactApproval,
+  type ArtifactState,
+  type ArtifactStateFrame,
+  type Availability,
   type Candidate,
   type Evidence,
   type HarnessFrame,
   type OutboxStatus,
+  type ProviderState,
+  type Publication,
   type ShellError,
+  type ShellErrorCode,
 } from './harness'
 
 // The jsdom crypto polyfill is installed once for every test file by
@@ -378,18 +388,33 @@ describe('adaptersList', () => {
 })
 
 describe('workspacePick', () => {
-  it('invokes workspace_pick with no arguments and returns the workspace verbatim', async () => {
+  it('invokes workspace_pick with no arguments and returns the workspace verbatim -- displayPath and, since slice 5b, its workArea check', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'workspace_pick') {
         expect(args).toEqual({})
-        return { displayPath: '/home/user/project' }
+        return { displayPath: '/home/user/project', workArea: 'valid' }
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
 
     const result = await workspacePick()
 
-    expect(result).toEqual({ displayPath: '/home/user/project' })
+    expect(result).toEqual({ displayPath: '/home/user/project', workArea: 'valid' })
+    expect(result.workArea).toBe('valid')
+    expect(Object.keys(result).sort()).toEqual(['displayPath', 'workArea'])
+  })
+
+  it('returns a work-area-invalid workArea verbatim: the product work area re-checked against the picked workspace (slice 5b, HAP-001-R7)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_pick') {
+        return { displayPath: '/home/user/project', workArea: 'work-area-invalid' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await workspacePick()
+
+    expect(result.workArea).toBe('work-area-invalid')
   })
 
   it('rejects with no-workspace when the folder dialog was canceled', async () => {
@@ -405,18 +430,37 @@ describe('workspacePick', () => {
 })
 
 describe('workspaceCurrent', () => {
-  it('invokes workspace_current with no arguments and returns the active workspace', async () => {
+  it('invokes workspace_current with no arguments and returns the active workspace, its workArea included', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'workspace_current') {
         expect(args).toEqual({})
-        return { displayPath: '/home/user/project' }
+        return { displayPath: '/home/user/project', workArea: 'work-area-invalid' }
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
 
     const result = await workspaceCurrent()
 
-    expect(result).toEqual({ displayPath: '/home/user/project' })
+    expect(result).toEqual({ displayPath: '/home/user/project', workArea: 'work-area-invalid' })
+    expect(result?.workArea).toBe('work-area-invalid')
+  })
+
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the workArea tokens with a never default compiles, and at runtime maps both tokens to themselves (slice 5b)', () => {
+    type WorkArea = NonNullable<Awaited<ReturnType<typeof workspaceCurrent>>>['workArea']
+    function workAreaLabel(state: WorkArea): string {
+      switch (state) {
+        case 'valid':
+        case 'work-area-invalid':
+          return state
+        default: {
+          const unreachable: never = state
+          return unreachable
+        }
+      }
+    }
+
+    const states: WorkArea[] = ['valid', 'work-area-invalid']
+    expect(states.map(workAreaLabel)).toEqual(states)
   })
 
   it('returns null when no workspace is active', async () => {
@@ -714,6 +758,7 @@ const OUTBOX_STATUS_VALID: OutboxStatus = {
   state: 'valid',
   reason: null,
   policyPath: '.omnifrons/asset-policy.json',
+  assetRootId: 'main',
 }
 
 const RUN_ID = 'run-1725782401-000000001-0'
@@ -727,6 +772,7 @@ const SAMPLE_CANDIDATES: Candidate[] = [
   {
     name: `${RUN_ID}/report.pdf`,
     size: 4096,
+    sha256: 'ab'.repeat(32),
     sha256Short: 'abababab',
     detectedType: 'pdf',
     class: 'generated-heavy',
@@ -736,6 +782,7 @@ const SAMPLE_CANDIDATES: Candidate[] = [
   {
     name: `${RUN_ID}/linked.bin`,
     size: null,
+    sha256: null,
     sha256Short: null,
     detectedType: null,
     class: null,
@@ -757,10 +804,28 @@ describe('outboxStatus (slice 5)', () => {
     const result = await outboxStatus()
 
     expect(result).toEqual(OUTBOX_STATUS_VALID)
+    // Since slice 5b the status carries the policy's asset root identity
+    // token -- the destination the approval surface shows before the
+    // decision (HAP-001-R22) -- never a path.
+    expect(result.assetRootId).toBe('main')
+    expect(Object.keys(result).sort()).toEqual([
+      'assetRootId',
+      'declared',
+      'exists',
+      'outbox',
+      'policyPath',
+      'reason',
+      'state',
+    ])
   })
 
   it('returns a valid, not-yet-created status and an outbox-invalid status with its reason token verbatim', async () => {
-    const notYetCreated: OutboxStatus = { ...OUTBOX_STATUS_VALID, outbox: null, exists: false }
+    const notYetCreated: OutboxStatus = {
+      ...OUTBOX_STATUS_VALID,
+      outbox: null,
+      exists: false,
+      assetRootId: null,
+    }
     const invalid: OutboxStatus = {
       declared: 'elsewhere/outbox',
       outbox: null,
@@ -768,6 +833,7 @@ describe('outboxStatus (slice 5)', () => {
       state: 'outbox-invalid',
       reason: 'link',
       policyPath: '.omnifrons/asset-policy.json',
+      assetRootId: 'main',
     }
     const responses: OutboxStatus[] = [notYetCreated, invalid]
     mockIPC((cmd) => {
@@ -796,8 +862,24 @@ describe('candidatesList (slice 5)', () => {
     expect(capturedArgs).toEqual({ runId: RUN_ID })
     expect(Object.keys(capturedArgs!)).toEqual(['runId'])
     expect(result).toEqual(SAMPLE_CANDIDATES)
+    // Since slice 5b the row carries its full digest beside the short one
+    // (identity evidence, the `Evidence.sha256` precedent), `null` for a
+    // refused entry like every other digested fact.
+    expect(result[0]?.sha256).toBe('ab'.repeat(32))
+    expect(result[0]?.sha256).toHaveLength(64)
+    expect(Object.keys(result[0]!).sort()).toEqual([
+      'attribution',
+      'class',
+      'detectedType',
+      'name',
+      'sha256',
+      'sha256Short',
+      'size',
+      'state',
+    ])
     expect(result[1]).toMatchObject({
       size: null,
+      sha256: null,
       sha256Short: null,
       detectedType: null,
       class: null,
@@ -948,5 +1030,459 @@ describe('isShellError', () => {
     expect(isShellError('error')).toBe(false)
     expect(isShellError({ message: 'x' })).toBe(false)
     expect(isShellError({ code: 1, message: 'x' })).toBe(false)
+  })
+})
+
+// -- Slice 5b: approval, publication, and the Catalog listing --
+
+const PUBLICATION_ID = '2a91ea59fc5047831d97dbaebd763a3de37a5b382b683be59d10d6bdcdd92d4e'
+
+/** The full digest of the entry `candidates_list` lists as `061eb0a8`: 64 hex characters. */
+const REPORT_DIGEST = `061eb0a8${'c'.repeat(56)}`
+
+/**
+ * `artifact_approve`'s payload for the fixture run's attributed entry
+ * (`docs/spike-log.md` § Slice 5b, IPC shapes): every field a logical
+ * value, the approval id 16 hex, the publication identity 64, the act-as
+ * identity the device-local user. Never a device path.
+ */
+const SAMPLE_ARTIFACT_APPROVAL: ArtifactApproval = {
+  approvalId: '23121521465ad9be',
+  publicationId: PUBLICATION_ID,
+  runId: RUN_ID,
+  name: `${RUN_ID}/report.pdf`,
+  displayName: 'report.pdf',
+  sha256Short: '061eb0a8',
+  size: 37,
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  attribution: { kind: 'run', runId: RUN_ID },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1725782401000,
+}
+
+/** A `registered` publication: the reference is AEC-001's `ref`, the locator the Catalog identity. */
+const REGISTERED_PUBLICATION: Publication = {
+  publicationId: PUBLICATION_ID,
+  state: 'registered',
+  reference: { kind: 'artifact', id: PUBLICATION_ID, locator: `main/${PUBLICATION_ID}` },
+  providerState: 'pending',
+  catalogId: `main/${PUBLICATION_ID}`,
+  names: ['report.pdf'],
+  availability: 'local',
+}
+
+/** A registration that failed after a verified `published-local`: no reference before registration (HAP-001-R24). */
+const PENDING_PUBLICATION: Publication = {
+  publicationId: PUBLICATION_ID,
+  state: 'registration-pending',
+  reference: null,
+  providerState: null,
+  catalogId: null,
+  names: ['report.pdf'],
+  availability: 'local',
+}
+
+type LiveStateChannel = { onmessage: (frame: ArtifactStateFrame) => void }
+
+describe('artifactApprove (slice 5b)', () => {
+  it('invokes artifact_approve with exactly { runId, name, sha256 } -- the full 64-hex digest -- and returns the approval verbatim, with no path-shaped key', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'artifact_approve') {
+        capturedArgs = args as Record<string, unknown>
+        return SAMPLE_ARTIFACT_APPROVAL
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const approval = await artifactApprove(RUN_ID, `${RUN_ID}/report.pdf`, REPORT_DIGEST)
+
+    expect(approval).toEqual(SAMPLE_ARTIFACT_APPROVAL)
+    expect(capturedArgs).toEqual({
+      runId: RUN_ID,
+      name: `${RUN_ID}/report.pdf`,
+      sha256: REPORT_DIGEST,
+    })
+    expect(Object.keys(capturedArgs!).sort()).toEqual(['name', 'runId', 'sha256'])
+    expect(capturedArgs!.sha256).toHaveLength(64)
+    for (const key of Object.keys(capturedArgs!)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
+    expect(Object.keys(approval).sort()).toEqual([
+      'actAs',
+      'approvalId',
+      'approvedAt',
+      'assetRootId',
+      'attribution',
+      'class',
+      'detectedType',
+      'displayName',
+      'name',
+      'publicationId',
+      'runId',
+      'sha256Short',
+      'size',
+    ])
+  })
+
+  it('returns an unattributed approval verbatim: its attribution the bare unattributed kind, nothing standing in for a producer', async () => {
+    const unattributed: ArtifactApproval = {
+      ...SAMPLE_ARTIFACT_APPROVAL,
+      approvalId: '5f0c5f0c5f0c5f0c',
+      name: `${RUN_ID}/stray.png`,
+      displayName: 'stray.png',
+      sha256Short: '11111111',
+      size: 11,
+      detectedType: 'png',
+      attribution: { kind: 'unattributed' },
+    }
+    mockIPC((cmd) => {
+      if (cmd === 'artifact_approve') return unattributed
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const approval = await artifactApprove(RUN_ID, `${RUN_ID}/stray.png`, `11111111${'d'.repeat(56)}`)
+
+    expect(approval).toEqual(unattributed)
+    expect(approval.attribution).toEqual({ kind: 'unattributed' })
+    expect(Object.keys(approval.attribution)).toEqual(['kind'])
+  })
+
+  it('rejects with the typed refused, destination-invalid and run-active ShellErrors', async () => {
+    const refused: ShellError = {
+      code: 'refused',
+      message: 'only a generated-heavy candidate can be approved for publication',
+    }
+    const destination: ShellError = {
+      code: 'destination-invalid',
+      message: 'the project declares no asset root',
+    }
+    // The backend mirror of the renderer's frozen surface: refused while
+    // any supervised process runs (`docs/spike-log.md` § Slice 5b).
+    const runActive: ShellError = {
+      code: 'run-active',
+      message: 'a run is active; approve or publish once it has ended',
+    }
+    for (const error of [refused, destination, runActive]) {
+      mockIPC((cmd) => {
+        if (cmd === 'artifact_approve') return Promise.reject(error)
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      await expect(
+        artifactApprove(RUN_ID, `${RUN_ID}/notes.md`, REPORT_DIGEST),
+      ).rejects.toMatchObject(error)
+      expect(isShellError(error)).toBe(true)
+      clearMocks()
+    }
+  })
+})
+
+describe('artifactPublish (slice 5b)', () => {
+  it('invokes artifact_publish with exactly { approvalId, onState }, onState the live Channel, and returns the registered publication verbatim, its reference exactly { kind, id, locator }, no path-shaped key', async () => {
+    let capturedArgs: Record<string, unknown> | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'artifact_publish') {
+        capturedArgs = args as Record<string, unknown>
+        return REGISTERED_PUBLICATION
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const publication = await artifactPublish('23121521465ad9be', () => {})
+
+    expect(publication).toEqual(REGISTERED_PUBLICATION)
+    expect(Object.keys(capturedArgs!).sort()).toEqual(['approvalId', 'onState'])
+    expect(capturedArgs!.approvalId).toBe('23121521465ad9be')
+    expect(typeof (capturedArgs!.onState as LiveStateChannel).onmessage).toBe('function')
+    for (const key of Object.keys(capturedArgs!)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
+    expect(Object.keys(publication).sort()).toEqual([
+      'availability',
+      'catalogId',
+      'names',
+      'providerState',
+      'publicationId',
+      'reference',
+      'state',
+    ])
+    if (publication.reference === null) throw new Error('expected a reference')
+    expect(Object.keys(publication.reference).sort()).toEqual(['id', 'kind', 'locator'])
+    expect(publication.reference.kind).toBe('artifact')
+  })
+
+  it('delivers artifact-state frames sent on the live Channel to onState, in order, each payload exactly { publicationId, state, providerState }', async () => {
+    let channelRef: LiveStateChannel | undefined
+    mockIPC((cmd, args) => {
+      if (cmd === 'artifact_publish') {
+        channelRef = (args as Record<string, unknown>).onState as LiveStateChannel
+        return REGISTERED_PUBLICATION
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const received: ArtifactStateFrame[] = []
+    await artifactPublish('23121521465ad9be', (frame) => {
+      received.push(frame)
+    })
+    if (!channelRef) throw new Error('artifact_publish was not called')
+    const frames: ArtifactStateFrame[] = [
+      {
+        kind: 'artifact-state',
+        payload: { publicationId: PUBLICATION_ID, state: 'published-local', providerState: null },
+      },
+      {
+        kind: 'artifact-state',
+        payload: { publicationId: PUBLICATION_ID, state: 'registered', providerState: 'pending' },
+      },
+    ]
+    for (const frame of frames) channelRef.onmessage(frame)
+
+    expect(received).toEqual(frames)
+    expect(received.map((frame) => frame.payload.state)).toEqual(['published-local', 'registered'])
+    expect(Object.keys(received[0]!.payload).sort()).toEqual([
+      'providerState',
+      'publicationId',
+      'state',
+    ])
+  })
+
+  it('returns a registration-pending publication verbatim: null reference, provider state and catalog id, its names and availability kept', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'artifact_publish') return PENDING_PUBLICATION
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const publication = await artifactPublish('23121521465ad9be', () => {})
+
+    expect(publication).toEqual(PENDING_PUBLICATION)
+    expect(publication.reference).toBeNull()
+    expect(publication.providerState).toBeNull()
+    expect(publication.catalogId).toBeNull()
+  })
+
+  it("rejects with the typed duplicate-publication ShellError carrying the existing record's publicationId and catalogId as detail, and with a typed integrity-mismatch carrying no detail", async () => {
+    const duplicate: ShellError = {
+      code: 'duplicate-publication',
+      message: 'an artifact with this content is already registered for this project',
+      detail: { publicationId: PUBLICATION_ID, catalogId: `main/${PUBLICATION_ID}` },
+    }
+    const mismatch: ShellError = {
+      code: 'integrity-mismatch',
+      message:
+        'the published copy did not verify against the approved digest; it was discarded and the entry preserved',
+    }
+    const runActive: ShellError = {
+      code: 'run-active',
+      message: 'a run is active; approve or publish once it has ended',
+    }
+    for (const error of [duplicate, mismatch, runActive]) {
+      mockIPC((cmd) => {
+        if (cmd === 'artifact_publish') return Promise.reject(error)
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      await expect(artifactPublish('23121521465ad9be', () => {})).rejects.toMatchObject(error)
+      expect(isShellError(error)).toBe(true)
+      clearMocks()
+    }
+    expect(Object.keys(duplicate.detail!).sort()).toEqual(['catalogId', 'publicationId'])
+    expect(mismatch.detail).toBeUndefined()
+  })
+})
+
+describe('publicationsList (slice 5b)', () => {
+  it('invokes publications_list with no arguments and returns the records verbatim, a registered and a registration-pending one', async () => {
+    const records = [
+      { ...REGISTERED_PUBLICATION, names: ['report.pdf', 'report-copy.pdf'] },
+      { ...PENDING_PUBLICATION, publicationId: 'b'.repeat(64) },
+    ]
+    mockIPC((cmd, args) => {
+      if (cmd === 'publications_list') {
+        expect(args).toEqual({})
+        return records
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    const result = await publicationsList()
+
+    expect(result).toEqual(records)
+    expect(result[0]?.names).toEqual(['report.pdf', 'report-copy.pdf'])
+    expect(result[1]?.reference).toBeNull()
+  })
+
+  it('rejects with the typed catalog-unavailable and work-area-invalid ShellErrors', async () => {
+    const catalog: ShellError = { code: 'catalog-unavailable', message: 'the catalog is corrupt' }
+    const workArea: ShellError = {
+      code: 'work-area-invalid',
+      message: 'the product work area resolves inside a registered workspace root',
+    }
+    for (const error of [catalog, workArea]) {
+      mockIPC((cmd) => {
+        if (cmd === 'publications_list') return Promise.reject(error)
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      await expect(publicationsList()).rejects.toMatchObject(error)
+      expect(isShellError(error)).toBe(true)
+      clearMocks()
+    }
+  })
+})
+
+describe('slice 5b closed sets', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over ArtifactState with a never default compiles, and at runtime maps each of the ten tokens to itself', () => {
+    function stateLabel(state: ArtifactState): string {
+      switch (state) {
+        case 'candidate':
+        case 'published-local':
+        case 'registered':
+        case 'provider-synced':
+        case 'registration-pending':
+        case 'refused':
+        case 'integrity-mismatch':
+        case 'duplicate-publication':
+        case 'outbox-escape':
+        case 'outbox-linked':
+          return state
+        default: {
+          const unreachable: never = state
+          return unreachable
+        }
+      }
+    }
+
+    const states: ArtifactState[] = [
+      'candidate',
+      'published-local',
+      'registered',
+      'provider-synced',
+      'registration-pending',
+      'refused',
+      'integrity-mismatch',
+      'duplicate-publication',
+      'outbox-escape',
+      'outbox-linked',
+    ]
+    expect(states.map(stateLabel)).toEqual(states)
+  })
+
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: switches over ProviderState (four tokens) and Availability (two) with never defaults compile, and at runtime map each token to itself', () => {
+    function providerLabel(state: ProviderState): string {
+      switch (state) {
+        case 'pending':
+        case 'synced':
+        case 'failed':
+        case 'unavailable':
+          return state
+        default: {
+          const unreachable: never = state
+          return unreachable
+        }
+      }
+    }
+    function availabilityLabel(availability: Availability): string {
+      switch (availability) {
+        case 'local':
+        case 'unknown':
+          return availability
+        default: {
+          const unreachable: never = availability
+          return unreachable
+        }
+      }
+    }
+
+    const providerStates: ProviderState[] = ['pending', 'synced', 'failed', 'unavailable']
+    const availabilities: Availability[] = ['local', 'unknown']
+    expect(providerStates.map(providerLabel)).toEqual(providerStates)
+    expect(availabilities.map(availabilityLabel)).toEqual(availabilities)
+  })
+
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes among the thirty-two -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
+    function codeLabel(code: ShellErrorCode): string {
+      switch (code) {
+        case 'unknown-process':
+        case 'spawn-failed':
+        case 'already-subscribed':
+        case 'invalid-request':
+        case 'too-many-processes':
+        case 'no-candidate':
+        case 'not-executable':
+        case 'probe-failed':
+        case 'too-large':
+        case 'unapproved':
+        case 'changed-since-approval':
+        case 'shadowed-path':
+        case 'revoked':
+        case 'approval-store-unavailable':
+        case 'unknown-adapter':
+        case 'prompt-too-large':
+        case 'workspace-unavailable':
+        case 'secret-shaped-env':
+        case 'no-workspace':
+        case 'pty-unsupported':
+        case 'prompt-not-typeable':
+        case 'outbox-invalid':
+        case 'outbox-unavailable':
+        case 'integrity-mismatch':
+        case 'duplicate-publication':
+        case 'work-area-invalid':
+        case 'destination-invalid':
+        case 'outbox-escape':
+        case 'outbox-linked':
+        case 'refused':
+        case 'catalog-unavailable':
+        case 'run-active':
+          return code
+        default: {
+          const unreachable: never = code
+          return unreachable
+        }
+      }
+    }
+
+    const codes: ShellErrorCode[] = [
+      'unknown-process',
+      'spawn-failed',
+      'already-subscribed',
+      'invalid-request',
+      'too-many-processes',
+      'no-candidate',
+      'not-executable',
+      'probe-failed',
+      'too-large',
+      'unapproved',
+      'changed-since-approval',
+      'shadowed-path',
+      'revoked',
+      'approval-store-unavailable',
+      'unknown-adapter',
+      'prompt-too-large',
+      'workspace-unavailable',
+      'secret-shaped-env',
+      'no-workspace',
+      'pty-unsupported',
+      'prompt-not-typeable',
+      'outbox-invalid',
+      'outbox-unavailable',
+      'integrity-mismatch',
+      'duplicate-publication',
+      'work-area-invalid',
+      'destination-invalid',
+      'outbox-escape',
+      'outbox-linked',
+      'refused',
+      'catalog-unavailable',
+      'run-active',
+    ]
+    expect(new Set(codes).size).toBe(32)
+    expect(codes.map(codeLabel)).toEqual(codes)
+    const kind: ArtifactStateFrame['kind'] = 'artifact-state'
+    expect(kind).toBe('artifact-state')
   })
 })

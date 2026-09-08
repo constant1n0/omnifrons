@@ -42,10 +42,10 @@ const BUILT_IN_ADAPTERS: AdapterDescriptor[] = [
 
 // `ApprovalSurface` and `AgentPanel` (both mounted by `App`) each call
 // `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`,
-// `adapters_list` and `outbox_status` -- mock all five here, for every
-// test, so this module's IPC surface is deterministic rather than leaving
-// `invoke` unmocked, which throws a bare `TypeError` (no
-// `__TAURI_INTERNALS__` in this jsdom environment) instead of a proper
+// `adapters_list`, `outbox_status` and `publications_list` -- mock all six
+// here, for every test, so this module's IPC surface is deterministic
+// rather than leaving `invoke` unmocked, which throws a bare `TypeError`
+// (no `__TAURI_INTERNALS__` in this jsdom environment) instead of a proper
 // `ShellError` rejection (R3-003). Any other command is a real error in
 // this file's tests, so it rejects with a fixed, catalogue `ShellError`
 // rather than throwing.
@@ -54,11 +54,12 @@ beforeEach(() => {
     if (cmd === 'approvals_list') return []
     if (cmd === 'workspace_current') return null
     if (cmd === 'adapters_list') return BUILT_IN_ADAPTERS
-    // No workspace is active in this mock, so `outbox_status` answers the
-    // way the shell does (`docs/spike-log.md` § Slice 5, IPC shapes): the
-    // same `workspace-unavailable` rejection an adapter launch gets, which
-    // `AgentPanel` meets with no status line and no alert.
-    if (cmd === 'outbox_status') {
+    // No workspace is active in this mock, so `outbox_status` and
+    // `publications_list` answer the way the shell does (`docs/spike-log.md`
+    // § Slice 5 and § Slice 5b, IPC shapes): the same `workspace-unavailable`
+    // rejection an adapter launch gets, which `AgentPanel` meets with no
+    // status line, no publications table, and no alert.
+    if (cmd === 'outbox_status' || cmd === 'publications_list') {
       return Promise.reject({
         code: 'workspace-unavailable',
         message: 'no workspace has been picked yet',

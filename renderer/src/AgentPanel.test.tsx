@@ -1,5 +1,5 @@
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { AgentPanel } from './AgentPanel'
@@ -8,11 +8,14 @@ import { HarnessPanel } from './HarnessPanel'
 import type {
   AdapterDescriptor,
   Approval,
+  ArtifactApproval,
+  ArtifactStateFrame,
   Candidate,
   Evidence,
   HarnessFrame,
   OutboxReason,
   OutboxStatus,
+  Publication,
 } from './ipc/harness'
 
 // The jsdom crypto polyfill and React Testing Library's `cleanup()` are
@@ -76,6 +79,7 @@ const OUTBOX_STATUS_VALID: OutboxStatus = {
   state: 'valid',
   reason: null,
   policyPath: '.omnifrons/asset-policy.json',
+  assetRootId: 'main',
 }
 
 /**
@@ -96,11 +100,25 @@ const OUTBOX_NO_WORKSPACE = {
  * approval. Individual tests override `onCommand` to add `harness_spawn`/
  * `workspace_pick` handling.
  */
-function defaultHandlers(onCommand?: (cmd: string, args: Record<string, unknown>) => unknown) {
+/**
+ * Overrides for the default mock (slice 5b): `outbox` answers `outbox_status`
+ * with a status instead of the no-workspace rejection -- the approval block
+ * reads its destination from it -- and `adapters` replaces the adapter list.
+ */
+interface MockOptions {
+  outbox?: OutboxStatus
+  adapters?: AdapterDescriptor[]
+}
+
+function defaultHandlers(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  options: MockOptions = {},
+) {
   return (cmd: string, args: unknown) => {
     if (cmd === 'workspace_current') return null
-    if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
-    if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+    if (cmd === 'outbox_status') return options.outbox ?? Promise.reject(OUTBOX_NO_WORKSPACE)
+    if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+    if (cmd === 'adapters_list') return options.adapters ?? [SAMPLE_ADAPTER, PTY_ADAPTER]
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
     throw new Error(`unexpected command: ${cmd}`)
@@ -125,9 +143,10 @@ async function selectOption(labelText: string, value: string): Promise<void> {
 
 async function renderReady(
   onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
-  adapterId: 'claude-code' | 'pty-cli' = 'claude-code',
+  adapterId = 'claude-code',
+  options?: MockOptions,
 ) {
-  mockIPC(defaultHandlers(onCommand))
+  mockIPC(defaultHandlers(onCommand, options))
   render(<AgentPanel />)
   await selectOption('Adapter', adapterId)
   await selectOption('Approval', '42')
@@ -137,17 +156,22 @@ async function renderReady(
 /** Fills in the required selects, starts a run, and returns the live Channel. */
 async function startAndCaptureChannel(
   onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
-  adapterId: 'claude-code' | 'pty-cli' = 'claude-code',
+  adapterId = 'claude-code',
+  options?: MockOptions,
 ): Promise<{ onmessage: (frame: HarnessFrame) => void }> {
   let channelRef: { onmessage: (frame: HarnessFrame) => void } | undefined
-  await renderReady((cmd, args) => {
-    if (cmd === 'harness_spawn') {
-      channelRef = (args as { onFrame: { onmessage: (frame: HarnessFrame) => void } }).onFrame
-      return 7
-    }
-    if (onCommand) return onCommand(cmd, args)
-    throw new Error(`unexpected command: ${cmd}`)
-  }, adapterId)
+  await renderReady(
+    (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channelRef = (args as { onFrame: { onmessage: (frame: HarnessFrame) => void } }).onFrame
+        return 7
+      }
+      if (onCommand) return onCommand(cmd, args)
+      throw new Error(`unexpected command: ${cmd}`)
+    },
+    adapterId,
+    options,
+  )
 
   fireEvent.click(screen.getByRole('button', { name: 'Start' }))
   await waitFor(() => {
@@ -181,8 +205,9 @@ describe('AgentPanel', () => {
 
   it('calls workspace_current on mount and shows the display path through PlainTextLine', async () => {
     mockIPC((cmd) => {
-      if (cmd === 'workspace_current') return { displayPath: '/home/user/project' }
+      if (cmd === 'workspace_current') return { displayPath: '/home/user/project', workArea: 'valid' }
       if (cmd === 'outbox_status') return OUTBOX_STATUS_VALID
+      if (cmd === 'publications_list') return []
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') return [sampleApproval()]
       throw new Error(`unexpected command: ${cmd}`)
@@ -493,7 +518,7 @@ describe('AgentPanel', () => {
   it('shows the workspace display path after a successful pick', async () => {
     mockIPC(
       defaultHandlers((cmd) => {
-        if (cmd === 'workspace_pick') return { displayPath: '/home/user/project' }
+        if (cmd === 'workspace_pick') return { displayPath: '/home/user/project', workArea: 'valid' }
         throw new Error(`unexpected command: ${cmd}`)
       }),
     )
@@ -639,7 +664,7 @@ describe('AgentPanel', () => {
     unmount()
 
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    resolvePick({ displayPath: '/home/user/project' })
+    resolvePick({ displayPath: '/home/user/project', workArea: 'valid' })
     await new Promise((resolve) => {
       setTimeout(resolve, 0)
     })
@@ -708,6 +733,7 @@ describe('AgentPanel', () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return [
@@ -740,21 +766,26 @@ type LiveChannel = { onmessage: (frame: HarnessFrame) => void }
  */
 async function renderMultiRun(
   onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
-  adapterId: 'claude-code' | 'pty-cli' = 'claude-code',
+  adapterId = 'claude-code',
+  options?: MockOptions,
 ): Promise<{ channels: LiveChannel[]; spawnCount: () => number }> {
   const channels: LiveChannel[] = []
   let nextId = 7
-  await renderReady((cmd, args) => {
-    if (cmd === 'harness_spawn') {
-      channels.push((args as { onFrame: LiveChannel }).onFrame)
-      const id = nextId
-      nextId += 1
-      return id
-    }
-    if (onCommand) return onCommand(cmd, args)
-    if (cmd === 'harness_stop') return { state: 'killed', code: null }
-    throw new Error(`unexpected command: ${cmd}`)
-  }, adapterId)
+  await renderReady(
+    (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channels.push((args as { onFrame: LiveChannel }).onFrame)
+        const id = nextId
+        nextId += 1
+        return id
+      }
+      if (onCommand) return onCommand(cmd, args)
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      throw new Error(`unexpected command: ${cmd}`)
+    },
+    adapterId,
+    options,
+  )
   return { channels, spawnCount: () => channels.length }
 }
 
@@ -1446,6 +1477,7 @@ describe('AgentPanel unexpected fallback (R3-005)', () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return Promise.reject(new Error(LEAKY_MESSAGE))
       if (cmd === 'approvals_list') return [sampleApproval()]
       throw new Error(`unexpected command: ${cmd}`)
@@ -1466,6 +1498,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
         return Promise.reject({ code: 'invalid-request', message: 'bad request' })
       }
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
       throw new Error(`unexpected command: ${cmd}`)
@@ -1491,6 +1524,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') {
         return Promise.reject({ code: 'invalid-request', message: 'adapter catalog unavailable' })
       }
@@ -1516,6 +1550,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return Promise.reject({
@@ -1662,6 +1697,7 @@ describe('AgentPanel control stripping per harness string (R3-008)', () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') {
         return [
           {
@@ -1699,6 +1735,7 @@ describe('AgentPanel control stripping per harness string (R3-008)', () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return null
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return [
@@ -2532,10 +2569,11 @@ const OUTBOX_LINE_VALID =
  */
 function mockMountWithOutbox(answer: () => unknown) {
   mockIPC((cmd) => {
-    if (cmd === 'workspace_current') return { displayPath: '/home/user/project' }
+    if (cmd === 'workspace_current') return { displayPath: '/home/user/project', workArea: 'valid' }
     if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
     if (cmd === 'outbox_status') return answer()
+    if (cmd === 'publications_list') return []
     throw new Error(`unexpected command: ${cmd}`)
   })
 }
@@ -2598,6 +2636,7 @@ describe('AgentPanel outbox status line (slice 5)', () => {
         state: 'outbox-invalid',
         reason,
         policyPath: '.omnifrons/asset-policy.json',
+        assetRootId: declared === null ? null : 'main',
       }))
       const { unmount } = render(<AgentPanel />)
 
@@ -2629,6 +2668,7 @@ describe('AgentPanel outbox status line (slice 5)', () => {
         state: 'outbox-unavailable',
         reason,
         policyPath: '.omnifrons/asset-policy.json',
+        assetRootId: 'main',
       }))
       const { unmount } = render(<AgentPanel />)
 
@@ -2649,6 +2689,7 @@ describe('AgentPanel outbox status line (slice 5)', () => {
       state: 'outbox-invalid',
       reason: null,
       policyPath: '.omnifrons/asset-policy.json',
+      assetRootId: null,
     }))
 
     render(<AgentPanel />)
@@ -2667,6 +2708,7 @@ describe('AgentPanel outbox status line (slice 5)', () => {
         statusCalls += 1
         return Promise.reject(OUTBOX_NO_WORKSPACE)
       }
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       throw new Error(`unexpected command: ${cmd}`)
     })
 
@@ -2693,9 +2735,10 @@ describe('AgentPanel outbox status line (slice 5)', () => {
         statusCalls += 1
         return picked ? OUTBOX_STATUS_VALID : Promise.reject(OUTBOX_NO_WORKSPACE)
       }
+      if (cmd === 'publications_list') return picked ? [] : Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'workspace_pick') {
         picked = true
-        return { displayPath: '/home/user/project' }
+        return { displayPath: '/home/user/project', workArea: 'valid' }
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
@@ -2731,7 +2774,8 @@ describe('AgentPanel outbox status line (slice 5)', () => {
         }
         return OUTBOX_STATUS_VALID
       }
-      if (cmd === 'workspace_pick') return { displayPath: '/home/user/project' }
+      if (cmd === 'publications_list') return []
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/project', workArea: 'valid' }
       throw new Error(`unexpected command: ${cmd}`)
     })
 
@@ -2998,6 +3042,15 @@ const CANDIDATES_LINE =
   'candidates: 5 total, 3 candidate, 1 escape, 1 linked, 2 attributed, 3 unattributed, 0 unreadable, 1 unmatched proposals'
 
 /**
+ * The full digests of the two validated fixture candidates
+ * (`docs/spike-log.md` § Slice 5, IPC shapes): 64 lowercase hex characters,
+ * `sha256Short` their first eight. Identity evidence on the row since slice
+ * 5b, so an approval is made from the row itself.
+ */
+const REPORT_SHA256 = 'ab'.repeat(32)
+const STRAY_SHA256 = '1'.repeat(64)
+
+/**
  * `candidates_list { runId }` for that run: two validated candidates (one
  * attributed by the run's own proposal, one not) and two refused entries
  * carrying no digest facts at all (HAP-001-R20).
@@ -3006,6 +3059,7 @@ const SAMPLE_CANDIDATES: Candidate[] = [
   {
     name: `${RUN_ID}/report.pdf`,
     size: 4096,
+    sha256: REPORT_SHA256,
     sha256Short: 'abababab',
     detectedType: 'pdf',
     class: 'generated-heavy',
@@ -3015,6 +3069,7 @@ const SAMPLE_CANDIDATES: Candidate[] = [
   {
     name: `${RUN_ID}/stray.png`,
     size: 8,
+    sha256: STRAY_SHA256,
     sha256Short: '11111111',
     detectedType: 'png',
     class: 'generated-heavy',
@@ -3024,6 +3079,7 @@ const SAMPLE_CANDIDATES: Candidate[] = [
   {
     name: `${RUN_ID}/linked.bin`,
     size: null,
+    sha256: null,
     sha256Short: null,
     detectedType: null,
     class: null,
@@ -3033,6 +3089,7 @@ const SAMPLE_CANDIDATES: Candidate[] = [
   {
     name: `${RUN_ID}/escape-link`,
     size: null,
+    sha256: null,
     sha256Short: null,
     detectedType: null,
     class: null,
@@ -3141,7 +3198,7 @@ describe('AgentPanel candidates count magnitude (slice 5 review, R3-015)', () =>
 })
 
 describe('AgentPanel candidates table (slice 5)', () => {
-  it('after a candidates event, calls candidates_list with exactly { runId } and renders the table -- name, size, sha256, type, class, attribution, state -- with nulls as "—" and every refused row marked', async () => {
+  it('after a candidates event, calls candidates_list with exactly { runId } and renders the table -- name, size, sha256, type, class, attribution, state, action -- with nulls as "—", every refused row marked, and an Approve button only on the generated-heavy candidate rows (slice 5b)', async () => {
     const { channel, calls } = await startWithCandidatesList(() => SAMPLE_CANDIDATES)
 
     deliverCandidates(channel)
@@ -3156,12 +3213,31 @@ describe('AgentPanel candidates table (slice 5)', () => {
       'class',
       'attribution',
       'state',
+      'action',
     ])
     expect(candidateRows()).toEqual([
-      [`${RUN_ID}/report.pdf`, '4096', 'abababab', 'pdf', 'generated-heavy', 'run', 'candidate'],
-      [`${RUN_ID}/stray.png`, '8', '11111111', 'png', 'generated-heavy', 'unattributed', 'candidate'],
-      [`${RUN_ID}/linked.bin`, '—', '—', '—', '—', 'unattributed', 'outbox-linked refused'],
-      [`${RUN_ID}/escape-link`, '—', '—', '—', '—', 'unattributed', 'outbox-escape refused'],
+      [
+        `${RUN_ID}/report.pdf`,
+        '4096',
+        'abababab',
+        'pdf',
+        'generated-heavy',
+        'run',
+        'candidate',
+        'Approve',
+      ],
+      [
+        `${RUN_ID}/stray.png`,
+        '8',
+        '11111111',
+        'png',
+        'generated-heavy',
+        'unattributed',
+        'candidate',
+        'Approve',
+      ],
+      [`${RUN_ID}/linked.bin`, '—', '—', '—', '—', 'unattributed', 'outbox-linked refused', ''],
+      [`${RUN_ID}/escape-link`, '—', '—', '—', '—', 'unattributed', 'outbox-escape refused', ''],
     ])
     const rows = Array.from(region.querySelectorAll('tbody tr'))
     expect(rows.map((row) => row.querySelector('mark')?.textContent ?? null)).toEqual([
@@ -3174,28 +3250,28 @@ describe('AgentPanel candidates table (slice 5)', () => {
     expect(screen.getByLabelText('Agent transcript').contains(region)).toBe(false)
   })
 
-  it('says, in a fixed line, that publication is not available in this slice', async () => {
+  it('renders no "publication not available in this slice" line: the slice 5b approval affordance replaces it', async () => {
     const { channel } = await startWithCandidatesList(() => SAMPLE_CANDIDATES)
 
     deliverCandidates(channel)
 
     const region = await screen.findByRole('region', { name: 'Candidates' })
-    expect(screen.getByText('publication not available in this slice')).toBeTruthy()
-    expect(region.textContent).toContain('publication not available in this slice')
+    expect(screen.queryByText('publication not available in this slice')).toBeNull()
+    expect(region.textContent).not.toContain('not available')
   })
 
-  it('renders an empty candidates_list as the fixed line and the header row with no data rows', async () => {
+  it('renders an empty candidates_list as the header row alone, with no data rows and no button', async () => {
     const { channel } = await startWithCandidatesList(() => [])
 
     deliverCandidates(channel, ZERO_SUMMARY)
 
     const region = await screen.findByRole('region', { name: 'Candidates' })
-    expect(region.textContent).toContain('publication not available in this slice')
-    expect(region.querySelectorAll('th').length).toBe(7)
+    expect(region.querySelectorAll('th').length).toBe(8)
     expect(candidateRows()).toEqual([])
+    expect(region.querySelectorAll('button').length).toBe(0)
   })
 
-  it('the candidates region has zero interactive elements, no interactive attributes, and no IPC on click (same assertions as the tool-call block)', async () => {
+  it("the candidates region's only interactive elements are the action column's Approve buttons: the header row and every data cell are inert (no interactive elements or attributes), and clicking anywhere in the region -- the Approve buttons included, disabled while the run is active -- triggers no IPC", async () => {
     const { channel, invokeCount } = await startWithCountedInvokes((cmd) => {
       if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
       return null
@@ -3204,10 +3280,21 @@ describe('AgentPanel candidates table (slice 5)', () => {
     deliverCandidates(channel)
 
     const region = await screen.findByRole('region', { name: 'Candidates' })
-    const blockAndDescendants = expectNoInteractiveElements(region)
+    const interactive = Array.from(
+      region.querySelectorAll('button, a, input, textarea, select, details, summary'),
+    )
+    expect(interactive.map((element) => element.tagName)).toEqual(['BUTTON', 'BUTTON'])
+    expect(interactive.map((element) => element.textContent)).toEqual(['Approve', 'Approve'])
+    expect(interactive.every((element) => (element as HTMLButtonElement).disabled)).toBe(true)
+    expectNoInteractiveElements(region.querySelector('thead') as HTMLElement)
+    for (const cell of Array.from(
+      region.querySelectorAll<HTMLElement>('tbody td:not(:last-child)'),
+    )) {
+      expectNoInteractiveElements(cell)
+    }
 
     const invokesBeforeClick = invokeCount()
-    for (const element of blockAndDescendants) {
+    for (const element of [region, ...Array.from(region.querySelectorAll<HTMLElement>('*'))]) {
       fireEvent.click(element)
     }
     await new Promise((resolve) => {
@@ -3565,5 +3652,1600 @@ describe('AgentPanel outbox error codes (slice 5, R3-013 analogue)', () => {
       false,
     )
     expect(screen.getByLabelText('Agent transcript').querySelectorAll('li').length).toBe(0)
+  })
+})
+
+// -- Slice 5b: approval and publication --
+
+const PUBLICATION_ID = '2a91ea59fc5047831d97dbaebd763a3de37a5b382b683be59d10d6bdcdd92d4e'
+const CATALOG_ID = `main/${PUBLICATION_ID}`
+
+/**
+ * `publications_list`'s registered record for the fixture publication
+ * (`docs/spike-log.md` § Slice 5b, IPC shapes): the reference is AEC-001's
+ * `ref` with the Catalog identity as locator, `names` the sanitized display
+ * name plus an alias a later identical publication added, `availability`
+ * this device's own observation. Never a device path.
+ */
+const REGISTERED_PUBLICATION: Publication = {
+  publicationId: PUBLICATION_ID,
+  state: 'registered',
+  reference: { kind: 'artifact', id: PUBLICATION_ID, locator: CATALOG_ID },
+  providerState: 'pending',
+  catalogId: CATALOG_ID,
+  names: ['report.pdf', 'report-copy.pdf'],
+  availability: 'local',
+}
+
+/**
+ * A registration that failed after a verified `published-local`: no
+ * reference, provider state or Catalog identity yet (HAP-001-R24, R29).
+ */
+const PENDING_PUBLICATION: Publication = {
+  publicationId: 'b'.repeat(64),
+  state: 'registration-pending',
+  reference: null,
+  providerState: null,
+  catalogId: null,
+  names: ['stray.png'],
+  availability: 'local',
+}
+
+const PUBLICATION_HEADERS = [
+  'names',
+  'state',
+  'provider state',
+  'reference',
+  'catalog id',
+  'availability',
+]
+
+/**
+ * Mounts the panel's IPC with an active workspace and a valid outbox whose
+ * `publications_list` answers whatever `answer` returns (records, or a
+ * rejection built lazily inside the handler); `onCommand` handles anything
+ * further.
+ */
+function mockMountWithPublications(
+  answer: () => unknown,
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+) {
+  mockIPC((cmd, args) => {
+    if (cmd === 'workspace_current') return { displayPath: '/home/user/project', workArea: 'valid' }
+    if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'outbox_status') return OUTBOX_STATUS_VALID
+    if (cmd === 'publications_list') return answer()
+    if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+}
+
+/** The publications table's data rows, each as its cells' text. */
+function publicationRows(): string[][] {
+  const region = screen.getByRole('region', { name: 'Publications' })
+  return Array.from(region.querySelectorAll('tbody tr')).map((row) =>
+    Array.from(row.querySelectorAll('td')).map((cell) => cell.textContent ?? ''),
+  )
+}
+
+describe('AgentPanel publications table (slice 5b)', () => {
+  it("calls publications_list on mount and renders the Publications table -- names, state, provider state, reference, catalog id, availability -- with the record's facts, the names joined, the catalog id short, and the table outside the transcript", async () => {
+    mockMountWithPublications(() => [REGISTERED_PUBLICATION])
+
+    render(<AgentPanel />)
+
+    const region = await screen.findByRole('region', { name: 'Publications' })
+    expect(Array.from(region.querySelectorAll('th')).map((header) => header.textContent)).toEqual(
+      PUBLICATION_HEADERS,
+    )
+    expect(publicationRows()).toEqual([
+      ['report.pdf, report-copy.pdf', 'registered', 'pending', CATALOG_ID, 'main/2a91ea59', 'local'],
+    ])
+    expect(screen.getByLabelText('Agent transcript').contains(region)).toBe(false)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('renders a registration-pending record with "—" for its null provider state, reference and catalog id', async () => {
+    mockMountWithPublications(() => [REGISTERED_PUBLICATION, PENDING_PUBLICATION])
+
+    render(<AgentPanel />)
+
+    await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()[1]).toEqual([
+      'stray.png',
+      'registration-pending',
+      '—',
+      '—',
+      '—',
+      'local',
+    ])
+  })
+
+  it('renders an empty publications_list as the section with the header row and no data rows', async () => {
+    mockMountWithPublications(() => [])
+
+    render(<AgentPanel />)
+
+    const region = await screen.findByRole('region', { name: 'Publications' })
+    expect(region.querySelectorAll('th').length).toBe(6)
+    expect(publicationRows()).toEqual([])
+  })
+
+  it('calls publications_list on mount and renders no Publications section and no alert when it rejects workspace-unavailable (no workspace picked)', async () => {
+    let listCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') {
+        listCalls += 1
+        return Promise.reject(OUTBOX_NO_WORKSPACE)
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+
+    await waitFor(() => {
+      expect(listCalls).toBe(1)
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(screen.queryByRole('region', { name: 'Publications' })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('fetches publications_list again after a successful workspace pick: no section before the pick, the table after it', async () => {
+    let picked = false
+    let listCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') {
+        return picked ? OUTBOX_STATUS_VALID : Promise.reject(OUTBOX_NO_WORKSPACE)
+      }
+      if (cmd === 'publications_list') {
+        listCalls += 1
+        return picked ? [REGISTERED_PUBLICATION] : Promise.reject(OUTBOX_NO_WORKSPACE)
+      }
+      if (cmd === 'workspace_pick') {
+        picked = true
+        return { displayPath: '/home/user/project', workArea: 'valid' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    await waitFor(() => {
+      expect(listCalls).toBe(1)
+    })
+    expect(screen.queryByRole('region', { name: 'Publications' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+
+    await screen.findByText('/home/user/project')
+    await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()).toHaveLength(1)
+    expect(listCalls).toBe(2)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('drops a stale mount-time publications_list response that resolves after the pick-time response (sequenced fetch)', async () => {
+    let resolveMountList: (records: Publication[]) => void = () => {}
+    let listCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') {
+        listCalls += 1
+        if (listCalls === 1) {
+          return new Promise<Publication[]>((resolve) => {
+            resolveMountList = resolve
+          })
+        }
+        return [REGISTERED_PUBLICATION]
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/project', workArea: 'valid' }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    await waitFor(() => {
+      expect(listCalls).toBe(1)
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()).toHaveLength(1)
+    expect(listCalls).toBe(2)
+
+    await act(async () => {
+      resolveMountList([PENDING_PUBLICATION])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(publicationRows()).toEqual([
+      ['report.pdf, report-copy.pdf', 'registered', 'pending', CATALOG_ID, 'main/2a91ea59', 'local'],
+    ])
+  })
+
+  it('shows the banner for catalog-unavailable from publications_list as a plain catalogue code with its fixed message, no "untrusted", no stray detail and no section, and leaves the panel usable', async () => {
+    mockMountWithPublications(() =>
+      Promise.reject({
+        code: 'catalog-unavailable',
+        message: 'the catalog is corrupt',
+        detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+      }),
+    )
+
+    render(<AgentPanel />)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('catalog-unavailable: the catalog is corrupt')
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(screen.queryByRole('region', { name: 'Publications' })).toBeNull()
+    const approvalSelect = (await screen.findByLabelText('Approval')) as HTMLSelectElement
+    await waitFor(() => {
+      expect(Array.from(approvalSelect.options).map((option) => option.value)).toContain('42')
+    })
+    expect(
+      (screen.getByRole('button', { name: 'Pick workspace' }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+
+  it('shows only "unexpected error" when publications_list rejects with a plain Error, never its message', async () => {
+    mockMountWithPublications(() => Promise.reject(new Error('catalog path /secret/catalog.jsonl')))
+
+    render(<AgentPanel />)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('unexpected error')
+    expect(document.body.textContent).not.toContain('/secret/catalog.jsonl')
+  })
+
+  it('the publications_list continuation no-ops after unmount: nothing thrown, no console.error', async () => {
+    let resolveList: (records: Publication[]) => void = () => {}
+    let listCalled = false
+    mockMountWithPublications(() => {
+      listCalled = true
+      return new Promise<Publication[]>((resolve) => {
+        resolveList = resolve
+      })
+    })
+
+    const { unmount } = render(<AgentPanel />)
+    await waitFor(() => {
+      expect(listCalled).toBe(true)
+    })
+    unmount()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    resolveList([REGISTERED_PUBLICATION])
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('the publications_list continuation no-ops when the fetch rejects after unmount: nothing thrown, no console.error, no alert', async () => {
+    let rejectList: (reason: unknown) => void = () => {}
+    let listCalled = false
+    mockMountWithPublications(() => {
+      listCalled = true
+      return new Promise<Publication[]>((_resolve, reject) => {
+        rejectList = reject
+      })
+    })
+
+    const { unmount } = render(<AgentPanel />)
+    await waitFor(() => {
+      expect(listCalled).toBe(true)
+    })
+    unmount()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rejectList({ code: 'catalog-unavailable', message: 'the catalog is corrupt' })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="alert"]')).toBeNull()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel publications content security (slice 5b, RCS-001)', () => {
+  const esc = String.fromCharCode(0x1b)
+  /** U+202E RIGHT-TO-LEFT OVERRIDE, built from its code point so no bidi control sits in this source file. */
+  const rlo = String.fromCodePoint(0x202e)
+
+  it('renders a display name carrying a literal <b>, a C0 byte and a bidi override as text with no <b> element, and the reference locator and catalog id as text with no anchor and no href', async () => {
+    mockMountWithPublications(() => [
+      { ...REGISTERED_PUBLICATION, names: [`<b>report</b>${esc}.pdf${rlo}`, 'plain.pdf'] },
+    ])
+
+    render(<AgentPanel />)
+
+    const region = await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()[0]?.[0]).toBe('<b>report</b>.pdf, plain.pdf')
+    expect(publicationRows()[0]?.[3]).toBe(CATALOG_ID)
+    expect(publicationRows()[0]?.[4]).toBe('main/2a91ea59')
+    expect(region.querySelector('b')).toBeNull()
+    expect(region.querySelector('a')).toBeNull()
+    expect(region.querySelector('[href]')).toBeNull()
+    expect(region.textContent).not.toContain(esc)
+    expect(region.textContent).not.toContain(rlo)
+  })
+})
+
+/**
+ * The short digest of `report.pdf` as the row lists it -- what the user
+ * types to approve (slice 2's shape); the row's own full `sha256` is what
+ * the request carries, never the typed value.
+ */
+const REPORT_SHORT = 'abababab'
+
+/**
+ * `artifact_approve`'s payload for the fixture run's attributed entry
+ * (`docs/spike-log.md` § Slice 5b, IPC shapes): the identity-bound facts,
+ * the destination asset root identity, the act-as identity, the derived
+ * ids. Never a device path.
+ */
+const SAMPLE_ARTIFACT_APPROVAL: ArtifactApproval = {
+  approvalId: '23121521465ad9be',
+  publicationId: PUBLICATION_ID,
+  runId: RUN_ID,
+  name: `${RUN_ID}/report.pdf`,
+  displayName: 'report.pdf',
+  sha256Short: 'abababab',
+  size: 4096,
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  attribution: { kind: 'run', runId: RUN_ID },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1725782401000,
+}
+
+const APPROVED_REPORT_CELL = 'approved 23121521465ad9be — report.pdf, asset root main Publish'
+
+/** Ends run `id` with a terminal state frame, so the run guards release the approval controls. */
+async function endRun(channel: LiveChannel, id = 7, seq = 10): Promise<void> {
+  act(() => {
+    channel.onmessage({
+      stream: 'state',
+      body: { id, seq, droppedBefore: 0, state: 'exited', code: 0 },
+    })
+  })
+  await screen.findByText('exited (code 0)')
+}
+
+/** The candidates table's data row whose name cell reads `name`. */
+function candidateRow(name: string): HTMLElement {
+  const region = screen.getByRole('region', { name: 'Candidates' })
+  const row = Array.from(region.querySelectorAll<HTMLElement>('tbody tr')).find(
+    (candidate) => candidate.querySelector('td')?.textContent === name,
+  )
+  if (!row) throw new Error(`no candidates row named ${name}`)
+  return row
+}
+
+/** The action cell of the row named `name`, as text. */
+function actionCell(name: string): string {
+  const cells = candidateRow(name).querySelectorAll('td')
+  return cells[cells.length - 1]?.textContent ?? ''
+}
+
+/**
+ * Starts a run whose inventory is the sample candidates, ends it (the
+ * approval controls are frozen while a run is active), and returns the
+ * live Channel plus every IPC call made from then on -- `onCommand`
+ * answers the approval and publication commands a test drives.
+ */
+async function startInventoryAndEndRun(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  // A valid outbox whose policy declares the asset root `main` by default:
+  // the approval block shows its destination from the outbox status and
+  // will not approve toward an unknown or unconfigured one.
+  options: MockOptions = { outbox: OUTBOX_STATUS_VALID },
+  adapterId = 'claude-code',
+): Promise<{ channel: LiveChannel; calls: { cmd: string; args: Record<string, unknown> }[] }> {
+  const calls: { cmd: string; args: Record<string, unknown> }[] = []
+  const channel = await startAndCaptureChannel(
+    (cmd, args) => {
+      calls.push({ cmd, args })
+      if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+      if (onCommand) return onCommand(cmd, args)
+      throw new Error(`unexpected command: ${cmd}`)
+    },
+    adapterId,
+    options,
+  )
+  deliverCandidates(channel)
+  await screen.findByRole('region', { name: 'Candidates' })
+  await endRun(channel)
+  return { channel, calls }
+}
+
+const APPROVAL_INPUT_LABEL = /Type the short digest/
+
+/**
+ * A fixture adapter with a stricter scope mode than the two built-ins, so
+ * the block's `scope:` line can be shown to follow the adapter the run was
+ * started with rather than the current selection. Metadata only, like the
+ * real descriptors.
+ */
+const SANDBOX_ADAPTER: AdapterDescriptor = {
+  id: 'sandbox-cli',
+  displayName: 'Sandbox CLI',
+  transportClass: 'structured-streaming-cli',
+  promptChannel: 'stdin-then-close',
+  scopeMode: 'sandbox-enforced',
+  notes: 'fixture: a sandbox-enforced scope mode',
+}
+
+/** Clicks the Approve button of the row named `name` and returns the approval block it opens. */
+async function openApproval(name: string): Promise<HTMLElement> {
+  fireEvent.click(within(candidateRow(name)).getByRole('button', { name: 'Approve' }))
+  return screen.findByLabelText('Publication approval')
+}
+
+function approvalInput(): HTMLInputElement {
+  return screen.getByLabelText(APPROVAL_INPUT_LABEL) as HTMLInputElement
+}
+
+function confirmButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Approve publication' }) as HTMLButtonElement
+}
+
+function typeDigest(value: string): void {
+  fireEvent.change(approvalInput(), { target: { value } })
+}
+
+/** Types the report's full digest and clicks the final button. */
+function confirmReportApproval(): void {
+  typeDigest(REPORT_SHORT)
+  fireEvent.click(confirmButton())
+}
+
+describe('AgentPanel approval affordance (slice 5b, HAP-001-R22, TM-001-R7)', () => {
+  it("Approve opens a block, inside the Candidates region and outside the transcript, showing the candidate's identity-bound facts verbatim -- name, class, type, size, sha256, attribution with its run id -- then the destination (the outbox status's asset root) and the scope mode of the run's adapter, and the fixed act-as line; opening it invokes nothing, the input opens empty and the final button disabled", async () => {
+    const { calls } = await startInventoryAndEndRun()
+    const invokesBefore = calls.length
+
+    const block = await openApproval(`${RUN_ID}/report.pdf`)
+
+    expect(Array.from(block.querySelectorAll('p')).map((line) => line.textContent)).toEqual([
+      `name: ${RUN_ID}/report.pdf`,
+      'class: generated-heavy',
+      'type: pdf',
+      'size: 4096',
+      `sha256: ${REPORT_SHA256}`,
+      'sha256 short: abababab',
+      `attribution: run ${RUN_ID}`,
+      'destination: asset root main',
+      'scope: advisory',
+      'act as: device-local-user',
+    ])
+    expect(calls.length).toBe(invokesBefore)
+    expect(approvalInput().value).toBe('')
+    expect(confirmButton().disabled).toBe(true)
+    expect(screen.getByRole('region', { name: 'Candidates' }).contains(block)).toBe(true)
+    expect(screen.getByLabelText('Agent transcript').contains(block)).toBe(false)
+  })
+
+  it('shows the unattributed fact for an unattributed candidate: "attribution: unattributed", with no run id standing in for a producer', async () => {
+    await startInventoryAndEndRun()
+
+    const block = await openApproval(`${RUN_ID}/stray.png`)
+
+    const lines = Array.from(block.querySelectorAll('p')).map((line) => line.textContent)
+    expect(lines).toContain('attribution: unattributed')
+    expect(lines).toContain(`sha256: ${STRAY_SHA256}`)
+    expect(lines).toContain('sha256 short: 11111111')
+    expect(lines).toContain(`name: ${RUN_ID}/stray.png`)
+    expect(lines.filter((line) => line?.startsWith('attribution:'))).toEqual([
+      'attribution: unattributed',
+    ])
+  })
+
+  it('shows "destination: unconfigured" when the outbox status carries no asset root id, and keeps the final button disabled with the right short digest typed -- the shell would refuse with destination-invalid (HAP-001-R22, R1-002)', async () => {
+    const { calls } = await startInventoryAndEndRun(undefined, {
+      outbox: { ...OUTBOX_STATUS_VALID, assetRootId: null },
+    })
+
+    const block = await openApproval(`${RUN_ID}/report.pdf`)
+
+    const lines = Array.from(block.querySelectorAll('p')).map((line) => line.textContent)
+    expect(lines).toContain('destination: unconfigured')
+    expect(lines).not.toContain('destination: asset root main')
+    typeDigest(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(true)
+    fireEvent.click(confirmButton())
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(calls.filter((call) => call.cmd === 'artifact_approve')).toHaveLength(0)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows "destination: unknown" while no outbox status is known at all, and keeps the final button disabled with the right short digest typed', async () => {
+    const { calls } = await startInventoryAndEndRun(undefined, {})
+
+    const block = await openApproval(`${RUN_ID}/report.pdf`)
+
+    const lines = Array.from(block.querySelectorAll('p')).map((line) => line.textContent)
+    expect(lines).toContain('destination: unknown')
+    typeDigest(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(true)
+    fireEvent.click(confirmButton())
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(calls.filter((call) => call.cmd === 'artifact_approve')).toHaveLength(0)
+  })
+
+  it("shows the scope mode of the adapter the run was started with, from its descriptor and not from the current selection: a run started with a sandbox-enforced adapter keeps 'scope: sandbox-enforced' after the selection moves to an advisory one", async () => {
+    await startInventoryAndEndRun(
+      undefined,
+      { outbox: OUTBOX_STATUS_VALID, adapters: [SAMPLE_ADAPTER, SANDBOX_ADAPTER] },
+      'sandbox-cli',
+    )
+    // The run has ended, so the selection controls are live again.
+    await selectOption('Adapter', 'claude-code')
+
+    const block = await openApproval(`${RUN_ID}/report.pdf`)
+
+    const lines = Array.from(block.querySelectorAll('p')).map((line) => line.textContent)
+    expect(lines).toContain('scope: sandbox-enforced')
+    expect(lines).not.toContain('scope: advisory')
+  })
+
+  it("enables the final button only when the typed value equals the row's sha256Short exactly -- never for the fixed phrase, uppercase hex, another row's short digest, a 7- or 9-character prefix, or the full digest", async () => {
+    await startInventoryAndEndRun()
+    await openApproval(`${RUN_ID}/report.pdf`)
+
+    typeDigest('approve')
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest('ABABABAB')
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest('11111111')
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest('abababa')
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest('ababababa')
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest(REPORT_SHA256)
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(false)
+  })
+
+  it("no harness string pre-fills or enables the approval (TM-001-R1): a publish proposal naming the entry by its exact full digest leaves the input empty and the final button disabled, and setting the input's value programmatically with no input event leaves it disabled too", async () => {
+    const channel = await startAndCaptureChannel(
+      (cmd) => {
+        if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+      'claude-code',
+      { outbox: OUTBOX_STATUS_VALID },
+    )
+    // The harness's own proposal, naming the very row by the very digest
+    // the row carries: content, and never an approval input.
+    deliverPublishProposal(channel, [{ name: 'report.pdf', sha256: REPORT_SHA256 }])
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channel)
+
+    await openApproval(`${RUN_ID}/report.pdf`)
+
+    expect(approvalInput().value).toBe('')
+    expect(confirmButton().disabled).toBe(true)
+    // What a script-driven pre-fill would do: set the DOM value with no
+    // input event. React's controlled input never sees it -- its state,
+    // and so the gate, stays on the empty string.
+    approvalInput().value = REPORT_SHORT
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(approvalInput().value).toBe(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(true)
+    // The user's own typing is what enables it. (React's value tracker
+    // treats a change event carrying the very string already set on the
+    // node as no change, so the typed sequence passes through another
+    // value first -- a test-harness detail, not a property of the gate.)
+    typeDigest('')
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(false)
+  })
+
+  it('the final button calls artifact_approve with exactly { runId, name, sha256 } -- the inventory\'s run id, the row\'s name, the row\'s own full digest and never the typed value -- and on success the row\'s action cell shows "approved <approvalId> — <displayName>, asset root <assetRootId>" with a Publish button, its Approve button gone, the block closed, the other rows untouched', async () => {
+    const { calls } = await startInventoryAndEndRun((cmd) => {
+      if (cmd === 'artifact_approve') return SAMPLE_ARTIFACT_APPROVAL
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    await openApproval(`${RUN_ID}/report.pdf`)
+
+    confirmReportApproval()
+
+    await waitFor(() => {
+      expect(actionCell(`${RUN_ID}/report.pdf`)).toBe(APPROVED_REPORT_CELL)
+    })
+    const approveCalls = calls.filter((call) => call.cmd === 'artifact_approve')
+    expect(approveCalls).toHaveLength(1)
+    expect(approveCalls[0]?.args).toEqual({
+      runId: RUN_ID,
+      name: `${RUN_ID}/report.pdf`,
+      sha256: REPORT_SHA256,
+    })
+    expect(Object.keys(approveCalls[0]!.args).sort()).toEqual(['name', 'runId', 'sha256'])
+    expect(approveCalls[0]?.args.sha256).toHaveLength(64)
+    expect(approveCalls[0]?.args.sha256).not.toBe(REPORT_SHORT)
+    const report = candidateRow(`${RUN_ID}/report.pdf`)
+    expect(within(report).queryByRole('button', { name: 'Approve' })).toBeNull()
+    expect(within(report).getByRole('button', { name: 'Publish' })).toBeTruthy()
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+    expect(actionCell(`${RUN_ID}/stray.png`)).toBe('Approve')
+    expect(actionCell(`${RUN_ID}/linked.bin`)).toBe('')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('renders refused from artifact_approve as a plain catalogue code with its message, no "untrusted" and no stray detail; the row keeps its Approve button, the block stays open with the typed digest kept and the final button enabled again', async () => {
+    await startInventoryAndEndRun((cmd) => {
+      if (cmd === 'artifact_approve') {
+        return Promise.reject({
+          code: 'refused',
+          message: "the candidate's digest does not match the approval request",
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    await openApproval(`${RUN_ID}/report.pdf`)
+
+    confirmReportApproval()
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      "refused: the candidate's digest does not match the approval request",
+    )
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(banner.textContent).not.toContain('aaaaaaaa')
+    expect(actionCell(`${RUN_ID}/report.pdf`)).toBe('Approve')
+    expect(screen.getByLabelText('Publication approval')).toBeTruthy()
+    expect(approvalInput().value).toBe(REPORT_SHORT)
+    await waitFor(() => {
+      expect(confirmButton().disabled).toBe(false)
+    })
+  })
+
+  it.each([
+    ['destination-invalid', 'the project declares no asset root'],
+    ['work-area-invalid', 'the product work area resolves inside a registered workspace root'],
+    ['invalid-request', 'no run with that id is remembered'],
+    ['outbox-invalid', 'the classification policy could not be loaded'],
+    ['workspace-unavailable', 'no workspace has been picked yet'],
+    // The backend mirror of the frozen surface: the shell refuses while any
+    // supervised process runs, even a request the renderer never freezes.
+    ['run-active', 'a run is active; approve or publish once it has ended'],
+  ])(
+    'renders %s from artifact_approve as a plain catalogue code with its fixed message, no "untrusted" and no stray detail; the row keeps its Approve button and the block stays usable with the typed digest kept and the final button enabled again (R3-021)',
+    async (code, message) => {
+      await startInventoryAndEndRun((cmd) => {
+        if (cmd === 'artifact_approve') {
+          return Promise.reject({
+            code,
+            message,
+            detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+          })
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+      await openApproval(`${RUN_ID}/report.pdf`)
+
+      confirmReportApproval()
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(banner.textContent).not.toContain('untrusted')
+      expect(banner.textContent).not.toContain('aaaaaaaa')
+      expect(actionCell(`${RUN_ID}/report.pdf`)).toBe('Approve')
+      expect(screen.getByLabelText('Publication approval')).toBeTruthy()
+      expect(approvalInput().value).toBe(REPORT_SHORT)
+      await waitFor(() => {
+        expect(confirmButton().disabled).toBe(false)
+      })
+    },
+  )
+
+  it('shows only "unexpected error" when artifact_approve rejects with a plain Error, never its message', async () => {
+    await startInventoryAndEndRun((cmd) => {
+      if (cmd === 'artifact_approve') return Promise.reject(new Error('journal path /secret/work-area'))
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    await openApproval(`${RUN_ID}/report.pdf`)
+
+    confirmReportApproval()
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('unexpected error')
+    expect(document.body.textContent).not.toContain('/secret/work-area')
+  })
+
+  it('disables the final button and every Approve button while the approve is in flight, so a double-click fires one artifact_approve, and applies the response once it resolves', async () => {
+    let resolveApprove: (approval: ArtifactApproval) => void = () => {}
+    const { calls } = await startInventoryAndEndRun((cmd) => {
+      if (cmd === 'artifact_approve') {
+        return new Promise<ArtifactApproval>((resolve) => {
+          resolveApprove = resolve
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    await openApproval(`${RUN_ID}/report.pdf`)
+    typeDigest(REPORT_SHORT)
+
+    fireEvent.click(confirmButton())
+    fireEvent.click(confirmButton())
+
+    await waitFor(() => {
+      expect(confirmButton().disabled).toBe(true)
+    })
+    expect(
+      (within(candidateRow(`${RUN_ID}/stray.png`)).getByRole('button', { name: 'Approve' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true)
+    expect(calls.filter((call) => call.cmd === 'artifact_approve')).toHaveLength(1)
+
+    await act(async () => {
+      resolveApprove(SAMPLE_ARTIFACT_APPROVAL)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(actionCell(`${RUN_ID}/report.pdf`)).toBe(APPROVED_REPORT_CELL)
+    expect(
+      (within(candidateRow(`${RUN_ID}/stray.png`)).getByRole('button', { name: 'Approve' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false)
+  })
+
+  it('keeps every Approve button disabled while the run is active -- the inventory arrives before the terminal state frame -- and enables them once the run ends (controls frozen, spike default)', async () => {
+    const { channel } = await startWithCandidatesList(() => SAMPLE_CANDIDATES)
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+
+    const approveButtons = () =>
+      Array.from(
+        screen.getByRole('region', { name: 'Candidates' }).querySelectorAll<HTMLButtonElement>('button'),
+      )
+    expect(approveButtons().map((button) => button.disabled)).toEqual([true, true])
+
+    await endRun(channel)
+
+    expect(approveButtons().map((button) => button.disabled)).toEqual([false, false])
+  })
+
+  it('offers Approve only on a generated-heavy candidate carrying its digest: none on a generated-heavy candidate whose sha256 is null, none on a candidate of another class with a digest, none on an executable candidate without one (R3-024)', async () => {
+    const { channel } = await startWithCandidatesList(() => [
+      { ...SAMPLE_CANDIDATES[0]!, sha256: null },
+      {
+        ...SAMPLE_CANDIDATES[1]!,
+        name: `${RUN_ID}/notes.md`,
+        class: 'portable-text',
+        detectedType: 'markdown',
+      },
+      { ...SAMPLE_CANDIDATES[1]!, name: `${RUN_ID}/tool`, class: 'executable', sha256: null },
+      SAMPLE_CANDIDATES[1]!,
+    ])
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channel)
+
+    expect(actionCell(`${RUN_ID}/report.pdf`)).toBe('')
+    expect(actionCell(`${RUN_ID}/notes.md`)).toBe('')
+    expect(actionCell(`${RUN_ID}/tool`)).toBe('')
+    expect(actionCell(`${RUN_ID}/stray.png`)).toBe('Approve')
+  })
+
+  it("clicking another row's Approve switches the block to that row's facts and clears the typed digest", async () => {
+    await startInventoryAndEndRun()
+    await openApproval(`${RUN_ID}/report.pdf`)
+    typeDigest(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(false)
+
+    const block = await openApproval(`${RUN_ID}/stray.png`)
+
+    expect(Array.from(block.querySelectorAll('p')).map((line) => line.textContent)).toContain(
+      `name: ${RUN_ID}/stray.png`,
+    )
+    expect(block.textContent).not.toContain('report.pdf')
+    expect(approvalInput().value).toBe('')
+    expect(confirmButton().disabled).toBe(true)
+    expect(screen.getAllByLabelText('Publication approval')).toHaveLength(1)
+  })
+
+  it('the approve continuation no-ops after unmount: nothing thrown, no console.error', async () => {
+    let resolveApprove: (approval: ArtifactApproval) => void = () => {}
+    let approveCalled = false
+    await startInventoryAndEndRun((cmd) => {
+      if (cmd === 'artifact_approve') {
+        approveCalled = true
+        return new Promise<ArtifactApproval>((resolve) => {
+          resolveApprove = resolve
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    await openApproval(`${RUN_ID}/report.pdf`)
+    confirmReportApproval()
+    await waitFor(() => {
+      expect(approveCalled).toBe(true)
+    })
+
+    // `render()` was called by the helpers; `cleanup()` unmounts everything
+    // it mounted, the way the global `afterEach` does after each test.
+    cleanup()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    resolveApprove(SAMPLE_ARTIFACT_APPROVAL)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('the approve continuation no-ops when artifact_approve rejects after unmount: nothing thrown, no console.error, no alert (R3-022)', async () => {
+    let rejectApprove: (reason: unknown) => void = () => {}
+    let approveCalled = false
+    await startInventoryAndEndRun((cmd) => {
+      if (cmd === 'artifact_approve') {
+        approveCalled = true
+        return new Promise<ArtifactApproval>((_resolve, reject) => {
+          rejectApprove = reject
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    await openApproval(`${RUN_ID}/report.pdf`)
+    confirmReportApproval()
+    await waitFor(() => {
+      expect(approveCalled).toBe(true)
+    })
+
+    cleanup()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rejectApprove({
+      code: 'refused',
+      message: "the candidate's digest does not match the approval request",
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="alert"]')).toBeNull()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it("drops an approve response that lands after a new run replaced the inventory (stale-response guard): the new run's row of the same name stays unapproved and no alert renders", async () => {
+    let resolveApprove: (approval: ArtifactApproval) => void = () => {}
+    const { channels } = await renderMultiRun(
+      (cmd) => {
+        if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+        if (cmd === 'artifact_approve') {
+          return new Promise<ArtifactApproval>((resolve) => {
+            resolveApprove = resolve
+          })
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+      'claude-code',
+      { outbox: OUTBOX_STATUS_VALID },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    deliverCandidates(channels[0]!)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channels[0]!)
+    await openApproval(`${RUN_ID}/report.pdf`)
+    confirmReportApproval()
+    await waitFor(() => {
+      expect(confirmButton().disabled).toBe(true)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    act(() => {
+      channels[1]!.onmessage({
+        stream: 'event',
+        body: { id: 8, seq: 9, droppedBefore: 0, kind: 'candidates', payload: CANDIDATES_SUMMARY },
+      })
+    })
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channels[1]!, 8)
+
+    await act(async () => {
+      resolveApprove(SAMPLE_ARTIFACT_APPROVAL)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(actionCell(`${RUN_ID}/report.pdf`)).toBe('Approve')
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+describe('AgentPanel approval block content security (slice 5b, RCS-001)', () => {
+  const esc = String.fromCharCode(0x1b)
+  /** U+202E RIGHT-TO-LEFT OVERRIDE, built from its code point so no bidi control sits in this source file. */
+  const rlo = String.fromCodePoint(0x202e)
+
+  it('renders a candidate name carrying a literal <b>, a C0 byte, a bidi override and a "../" traversal in the block as text: no <b> element, no anchor, controls stripped, the traversal kept as data the renderer never resolves; the label shows the short digest as text', async () => {
+    const channel = await startAndCaptureChannel((cmd) => {
+      if (cmd === 'candidates_list') {
+        return [
+          {
+            ...SAMPLE_CANDIDATES[0]!,
+            name: `../../<b>etc</b>/pass${esc}wd${rlo}`,
+            detectedType: '<b>pdf</b>',
+          },
+        ]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channel)
+
+    const block = await openApproval('../../<b>etc</b>/passwd')
+
+    const lines = Array.from(block.querySelectorAll('p')).map((line) => line.textContent)
+    expect(lines[0]).toBe('name: ../../<b>etc</b>/passwd')
+    expect(lines).toContain('type: <b>pdf</b>')
+    expect(block.querySelector('b')).toBeNull()
+    expect(block.querySelector('a')).toBeNull()
+    expect(block.querySelector('[href]')).toBeNull()
+    expect(block.textContent).not.toContain(esc)
+    expect(block.textContent).not.toContain(rlo)
+    expect(screen.getByText(APPROVAL_INPUT_LABEL).textContent).toContain('abababab')
+  })
+})
+
+const WORK_AREA_LINE = 'work area invalid — publication refused until it is fixed'
+
+describe('AgentPanel work area line (slice 5b, HAP-001-R7)', () => {
+  it('renders the fixed work-area line as a status line named "Work area", beside the outbox line, when workspace_current reports work-area-invalid on mount; the raw token is not rendered and no alert', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') {
+        return { displayPath: '/home/user/project', workArea: 'work-area-invalid' }
+      }
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') return OUTBOX_STATUS_VALID
+      if (cmd === 'publications_list') return []
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+
+    const line = await screen.findByRole('status', { name: 'Work area' })
+    expect(line.textContent).toBe(WORK_AREA_LINE)
+    expect(document.body.textContent).not.toContain('work-area-invalid')
+    const outboxLine = await screen.findByRole('status', { name: 'Outbox' })
+    expect(line.parentElement).toBe(outboxLine.parentElement)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('renders no work-area line for a valid workArea, on mount and after a pick', async () => {
+    mockMountWithPublications(
+      () => [],
+      (cmd) => {
+        if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+    )
+
+    render(<AgentPanel />)
+
+    await screen.findByRole('status', { name: 'Outbox' })
+    expect(screen.queryByRole('status', { name: 'Work area' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+
+    await screen.findByText('/home/user/other')
+    expect(screen.queryByRole('status', { name: 'Work area' })).toBeNull()
+  })
+
+  it('renders the work-area line after a pick whose workspace reports work-area-invalid, and removes it after a later pick reporting valid', async () => {
+    let pickCount = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval()]
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'workspace_pick') {
+        pickCount += 1
+        return pickCount === 1
+          ? { displayPath: '/home/user/a', workArea: 'work-area-invalid' }
+          : { displayPath: '/home/user/b', workArea: 'valid' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    expect(screen.queryByRole('status', { name: 'Work area' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await screen.findByText('/home/user/a')
+    expect(screen.getByRole('status', { name: 'Work area' }).textContent).toBe(WORK_AREA_LINE)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await screen.findByText('/home/user/b')
+    expect(screen.queryByRole('status', { name: 'Work area' })).toBeNull()
+  })
+})
+
+type LiveStateChannel = { onmessage: (frame: ArtifactStateFrame) => void }
+type StatePayload = ArtifactStateFrame['payload']
+
+/** The publication `artifact_publish` returns for the report: a fresh record, one name. */
+const PUBLISHED_REPORT: Publication = { ...REGISTERED_PUBLICATION, names: ['report.pdf'] }
+
+/** The same publication left `registration-pending`: no reference, provider state or Catalog identity. */
+const PENDING_REPORT: Publication = {
+  ...PENDING_PUBLICATION,
+  publicationId: PUBLICATION_ID,
+  names: ['report.pdf'],
+}
+
+const REPORT_NAME = `${RUN_ID}/report.pdf`
+const STRAY_NAME = `${RUN_ID}/stray.png`
+const STRAY_PUBLICATION_ID = 'c'.repeat(64)
+
+/** The unattributed row's approval (`docs/spike-log.md` § Slice 5b, IPC shapes): the unattributed fact recorded, nothing standing in for a producer. */
+const STRAY_ARTIFACT_APPROVAL: ArtifactApproval = {
+  approvalId: '5f0c5f0c5f0c5f0c',
+  publicationId: STRAY_PUBLICATION_ID,
+  runId: RUN_ID,
+  name: STRAY_NAME,
+  displayName: 'stray.png',
+  sha256Short: '11111111',
+  size: 8,
+  detectedType: 'png',
+  class: 'generated-heavy',
+  attribution: { kind: 'unattributed' },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1725782402000,
+}
+
+/** The unattributed row's registered publication. */
+const PUBLISHED_STRAY: Publication = {
+  publicationId: STRAY_PUBLICATION_ID,
+  state: 'registered',
+  reference: {
+    kind: 'artifact',
+    id: STRAY_PUBLICATION_ID,
+    locator: `main/${STRAY_PUBLICATION_ID}`,
+  },
+  providerState: 'pending',
+  catalogId: `main/${STRAY_PUBLICATION_ID}`,
+  names: ['stray.png'],
+  availability: 'local',
+}
+
+const APPROVED_STRAY_CELL = 'approved 5f0c5f0c5f0c5f0c — stray.png, asset root main Publish'
+const PUBLISHED_REPORT_ROW = [
+  'report.pdf',
+  'registered',
+  'pending',
+  CATALOG_ID,
+  'main/2a91ea59',
+  'local',
+]
+const PUBLISHED_STRAY_ROW = [
+  'stray.png',
+  'registered',
+  'pending',
+  `main/${STRAY_PUBLICATION_ID}`,
+  'main/cccccccc',
+  'local',
+]
+
+/** Delivers one `artifact-state` frame on the publish channel. */
+function deliverArtifactState(
+  channel: LiveStateChannel,
+  state: StatePayload['state'],
+  providerState: StatePayload['providerState'] = null,
+  publicationId = PUBLICATION_ID,
+): void {
+  act(() => {
+    channel.onmessage({ kind: 'artifact-state', payload: { publicationId, state, providerState } })
+  })
+}
+
+/**
+ * Starts a run on the sample inventory, ends it, approves `report.pdf`
+ * with the fixture approval, and returns every IPC call from the start plus
+ * a reader of the live publish channel once Publish has been clicked.
+ * `onPublish` answers `artifact_publish` (the registered publication by
+ * default; a deferred promise or a rejection when given).
+ */
+async function approveReport(
+  onPublish?: () => unknown,
+): Promise<{
+  calls: { cmd: string; args: Record<string, unknown> }[]
+  publishChannel: () => LiveStateChannel
+}> {
+  let publishChannelRef: LiveStateChannel | undefined
+  const { calls } = await startInventoryAndEndRun((cmd, args) => {
+    if (cmd === 'artifact_approve') return SAMPLE_ARTIFACT_APPROVAL
+    if (cmd === 'artifact_publish') {
+      publishChannelRef = (args as { onState: LiveStateChannel }).onState
+      return onPublish ? onPublish() : PUBLISHED_REPORT
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  await openApproval(REPORT_NAME)
+  confirmReportApproval()
+  await waitFor(() => {
+    expect(actionCell(REPORT_NAME)).toBe(APPROVED_REPORT_CELL)
+  })
+  return {
+    calls,
+    publishChannel: () => {
+      if (!publishChannelRef) throw new Error('artifact_publish was not called')
+      return publishChannelRef
+    },
+  }
+}
+
+function publishButton(name = REPORT_NAME): HTMLButtonElement {
+  return within(candidateRow(name)).getByRole('button', { name: 'Publish' }) as HTMLButtonElement
+}
+
+/** Every transcript entry, as text, in order. */
+function transcriptTexts(): string[] {
+  return Array.from(screen.getByLabelText('Agent transcript').querySelectorAll('li')).map(
+    (entry) => entry.textContent ?? '',
+  )
+}
+
+/** Clicks Publish and waits for the one `artifact_publish` call. */
+async function clickPublish(calls: { cmd: string }[]): Promise<void> {
+  fireEvent.click(publishButton())
+  await waitFor(() => {
+    expect(calls.filter((call) => call.cmd === 'artifact_publish')).toHaveLength(1)
+  })
+}
+
+describe('AgentPanel publish (slice 5b, HAP-001-R35)', () => {
+  it('Publish calls artifact_publish with exactly { approvalId, onState } -- the approval id, a live Channel -- renders each artifact-state frame as the transcript line "publication <short id>: <state>" in order, and on resolution shows the row as "<state> <short id>" with no button and the publication as a Publications row', async () => {
+    let resolvePublish: (publication: Publication) => void = () => {}
+    const { calls, publishChannel } = await approveReport(
+      () =>
+        new Promise<Publication>((resolve) => {
+          resolvePublish = resolve
+        }),
+    )
+    const linesBefore = transcriptTexts()
+
+    await clickPublish(calls)
+
+    const publishCall = calls.find((call) => call.cmd === 'artifact_publish')!
+    expect(Object.keys(publishCall.args).sort()).toEqual(['approvalId', 'onState'])
+    expect(publishCall.args.approvalId).toBe('23121521465ad9be')
+    expect(typeof (publishCall.args.onState as LiveStateChannel).onmessage).toBe('function')
+    for (const key of Object.keys(publishCall.args)) {
+      expect(key.toLowerCase()).not.toContain('path')
+    }
+
+    deliverArtifactState(publishChannel(), 'published-local')
+    deliverArtifactState(publishChannel(), 'registered', 'pending')
+
+    expect(transcriptTexts()).toEqual([
+      ...linesBefore,
+      'publication 2a91ea59: published-local',
+      'publication 2a91ea59: registered',
+    ])
+    expect(screen.getByLabelText('Agent transcript').textContent).not.toContain(PUBLICATION_ID)
+
+    await act(async () => {
+      resolvePublish(PUBLISHED_REPORT)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(actionCell(REPORT_NAME)).toBe('registered 2a91ea59')
+    expect(within(candidateRow(REPORT_NAME)).queryByRole('button')).toBeNull()
+    await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()).toEqual([
+      ['report.pdf', 'registered', 'pending', CATALOG_ID, 'main/2a91ea59', 'local'],
+    ])
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+  })
+
+  it('a registration-pending result shows the row as "registration-pending <short id>" and a Publications row with "—" for the missing record facts, after its published-local line', async () => {
+    let resolvePublish: (publication: Publication) => void = () => {}
+    const { calls, publishChannel } = await approveReport(
+      () =>
+        new Promise<Publication>((resolve) => {
+          resolvePublish = resolve
+        }),
+    )
+
+    await clickPublish(calls)
+    deliverArtifactState(publishChannel(), 'published-local')
+    await act(async () => {
+      resolvePublish(PENDING_REPORT)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(transcriptTexts().at(-1)).toBe('publication 2a91ea59: published-local')
+    expect(actionCell(REPORT_NAME)).toBe('registration-pending 2a91ea59')
+    await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()).toEqual([
+      ['report.pdf', 'registration-pending', '—', '—', '—', 'local'],
+    ])
+  })
+
+  it("renders duplicate-publication from artifact_publish with its message and only the detail's two short ids -- never the full identities -- and no \"untrusted\"; the row keeps its approval with Publish enabled again, and the state frame's line stands", async () => {
+    let rejectPublish: (reason: unknown) => void = () => {}
+    const { calls, publishChannel } = await approveReport(
+      () =>
+        new Promise<Publication>((_resolve, reject) => {
+          rejectPublish = reject
+        }),
+    )
+
+    await clickPublish(calls)
+    deliverArtifactState(publishChannel(), 'duplicate-publication', 'pending')
+    await act(async () => {
+      rejectPublish({
+        code: 'duplicate-publication',
+        message: 'an artifact with this content is already registered for this project',
+        detail: { publicationId: PUBLICATION_ID, catalogId: CATALOG_ID },
+      })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      'duplicate-publication: an artifact with this content is already registered for this project (publication 2a91ea59, catalog main/2a91ea59)',
+    )
+    expect(banner.textContent).not.toContain(PUBLICATION_ID)
+    expect(banner.textContent).not.toContain('untrusted')
+    expect(transcriptTexts().at(-1)).toBe('publication 2a91ea59: duplicate-publication')
+    expect(actionCell(REPORT_NAME)).toBe(APPROVED_REPORT_CELL)
+    expect(publishButton().disabled).toBe(false)
+    expect(screen.queryByRole('region', { name: 'Publications' })).toBeNull()
+  })
+
+  it.each([
+    [
+      'integrity-mismatch',
+      'the published copy did not verify against the approved digest; it was discarded and the entry preserved',
+      'integrity-mismatch',
+    ],
+    [
+      'outbox-escape',
+      "the entry's path no longer names the approved file; the approved bytes were kept as a recovery entry",
+      'outbox-escape',
+    ],
+    ['outbox-linked', "the entry's link count is greater than one", 'outbox-linked'],
+    ['refused', "the entry's identity facts changed since it was approved", 'refused'],
+    ['catalog-unavailable', 'the catalog is corrupt', null],
+    [
+      'destination-invalid',
+      'the device asset path resolves inside a registered workspace root',
+      null,
+    ],
+    [
+      'work-area-invalid',
+      'the product work area resolves inside a registered workspace root',
+      null,
+    ],
+    ['invalid-request', 'no approval with that id is recorded', null],
+    ['workspace-unavailable', 'no workspace has been picked yet', null],
+    // The backend mirror of the frozen surface (`docs/spike-log.md` § Slice 5b).
+    ['run-active', 'a run is active; approve or publish once it has ended', null],
+  ] as const)(
+    'renders %s from artifact_publish as a plain catalogue code with its fixed message, no "untrusted" and no stray detail; the row keeps its approval with Publish enabled again',
+    async (code, message, state) => {
+      let rejectPublish: (reason: unknown) => void = () => {}
+      const { calls, publishChannel } = await approveReport(
+        () =>
+          new Promise<Publication>((_resolve, reject) => {
+            rejectPublish = reject
+          }),
+      )
+
+      await clickPublish(calls)
+      if (state !== null) deliverArtifactState(publishChannel(), state)
+      await act(async () => {
+        rejectPublish({
+          code,
+          message,
+          detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+        })
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0)
+        })
+      })
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(banner.textContent).not.toContain('untrusted')
+      expect(banner.textContent).not.toContain('aaaaaaaa')
+      if (state !== null) {
+        expect(transcriptTexts().at(-1)).toBe(`publication 2a91ea59: ${state}`)
+      }
+      expect(actionCell(REPORT_NAME)).toBe(APPROVED_REPORT_CELL)
+      expect(publishButton().disabled).toBe(false)
+    },
+  )
+
+  it('shows only "unexpected error" when artifact_publish rejects with a plain Error, never its message; the row keeps its approval with Publish enabled again', async () => {
+    const { calls } = await approveReport(() =>
+      Promise.reject(new Error('asset root path /secret/asset-roots/main')),
+    )
+
+    await clickPublish(calls)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('unexpected error')
+    expect(document.body.textContent).not.toContain('/secret/asset-roots/main')
+    expect(actionCell(REPORT_NAME)).toBe(APPROVED_REPORT_CELL)
+    await waitFor(() => {
+      expect(publishButton().disabled).toBe(false)
+    })
+  })
+
+  it('disables Publish while the publish is in flight, so a double-click fires one artifact_publish', async () => {
+    let resolvePublish: (publication: Publication) => void = () => {}
+    const { calls } = await approveReport(
+      () =>
+        new Promise<Publication>((resolve) => {
+          resolvePublish = resolve
+        }),
+    )
+
+    fireEvent.click(publishButton())
+    fireEvent.click(publishButton())
+    await waitFor(() => {
+      expect(publishButton().disabled).toBe(true)
+    })
+    fireEvent.click(publishButton())
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(calls.filter((call) => call.cmd === 'artifact_publish')).toHaveLength(1)
+
+    await act(async () => {
+      resolvePublish(PUBLISHED_REPORT)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(actionCell(REPORT_NAME)).toBe('registered 2a91ea59')
+  })
+
+  it("drops publish frames that arrive after a new Start (generation guard): no publication line enters the new run's transcript, while the resolved publication still reaches the Publications table, the project's own truth", async () => {
+    let resolvePublish: (publication: Publication) => void = () => {}
+    const { calls, publishChannel } = await approveReport(
+      () =>
+        new Promise<Publication>((resolve) => {
+          resolvePublish = resolve
+        }),
+    )
+    await clickPublish(calls)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+    const linesBefore = transcriptTexts()
+
+    deliverArtifactState(publishChannel(), 'published-local')
+    deliverArtifactState(publishChannel(), 'registered', 'pending')
+    expect(transcriptTexts()).toEqual(linesBefore)
+
+    await act(async () => {
+      resolvePublish(PUBLISHED_REPORT)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(transcriptTexts()).toEqual(linesBefore)
+    await screen.findByRole('region', { name: 'Publications' })
+    expect(publicationRows()).toHaveLength(1)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it("a rejected Start restores the candidates table with its approvals and its open approval block intact, since no run replaced the inventory (R3-019 extended to slice 5b's row state)", async () => {
+    let spawnCount = 0
+    let channelRef: LiveChannel | undefined
+    await renderReady((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        spawnCount += 1
+        if (spawnCount === 1) {
+          channelRef = (args as { onFrame: LiveChannel }).onFrame
+          return 7
+        }
+        return Promise.reject({
+          code: 'spawn-failed',
+          message: 'failed to start the requested process',
+        })
+      }
+      if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+      if (cmd === 'artifact_approve') return SAMPLE_ARTIFACT_APPROVAL
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'claude-code', { outbox: OUTBOX_STATUS_VALID })
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    if (!channelRef) throw new Error('harness_spawn was not called')
+    deliverCandidates(channelRef)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channelRef)
+    await openApproval(REPORT_NAME)
+    confirmReportApproval()
+    await waitFor(() => {
+      expect(actionCell(REPORT_NAME)).toBe(APPROVED_REPORT_CELL)
+    })
+    await openApproval(`${RUN_ID}/stray.png`)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('spawn-failed: failed to start the requested process')
+    expect(spawnCount).toBe(2)
+    expect(actionCell(REPORT_NAME)).toBe(APPROVED_REPORT_CELL)
+    expect(publishButton().disabled).toBe(false)
+    const block = screen.getByLabelText('Publication approval')
+    expect(block.textContent).toContain(`name: ${RUN_ID}/stray.png`)
+  })
+
+  it('the publish continuation no-ops when artifact_publish rejects after unmount: nothing thrown, no console.error, no alert (R3-022)', async () => {
+    let rejectPublish: (reason: unknown) => void = () => {}
+    const { calls } = await approveReport(
+      () =>
+        new Promise<Publication>((_resolve, reject) => {
+          rejectPublish = reject
+        }),
+    )
+    await clickPublish(calls)
+
+    cleanup()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rejectPublish({
+      code: 'integrity-mismatch',
+      message:
+        'the published copy did not verify against the approved digest; it was discarded and the entry preserved',
+    })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="alert"]')).toBeNull()
+    consoleErrorSpy.mockRestore()
+  })
+
+  /**
+   * Answers `artifact_approve` and `artifact_publish` for both approvable
+   * fixture rows, by name and by approval id respectively.
+   */
+  function twoRowHandlers(cmd: string, args: Record<string, unknown>): unknown {
+    if (cmd === 'artifact_approve') {
+      return (args as { name: string }).name === REPORT_NAME
+        ? SAMPLE_ARTIFACT_APPROVAL
+        : STRAY_ARTIFACT_APPROVAL
+    }
+    if (cmd === 'artifact_publish') {
+      return (args as { approvalId: string }).approvalId === SAMPLE_ARTIFACT_APPROVAL.approvalId
+        ? PUBLISHED_REPORT
+        : PUBLISHED_STRAY
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  }
+
+  /** Approves and publishes the row named `name`, waiting for each cell in turn. */
+  async function approveAndPublish(
+    name: string,
+    short: string,
+    approvedCell: string,
+    publishedCell: string,
+  ): Promise<void> {
+    await openApproval(name)
+    typeDigest(short)
+    fireEvent.click(confirmButton())
+    await waitFor(() => {
+      expect(actionCell(name)).toBe(approvedCell)
+    })
+    fireEvent.click(publishButton(name))
+    await waitFor(() => {
+      expect(actionCell(name)).toBe(publishedCell)
+    })
+  }
+
+  it("two rows, report then stray: the first row's published cell and Publications entry survive the second row's approve-and-publish cycle, and both rows end published with two Publications rows (R3-020)", async () => {
+    await startInventoryAndEndRun(twoRowHandlers)
+
+    await approveAndPublish(REPORT_NAME, REPORT_SHORT, APPROVED_REPORT_CELL, 'registered 2a91ea59')
+    expect(publicationRows()).toEqual([PUBLISHED_REPORT_ROW])
+    await approveAndPublish(STRAY_NAME, '11111111', APPROVED_STRAY_CELL, 'registered cccccccc')
+
+    expect(actionCell(REPORT_NAME)).toBe('registered 2a91ea59')
+    expect(actionCell(STRAY_NAME)).toBe('registered cccccccc')
+    expect(publicationRows()).toEqual([PUBLISHED_REPORT_ROW, PUBLISHED_STRAY_ROW])
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+  })
+
+  it("two rows, stray then report: the reverse order leaves both rows published, the first row's state intact through the second cycle, and the Publications rows in publication order (R3-020)", async () => {
+    await startInventoryAndEndRun(twoRowHandlers)
+
+    await approveAndPublish(STRAY_NAME, '11111111', APPROVED_STRAY_CELL, 'registered cccccccc')
+    expect(publicationRows()).toEqual([PUBLISHED_STRAY_ROW])
+    await approveAndPublish(REPORT_NAME, REPORT_SHORT, APPROVED_REPORT_CELL, 'registered 2a91ea59')
+
+    expect(actionCell(STRAY_NAME)).toBe('registered cccccccc')
+    expect(actionCell(REPORT_NAME)).toBe('registered 2a91ea59')
+    expect(publicationRows()).toEqual([PUBLISHED_STRAY_ROW, PUBLISHED_REPORT_ROW])
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('the publish continuations no-op after unmount: a frame and the resolution after unmount throw nothing and log no console.error', async () => {
+    let resolvePublish: (publication: Publication) => void = () => {}
+    const { calls, publishChannel } = await approveReport(
+      () =>
+        new Promise<Publication>((resolve) => {
+          resolvePublish = resolve
+        }),
+    )
+    await clickPublish(calls)
+    const channel = publishChannel()
+
+    cleanup()
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    channel.onmessage({
+      kind: 'artifact-state',
+      payload: { publicationId: PUBLICATION_ID, state: 'published-local', providerState: null },
+    })
+    resolvePublish(PUBLISHED_REPORT)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
   })
 })
