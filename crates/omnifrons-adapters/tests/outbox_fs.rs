@@ -356,12 +356,29 @@ fn open_subdirectory_refuses_a_linked_directory() {
 }
 
 /// Unix only (a Unix domain socket has no Windows equivalent here): a
-/// socket bound inside the run subdirectory is refused as not a regular
-/// file (HAP-001-R15) -- `open(2)` refuses it outright, `ENXIO` on Linux,
+/// socket inside the run subdirectory is refused as not a regular file
+/// (HAP-001-R15) -- `open(2)` refuses it outright, `ENXIO` on Linux,
 /// `EOPNOTSUPP` on macOS -- and is never read (R3-001/R1-009).
+///
+/// The socket is bound at a short path directly under the temp directory
+/// and then renamed into the run subdirectory: `sockaddr_un`'s `sun_path`
+/// is 104 bytes on macOS (`SUN_LEN`; 108 on Linux), and the macOS temp
+/// directory plus the project, outbox, and run subdirectory exceeds it, so
+/// `bind` refuses the long path outright ("path must be shorter than
+/// `SUN_LEN`"). A rename moves only the directory entry -- the listener
+/// stays bound to the same inode -- and the prober opens that entry by
+/// name inside the run subdirectory, exactly as it would any other.
 #[cfg(unix)]
 #[test]
 fn a_unix_socket_is_outbox_escape() {
+    /// Best-effort removal of a fixture path on every exit path.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     let project = TempProject::new("prober-socket");
     let subdirectory = FsRunOutboxPreparer::new()
         .prepare(
@@ -370,8 +387,15 @@ fn a_unix_socket_is_outbox_escape() {
             &run("run-sock"),
         )
         .expect("run subdirectory");
-    let _listener = std::os::unix::net::UnixListener::bind(subdirectory.path.join("sock"))
-        .expect("fixture socket");
+    let short_path = std::env::temp_dir().join(format!("omfs-{}-sock", std::process::id()));
+    let _short_cleanup = RemoveOnDrop(short_path.clone());
+    let _listener = std::os::unix::net::UnixListener::bind(&short_path)
+        .expect("fixture socket at a short path under the temp directory");
+    let in_run = subdirectory.path.join("sock");
+    let _in_run_cleanup = RemoveOnDrop(in_run.clone());
+    std::fs::rename(&short_path, &in_run)
+        .expect("renaming the socket's directory entry into the run subdirectory");
+
     let probe = FsCandidateProber::new().probe(
         &subdirectory.handle,
         &subdirectory.path,
