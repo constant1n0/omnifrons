@@ -23,6 +23,8 @@ use omnifrons_app::harness_adapter::{
 use omnifrons_domain::adapter::{
     AdapterEvent, AdapterId, AgentPhase, PromptChannel, StdinPlan, ToolCallProposal, TransportClass,
 };
+use omnifrons_domain::executable::Sha256Digest;
+use omnifrons_domain::outbox::{PUBLISH_PROPOSAL_TOOL_NAME, ProposedEntry, PublishProposal};
 use omnifrons_domain::scope::ScopeMode;
 use serde_json::Value;
 
@@ -94,6 +96,7 @@ impl HarnessAdapter for LineAgent {
             // this field to pick the pipe wiring (`docs/spike-log.md` §
             // Slice 4).
             transport: TransportClass::StructuredStreamingCli,
+            output_dir: None,
         })
     }
 
@@ -209,12 +212,16 @@ fn parse_assistant(value: &Value) -> Option<Vec<AdapterEvent>> {
 }
 
 /// One assistant content block -> `Message` (a well-formed `text` block),
-/// `ToolCall` (a well-formed `tool_use` block), or `Unknown` carrying the
-/// block's own JSON for anything else (an unrecognized block `type`, or a
-/// known type missing its required field). `raw` is the block's JSON
-/// re-serialized compactly -- `serde_json` does not expose a block's
-/// original byte span within the line -- so it is byte-faithful to the
-/// block's content, not necessarily to the line's original whitespace.
+/// `ArtifactPublish` (a `tool_use` block named `artifact.publish` whose
+/// input parses as a publish proposal; spike slice 5), `ToolCall` (any
+/// other well-formed `tool_use` block, including an `artifact.publish`
+/// whose input does not parse -- surfaced as the plain proposal it is,
+/// never dropped), or `Unknown` carrying the block's own JSON for anything
+/// else (an unrecognized block `type`, or a known type missing its
+/// required field). `raw` is the block's JSON re-serialized compactly --
+/// `serde_json` does not expose a block's original byte span within the
+/// line -- so it is byte-faithful to the block's content, not necessarily
+/// to the line's original whitespace.
 fn parse_content_block(block: &Value) -> AdapterEvent {
     let event = match block.get("type").and_then(Value::as_str) {
         Some("text") => {
@@ -226,9 +233,15 @@ fn parse_content_block(block: &Value) -> AdapterEvent {
                 })
         }
         Some("tool_use") => block.get("name").and_then(Value::as_str).map(|name| {
+            let input = block.get("input");
+            if name == PUBLISH_PROPOSAL_TOOL_NAME
+                && let Some(proposal) = input.and_then(parse_publish_proposal)
+            {
+                return AdapterEvent::ArtifactPublish(proposal);
+            }
             AdapterEvent::ToolCall(ToolCallProposal {
                 name: name.to_string(),
-                arguments_text: block.get("input").map(Value::to_string).unwrap_or_default(),
+                arguments_text: input.map(Value::to_string).unwrap_or_default(),
             })
         }),
         _ => None,
@@ -237,6 +250,25 @@ fn parse_content_block(block: &Value) -> AdapterEvent {
         raw: block.to_string().into_bytes(),
         truncated: false,
     })
+}
+
+/// `{"entries": [{"name": ..., "sha256": <64 hex>}, ...]}` -> a
+/// [`PublishProposal`], or `None` if the shape does not match exactly:
+/// `entries` must be an array and every element must carry a string
+/// `name` and a parseable `sha256`. An empty array is a valid, empty
+/// proposal. Nothing here is executed or trusted: the digests are claims
+/// the shell compares against its own (HAP-001-R11).
+fn parse_publish_proposal(input: &Value) -> Option<PublishProposal> {
+    let entries = input.get("entries")?.as_array()?;
+    let entries = entries
+        .iter()
+        .map(|entry| {
+            let name = entry.get("name")?.as_str()?.to_string();
+            let sha256 = Sha256Digest::from_hex(entry.get("sha256")?.as_str()?)?;
+            Some(ProposedEntry { name, sha256 })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PublishProposal { entries })
 }
 
 /// Render a JSON value as observation text: a string value's own content

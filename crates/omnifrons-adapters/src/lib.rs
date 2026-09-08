@@ -23,13 +23,32 @@
 //! dependency (verified by `tests/deps.rs`), so that a future Git, Engram,
 //! Knowledge, or secret-store adapter never has to fight an accidental
 //! async or desktop-shell dependency creeping in from this crate.
+//!
+//! As of spike slice 5 (HAP-001's launch side) this crate also implements
+//! the outbox ports over the same dependency set: [`FsRunOutboxPreparer`]
+//! (`omnifrons_app::RunOutboxPreparer`), [`FsCandidateProber`]
+//! (`omnifrons_app::CandidateProber`, sharing the prober's open-once
+//! discipline), [`FsOutboxInventory`] (`omnifrons_app::OutboxInventory`),
+//! and [`JsonOutboxPolicyStore`] (`omnifrons_app::OutboxPolicyStore`).
+//! The unix `openat`/`mkdirat`/`O_NOFOLLOW`/`O_DIRECTORY` calls they use
+//! are all gated by `nix`'s `fs` feature this crate already enables
+//! (verified against the vendored 0.31.3 source); no feature and no
+//! dependency was added.
 
+pub mod fs_candidate_prober;
+pub mod fs_outbox_inventory;
 pub mod fs_prober;
+pub mod fs_run_outbox_preparer;
+pub mod json_outbox_policy_store;
 pub mod jsonl_approval_store;
 pub mod line_agent;
 pub mod pty_cli;
 
+pub use fs_candidate_prober::FsCandidateProber;
+pub use fs_outbox_inventory::FsOutboxInventory;
 pub use fs_prober::FsExecutableProber;
+pub use fs_run_outbox_preparer::FsRunOutboxPreparer;
+pub use json_outbox_policy_store::JsonOutboxPolicyStore;
 pub use jsonl_approval_store::JsonlApprovalStore;
 pub use line_agent::LineAgent;
 pub use omnifrons_app::harness_adapter::HarnessAdapter;

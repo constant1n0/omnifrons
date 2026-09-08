@@ -105,6 +105,7 @@ impl HarnessAdapter for PtyCli {
             prompt: Some(request.prompt.clone()),
             scope_mode: descriptor.scope_mode,
             transport: TransportClass::Pty,
+            output_dir: None,
         })
     }
 
