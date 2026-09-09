@@ -42,9 +42,11 @@ fn artifact_approval_id_preimage_is_domain_publication_and_nanos() {
         b"omnifrons-artifact-approval-v1"
     );
     let publication = PublicationIdentity(digest(0x33));
-    let at = SystemTime::UNIX_EPOCH + Duration::new(5, 7);
+    // A sub-second part that is a multiple of 100 ns: Windows keeps
+    // `SystemTime` in 100 ns steps, so 7 ns would round to 0 there.
+    let at = SystemTime::UNIX_EPOCH + Duration::new(5, 700);
     let preimage = artifact_approval_id_preimage(&publication, at);
-    let nanos: u128 = 5_000_000_007;
+    let nanos: u128 = 5_000_000_700;
     let mut expected = ARTIFACT_APPROVAL_ID_DOMAIN.to_vec();
     expected.extend_from_slice(&[0x33; 32]);
     expected.extend_from_slice(&nanos.to_be_bytes());

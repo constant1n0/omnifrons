@@ -15,7 +15,11 @@ fn demo_harness_path() -> PathBuf {
 }
 
 /// A live demo-harness child is listed while it runs and gone from the
-/// list once its terminal state is confirmed through `stop`.
+/// list once its terminal state is confirmed through `stop`. Windows
+/// `stop` is the Job Object placeholder: it reports `OrphanRiskUncertain`
+/// and never evicts the entry, so the id stays listed there -- the
+/// documented limitation `bookkeeping_caps.rs` asserts, and the reason the
+/// shell's publication surface stays frozen after a stop on Windows.
 #[test]
 fn running_ids_lists_a_live_child_and_forgets_it_once_terminal() {
     let mut supervisor = TokioProcessSupervisor::with_demo_launcher(demo_harness_path());
@@ -28,15 +32,32 @@ fn running_ids_lists_a_live_child_and_forgets_it_once_terminal() {
         .expect("spawn the demo harness");
     assert_eq!(supervisor.running_ids(), vec![id]);
 
-    supervisor
-        .stop(id, Duration::from_secs(10))
-        .expect("the child stops within the deadline");
-    assert!(
-        supervisor.running_ids().is_empty(),
-        "a terminal child is no longer running"
-    );
-    assert!(matches!(
-        supervisor.observe(id),
-        Some(ProcessStatus::Terminal(_))
-    ));
+    #[cfg(unix)]
+    {
+        supervisor
+            .stop(id, Duration::from_secs(10))
+            .expect("the child stops within the deadline");
+        assert!(
+            supervisor.running_ids().is_empty(),
+            "a terminal child is no longer running"
+        );
+        assert!(matches!(
+            supervisor.observe(id),
+            Some(ProcessStatus::Terminal(_))
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use omnifrons_app::ProcessTerminalState;
+        let stopped = supervisor
+            .stop(id, Duration::from_secs(10))
+            .expect("stop still succeeds as a best-effort direct-child kill");
+        assert_eq!(stopped, ProcessTerminalState::OrphanRiskUncertain);
+        assert_eq!(
+            supervisor.running_ids(),
+            vec![id],
+            "an unconfirmed stop keeps the id listed on Windows"
+        );
+        assert_eq!(supervisor.observe(id), Some(ProcessStatus::Running));
+    }
 }

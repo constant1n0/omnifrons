@@ -323,7 +323,13 @@ fn the_copy_comes_from_the_held_handle_even_when_the_path_was_swapped() {
     let approval = fixture.approval("report.pdf", PDF);
     let source = fixture.source("report.pdf");
     // Swap: a different file now sits at the path the handle was opened at.
-    std::fs::remove_file(fixture.run_dir.join("report.pdf")).expect("unlink");
+    // The original is renamed away rather than deleted: Windows keeps a
+    // deleted-but-open name pending and refuses a new file there.
+    std::fs::rename(
+        fixture.run_dir.join("report.pdf"),
+        fixture.run_dir.join("report.pdf.orig"),
+    )
+    .expect("rename the original away");
     std::fs::write(
         fixture.run_dir.join("report.pdf"),
         b"%PDF-1.7\nsomething else\n",
