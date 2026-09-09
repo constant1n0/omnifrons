@@ -375,8 +375,24 @@ fn a_corrupt_journal_line_fails_the_whole_replay() {
 
 // -- entry ops: identity by handle, removal relative to the directory --
 
+/// Open a directory handle for a fixture. Windows refuses a plain
+/// `File::open` on a directory: `FILE_FLAG_BACKUP_SEMANTICS` is required,
+/// as the production preparer documents.
+#[cfg(unix)]
 fn open_dir(path: &Path) -> DirectoryHandle {
     DirectoryHandle::new(File::open(path).expect("open dir"))
+}
+
+#[cfg(windows)]
+fn open_dir(path: &Path) -> DirectoryHandle {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open dir");
+    DirectoryHandle::new(file)
 }
 
 /// Unix: the path names the handle's file -> `SameFile`; a different file

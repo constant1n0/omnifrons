@@ -42,6 +42,24 @@ use omnifrons_domain::publication::{
     PortableReference, Producer, ProjectIdentity, ProviderState, RECORD_VERSION, StepOutcome,
 };
 
+/// Open a directory handle for a fixture. Windows refuses a plain
+/// `File::open` on a directory: `FILE_FLAG_BACKUP_SEMANTICS` is required.
+#[cfg(unix)]
+fn open_directory(path: &Path) -> File {
+    File::open(path).expect("open the directory")
+}
+
+#[cfg(windows)]
+fn open_directory(path: &Path) -> File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open the directory")
+}
+
 /// A drop-guard temp directory.
 struct TempDir(PathBuf);
 
@@ -117,7 +135,7 @@ impl Fixture {
     /// Open the held handle for `name` in the run subdirectory: the one
     /// handle every fact and every published byte comes from.
     fn source(&self, name: &str) -> CandidateSource {
-        let dir = File::open(&self.run_dir).expect("open the run subdirectory");
+        let dir = open_directory(&self.run_dir);
         let handle = File::open(self.run_dir.join(name)).expect("open the entry");
         CandidateSource {
             dir: DirectoryHandle::new(dir),
@@ -858,7 +876,7 @@ fn a_held_handle_that_is_not_a_regular_file_is_outbox_escape_with_nothing_staged
     let mut fixture = Fixture::new("not-regular");
     let approval = fixture.approval("report.pdf", PDF);
     let mut source = fixture.source("report.pdf");
-    source.handle = File::open(&fixture.run_dir).expect("a directory handle");
+    source.handle = open_directory(&fixture.run_dir);
     let entry_ops = ScriptedEntryOps::always(EntryIdentity::SameFile);
     let workspace = fixture.workspace();
     let mut events = Vec::new();
