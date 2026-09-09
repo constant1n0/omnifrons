@@ -606,7 +606,7 @@ impl RunEndTracker {
         match self.snapshot() {
             RunEndPhase::NoRecord => Vec::new(),
             RunEndPhase::HandleUnavailable => vec![inventory_failed_diagnostic()],
-            RunEndPhase::Ready(input) => self.conclude(input),
+            RunEndPhase::Ready(input) => self.conclude(*input),
         }
     }
 
@@ -622,14 +622,14 @@ impl RunEndTracker {
             return RunEndPhase::NoRecord;
         };
         match record.subdirectory_clone() {
-            Ok(subdirectory) => RunEndPhase::Ready(RunEndInput {
+            Ok(subdirectory) => RunEndPhase::Ready(Box::new(RunEndInput {
                 subdirectory,
                 policy: record.policy().clone(),
                 proposals: record.proposals().to_vec(),
                 run_id: record.run_id().clone(),
                 recorded_entries: record.recorded_proposal_entries(),
                 dropped_entries: record.dropped_proposal_entries(),
-            }),
+            })),
             Err(_) => RunEndPhase::HandleUnavailable,
         }
     }
@@ -733,7 +733,7 @@ enum RunEndPhase {
     /// The held handle could not be duplicated: reported, not inventoried.
     HandleUnavailable,
     /// Everything the inventory needs.
-    Ready(RunEndInput),
+    Ready(Box<RunEndInput>),
 }
 
 /// The fixed diagnostic for a run subdirectory that could not be
@@ -3804,7 +3804,7 @@ mod tests {
         }
         let tracker = tracker_for(&runs, id);
         let input = match tracker.snapshot() {
-            super::RunEndPhase::Ready(input) => input,
+            super::RunEndPhase::Ready(input) => *input,
             other => panic!("the record is remembered before the eviction, got {other:?}"),
         };
 
