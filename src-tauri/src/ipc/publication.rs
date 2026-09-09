@@ -1244,8 +1244,10 @@ mod tests {
             .expect_err("the derived id is already recorded");
         assert_eq!(error.code, ShellErrorCode::InvalidRequest);
         assert_eq!(fixture.journal_text().lines().count(), 1, "recorded once");
+        // One second, not one nanosecond: Windows keeps `SystemTime` in
+        // 100 ns steps, so a 1 ns later instant is the same instant there.
         let later = fixture
-            .approve_at("report.pdf", PDF, Fixture::now() + Duration::from_nanos(1))
+            .approve_at("report.pdf", PDF, Fixture::now() + Duration::from_secs(1))
             .expect("a later instant is another approval");
         assert_ne!(later.approval_id, first.approval_id);
     }

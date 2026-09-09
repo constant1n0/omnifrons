@@ -68,9 +68,11 @@ fn artifact_approval_id_is_the_first_eight_bytes_of_the_preimage_hash() {
     let mut expected = [0u8; 8];
     expected.copy_from_slice(&full.0[..8]);
     assert_eq!(id.0, u64::from_be_bytes(expected));
+    // One second, not one nanosecond: Windows keeps `SystemTime` in 100 ns
+    // steps, so a 1 ns later instant is the same instant there.
     assert_ne!(
         id,
-        derive_artifact_approval_id(&hasher, &publication, at + Duration::from_nanos(1)),
+        derive_artifact_approval_id(&hasher, &publication, at + Duration::from_secs(1)),
         "a later instant is a different approval id"
     );
 }
