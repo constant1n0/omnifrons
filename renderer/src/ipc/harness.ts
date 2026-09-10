@@ -195,6 +195,15 @@ export interface CandidatesSummary {
  * renderer only ever shows and never executes -- and `candidates` is the
  * shell's own run-end inventory summary, emitted once per adapter launch
  * before the terminal `state` frame.
+ *
+ * One kind (spike slice 5d, `docs/spike-log.md` § Slice 5d) is the
+ * wrong-root scan's: `misplaced` is the shell's own run-end scan of the
+ * active workspace root, emitted once per adapter launch **after
+ * `candidates` and before the terminal `state` frame**, with the launch's
+ * `seq` contiguous across all three. Counts only -- no name and no path
+ * rides it. A scan that could not run emits the fixed `diagnostic` text
+ * `the project could not be scanned for output written outside the outbox`
+ * in its place, never a `misplaced` frame claiming nothing was found.
  */
 export type AgentEvent =
   | {
@@ -210,6 +219,7 @@ export type AgentEvent =
   | { kind: 'terminal-drops'; payload: TerminalDropCounts }
   | { kind: 'artifact-publish'; payload: { entries: ProposedEntry[] } }
   | { kind: 'candidates'; payload: CandidatesSummary }
+  | { kind: 'misplaced'; payload: ScanSummary }
 
 interface HarnessEventFrameBody {
   id: ProcessId
@@ -367,6 +377,25 @@ export type ShellErrorCode =
    * (spike slice 5c).
    */
   | 'snapshot-unavailable'
+  /**
+   * `misplaced_remedy` named a finding this shell's last scan did not
+   * report, or reported at a different digest, or nothing sits at that name
+   * any more: the surface is stale and nothing was moved, copied or
+   * recorded (spike slice 5d, HAP-001-R32). Scan again and retry.
+   */
+  | 'misplaced-unknown'
+  /**
+   * The quarantine directory resolves inside a registered workspace root,
+   * could not be created owner-only, or could not be written; the file
+   * stays exactly where it was found (spike slice 5d, RCS-001-R10).
+   */
+  | 'quarantine-unavailable'
+  /**
+   * The wrong-root scan could not walk the active workspace root, so no
+   * verdict is claimed for it (spike slice 5d) -- never a claim that
+   * nothing was misplaced.
+   */
+  | 'scan-failed'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {
@@ -1206,4 +1235,283 @@ export async function guidanceRestore(
   fileSha256: string | null,
 ): Promise<GuidanceApplied> {
   return invoke('guidance_restore', { id, fileSha256 })
+}
+
+// -- Slice 5d: wrong-root detection, `misplaced`, and its three remedies --
+
+/**
+ * The output discipline the active scope reports (`docs/spike-log.md` §
+ * Slice 5d, HAP-001-R33), mirroring `dto.rs`'s `OutputDisciplineTag`:
+ * `enforced` only under `sandbox-enforced` scope whose declared write set
+ * is the project root, `advisory` under every other mode.
+ *
+ * Neither value says a write inside the project but outside the outbox is
+ * prevented -- it never is, in any mode. That is HAP-001-R34's disclosure,
+ * carried as text on every report.
+ */
+export type OutputDiscipline = 'enforced' | 'advisory'
+
+/**
+ * `wrongroot_status`'s payload (`docs/spike-log.md` § Slice 5d): the
+ * output-discipline label, the scope mode it was derived from -- the
+ * weakest any registered adapter declares -- every disclosure HAP-001-R33
+ * and R34 fix, and whether a scan has run in this session with how many
+ * findings it left standing. Mirrors `WrongRootStatusDto` field-for-field.
+ * Never a device path.
+ *
+ * `disclosures` is never empty: an `enforced` report carries HAP-001-R34's
+ * line alone, an `advisory` one carries R33's beside it. The strings are
+ * the contract's own honesty about what is *not* prevented, carried as
+ * text so a consumer states them verbatim rather than composing its own.
+ */
+export interface WrongRootStatus {
+  outputDiscipline: OutputDiscipline
+  scopeMode: ScopeMode
+  disclosures: string[]
+  scanned: boolean
+  findings: number
+}
+
+/**
+ * The output-discipline report and whether a scan has run
+ * (`docs/spike-log.md` § Slice 5d; HAP-001-R33, R34). Read-only: it starts
+ * no scan and moves no file. Invokes `wrongroot_status` with no arguments.
+ *
+ * # Errors
+ * Never rejects in the shell's own implementation -- the `Promise` matches
+ * every other wrapper's shape -- so a rejection here is a transport
+ * failure, not a catalogue code.
+ */
+export async function wrongRootStatus(): Promise<WrongRootStatus> {
+  return invoke('wrongroot_status')
+}
+
+/**
+ * `wrongroot_scan`'s payload (`docs/spike-log.md` § Slice 5d): what the
+ * walk saw, counts only -- the findings themselves come from
+ * {@link misplacedList}. Mirrors `MisplacedScanDto` field-for-field.
+ * No name and no path rides this shape.
+ *
+ * `truncated` is `true` when the walk stopped at its own bound (the shell's
+ * `MAX_SCANNED_ENTRIES`/`MAX_SCAN_DEPTH`) rather than reaching the end of
+ * the project: the counts are then a partial view and the list is
+ * incomplete, which a consumer must say rather than imply completeness.
+ */
+export interface ScanSummary {
+  scanned: number
+  findings: number
+  ignored: number
+  excluded: number
+  unreadable: number
+  truncated: boolean
+}
+
+/**
+ * Scan the active workspace root for output written outside the outbox
+ * (`docs/spike-log.md` § Slice 5d; HAP-001-R32, R43, R44) and remember the
+ * findings for {@link misplacedList}. Observation only: nothing is moved,
+ * copied, recorded or held, and a live run does not freeze it -- the
+ * run-end scan is this same body. Invokes `wrongroot_scan` with no
+ * arguments.
+ *
+ * # Errors
+ * Rejects with `scan-failed` (the project root could not be walked, so no
+ * verdict is claimed for it), `outbox-invalid` (the classification policy
+ * declaring the outbox could not be loaded), `work-area-invalid` (the
+ * ignore ledger could not be opened or read), or `workspace-unavailable`
+ * if no workspace is active.
+ */
+export async function wrongRootScan(): Promise<ScanSummary> {
+  return invoke('wrongroot_scan')
+}
+
+/**
+ * [`omnifrons_domain::wrong_root::Remedy`], as it crosses IPC
+ * (HAP-001-R32): the closed set of three, in the order HAP-001 §
+ * Wrong-root detection and remedies lists them, and nothing else. Mirrors
+ * `dto.rs`'s `RemedyTag`.
+ *
+ * Quarantine is the only one that removes the original.
+ */
+export type Remedy = 'quarantine' | 'publish' | 'ignore'
+
+/**
+ * Why a file is `misplaced` (HAP-001-R32), mirroring `dto.rs`'s wire token
+ * for `WrongRootReason`: one arm in this slice -- the file sits inside the
+ * project but outside the project's outbox. A *tracked* path is not a
+ * reason here: a finding the project's classification policy calls
+ * `git-tracked` is filtered out before a reason is ever assigned
+ * (`docs/spike-log.md` § Slice 5d, D1).
+ */
+export type WrongRootReason = 'in-project-outside-outbox'
+
+/**
+ * One `misplaced` file, as `misplaced_list` returns it
+ * (`docs/spike-log.md` § Slice 5d): the project-relative name it was found
+ * at -- producer-supplied text, plain text only, never resolved as a path
+ * and never used to build a link by the renderer -- the facts taken from
+ * its own handle, why it is misplaced, and the remedies HAP-001-R32 offers
+ * for this row. Mirrors `MisplacedDto` field-for-field. Never a device
+ * path (RCS-001-R14).
+ *
+ * `remedies` is the row's own list: a consumer offers exactly what it
+ * carries, never a set of its own.
+ */
+export interface MisplacedRow {
+  name: string
+  size: number
+  /**
+   * The full 64-hex content digest: the identity fact
+   * {@link misplacedRemedy} names the finding by, so a remedy is chosen
+   * from the row itself -- identity evidence, not a secret, under the same
+   * TM-001-R7 display precedent as `Evidence.sha256`.
+   */
+  sha256: string
+  sha256Short: string
+  detectedType: string
+  class: ArtifactClass
+  reason: WrongRootReason
+  remedies: Remedy[]
+}
+
+/**
+ * Every finding the last scan left standing (`misplaced_list`), in walk
+ * order; empty when no scan has run in this session. Read-only: listing
+ * moves nothing. Invokes `misplaced_list` with no arguments.
+ *
+ * # Errors
+ * Never rejects in the shell's own implementation -- the findings are read
+ * from shell state, so a rejection here is a transport failure, not a
+ * catalogue code.
+ */
+export async function misplacedList(): Promise<MisplacedRow[]> {
+  return invoke('misplaced_list')
+}
+
+/**
+ * What a remedy actually did, mirroring `dto.rs`'s `RemedyOutcomeTag`:
+ * `quarantined` -- the file was moved into the product's quarantine
+ * directory, outside any workspace (RCS-001-R10), and is gone from the
+ * project; `copied-to-outbox` -- the file's bytes were copied into the
+ * outbox as a new unattributed entry and the original was left exactly
+ * where it was found (HAP-001-R28), with nothing published until that
+ * entry is approved like any other; `ignored` -- the decision was recorded
+ * against the file's name and digest, and the file was not touched.
+ */
+export type RemedyOutcome = 'quarantined' | 'copied-to-outbox' | 'ignored'
+
+/**
+ * The fixed token qualifying a remedy's outcome (`docs/spike-log.md` §
+ * Slice 5d): which move ran, or why the original was kept. Never free text
+ * and never a path.
+ *
+ * `renamed` is the handle-anchored rename on one volume; `renamed-unverified`
+ * is that same rename after which the destination could not be re-opened and
+ * digested, so the move happened and only its verification did not (it
+ * carries `originalKept: false`, because a rename removes the original name
+ * whatever the verification then found); `different-volume`,
+ * `rename-unsupported` and `rename-failed` name the fallback the copy path
+ * took, with the original removed after it; `unlink-failed`,
+ * `original-already-gone`, `original-changed-during-the-move` and
+ * `identity-check-unavailable` are the four cases where the copy stands and
+ * the **original was kept** -- HAP-001-R19's residual, disclosed rather
+ * than closed.
+ *
+ * Nine tokens, matching `quarantine_detail` in
+ * `src-tauri/src/ipc/wrong_root.rs` arm for arm. The wire types this field
+ * as a plain string, so a consumer must still have an answer for a token
+ * this union does not name.
+ */
+export type RemedyDetail =
+  | 'renamed'
+  | 'renamed-unverified'
+  | 'different-volume'
+  | 'rename-unsupported'
+  | 'rename-failed'
+  | 'unlink-failed'
+  | 'original-already-gone'
+  | 'original-changed-during-the-move'
+  | 'identity-check-unavailable'
+
+/**
+ * `misplaced_remedy`'s payload (`docs/spike-log.md` § Slice 5d): one shape
+ * for all three remedies -- which one ran, what it did, and, for the two
+ * that produce something, the logical name of what was produced beside its
+ * digest. Mirrors `MisplacedRemedyDto` field-for-field.
+ *
+ * `name` is a quarantined file's sanitized name or the new outbox entry's
+ * name, one component either way, and `null` for the ignore remedy, which
+ * produces nothing.
+ *
+ * `originalKept` says whether **this remedy removed the original**, and
+ * nothing beyond that. It is `false` for a quarantine that took the
+ * original name away -- the handle-anchored `renamed`, `renamed-unverified`
+ * (a rename removes the name whatever the verification then found), and
+ * the `different-volume` / `rename-unsupported` / `rename-failed` copy
+ * paths that unlink after copying -- and `true` for publish, for ignore,
+ * and for each of {@link RemedyDetail}'s four residual details. `true` is
+ * therefore **not** a report that the file is still in the project: three
+ * of those four (`original-already-gone`,
+ * `original-changed-during-the-move`, `identity-check-unavailable`) say
+ * the opposite or say nothing at all, which is why the surface renders it
+ * as "this remedy did not remove the original" rather than as "the
+ * original is still in the project" (R1-004). The earlier wording here --
+ * "whether the file is still in the project: `false` only for a quarantine
+ * that completed the move" -- was the same claim the UI dropped, and it
+ * contradicted both {@link RemedyDetail} above and `formatOriginalKept`
+ * below it (R3-041).
+ *
+ * Every one of `name`, `sha256`, `originalKept` and `detail` is nullable
+ * on the wire, so a consumer states the absence rather than assuming a
+ * value. Never a device path (RCS-001-R14).
+ */
+export interface MisplacedRemedy {
+  remedy: Remedy
+  outcome: RemedyOutcome
+  name: string | null
+  sha256: string | null
+  originalKept: boolean | null
+  detail: RemedyDetail | null
+}
+
+/**
+ * Run one of HAP-001-R32's three remedies over the finding named by `name`
+ * and `sha256` -- the project-relative name and the full 64-hex digest the
+ * last scan reported, taken from the row itself and never from anything
+ * typed. Nothing happens without this explicit choice, and nothing outside
+ * the row's own `remedies` is ever offered. Invokes `misplaced_remedy` with
+ * exactly `{ name, sha256, remedy }`; never a path (RCS-001-R14).
+ *
+ * The digest binds the request exactly as `artifactApprove` binds a
+ * candidate: a name the last scan never reported, or reported at other
+ * bytes, is `misplaced-unknown` and nothing moves.
+ *
+ * # Errors
+ * Rejects with `misplaced-unknown` (no scan reported that file at that
+ * digest, or nothing sits at that name any more), `refused` (a fact bound
+ * at scan time stopped holding: not a regular file, the name no longer
+ * holds the opened file, the content changed), `quarantine-unavailable`
+ * (the quarantine directory could not be used, resolves inside a
+ * registered workspace root, could not be made owner-only, or the move
+ * failed), `outbox-unavailable` (the publish remedy's copy-in could not
+ * create its entry, or an entry of that name already holds other bytes),
+ * `outbox-invalid` (the classification policy could not be loaded),
+ * `outbox-linked` (the misplaced file's link count is greater than one, so
+ * HAP-001-R20's hard-link refusal applies to it as it does to an outbox
+ * entry -- reachable from **both** the quarantine and the publish remedy,
+ * since each opens the file through `open_misplaced`, and additionally from
+ * the publish remedy's own copy-in), `work-area-invalid` (the ignore ledger
+ * could not be opened, read or written), `invalid-request` (a digest that is
+ * not 64 hex characters, or a name that is not project-relative),
+ * `run-active` (a supervised process is still running), or
+ * `workspace-unavailable` if no workspace is active.
+ *
+ * Ten codes; `src-tauri/src/ipc/wrong_root.rs` reaches exactly these.
+ */
+export async function misplacedRemedy(
+  name: string,
+  sha256: string,
+  remedy: Remedy,
+): Promise<MisplacedRemedy> {
+  return invoke('misplaced_remedy', { name, sha256, remedy })
 }

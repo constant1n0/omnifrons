@@ -21,10 +21,14 @@ import {
   harnessSpawn,
   harnessStop,
   isShellError,
+  misplacedList,
+  misplacedRemedy,
   outboxStatus,
   publicationsList,
   workspaceCurrent,
   workspacePick,
+  wrongRootScan,
+  wrongRootStatus,
   type AdapterDescriptor,
   type AgentEvent,
   type Approval,
@@ -46,7 +50,16 @@ import {
   type Publication,
   type ShellError,
   type ShellErrorCode,
+  type MisplacedRemedy,
+  type MisplacedRow,
+  type OutputDiscipline,
+  type Remedy,
+  type RemedyDetail,
+  type RemedyOutcome,
+  type ScanSummary,
   type Snapshot,
+  type WrongRootReason,
+  type WrongRootStatus,
 } from './harness'
 
 // The jsdom crypto polyfill is installed once for every test file by
@@ -654,7 +667,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
     ])
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the ten kinds to itself', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the eleven kinds to itself', () => {
     function kindLabel(kind: AgentEvent['kind']): string {
       switch (kind) {
         case 'state':
@@ -667,6 +680,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
         case 'terminal-drops':
         case 'artifact-publish':
         case 'candidates':
+        case 'misplaced':
           return kind
         default: {
           const unreachable: never = kind
@@ -686,6 +700,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
       'terminal-drops',
       'artifact-publish',
       'candidates',
+      'misplaced',
     ]
     expect(kinds.map(kindLabel)).toEqual(kinds)
   })
@@ -1421,7 +1436,7 @@ describe('slice 5b closed sets', () => {
     expect(availabilities.map(availabilityLabel)).toEqual(availabilities)
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes and the six slice 5c codes among the thirty-eight -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes and the three slice 5d codes among the forty-one -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
     function codeLabel(code: ShellErrorCode): string {
       switch (code) {
         case 'unknown-process':
@@ -1462,6 +1477,9 @@ describe('slice 5b closed sets', () => {
         case 'guidance-block-malformed':
         case 'guidance-unmanaged':
         case 'snapshot-unavailable':
+        case 'misplaced-unknown':
+        case 'quarantine-unavailable':
+        case 'scan-failed':
           return code
         default: {
           const unreachable: never = code
@@ -1509,8 +1527,11 @@ describe('slice 5b closed sets', () => {
       'guidance-block-malformed',
       'guidance-unmanaged',
       'snapshot-unavailable',
+      'misplaced-unknown',
+      'quarantine-unavailable',
+      'scan-failed',
     ]
-    expect(new Set(codes).size).toBe(38)
+    expect(new Set(codes).size).toBe(41)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
@@ -2069,5 +2090,492 @@ describe('slice 5c closed sets', () => {
     expect(kinds.map(kindLabel)).toEqual(kinds)
     expect(statuses.map(managedLabel)).toEqual(statuses)
     expect(actions.map(actionLabel)).toEqual(actions)
+  })
+})
+
+// -- Slice 5d: wrong-root detection, `misplaced`, and its three remedies --
+
+/** HAP-001-R34's disclosure, carried in every mode including `sandbox-enforced`. */
+const IN_PROJECT_DISCLOSURE =
+  'a write inside the project but outside the outbox is detected after the run, never prevented'
+
+/** HAP-001-R33's additional disclosure, carried under `advisory` only. */
+const OUTSIDE_PROJECT_DISCLOSURE =
+  'a write outside the project is possible and is detected after the run, not prevented'
+
+/** `wrongroot_status` for a project no scan has run over yet (`docs/spike-log.md` § Slice 5d, IPC shapes). */
+const STATUS_ADVISORY: WrongRootStatus = {
+  outputDiscipline: 'advisory',
+  scopeMode: 'advisory',
+  disclosures: [IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE],
+  scanned: false,
+  findings: 0,
+}
+
+describe('wrongRootStatus (slice 5d)', () => {
+  it('invokes wrongroot_status with no arguments and returns the report verbatim: five keys, both disclosures under advisory scope, no path-shaped key', async () => {
+    const mocked = mockCommand('wrongroot_status', () => STATUS_ADVISORY)
+
+    const status = await wrongRootStatus()
+
+    expect(mocked.args()).toEqual({})
+    expect(status).toEqual(STATUS_ADVISORY)
+    expect(Object.keys(status).sort()).toEqual([
+      'disclosures',
+      'findings',
+      'outputDiscipline',
+      'scanned',
+      'scopeMode',
+    ])
+    expectNoPathShapedKey(status)
+  })
+
+  it('returns an enforced report verbatim: HAP-001-R34\'s disclosure alone, one entry and never zero, with the scan counts it carries', async () => {
+    mockCommand('wrongroot_status', () => ({
+      outputDiscipline: 'enforced',
+      scopeMode: 'sandbox-enforced',
+      disclosures: [IN_PROJECT_DISCLOSURE],
+      scanned: true,
+      findings: 2,
+    }))
+
+    const status = await wrongRootStatus()
+
+    expect(status.outputDiscipline).toBe('enforced')
+    expect(status.scopeMode).toBe('sandbox-enforced')
+    expect(status.disclosures).toEqual([IN_PROJECT_DISCLOSURE])
+    expect(status.scanned).toBe(true)
+    expect(status.findings).toBe(2)
+  })
+})
+
+/** `wrongroot_scan`'s answer for a walk that saw twelve files and left two findings standing. */
+const SCAN_SUMMARY: ScanSummary = {
+  scanned: 12,
+  findings: 2,
+  ignored: 1,
+  excluded: 3,
+  unreadable: 0,
+  truncated: false,
+}
+
+describe('wrongRootScan (slice 5d)', () => {
+  it('invokes wrongroot_scan with no arguments and returns the counts verbatim: exactly six keys, no name and no path among them', async () => {
+    const mocked = mockCommand('wrongroot_scan', () => SCAN_SUMMARY)
+
+    const summary = await wrongRootScan()
+
+    expect(mocked.args()).toEqual({})
+    expect(summary).toEqual(SCAN_SUMMARY)
+    expect(Object.keys(summary).sort()).toEqual([
+      'excluded',
+      'findings',
+      'ignored',
+      'scanned',
+      'truncated',
+      'unreadable',
+    ])
+    expectNoPathShapedKey(summary)
+  })
+
+  it('returns truncated true verbatim for a walk that stopped at its bound, with the partial counts it did reach', async () => {
+    mockCommand('wrongroot_scan', () => ({ ...SCAN_SUMMARY, scanned: 20000, truncated: true }))
+
+    const summary = await wrongRootScan()
+
+    expect(summary.truncated).toBe(true)
+    expect(summary.scanned).toBe(20000)
+  })
+
+  it('rejects with the typed scan-failed, outbox-invalid, work-area-invalid and workspace-unavailable ShellErrors, none carrying detail', async () => {
+    const errors: ShellError[] = [
+      { code: 'scan-failed', message: 'the project could not be scanned' },
+      { code: 'outbox-invalid', message: 'the classification policy could not be loaded' },
+      { code: 'work-area-invalid', message: 'the ignore ledger could not be read' },
+      { code: 'workspace-unavailable', message: 'no workspace has been picked yet' },
+    ]
+    for (const error of errors) {
+      mockCommand('wrongroot_scan', () => Promise.reject(error))
+
+      const rejected: unknown = await wrongRootScan().then(
+        () => {
+          throw new Error('wrongroot_scan resolved instead of rejecting')
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(Object.keys(rejected as object).sort()).toEqual(['code', 'message'])
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+      clearMocks()
+    }
+  })
+})
+
+/** The full digest of the misplaced PDF the fixture scan found under `docs/`. */
+const MISPLACED_DIGEST = 'ab'.repeat(32)
+
+/** One `misplaced_list` row (`docs/spike-log.md` § Slice 5d, IPC shapes): a project-relative name, never a device path. */
+const MISPLACED_ROW: MisplacedRow = {
+  name: 'docs/report.pdf',
+  size: 4096,
+  sha256: MISPLACED_DIGEST,
+  sha256Short: 'abababab',
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  reason: 'in-project-outside-outbox',
+  remedies: ['quarantine', 'publish', 'ignore'],
+}
+
+describe('misplacedList (slice 5d)', () => {
+  it('invokes misplaced_list with no arguments and returns the rows verbatim, in walk order: eight keys per row, the full digest beside its short form, the three remedies, no path-shaped key', async () => {
+    const second: MisplacedRow = {
+      ...MISPLACED_ROW,
+      name: 'build/bundle.zip',
+      size: 90210,
+      sha256: 'cd'.repeat(32),
+      sha256Short: 'cdcdcdcd',
+      detectedType: 'zip',
+    }
+    const mocked = mockCommand('misplaced_list', () => [MISPLACED_ROW, second])
+
+    const rows = await misplacedList()
+
+    expect(mocked.args()).toEqual({})
+    expect(rows).toEqual([MISPLACED_ROW, second])
+    expect(rows[0]?.sha256).toHaveLength(64)
+    expect(Object.keys(rows[0]!).sort()).toEqual([
+      'class',
+      'detectedType',
+      'name',
+      'reason',
+      'remedies',
+      'sha256',
+      'sha256Short',
+      'size',
+    ])
+    expectNoPathShapedKey(rows[0]!)
+  })
+
+  it('returns an empty list verbatim when no scan has run, or when the last one left nothing standing', async () => {
+    mockCommand('misplaced_list', () => [])
+
+    expect(await misplacedList()).toEqual([])
+  })
+})
+
+describe('misplacedRemedy (slice 5d)', () => {
+  it('invokes misplaced_remedy with exactly { name, sha256, remedy } -- the row\'s own full 64-hex digest, never a path -- and returns the quarantine outcome verbatim: six keys, originalKept false, the detail token', async () => {
+    const quarantined: MisplacedRemedy = {
+      remedy: 'quarantine',
+      outcome: 'quarantined',
+      name: 'abababab-report.pdf',
+      sha256: MISPLACED_DIGEST,
+      originalKept: false,
+      detail: 'renamed',
+    }
+    const mocked = mockCommand('misplaced_remedy', () => quarantined)
+
+    const result = await misplacedRemedy('docs/report.pdf', MISPLACED_DIGEST, 'quarantine')
+
+    expect(mocked.args()).toEqual({
+      name: 'docs/report.pdf',
+      sha256: MISPLACED_DIGEST,
+      remedy: 'quarantine',
+    })
+    expect(Object.keys(mocked.args()).sort()).toEqual(['name', 'remedy', 'sha256'])
+    expect(result).toEqual(quarantined)
+    expect(Object.keys(result).sort()).toEqual([
+      'detail',
+      'name',
+      'originalKept',
+      'remedy',
+      'sha256',
+      'outcome',
+    ].sort())
+    expectNoPathShapedKey(mocked.args())
+    expectNoPathShapedKey(result)
+  })
+
+  it('returns the publish outcome verbatim: copied-to-outbox, the new entry\'s name and digest, originalKept true and a null detail -- the original stays where it was found', async () => {
+    mockCommand('misplaced_remedy', () => ({
+      remedy: 'publish',
+      outcome: 'copied-to-outbox',
+      name: 'abababab-report.pdf',
+      sha256: MISPLACED_DIGEST,
+      originalKept: true,
+      detail: null,
+    }))
+
+    const result = await misplacedRemedy('docs/report.pdf', MISPLACED_DIGEST, 'publish')
+
+    expect(result.outcome).toBe('copied-to-outbox')
+    expect(result.name).toBe('abababab-report.pdf')
+    expect(result.originalKept).toBe(true)
+    expect(result.detail).toBeNull()
+  })
+
+  it('returns the ignore outcome verbatim: ignored, a null name -- the remedy produced nothing -- the finding\'s own digest, originalKept true and a null detail', async () => {
+    mockCommand('misplaced_remedy', () => ({
+      remedy: 'ignore',
+      outcome: 'ignored',
+      name: null,
+      sha256: MISPLACED_DIGEST,
+      originalKept: true,
+      detail: null,
+    }))
+
+    const result = await misplacedRemedy('docs/report.pdf', MISPLACED_DIGEST, 'ignore')
+
+    expect(result.outcome).toBe('ignored')
+    expect(result.name).toBeNull()
+    expect(result.sha256).toBe(MISPLACED_DIGEST)
+    expect(result.originalKept).toBe(true)
+  })
+
+  it('returns every one of the nine detail tokens verbatim, beside the originalKept the shell pairs with it: the five that removed the original (renamed-unverified among them, since the rename returned) and the four HAP-001-R19 residuals that kept it', async () => {
+    // Each token beside the `originalKept` `quarantine_detail` in
+    // `src-tauri/src/ipc/wrong_root.rs` produces for it, arm for arm --
+    // `renamed-unverified` included, which is `false` because a rename
+    // removes the original name whatever the verification afterwards found.
+    const cases: { detail: RemedyDetail; originalKept: boolean }[] = [
+      { detail: 'renamed', originalKept: false },
+      { detail: 'renamed-unverified', originalKept: false },
+      { detail: 'different-volume', originalKept: false },
+      { detail: 'rename-unsupported', originalKept: false },
+      { detail: 'rename-failed', originalKept: false },
+      { detail: 'unlink-failed', originalKept: true },
+      { detail: 'original-already-gone', originalKept: true },
+      { detail: 'original-changed-during-the-move', originalKept: true },
+      { detail: 'identity-check-unavailable', originalKept: true },
+    ]
+    expect(cases).toHaveLength(9)
+    for (const { detail, originalKept } of cases) {
+      mockCommand('misplaced_remedy', () => ({
+        remedy: 'quarantine',
+        outcome: 'quarantined',
+        name: 'abababab-report.pdf',
+        sha256: MISPLACED_DIGEST,
+        originalKept,
+        detail,
+      }))
+
+      const result = await misplacedRemedy('docs/report.pdf', MISPLACED_DIGEST, 'quarantine')
+
+      expect(result.detail).toBe(detail)
+      expect(result.originalKept).toBe(originalKept)
+      clearMocks()
+    }
+  })
+
+  it("rejects with each of the ten codes misplaced_remedy actually reaches -- outbox-linked, outbox-invalid and workspace-unavailable among them -- each with the shell's fixed message and none carrying detail", async () => {
+    // The set is taken from `src-tauri/src/ipc/wrong_root.rs`, not from the
+    // brief: every arm of the four `From<...> for ShellError` impls plus
+    // the command body's own refusals. `outbox-linked` is the one that had
+    // been missed on every list -- it is HAP-001-R20's hard-link refusal
+    // applied to a misplaced file, and it is reachable from **both**
+    // remedies, since `open_misplaced` raises it for the quarantine path
+    // and the copy-in raises it again for the publish path.
+    const errors: ShellError[] = [
+      {
+        code: 'misplaced-unknown',
+        message: 'no scan reported that file at that digest; scan again and retry',
+      },
+      {
+        code: 'quarantine-unavailable',
+        message: 'the quarantine directory resolves inside a registered workspace root',
+      },
+      { code: 'refused', message: "the file's content changed since it was found" },
+      {
+        code: 'outbox-unavailable',
+        message: 'an outbox entry of that name already exists with other content',
+      },
+      { code: 'outbox-linked', message: "the file's link count is greater than one" },
+      { code: 'outbox-invalid', message: 'the outbox declaration could not be loaded' },
+      { code: 'work-area-invalid', message: 'the ignore ledger could not be written' },
+      { code: 'invalid-request', message: 'the digest is not 64 hex characters' },
+      { code: 'run-active', message: 'a run is active; approve or publish once it has ended' },
+      { code: 'workspace-unavailable', message: 'no workspace is active' },
+    ]
+    expect(errors).toHaveLength(10)
+    for (const error of errors) {
+      mockCommand('misplaced_remedy', () => Promise.reject(error))
+
+      const rejected: unknown = await misplacedRemedy(
+        'docs/report.pdf',
+        MISPLACED_DIGEST,
+        'quarantine',
+      ).then(
+        () => {
+          throw new Error('misplaced_remedy resolved instead of rejecting')
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(Object.keys(rejected as object).sort()).toEqual(['code', 'message'])
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+      clearMocks()
+    }
+  })
+})
+
+describe('HarnessFrame misplaced event kind (slice 5d)', () => {
+  it('delivers a misplaced event frame with exactly the six camelCase count fields verbatim -- no name and no path rides it', async () => {
+    const { channel, received } = await spawnAdapterAndCapture('claude-code')
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 10,
+        droppedBefore: 0,
+        kind: 'misplaced',
+        payload: {
+          scanned: 12,
+          findings: 2,
+          ignored: 1,
+          excluded: 3,
+          unreadable: 0,
+          truncated: false,
+        },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    if (delivered?.stream !== 'event' || delivered.body.kind !== 'misplaced') {
+      throw new Error('expected a misplaced event frame')
+    }
+    expect(Object.keys(delivered.body.payload).sort()).toEqual([
+      'excluded',
+      'findings',
+      'ignored',
+      'scanned',
+      'truncated',
+      'unreadable',
+    ])
+    expectNoPathShapedKey(delivered.body.payload)
+  })
+
+  it('delivers the fixed diagnostic a scan that could not run emits in its place, as a diagnostic and never as a misplaced frame claiming nothing was found', async () => {
+    const { channel, received } = await spawnAdapterAndCapture('claude-code')
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 10,
+        droppedBefore: 0,
+        kind: 'diagnostic',
+        payload: {
+          text: 'the project could not be scanned for output written outside the outbox',
+        },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    if (delivered?.stream !== 'event' || delivered.body.kind !== 'diagnostic') {
+      throw new Error('expected a diagnostic event frame')
+    }
+    expect(delivered.body.payload.text).toBe(
+      'the project could not be scanned for output written outside the outbox',
+    )
+  })
+})
+
+describe('slice 5d closed sets', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: switches over OutputDiscipline (two tokens), Remedy (three), RemedyOutcome (three), RemedyDetail (eight) and WrongRootReason (one) with never defaults compile, and at runtime map each token to itself; misplaced is the run-end scan\'s one frame kind', () => {
+    function disciplineLabel(discipline: OutputDiscipline): string {
+      switch (discipline) {
+        case 'enforced':
+        case 'advisory':
+          return discipline
+        default: {
+          const unreachable: never = discipline
+          return unreachable
+        }
+      }
+    }
+    function remedyLabel(remedy: Remedy): string {
+      switch (remedy) {
+        case 'quarantine':
+        case 'publish':
+        case 'ignore':
+          return remedy
+        default: {
+          const unreachable: never = remedy
+          return unreachable
+        }
+      }
+    }
+    function outcomeLabel(outcome: RemedyOutcome): string {
+      switch (outcome) {
+        case 'quarantined':
+        case 'copied-to-outbox':
+        case 'ignored':
+          return outcome
+        default: {
+          const unreachable: never = outcome
+          return unreachable
+        }
+      }
+    }
+    function detailLabel(detail: RemedyDetail): string {
+      switch (detail) {
+        case 'renamed':
+        case 'renamed-unverified':
+        case 'different-volume':
+        case 'rename-unsupported':
+        case 'rename-failed':
+        case 'unlink-failed':
+        case 'original-already-gone':
+        case 'original-changed-during-the-move':
+        case 'identity-check-unavailable':
+          return detail
+        default: {
+          const unreachable: never = detail
+          return unreachable
+        }
+      }
+    }
+    function reasonLabel(reason: WrongRootReason): string {
+      switch (reason) {
+        case 'in-project-outside-outbox':
+          return reason
+        default: {
+          const unreachable: never = reason
+          return unreachable
+        }
+      }
+    }
+
+    const disciplines: OutputDiscipline[] = ['enforced', 'advisory']
+    const remedies: Remedy[] = ['quarantine', 'publish', 'ignore']
+    const outcomes: RemedyOutcome[] = ['quarantined', 'copied-to-outbox', 'ignored']
+    const details: RemedyDetail[] = [
+      'renamed',
+      'renamed-unverified',
+      'different-volume',
+      'rename-unsupported',
+      'rename-failed',
+      'unlink-failed',
+      'original-already-gone',
+      'original-changed-during-the-move',
+      'identity-check-unavailable',
+    ]
+    const reasons: WrongRootReason[] = ['in-project-outside-outbox']
+    expect(disciplines.map(disciplineLabel)).toEqual(disciplines)
+    expect(remedies.map(remedyLabel)).toEqual(remedies)
+    expect(outcomes.map(outcomeLabel)).toEqual(outcomes)
+    expect(details.map(detailLabel)).toEqual(details)
+    expect(reasons.map(reasonLabel)).toEqual(reasons)
+    const kind: Extract<AgentEvent, { kind: 'misplaced' }>['kind'] = 'misplaced'
+    expect(kind).toBe('misplaced')
   })
 })

@@ -17,10 +17,14 @@ import {
   harnessSpawn,
   harnessStop,
   isShellError,
+  misplacedList,
+  misplacedRemedy,
   outboxStatus,
   publicationsList,
   workspaceCurrent,
   workspacePick,
+  wrongRootScan,
+  wrongRootStatus,
   type AdapterDescriptor,
   type AgentEvent,
   type AgentPhaseTag,
@@ -39,13 +43,20 @@ import {
   type GuidanceKind,
   type GuidanceStatus,
   type HarnessFrame,
+  type MisplacedRemedy,
+  type MisplacedRow,
   type Observation,
   type OutboxReason,
   type OutboxStatus,
+  type OutputDiscipline,
   type ProcessId,
   type ProcessTerminalState,
   type ProviderState,
   type Publication,
+  type Remedy,
+  type RemedyDetail,
+  type RemedyOutcome,
+  type ScanSummary,
   type ScopeMode,
   type ShellError,
   type ShellErrorCode,
@@ -54,6 +65,8 @@ import {
   type TerminalDropCounts,
   type WorkAreaState,
   type Workspace,
+  type WrongRootReason,
+  type WrongRootStatus,
 } from './ipc/harness'
 import { PlainTextLine } from './PlainTextLine'
 
@@ -109,6 +122,31 @@ function formatObservation(observation: Observation): string {
   return `${observation.key}: ${observation.value}`
 }
 
+/**
+ * Whether `value` has the shape `Observation` promises, checked before it
+ * is read.
+ *
+ * The same decision `isMisplacedRow` makes about a listing row, made about
+ * a live frame's payload: `observations` is typed as an array of a
+ * two-string record, and the wire types it as whatever arrives. Reading
+ * `.map` off it unchecked threw at render, and a render-time throw inside
+ * the transcript closes the whole Agent panel -- the wrong-roots table,
+ * the remedies, the freeze guards and Stop with it (R3-049).
+ */
+function isObservation(value: unknown): value is Observation {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.key === 'string' && typeof candidate.value === 'string'
+}
+
+/**
+ * Stated at the end of a `state` line when the frame's `observations` was
+ * not a list of observations, so a line short of what the frame carried is
+ * never read as a frame that carried less. Fixed copy, the
+ * {@link MISPLACED_ROWS_DROPPED_SENTENCE} discipline applied to a frame.
+ */
+const OBSERVATIONS_DROPPED_SEGMENT = 'some observations could not be read and are not shown'
+
 /** A `state` event as one compact line: phase, subtype (if any), then each observation as `key: value`. */
 function formatStateEventLine(payload: {
   phase: AgentPhaseTag
@@ -117,7 +155,12 @@ function formatStateEventLine(payload: {
 }): string {
   const segments: string[] = [payload.phase]
   if (payload.subtype !== null) segments.push(payload.subtype)
-  segments.push(...payload.observations.map(formatObservation))
+  const observations: unknown[] = Array.isArray(payload.observations) ? payload.observations : []
+  const readable = observations.filter(isObservation)
+  segments.push(...readable.map(formatObservation))
+  if (readable.length !== observations.length || !Array.isArray(payload.observations)) {
+    segments.push(OBSERVATIONS_DROPPED_SEGMENT)
+  }
   return segments.join(', ')
 }
 
@@ -494,6 +537,8 @@ function formatScopeMode(mode: ScopeMode | null): string {
       return 'advisory'
     case null:
       return 'unreported'
+    default:
+      return unrecognizedWireToken(mode)
   }
 }
 
@@ -748,6 +793,14 @@ function DroppedFramesMarker({ droppedBefore }: { droppedBefore: number }) {
  * zero-interactive-elements bar as the tool-call block -- and `candidates`
  * as one fixed summary line of the eight counts (the table it announces is
  * rendered beside the transcript by the panel, not inside it).
+ *
+ * The wrong-root kind (`docs/spike-log.md` § Slice 5d) renders the same
+ * way: `misplaced` as one fixed summary line of the run-end scan's five
+ * counts -- the very line {@link formatScanSummary} gives the section's own
+ * on-demand scan, so one shape has one wording -- with the truncation
+ * sentence when the walk stopped early. A scan that could not run emits no
+ * `misplaced` frame at all: the shell sends its fixed `diagnostic` text in
+ * its place, which renders as the diagnostic it is.
  */
 function TranscriptEntryView({ item }: { item: TranscriptItem }) {
   if (item.type === 'prompt') {
@@ -822,6 +875,7 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
       {event.kind === 'candidates' && (
         <PlainTextLine text={formatCandidatesSummary(event.payload)} />
       )}
+      {event.kind === 'misplaced' && <PlainTextLine text={formatScanSummary(event.payload)} />}
       {event.kind === 'artifact-publish' && (
         <div data-testid="publish-proposal">
           <p>{PUBLISH_PROPOSAL_LABEL}</p>
@@ -1149,6 +1203,515 @@ function withManagedFile(
     : { ...previous, ignore: update(previous.ignore) }
 }
 
+// -- Slice 5d: wrong roots, `misplaced`, and its three remedies (HAP-001 D16) --
+
+/**
+ * The output-discipline line's fixed copy per closed token (HAP-001-R33),
+ * through an exhaustive switch so a new discipline cannot render
+ * unlabelled. Neither arm claims a write inside the project but outside
+ * the outbox is prevented -- it never is, in any mode; that is
+ * HAP-001-R34's disclosure, carried separately and rendered verbatim.
+ *
+ * The `enforced` arm reports a **declaration**, not a verified fact, and
+ * says so. It used to read "a write outside the project root is prevented
+ * by the sandbox", which asserted more than anything here knows: the
+ * discipline is derived from the weakest `scope_mode` the registered
+ * adapters *declare* (`reported_scope_mode`), nothing in the product
+ * confirms that a sandbox exists or holds, HAP-001 records the enforcement
+ * as unproven on every platform, and this panel's own badge says `advisory
+ * scope -- not a sandbox` two regions above. A user reading a prevention
+ * claim beside that badge has to decide which of the product's two
+ * sentences to believe. Now there is one sentence: the adapter declares it,
+ * and the product does not check.
+ */
+function formatOutputDiscipline(discipline: OutputDiscipline): string {
+  switch (discipline) {
+    case 'enforced':
+      return 'the adapter declares that a write outside the project root is prevented; the product does not verify that claim'
+    case 'advisory':
+      return 'a write outside the project root is not prevented'
+    default:
+      return unrecognizedWireToken(discipline)
+  }
+}
+
+/**
+ * The wrong-root status line: the discipline token with its own fixed
+ * copy, the scope mode it was derived from -- the weakest any registered
+ * adapter declares -- and whether a scan has run in this session with how
+ * many findings it left standing. The disclosures are not part of this
+ * line: each is rendered verbatim on a line of its own, since they are the
+ * contract's honesty about what is not prevented.
+ */
+function formatWrongRootStatusLine(status: WrongRootStatus): string {
+  const scan = status.scanned ? `scanned, findings ${status.findings}` : 'not scanned yet'
+  return `output discipline: ${status.outputDiscipline} (scope ${formatScopeMode(status.scopeMode)}) — ${formatOutputDiscipline(status.outputDiscipline)}; ${scan}`
+}
+
+/**
+ * Stated whenever a scan reports `truncated` (`docs/spike-log.md` § Slice
+ * 5d, D3): the walk stopped at its own bound rather than reaching the end
+ * of the project, so the counts are a partial view and the list beside
+ * them is incomplete. Fixed copy, never wire text -- a truncated scan must
+ * never read as a complete one.
+ */
+const SCAN_TRUNCATED_SENTENCE = 'the scan stopped early; the list is incomplete'
+
+/**
+ * The scan summary line: the five counts of the walk in a fixed order,
+ * zero counts included -- every count always accounted for, like
+ * {@link formatCandidatesSummary}'s -- and the truncation sentence when
+ * the walk stopped early. The same line renders in the section for an
+ * on-demand scan and in the transcript for a run-end `misplaced` frame:
+ * one shape, one wording.
+ */
+function formatScanSummary(summary: ScanSummary): string {
+  const counts = [
+    `${summary.scanned} scanned`,
+    `${summary.findings} findings`,
+    `${summary.ignored} ignored`,
+    `${summary.excluded} excluded`,
+    `${summary.unreadable} unreadable`,
+  ]
+  const line = `scan: ${counts.join(', ')}`
+  return summary.truncated ? `${line} — ${SCAN_TRUNCATED_SENTENCE}` : line
+}
+
+/**
+ * The answer every formatter over a wire-typed union gives for a token its
+ * union does not name.
+ *
+ * These unions are closed in TypeScript and **open on the wire**: the DTO
+ * types each of these fields as a plain string, so a shell one version
+ * ahead of this renderer -- or any payload that is not the one the contract
+ * promises -- puts a value here that no `case` matches. An exhaustive
+ * switch with no `default` then returns `undefined`, which reaches
+ * {@link PlainTextLine} and throws `Array.from(undefined)` during render.
+ * There is no error boundary between these panels and the root, so that
+ * throw takes the whole renderer down -- the approval surface and every
+ * freeze guard with it. A surface that can delete a file inside the user's
+ * project must not be able to disappear because a token it did not
+ * recognize arrived.
+ *
+ * The raw token is rendered as text rather than swallowed: an unrecognized
+ * value is then visible and inert, which is what lets a user report it,
+ * instead of a blank cell that reads as a fact. It reaches the DOM through
+ * `PlainTextLine` like every other wire string, so it is stripped and
+ * escaped on the way. `String(...)` covers the values that are not strings
+ * at all (`undefined` for an absent field, `null` for a null one).
+ */
+function unrecognizedWireToken(token: never): string {
+  return String(token)
+}
+
+/**
+ * A finding's reason cell: fixed copy per closed token through an
+ * exhaustive switch, never the wire token echoed, so a new reason cannot
+ * render unlabelled -- the discipline {@link formatCandidateState} sets --
+ * with {@link unrecognizedWireToken} answering for a token the union does
+ * not name.
+ */
+function formatWrongRootReason(reason: WrongRootReason): string {
+  switch (reason) {
+    case 'in-project-outside-outbox':
+      return 'inside the project, outside the outbox'
+    default:
+      return unrecognizedWireToken(reason)
+  }
+}
+
+/**
+ * Whether `row` has the shape `MisplacedDto` promises, checked field by
+ * field before it is allowed to reach render.
+ *
+ * The top-level `Array.isArray` guard on the listing already refuses a
+ * payload that is not a list, but it says nothing about what is *in* the
+ * list: a `misplaced_list` answering `[{}]` passed that guard and then
+ * threw `Cannot read properties of undefined (reading 'map')` inside the
+ * remedy cell, mid-render, with no error boundary above it. Trusting a
+ * row's shape structurally is the same decision as trusting the list's, and
+ * it is made in the same place.
+ *
+ * A row that fails this is dropped rather than repaired: a half-populated
+ * finding names a file this surface would otherwise offer to delete, and
+ * there is no honest way to render one whose name or digest is missing.
+ * The drop is not silent -- {@link MISPLACED_ROWS_DROPPED_SENTENCE} says
+ * some findings could not be read, so a shortened table is never mistaken
+ * for a shorter list of findings.
+ */
+function isMisplacedRow(row: unknown): row is MisplacedRow {
+  if (typeof row !== 'object' || row === null) return false
+  const candidate = row as Record<string, unknown>
+  return (
+    typeof candidate.name === 'string' &&
+    typeof candidate.size === 'number' &&
+    typeof candidate.sha256 === 'string' &&
+    typeof candidate.sha256Short === 'string' &&
+    typeof candidate.detectedType === 'string' &&
+    typeof candidate.class === 'string' &&
+    typeof candidate.reason === 'string' &&
+    Array.isArray(candidate.remedies) &&
+    candidate.remedies.every((remedy) => typeof remedy === 'string')
+  )
+}
+
+/**
+ * A remedy's button name, one per closed token through an exhaustive
+ * switch. The set offered for a row is the row's own `remedies` array,
+ * never this function's cases: a row that carries fewer offers fewer.
+ *
+ * **The `default` arm is dead, and is named as dead rather than counted as
+ * covered** (R3-044). Every other wire-typed formatter's runtime default is
+ * reachable, because the token reaches the formatter straight off the wire;
+ * this one is not, because `renderRemedies` filters the row's array through
+ * {@link isKnownRemedy} before a button exists to be named. Deleting the
+ * arm leaves the suite green -- measured, not assumed. It is kept for the
+ * same reason `runRemedy`'s own `isKnownRemedy` check is: it is what would
+ * still hold if a later caller named a remedy without going through the
+ * cell, and on this surface the cost of being wrong about that is a button
+ * whose behaviour the user would have to guess.
+ */
+function remedyButtonName(remedy: Remedy): string {
+  switch (remedy) {
+    case 'quarantine':
+      return 'Quarantine'
+    case 'publish':
+      return 'Publish to outbox'
+    case 'ignore':
+      return 'Ignore'
+    default:
+      return unrecognizedWireToken(remedy)
+  }
+}
+
+/**
+ * The remedies this renderer knows how to run, and the subset of them that
+ * removes the original -- both stated as explicit lists rather than
+ * inferred.
+ *
+ * The surface used to decide a remedy's kind by exclusion
+ * (`remedy === 'quarantine' ? gated : one click`), which fails **open**:
+ * every token that is not literally `quarantine` -- a remedy a later
+ * contract adds, a typo in a payload, anything at all -- was treated as
+ * non-destructive and given a one-click button. The direction of that
+ * default is wrong for this surface. A remedy is offered only if it is in
+ * {@link KNOWN_REMEDIES}, and it is gated if it is in
+ * {@link DESTRUCTIVE_REMEDIES}; an unknown token gets no button, so a
+ * remedy this renderer cannot describe cannot be run from it.
+ */
+const KNOWN_REMEDIES: readonly Remedy[] = ['quarantine', 'publish', 'ignore']
+
+/**
+ * The remedies that remove the original from the project, named explicitly
+ * (HAP-001-R32). Quarantine is the only one today; publish leaves the file
+ * where it was found (HAP-001-R28) and ignore touches no file at all.
+ */
+const DESTRUCTIVE_REMEDIES: readonly Remedy[] = ['quarantine']
+
+/** Whether `remedy` is a remedy this renderer knows how to offer and run. */
+function isKnownRemedy(remedy: Remedy): boolean {
+  return KNOWN_REMEDIES.includes(remedy)
+}
+
+/** Whether running `remedy` removes the original from the project. */
+function isDestructiveRemedy(remedy: Remedy): boolean {
+  return DESTRUCTIVE_REMEDIES.includes(remedy)
+}
+
+/**
+ * What a remedy did, fixed copy per closed outcome token through an
+ * exhaustive switch.
+ */
+function formatRemedyOutcome(outcome: RemedyOutcome): string {
+  switch (outcome) {
+    case 'quarantined':
+      return 'moved into quarantine, outside any workspace'
+    case 'copied-to-outbox':
+      return 'copied into the outbox as a new unattributed entry'
+    case 'ignored':
+      return 'the decision was recorded, and the file is not offered again until its content changes'
+    default:
+      return unrecognizedWireToken(outcome)
+  }
+}
+
+/**
+ * What `originalKept` actually means, said in words rather than left to a
+ * boolean.
+ *
+ * `true` is **not** "the file is still where you left it", and the copy
+ * used to say exactly that. The shell sets `originalKept: true` for
+ * `original-already-gone`, `original-changed-during-the-move` and
+ * `identity-check-unavailable` as well -- outcomes where the original is
+ * respectively gone, replaced, and unknown -- because what the flag records
+ * is that **this remedy** did not remove it, not that it is there. The
+ * receipt said one thing and its own `detail` line said another, and only
+ * the detail was right. So `true` now claims no more than the flag carries;
+ * where the file actually ended up is the `detail` token's sentence, on the
+ * same line.
+ *
+ * `false` is the unambiguous half: the remedy removed the original, and
+ * that includes `renamed-unverified`, where the rename returned and only
+ * its verification did not. `null` -- the wire admits it on every one of
+ * these fields -- states the absence rather than assuming either, since
+ * assuming `true` would under-report a deletion and assuming `false` would
+ * report one that never happened.
+ */
+function formatOriginalKept(originalKept: boolean | null): string {
+  if (originalKept === null) return 'whether the original was kept was not reported'
+  return originalKept
+    ? 'this remedy did not remove the original'
+    : 'the original is gone from the project'
+}
+
+/**
+ * A remedy's `detail` token, fixed copy per closed token through an
+ * exhaustive switch. The first five name which move ran; the last four are
+ * HAP-001-R19's residual -- the copy stands and the original was kept --
+ * stated rather than left as a bare token.
+ *
+ * `renamed-unverified` is the delete remedy's failure branch and is worded
+ * so it cannot be read as a clean move: the rename returned, so the file is
+ * out of the project and the original name is gone (`originalKept: false`),
+ * but the destination could not then be re-opened and digested, so nothing
+ * here has checked that what arrived is what left. Both halves are said,
+ * because either one alone misleads -- "moved" alone hides an unverified
+ * arrival, and "could not verify" alone reads as a refusal that left the
+ * file in place.
+ */
+function formatRemedyDetail(detail: RemedyDetail): string {
+  switch (detail) {
+    case 'renamed':
+      return 'moved by rename'
+    case 'renamed-unverified':
+      return 'moved by rename, but its arrival in quarantine could not be verified: the file is out of the project and nothing here has checked what arrived'
+    case 'different-volume':
+      return 'copied and removed: the quarantine is on another volume'
+    case 'rename-unsupported':
+      return 'copied and removed: this platform has no handle-anchored rename'
+    case 'rename-failed':
+      return 'copied and removed: the rename failed'
+    case 'unlink-failed':
+      return 'the copy stands and the original could not be removed'
+    case 'original-already-gone':
+      return 'the copy stands and the original was already gone'
+    case 'original-changed-during-the-move':
+      return 'the copy stands and the original changed during the move'
+    case 'identity-check-unavailable':
+      return 'the copy stands and this platform cannot prove the name still holds it'
+    default:
+      return unrecognizedWireToken(detail)
+  }
+}
+
+/**
+ * Stated on every `copied-to-outbox` result (HAP-001-R22, D3, and the Rust
+ * half's deliberate refusal to auto-approve): the remedy prepared an
+ * ordinary outbox entry and published nothing. The user still approves it
+ * explicitly, from the whole-outbox listing, like any other entry. Fixed
+ * copy.
+ */
+const COPY_NEEDS_APPROVAL_SENTENCE =
+  'the copy is not published: approve it in the outbox listing like any other entry'
+
+/**
+ * Stated on every `ignored` result: an ignore is one unconfirmed click and
+ * it is permanent.
+ *
+ * `docs/spike-log.md` § Slice 5d records that the ignore ledger "grows
+ * without bound and has no listing or revocation command" -- so a single
+ * click on a button beside two others suppresses a detection for that
+ * file's content forever, and there is nowhere in the product to see what
+ * has been suppressed or to undo it. The remedy is not destructive to the
+ * *file*, which is why it is not gated; it is destructive to the
+ * *detection*, and this slice can at least stop that from being a surprise.
+ * Fixed copy.
+ */
+const IGNORE_IS_PERMANENT_SENTENCE =
+  'this decision cannot be undone or reviewed from this product: nothing here lists what has been ignored'
+
+/**
+ * The result of a completed remedy: which remedy ran, what it did, what it
+ * produced (for the two that produce something), whether the original is
+ * still in the project, and the detail token's own fixed copy. The remedy
+ * token is transcribed verbatim (`docs/target-architecture.md` invariant
+ * 8); everything else is fixed copy chosen by an exhaustive switch. The
+ * whole line renders through {@link PlainTextLine}: the produced name is
+ * derived from project-originated text.
+ */
+function formatRemedyResultLine(result: MisplacedRemedy): string {
+  const segments = [`${result.remedy}: ${formatRemedyOutcome(result.outcome)}`]
+  if (result.name !== null) segments.push(`name ${result.name}`)
+  segments.push(formatOriginalKept(result.originalKept))
+  if (result.outcome === 'copied-to-outbox') segments.push(COPY_NEEDS_APPROVAL_SENTENCE)
+  if (result.outcome === 'ignored') segments.push(IGNORE_IS_PERMANENT_SENTENCE)
+  if (result.detail !== null) segments.push(formatRemedyDetail(result.detail))
+  return segments.join('; ')
+}
+
+/**
+ * Stated on the quarantine confirmation block before the decision
+ * (HAP-001-R32, RCS-001-R10, R11): quarantine is the one remedy that
+ * removes the original, and neither the button name nor the `quarantine`
+ * token says where the file goes or what happens to it there. Fixed copy.
+ *
+ * The line used to end "and left unexecuted and reveal-only", which
+ * promised two properties this spike does not implement.
+ * `docs/spike-log.md` § Slice 5d records RCS-001-R11's reveal-only rule as
+ * **honored by omission**: there is no reveal affordance and no listing
+ * command, so nothing sets a flag and nothing enforces one. "Unexecuted"
+ * is no better: the two quarantine paths do not even agree with each other
+ * -- the copy path creates its destination `0o600` on unix, while the
+ * rename path moves the file with whatever mode it already had, and
+ * Windows has neither -- so no single sentence about the file's own
+ * permissions is true of a quarantine in general, and the line says
+ * nothing about them at all rather than pick the flattering half.
+ *
+ * What is true on every path is the negative, and that is what it now
+ * says: this product gives the user no way back to the file. Stating the
+ * absence is also the more useful warning, since it is what makes the move
+ * hard to undo.
+ */
+const QUARANTINE_SCOPE_LINE =
+  'the file will be MOVED out of the project into the quarantine directory, outside any workspace; this product then offers no way to list, open or restore it'
+
+/**
+ * The disclosures the surface states when the report is unknown or carries
+ * none of its own (HAP-001-R33, R34).
+ *
+ * These lines are the contract's honesty about what is *not* prevented, so
+ * they are the one thing on this surface that must not depend on a fetch
+ * succeeding. `wrongroot_status` fails silently to `null` -- an automatic
+ * refresh is not a user act, so it raises no banner -- and the disclosures
+ * used to be rendered inside that `null` check: with the status rejecting,
+ * the user got no discipline line, no disclosures and no banner, while Scan
+ * stayed enabled and Quarantine stayed offered. The surface went on
+ * offering the acts and stopped saying what it does not prevent.
+ *
+ * The fallback is the **advisory** pair rather than the `enforced` line
+ * alone, and deliberately: with no report in hand the product cannot claim
+ * an enforcement it has not been told about, so it states the weaker,
+ * safer pair. They are the renderer's own fixed copy, matching
+ * `OutputDiscipline::disclosures`; when a report does arrive its own
+ * strings are rendered verbatim in their place.
+ */
+const FALLBACK_DISCLOSURES: readonly string[] = [
+  'a write inside the project but outside the outbox is detected after the run, never prevented',
+  'a write outside the project is possible and is detected after the run, not prevented',
+]
+
+/**
+ * Stated in place of the output-discipline line when `wrongroot_status`
+ * has not answered (HAP-001-R33): the report is unknown, and an unknown
+ * report is said rather than left as a blank space that reads like a clean
+ * one. Fixed copy.
+ */
+const OUTPUT_DISCIPLINE_UNKNOWN_LINE =
+  'output discipline: not reported — the report could not be read; the disclosures below hold in every mode'
+
+/**
+ * Stated when `misplaced_list` did not answer (HAP-001-R32).
+ *
+ * A rejection used to set an empty list, which renders no table at all --
+ * pixel-for-pixel what a project with nothing misplaced looks like. That is
+ * the one reading this surface must never allow by accident: "no findings"
+ * and "the findings could not be read" are opposite facts, and the second
+ * one silently rendering as the first is how a detection surface stops
+ * being a detection surface. Fixed copy.
+ */
+const MISPLACED_UNAVAILABLE_SENTENCE =
+  'the findings could not be read; this is not a report that nothing is misplaced'
+
+/**
+ * Stated when the listing answered but some of its rows did not have the
+ * shape the DTO promises and were dropped ({@link isMisplacedRow}), so a
+ * shortened table is never read as a shorter list of findings. Fixed copy.
+ */
+const MISPLACED_ROWS_DROPPED_SENTENCE =
+  'some findings could not be read and are not listed; the table below is incomplete'
+
+/**
+ * How long a remedy may go unanswered before the surface says so.
+ *
+ * This is a **notice deadline, not a cancellation one**, and the difference
+ * is the whole of R3-042's answer. `harnessStop(id, STOP_DEADLINE_MS)`
+ * passes its deadline to the shell, which enforces it -- graceful, then
+ * forceful, within the window. `misplaced_remedy` takes `{ name, sha256,
+ * remedy }` and nothing else, so the renderer has no deadline to hand it
+ * and no way to withdraw a request already made.
+ *
+ * What it must not do is give up on its own. The remedy holds the
+ * publication surface lock and may be part-way through moving a file out of
+ * the project; releasing the freeze on a timer would put a second delete
+ * button in front of the user while the first delete is still running, and
+ * would report an outcome nobody observed. So the wait stands, and what
+ * changes is that it stops being silent: a remedy that has not answered
+ * within this window says so, and keeps saying so until it does.
+ */
+const REMEDY_UNANSWERED_NOTICE_MS = 10_000
+
+/**
+ * Stated while a remedy has been in flight past
+ * {@link REMEDY_UNANSWERED_NOTICE_MS} -- the difference between a frozen
+ * surface and a frozen surface that has said why. Fixed copy, and
+ * deliberately claims nothing about what the remedy did: nothing here has
+ * observed it.
+ */
+const REMEDY_UNANSWERED_SENTENCE =
+  'the remedy has not answered yet; it may still be running, so nothing here can say whether the file has moved, and the findings stay frozen until it answers'
+
+/**
+ * Marked beside a finding's name when the name as displayed is not the name
+ * as it arrived -- that is, when stripping control and format characters
+ * changed it (`docs/renderer-content-security.md`).
+ *
+ * Two findings whose names differ only by an invisible character render
+ * identically, and this surface offers to delete one of them. The mark does
+ * not say which characters were removed (that would put them back on the
+ * screen) -- it says the displayed name is not the whole name, which is
+ * enough for the user to stop trusting the two rows to be distinguishable
+ * by eye and to use the digest column instead. Fixed copy.
+ */
+const NAME_HAS_HIDDEN_CHARACTERS_MARK = '(this name contains hidden characters; compare by digest)'
+
+/**
+ * Whether `name` renders as something other than itself, i.e. whether
+ * {@link stripControlCharacters} removed anything from it.
+ */
+function hasHiddenCharacters(name: string): boolean {
+  return stripControlCharacters(name) !== name
+}
+
+/**
+ * Whether `input` confirms the quarantine of `row`: an exact,
+ * case-sensitive match against the row's own short digest, the fact the
+ * block shows -- slice 2's shape and its R1-001 discipline, the same gate
+ * the 5b approval and the 5c guidance write use. The typed value is a gate
+ * only: the request carries the row's full `sha256`, never anything typed.
+ *
+ * Two refusals stand in front of that comparison, and both matter because
+ * this gate is the only thing between a click and a deleted file.
+ *
+ * An **empty** `sha256Short` would otherwise be confirmed by an empty
+ * input: the user types nothing, the strings match, and the button that
+ * removes a file from the project becomes clickable having asked for
+ * nothing at all. A gate that a blank row satisfies is not a gate.
+ *
+ * A `sha256Short` that is **not a prefix of** `sha256` means the fact the
+ * user is being asked to read and the fact the request will carry are not
+ * the same fact. The gate shows and checks the short digest; the request
+ * binds the full one; nothing in between had ever compared them, so a
+ * payload whose two digest fields disagree would have the user confirm one
+ * file and the shell act on another. They are two views of one identity or
+ * the row is not coherent, and an incoherent row is refused rather than
+ * confirmed.
+ */
+function isQuarantineConfirmed(row: MisplacedRow, input: string): boolean {
+  if (row.sha256Short === '') return false
+  if (!row.sha256.startsWith(row.sha256Short)) return false
+  return input === row.sha256Short
+}
+
 /**
  * First built-in harness adapter control panel (`docs/spike-log.md` §
  * Slice 3): pick a workspace, pick a built-in adapter and an approved
@@ -1182,7 +1745,22 @@ export function AgentPanel() {
   const [prompt, setPrompt] = useState('')
 
   const [activeId, setActiveId] = useState<ProcessId | null>(null)
-  const [isSpawning, setIsSpawning] = useState(false)
+  /**
+   * How many `harness_spawn` calls this panel has in flight -- a count, not
+   * a flag.
+   *
+   * A boolean here said "the last spawn to settle has settled", which is a
+   * different fact from "no spawn is pending" the moment more than one can
+   * exist: a spawn whose generation a later Start had already replaced
+   * still cleared the flag in its own `finally`, and the run-active freeze
+   * came off while a child process was live and another spawn was still
+   * out (R3-034). `handleStart` refuses a second spawn outright now
+   * (R3-033), so the count should never exceed one; it is kept as a count
+   * because the value's *meaning* is "any spawn pending", and a flag can
+   * only express that while exactly one exists.
+   */
+  const [pendingSpawns, setPendingSpawns] = useState(0)
+  const isSpawning = pendingSpawns > 0
   const [badge, setBadge] = useState('idle')
   const [transcript, setTranscript] = useState<TranscriptState>(EMPTY_TRANSCRIPT)
   const [error, setError] = useState<PanelError | null>(null)
@@ -1197,6 +1775,46 @@ export function AgentPanel() {
    * R3-005). A rejected stop leaves the run -- and this -- as it was.
    */
   const runActive = isSpawning || activeId !== null
+
+  /**
+   * The same fact as {@link runActive}, readable synchronously.
+   *
+   * `runActive` is a render value, so every handler closes over the value
+   * from the render it was created in -- one render behind a run that has
+   * just started. `handleStart` raises the pending-spawn count inside a
+   * click handler, so two clicks batched into one tick (Start, then a
+   * remedy, with no re-render between them) reach a remedy handler whose
+   * `runActive` still reads `false` **and** a remedy button whose
+   * `disabled` has not been recomputed either. Both halves of the freeze
+   * were one render stale at the same moment, which left the handler-side
+   * `runActive` check unable to refuse anything a click could actually
+   * deliver -- deleting it left the whole suite green, because nothing
+   * could reach it.
+   *
+   * The ref is set synchronously where the run starts, so the refusal is
+   * available in the tick the race happens in. **`handleStart` reads it
+   * too** (R3-033): Start is one of those entry points, it carries the same
+   * one-render-stale `disabled`, and the second click on it does not open a
+   * remedy but a second child process -- one whose id the generation check
+   * then discards, leaving a running process with no active id, no Stop
+   * button and no transcript.
+   *
+   * It is allowed to lag in the other direction: an effect clears it after
+   * the run ends, so it stays `true` a moment longer than necessary and
+   * refuses a remedy that would have been permitted a tick later. That is
+   * the conservative direction, and it is the one the shell also takes --
+   * `misplaced_remedy` holds the publication surface lock and re-checks
+   * `any_running()` itself, so this guard exists to make the surface answer
+   * the same way the shell does, not to be the only thing standing between
+   * a click and a moved file. What it must never do is lag the *other* way,
+   * which is why {@link pendingSpawns} counts rather than flags: the effect
+   * mirrors `runActive`, and `runActive` used to go false in the `finally`
+   * of whichever spawn settled first rather than the last (R3-034).
+   */
+  const runActiveRef = useRef(false)
+  useEffect(() => {
+    runActiveRef.current = runActive
+  }, [runActive])
 
   /**
    * Tracks whether this component instance is still mounted, guarding
@@ -1482,6 +2100,201 @@ export function AgentPanel() {
   const guidancePinBusyRef = useRef(false)
   const [guidancePinBusy, setGuidancePinBusy] = useState(false)
 
+  /**
+   * The active project's wrong-root state (slice 5d, HAP-001 D16): the
+   * output-discipline report `wrongroot_status` answered, or `null` while
+   * unknown; the findings the last scan left standing; the last scan's own
+   * summary line, or `null` while none has run since the section was reset;
+   * and the last remedy's receipt.
+   */
+  const [wrongRoot, setWrongRoot] = useState<WrongRootStatus | null>(null)
+  const [misplaced, setMisplaced] = useState<MisplacedRow[]>([])
+  const [scanSummary, setScanSummary] = useState<string | null>(null)
+  const [remedyResult, setRemedyResult] = useState<string | null>(null)
+
+  /**
+   * Why the findings table is empty, when it is empty for a reason other
+   * than "nothing is misplaced": `unavailable` when `misplaced_list` did
+   * not answer or did not answer a list, `dropped` when it answered a list
+   * some of whose rows were not findings. `null` when the listing is
+   * exactly what the shell reported.
+   *
+   * An empty table is the same picture as a clean project, so the reason
+   * has to be carried separately and stated -- this is the one surface
+   * where "I found nothing" and "I could not look" must never render alike.
+   */
+  const [misplacedFault, setMisplacedFault] = useState<'unavailable' | 'dropped' | null>(null)
+
+  /**
+   * The generation of the wrong-root section's context: the workspace it is
+   * about. Bumped by a workspace pick, the same generation guard
+   * `guidanceContextRef` puts on the guidance section and
+   * `spawnGenerationRef` on a run's continuations (slice 5c review,
+   * R1-001). A scan or a remedy that resolves after the user has picked
+   * another project is dropped whole rather than posting one project's
+   * findings, counts or receipt under the next -- the shell's own
+   * name-and-digest binding cannot tell two projects apart whose
+   * `docs/report.pdf` came byte-identical from one template.
+   */
+  const wrongRootContextRef = useRef(0)
+
+  /**
+   * The sequence number of the most recently *started* `wrongroot_status`
+   * and `misplaced_list` fetch -- the same sequenced-fetch pattern as
+   * `outbox_status` above (R3-008): only the latest fetch's response is
+   * applied.
+   */
+  const latestWrongRootStatusRef = useRef(0)
+  const latestMisplacedRef = useRef(0)
+
+  /**
+   * Fetches the output-discipline report. An automatic refresh -- on mount,
+   * after a workspace pick, after a scan, after a remedy -- is not a user
+   * act, so a rejection only clears the line rather than raising a banner
+   * the user cannot act on, exactly as the guidance fetches and the outbox
+   * status line do.
+   */
+  const refreshWrongRootStatus = useCallback(() => {
+    const context = wrongRootContextRef.current
+    const requestId = (latestWrongRootStatusRef.current += 1)
+    wrongRootStatus()
+      .then((status) => {
+        if (!mountedRef.current) return
+        if (context !== wrongRootContextRef.current) return
+        if (requestId !== latestWrongRootStatusRef.current) return
+        setWrongRoot(status)
+      })
+      .catch(() => {
+        if (!mountedRef.current) return
+        if (context !== wrongRootContextRef.current) return
+        if (requestId !== latestWrongRootStatusRef.current) return
+        setWrongRoot(null)
+      })
+  }, [])
+
+  /**
+   * Fetches the findings the last scan left standing. Sequenced and
+   * generation-guarded like the status fetch. A payload that is not the
+   * list the contract promises becomes no rows rather than throwing
+   * mid-render and taking the whole panel down with it -- the
+   * fail-safe-to-nothing discipline `handleFrame`, `fetchGuidanceSnapshots`
+   * and `handleListOutbox` already apply -- and each row is checked
+   * ({@link isMisplacedRow}) before it is allowed to render, since the
+   * list-level guard says nothing about what is in the list.
+   *
+   * Unlike the status fetch, this one is **not silent when it fails**. It
+   * raises no banner (an automatic refresh is not a user act, and the user
+   * has nothing to retry) but it does record why the table is empty, so
+   * "the findings could not be read" never renders as "nothing is
+   * misplaced". Every path sets the fault, including the success path,
+   * which clears it.
+   */
+  const refreshMisplaced = useCallback(() => {
+    const context = wrongRootContextRef.current
+    const requestId = (latestMisplacedRef.current += 1)
+    misplacedList()
+      .then((rows) => {
+        if (!mountedRef.current) return
+        if (context !== wrongRootContextRef.current) return
+        if (requestId !== latestMisplacedRef.current) return
+        if (!Array.isArray(rows)) {
+          setMisplaced([])
+          setMisplacedFault('unavailable')
+          return
+        }
+        const findings = rows.filter(isMisplacedRow)
+        setMisplaced(findings)
+        setMisplacedFault(findings.length === rows.length ? null : 'dropped')
+      })
+      .catch(() => {
+        if (!mountedRef.current) return
+        if (context !== wrongRootContextRef.current) return
+        if (requestId !== latestMisplacedRef.current) return
+        setMisplaced([])
+        setMisplacedFault('unavailable')
+      })
+  }, [])
+
+  /**
+   * Both wrong-root fetches: on mount, again after a successful workspace
+   * pick (the findings are the project's, and the shell clears them when
+   * the active workspace changes), and again after every scan and every
+   * remedy.
+   */
+  const refreshWrongRoot = useCallback(() => {
+    refreshWrongRootStatus()
+    refreshMisplaced()
+  }, [refreshWrongRootStatus, refreshMisplaced])
+
+  useEffect(() => {
+    refreshWrongRoot()
+  }, [refreshWrongRoot])
+
+  /** True while a `wrongroot_scan` is in flight (one at a time). */
+  const [isScanning, setIsScanning] = useState(false)
+
+  /**
+   * The same flag as `isScanning`, set synchronously so a second click
+   * landing before React has re-rendered the disabled button starts no
+   * second walk.
+   */
+  const scanBusyRef = useRef(false)
+
+  /**
+   * The identity of the row whose quarantine confirmation block is open, or
+   * `null` -- the name **and** the full digest, which is the same pair
+   * `misplaced_remedy` binds a request to.
+   *
+   * The block used to be bound by name alone. The section refetches on
+   * every scan and on every run-end `misplaced` frame, and a run-end frame
+   * arrives without the user doing anything at all: a refetch that returned
+   * the same name at different bytes swapped the identity facts inside an
+   * open confirmation -- the digest the user was part-way through reading
+   * and typing among them -- while the block stayed open and looked
+   * unchanged. Binding to the pair means the block the user opened either
+   * still names the finding they opened it for, or it is gone. It closes
+   * rather than re-binds: the facts they had read no longer describe
+   * anything, and the decision has to be taken again on the new ones.
+   */
+  const [quarantining, setQuarantining] = useState<{ name: string; sha256: string } | null>(null)
+
+  /**
+   * The digest the user has typed into the quarantine block. Only ever set
+   * from the input's own change events -- never from a finding's name, its
+   * digest, or any other harness- or project-originated string (TM-001-R1).
+   */
+  const [quarantineInput, setQuarantineInput] = useState('')
+
+  /** True while a `misplaced_remedy` is in flight (one at a time, whichever remedy). */
+  const [remedyBusy, setRemedyBusy] = useState(false)
+
+  /**
+   * The same flag as `remedyBusy`, set synchronously so a second click
+   * landing before React has re-rendered the disabled buttons is still
+   * refused -- a remedy must run once per choice, never twice, and
+   * quarantine removes the original.
+   */
+  const remedyBusyRef = useRef(false)
+
+  /**
+   * True once a remedy has been in flight past
+   * {@link REMEDY_UNANSWERED_NOTICE_MS} and until it settles: what turns a
+   * silently frozen section into one that has said why (R3-042).
+   */
+  const [remedyUnanswered, setRemedyUnanswered] = useState(false)
+
+  /**
+   * Closes the quarantine confirmation block and clears its typed gate.
+   * The two always move together -- a gate that outlived its block would
+   * pre-fill the next one, which is exactly what TM-001-R1 forbids -- so
+   * they are cleared from one place rather than from each of the four that
+   * close the block.
+   */
+  const closeQuarantineBlock = useCallback(() => {
+    setQuarantining(null)
+    setQuarantineInput('')
+  }, [])
+
   useEffect(() => {
     adaptersList()
       .then((list) => {
@@ -1691,6 +2504,14 @@ export function AgentPanel() {
             setError(isShellError(listError) ? listError : 'unexpected')
           })
       }
+      if (frame.body.kind === 'misplaced') {
+        // The run-end scan replaced the shell's findings for this project
+        // (slice 5d, D4/D5): the section's table and status line follow
+        // them rather than leaving the transcript's counts to speak for a
+        // table that still shows the previous scan's rows. Both fetches
+        // carry their own workspace-generation and sequence guards.
+        refreshWrongRoot()
+      }
       setTranscript((previous) =>
         appendTranscriptEntry(previous, {
           type: 'agent-event',
@@ -1705,12 +2526,27 @@ export function AgentPanel() {
     // (`docs/spike-log.md` § Slice 3) -- ignored defensively rather than
     // asserted unreachable, so a future protocol change fails safe (no
     // rendering) instead of throwing.
-  }, [])
+  }, [refreshWrongRoot])
 
   async function handlePickWorkspace() {
     // Belt and braces with the button's own `disabled`: never move the
-    // workspace under an active run.
-    if (runActive) return
+    // workspace under an active run. The ref is read first because the
+    // render value is one render behind a run that has just started.
+    if (runActiveRef.current || runActive) return
+    // Nor under a remedy in flight. The generation guard drops a remedy
+    // that resolves after a pick, which is right for a *receipt* -- posting
+    // one project's move under the next reads as a move inside that one --
+    // but it is the wrong answer for a quarantine, because the file has
+    // already left the project by then and dropping the receipt is the
+    // product silently declining to say so. Between telling the user about
+    // a deletion under the wrong project heading and not telling them at
+    // all, the honest fix is neither: hold the pick until the remedy
+    // resolves, so the receipt is always posted under the project it
+    // belongs to. A remedy is one file operation and the pick opens a
+    // native dialog the user must then work through, so the wait is short
+    // and the window it closes -- "confirm quarantine, then pick another
+    // project" -- is ordinary clicking, not a race the user has to lose.
+    if (remedyBusyRef.current) return
     setError(null)
     setWorkspaceStatus(null)
     setIsPickingWorkspace(true)
@@ -1734,6 +2570,23 @@ export function AgentPanel() {
       setGuidanceInput('')
       setGuidanceResult(null)
       refreshGuidance()
+      // The findings are the project's too, and the shell clears them when
+      // the active workspace changes (slice 5d, D5): the open quarantine
+      // block, its typed gate, the last scan's counts and the last remedy's
+      // receipt all belong to the project that was active when they were
+      // made, so the section is reset before it is fetched afresh. The
+      // context generation bumps with the reset, so a scan or a remedy
+      // still in flight for the previous project posts nothing here
+      // (R1-001) -- the shell's own name-and-digest binding cannot tell two
+      // projects apart whose `docs/report.pdf` came from one template.
+      wrongRootContextRef.current += 1
+      setWrongRoot(null)
+      setMisplaced([])
+      setMisplacedFault(null)
+      setScanSummary(null)
+      setRemedyResult(null)
+      closeQuarantineBlock()
+      refreshWrongRoot()
     } catch (pickError: unknown) {
       if (!mountedRef.current) return
       if (isShellError(pickError) && pickError.code === 'no-workspace') {
@@ -1747,6 +2600,16 @@ export function AgentPanel() {
   }
 
   async function handleStart() {
+    // Never a second child process. Start carries `disabled={runActive ||
+    // ...}` like every other entry point on this panel, and that attribute
+    // is one render behind a run that has just started -- so two clicks
+    // batched into one tick both used to reach here with the button still
+    // enabled, and both spawned. The second one's generation then won the
+    // check below, so the *first* process was left with no active id: no
+    // Stop button, no transcript, and no way for this surface to reach it
+    // again (R3-033). The ref is the same synchronous read every remedy
+    // makes, on the entry point whose second click costs the most.
+    if (runActiveRef.current) return
     // Belt-and-suspenders: the Start button is already disabled while a
     // required selection is missing or the prompt exceeds the advisory
     // cap, but never spawn on a value this panel itself considers invalid.
@@ -1771,7 +2634,11 @@ export function AgentPanel() {
       trimmedCount: 0,
     })
     setCandidates(null)
-    setIsSpawning(true)
+    // Synchronously, beside the state update it mirrors: a remedy click
+    // batched into this same tick must see the run as active, and the
+    // pending-spawn count will not be visible to it until the next render.
+    runActiveRef.current = true
+    setPendingSpawns((pending) => pending + 1)
     try {
       const id = await harnessSpawn(
         { type: 'adapter', adapterId, approvalId, prompt: sentPrompt },
@@ -1807,7 +2674,10 @@ export function AgentPanel() {
       setCandidates((current) => current ?? previousCandidates)
       setError(isShellError(spawnError) ? spawnError : 'unexpected')
     } finally {
-      if (mountedRef.current) setIsSpawning(false)
+      // This spawn's own share of the count, never the whole flag: a spawn
+      // whose generation a later Start replaced must not report that no
+      // spawn is pending (R3-034).
+      if (mountedRef.current) setPendingSpawns((pending) => pending - 1)
     }
   }
 
@@ -2115,6 +2985,154 @@ export function AgentPanel() {
   }
 
   /**
+   * Scans the active workspace root for output written outside the outbox
+   * (slice 5d; HAP-001-R32, R43, R44). Observation only: nothing is moved,
+   * copied or recorded, so -- unlike every remedy -- it stays live while a
+   * run is active, exactly as the shell's own `wrongroot_scan` does (a
+   * run-end scan is this same body). One at a time, by a ref set
+   * synchronously as well as by the button's own `disabled`.
+   *
+   * The answer is applied only while the section is still about the same
+   * workspace (R1-001): a scan in flight when the user picks another
+   * project resolves after the section has been reset, and its counts and
+   * findings belong to the project the user has left.
+   */
+  async function handleScan() {
+    if (scanBusyRef.current) return
+    const context = wrongRootContextRef.current
+    scanBusyRef.current = true
+    setIsScanning(true)
+    setError(null)
+    try {
+      const summary = await wrongRootScan()
+      if (!mountedRef.current) return
+      if (context !== wrongRootContextRef.current) return
+      setScanSummary(formatScanSummary(summary))
+      // The scan replaced the shell's findings: the table and the status
+      // line follow it rather than the counts this response carried.
+      refreshWrongRoot()
+    } catch (scanError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== wrongRootContextRef.current) return
+      setError(isShellError(scanError) ? scanError : 'unexpected')
+    } finally {
+      scanBusyRef.current = false
+      if (mountedRef.current) setIsScanning(false)
+    }
+  }
+
+  /**
+   * Opens the quarantine confirmation block for `row` (HAP-001-R32): the
+   * block shows that row's identity-bound facts, says in words that the
+   * file will be moved out of the project, and opens with an empty input --
+   * nothing pre-fills it. Invokes nothing. Frozen while a run is active or a
+   * remedy is in flight, belt and braces with the buttons' own `disabled`.
+   *
+   * It takes the whole row rather than a name because the block is bound to
+   * the row's **name and full digest**, the pair `misplaced_remedy` itself
+   * binds to: a later refetch reporting that name at other bytes is a
+   * different finding, and the block closes rather than re-binding to it
+   * under a decision the user is part-way through taking.
+   */
+  function openQuarantine(row: MisplacedRow) {
+    if (runActiveRef.current || runActive || remedyBusyRef.current) return
+    setQuarantining({ name: row.name, sha256: row.sha256 })
+    setQuarantineInput('')
+  }
+
+  /**
+   * One of HAP-001-R32's three remedies over one finding (slice 5d).
+   * Publish and Ignore do not remove the file -- publish leaves it where it
+   * was found and ignore touches no file at all -- so they act on a single
+   * click; every remedy in {@link DESTRUCTIVE_REMEDIES} reaches here only
+   * through the confirmation block's typed short-digest gate, re-checked
+   * here rather than trusted to the button's `disabled`, the discipline the
+   * slice 2, 5b and 5c gates set.
+   *
+   * The request carries the row's own name and full `sha256` -- the
+   * identity facts the last scan reported, never anything typed -- and only
+   * a remedy the row's own `remedies` array offers is ever sent.
+   *
+   * Both continuations still carry the workspace-generation guard (R1-001),
+   * but as belt and braces rather than as a reachable path: the workspace
+   * pick is now held for the length of a remedy, so a remedy can no longer
+   * be in flight across one. That guard was the right answer to the *wrong*
+   * half of the problem -- it stopped a receipt naming a file from posting
+   * under the project the user moved to, which would read as a move inside
+   * *that* project, but it did so by discarding the receipt, leaving the
+   * user never told that a quarantine had taken the file out. Holding the
+   * pick is what makes the receipt land under the project it belongs to.
+   */
+  async function runRemedy(row: MisplacedRow, remedy: Remedy) {
+    if (runActiveRef.current || runActive || remedyBusyRef.current) return
+    // Only a remedy this renderer knows how to describe, and only one the
+    // row itself offers.
+    //
+    // The first check is **belt and braces, and measured to be so**:
+    // `renderRemedies` already filters the row's array down to the known
+    // set, so no button exists for an unknown token and the only other
+    // caller passes the literal `'quarantine'`. Deleting this line leaves
+    // the whole suite green, which is recorded rather than papered over
+    // with a test that reaches it by some route a user cannot. It is kept
+    // because it is the check that would still hold if a later caller
+    // reached `runRemedy` without going through the cell.
+    if (!isKnownRemedy(remedy)) return
+    // The second check is not redundant: `remedies` comes off the wire, so
+    // this is what keeps the request inside the set the shell reported for
+    // *this* finding, and dropping it does turn the suite red.
+    if (!row.remedies.includes(remedy)) return
+    // The gate is required by the *destructive* set, named explicitly, and
+    // not by "is this the one token we happen to check for". Inferring it
+    // by exclusion fails open: a second removing remedy would arrive
+    // ungated by default, which is the wrong direction for the one surface
+    // that deletes a file inside the user's project.
+    if (isDestructiveRemedy(remedy) && !isQuarantineConfirmed(row, quarantineInput)) return
+
+    const context = wrongRootContextRef.current
+    remedyBusyRef.current = true
+    setRemedyBusy(true)
+    setError(null)
+    setRemedyUnanswered(false)
+    // The wait is not cancelled, only narrated: see
+    // {@link REMEDY_UNANSWERED_NOTICE_MS} for why a renderer-side deadline
+    // on this command cannot be a cancellation one.
+    const noticeTimer = setTimeout(() => {
+      if (!mountedRef.current) return
+      if (context !== wrongRootContextRef.current) return
+      setRemedyUnanswered(true)
+    }, REMEDY_UNANSWERED_NOTICE_MS)
+    try {
+      const result = await misplacedRemedy(row.name, row.sha256, remedy)
+      if (!mountedRef.current) return
+      if (context !== wrongRootContextRef.current) return
+      closeQuarantineBlock()
+      setRemedyResult(formatRemedyResultLine(result))
+      // The finding is gone from the shell's own list either way -- moved,
+      // copied, or recorded as ignored -- so the table and the status line
+      // are fetched afresh rather than edited here.
+      refreshWrongRoot()
+    } catch (remedyError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== wrongRootContextRef.current) return
+      setError(isShellError(remedyError) ? remedyError : 'unexpected')
+      // A stale surface is stale by definition: the block's facts name a
+      // finding the shell no longer reports, so it closes and the section
+      // is fetched afresh -- the `guidance-file-changed` precedent.
+      if (isShellError(remedyError) && remedyError.code === 'misplaced-unknown') {
+        closeQuarantineBlock()
+        refreshWrongRoot()
+      }
+    } finally {
+      clearTimeout(noticeTimer)
+      remedyBusyRef.current = false
+      if (mountedRef.current) {
+        setRemedyBusy(false)
+        setRemedyUnanswered(false)
+      }
+    }
+  }
+
+  /**
    * Opens the approval block for the row named `name` (slice 5b): the
    * block shows that row's identity-bound facts and an empty input --
    * nothing pre-fills it. Frozen while a run is active or an approve is in
@@ -2256,6 +3274,21 @@ export function AgentPanel() {
 
   /** The work area's status line, or `null` while no workspace is active or its work area is valid. */
   const workAreaLine = workspace === null ? null : formatWorkAreaLine(workspace.workArea)
+
+  /**
+   * The finding whose quarantine block is open, if the listing still
+   * reports it **at the identity the block was opened for**. A row matching
+   * the name at other bytes is a different finding, so the block closes
+   * rather than re-binding to it under the user's eyes.
+   */
+  const quarantiningRow =
+    quarantining === null
+      ? null
+      : (misplaced.find(
+          (row) => row.name === quarantining.name && row.sha256 === quarantining.sha256,
+        ) ?? null)
+  const quarantineConfirmed =
+    quarantiningRow !== null && isQuarantineConfirmed(quarantiningRow, quarantineInput)
 
   /** Whether the typed gate confirms the open guidance write block. */
   const guidanceConfirmed =
@@ -2429,6 +3462,51 @@ export function AgentPanel() {
     )
   }
 
+  /**
+   * One finding's remedy cell (slice 5d): exactly the remedies the row's
+   * own `remedies` array carries, in the order it carries them, never a set
+   * of this component's own -- **intersected with the remedies this
+   * renderer knows** ({@link KNOWN_REMEDIES}). A token outside that set
+   * renders no button at all, rather than a button whose behaviour would
+   * have to be guessed.
+   *
+   * Which remedies are destructive is read from {@link DESTRUCTIVE_REMEDIES}
+   * rather than inferred from what a token is *not*. The old cell asked
+   * `remedy === 'quarantine' ? gated : one click`, so anything that was not
+   * that exact string became a one-click button -- an unknown remedy was
+   * assumed harmless purely because it was unknown. On the one surface in
+   * this product that deletes a file inside the user's project, the default
+   * for "I do not recognize this" cannot be "act on a single click".
+   *
+   * Every button is frozen while a run is active or a remedy is in flight,
+   * mirroring the shell's own `run-active` refusal so direct IPC and this
+   * surface answer alike.
+   */
+  function renderRemedies(row: MisplacedRow): ReactNode {
+    return row.remedies.filter(isKnownRemedy).map((remedy, index) => (
+      // Keyed by position, not by token. `remedies` comes off the wire and
+      // nothing on it says the tokens are distinct, so a row listing one
+      // twice gave two children the same key -- which React reports on
+      // `console.error`, the signal this suite treats as a failure, and
+      // which makes the two buttons interchangeable to the reconciler
+      // (R3-052). The position is stable for the same reason the table's
+      // own row key is: the list is replaced whole by each fetch and is
+      // never reordered or edited in place.
+      <span key={`${index}-${remedy}`}>
+        {' '}
+        <button
+          type="button"
+          onClick={() =>
+            isDestructiveRemedy(remedy) ? openQuarantine(row) : runRemedy(row, remedy)
+          }
+          disabled={runActive || remedyBusy}
+        >
+          {remedyButtonName(remedy)}
+        </button>
+      </span>
+    ))
+  }
+
   const activeApprovals = approvals.filter((approval) => approval.status === 'active')
   const selectedAdapter = adapters.find((adapter) => adapter.id === adapterId) ?? null
   const promptTooLarge = promptByteLength(prompt) > PROMPT_MAX_BYTES
@@ -2439,7 +3517,12 @@ export function AgentPanel() {
       <h2>Agent</h2>
 
       <p>
-        <span data-testid="agent-scope-badge">advisory scope — not a sandbox</span>
+        {/* No test hook: the badge is fixed copy, so its own text is what
+            a test should ask for, and it is what a user reads. R3-017 and
+            R3-032 took the last `data-testid` queries off this surface;
+            this one was left behind and a test written after them reached
+            for it again (R3-045). */}
+        <span>advisory scope — not a sandbox</span>
       </p>
       <p data-testid="agent-producer-line">producer: unsigned (unknown)</p>
 
@@ -2481,10 +3564,19 @@ export function AgentPanel() {
       )}
 
       <div>
+        {/*
+          Held while a remedy is in flight as well as during a run: a
+          quarantine that resolves after the project has changed has already
+          taken a file out of the old one, and the generation guard would
+          drop its receipt -- correctly, since posting it under the new
+          project would read as a move inside that project, but leaving the
+          user never told that the file left. Holding the pick for the
+          length of one remedy is the only answer that is both.
+        */}
         <button
           type="button"
           onClick={handlePickWorkspace}
-          disabled={isPickingWorkspace || runActive}
+          disabled={isPickingWorkspace || runActive || remedyBusy}
         >
           Pick workspace
         </button>
@@ -2753,12 +3845,18 @@ export function AgentPanel() {
             {guidanceWrite.command === 'apply' && (
               <>
                 <p>proposed:</p>
-                <div data-testid="guidance-proposed">
+                {/*
+                  The proposed block, named rather than hooked (slice 5c
+                  review, R3-017): one child per rendered line, so the
+                  container's accessible name is enough to reach both the
+                  block and its lines without a `data-testid`.
+                */}
+                <div aria-label="proposed block">
                   {splitProposedLines(guidanceWrite.proposed).map((line, index) => (
                     // An index key is sound here: the list is derived once
                     // from an immutable proposal and is never reordered or
                     // edited.
-                    <div key={index} data-testid="guidance-proposed-line">
+                    <div key={index}>
                       <PlainTextLine text={line} />
                     </div>
                   ))}
@@ -2812,6 +3910,236 @@ export function AgentPanel() {
         {guidanceResult !== null && (
           <p role="status" aria-label="Guidance result">
             <PlainTextLine text={guidanceResult} />
+          </p>
+        )}
+      </section>
+
+      {/*
+        Wrong roots (slice 5d; HAP-001-R32, R33, R34, D16): a sibling of the
+        transcript, the Candidates region, the Guidance region and the
+        Publications region, never inside any of them, and never inside an
+        output pane (RCS-001-R6). Every fact renders through
+        `PlainTextLine`; nothing here moves a file until its own remedy is
+        chosen, and quarantine -- the one remedy that removes the original
+        -- only through a typed short-digest gate.
+      */}
+      <section aria-label="Wrong roots">
+        {wrongRoot ? (
+          <p role="status" aria-label="Output discipline">
+            <PlainTextLine text={formatWrongRootStatusLine(wrongRoot)} />
+          </p>
+        ) : (
+          // The report is unknown, which is a fact and is stated. It is
+          // given a name of its own rather than reusing `Output discipline`
+          // so that "the report says X" and "there is no report" can never
+          // be read as the same thing by anything downstream.
+          <p role="status" aria-label="Output discipline unavailable">
+            {OUTPUT_DISCIPLINE_UNKNOWN_LINE}
+          </p>
+        )}
+        {/*
+          Every disclosure the report carries, one line each and verbatim:
+          they are the contract's own honesty about what is *not* prevented
+          (HAP-001-R33, R34), so none may be collapsed, truncated, or hidden
+          behind a toggle.
+
+          Rendered **outside** the status check, which is the whole point.
+          These lines used to live inside `{wrongRoot && ...}`, and
+          `wrongroot_status` fails silently to `null`: with the status
+          rejecting, the surface showed no discipline line, no disclosures
+          and no banner, while Scan stayed enabled and Quarantine stayed
+          offered -- the product still doing the thing and no longer saying
+          what it does not prevent. A disclosure that a failed fetch can
+          remove is not a disclosure. `FALLBACK_DISCLOSURES` also covers a
+          report that arrives carrying none, which the contract says cannot
+          happen and which this surface therefore must not depend on.
+        */}
+        <ul aria-label="Output discipline disclosures">
+          {(wrongRoot && Array.isArray(wrongRoot.disclosures) && wrongRoot.disclosures.length > 0
+            ? wrongRoot.disclosures
+            : FALLBACK_DISCLOSURES
+          ).map((disclosure, index) => (
+            // An index key is sound here: the list is replaced whole by
+            // each fetch and is never reordered or edited in place.
+            <li key={index}>
+              <PlainTextLine text={String(disclosure)} />
+            </li>
+          ))}
+        </ul>
+
+        {/*
+          The scan observes and holds nothing, so it stays live while a run
+          is active -- the shell's own `wrongroot_scan` takes no lock and a
+          run-end scan is this same body.
+        */}
+        <button type="button" onClick={handleScan} disabled={isScanning}>
+          Scan
+        </button>
+        {scanSummary !== null && (
+          <p role="status" aria-label="Wrong roots scan">
+            <PlainTextLine text={scanSummary} />
+          </p>
+        )}
+
+        {/*
+          Why the table is empty, when it is empty for a reason other than
+          "nothing is misplaced" (HAP-001-R32). An empty table and a failed
+          listing look identical, and on a detection surface they are
+          opposite facts, so the reason is carried separately and said out
+          loud rather than left to be inferred from a blank space.
+        */}
+        {misplacedFault !== null && (
+          // Two faults, two accessible names: `unavailable` is "there is no
+          // table because the listing did not answer", `dropped` is "the
+          // table below is real but short". Naming both "Misplaced files
+          // unavailable" told a screen reader the findings were unavailable
+          // while the findings were on the screen beside it (R3-047).
+          <p
+            role="status"
+            aria-label={
+              misplacedFault === 'unavailable'
+                ? 'Misplaced files unavailable'
+                : 'Misplaced files incomplete'
+            }
+          >
+            {misplacedFault === 'unavailable'
+              ? MISPLACED_UNAVAILABLE_SENTENCE
+              : MISPLACED_ROWS_DROPPED_SENTENCE}
+          </p>
+        )}
+
+        {misplaced.length > 0 && (
+          <table aria-label="Misplaced files">
+            <thead>
+              <tr>
+                <th>name</th>
+                <th>class</th>
+                <th>type</th>
+                <th>size</th>
+                <th>sha256 short</th>
+                <th>reason</th>
+                <th>remedies</th>
+              </tr>
+            </thead>
+            <tbody>
+              {misplaced.map((row, index) => (
+                // An index key is sound here: the list is replaced whole by
+                // each fetch and is never reordered or edited in place.
+                <tr key={index}>
+                  <td>
+                    {/*
+                      The project-relative name the scan reported:
+                      display-only text. It is never resolved as a path,
+                      never used to build a link, and never sent anywhere
+                      but back to `misplaced_remedy` as the finding's own
+                      identity (RCS-001-R14).
+
+                      Stripping happens for display only, so two findings
+                      whose names differ solely by an invisible character
+                      render as the same string in this cell -- and one of
+                      them is about to be offered a delete button. The mark
+                      says the displayed name is not the whole name, which
+                      is what tells the user to compare the digest column
+                      instead of trusting their eyes.
+                    */}
+                    <PlainTextLine text={row.name} />
+                    {hasHiddenCharacters(row.name) && ` ${NAME_HAS_HIDDEN_CHARACTERS_MARK}`}
+                  </td>
+                  <td>
+                    <PlainTextLine text={row.class} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={row.detectedType} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={String(row.size)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={row.sha256Short} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={formatWrongRootReason(row.reason)} />
+                  </td>
+                  <td>{renderRemedies(row)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {quarantiningRow && (
+          // The quarantine confirmation (HAP-001-R32; TM-001-R1/R7): the
+          // finding's identity-bound facts verbatim, each through
+          // PlainTextLine, the sentence saying what the move does, the
+          // act-as identity as fixed copy, and a digest-typed confirmation
+          // the user fills -- beside the table, outside the transcript,
+          // never inside a terminal pane (RCS-001-R6).
+          //
+          // A `section` rather than a `div` carrying an `aria-label`: the
+          // label is what names this block for a screen reader, and an
+          // `aria-label` on a role-less element names nothing. Moving the
+          // test hook off `data-testid` and onto `aria-label` was the shape
+          // of the earlier fix, not its substance; an element with a real
+          // role and an accessible name is the substance.
+          <section aria-label="Quarantine confirmation">
+            <p>
+              name: <PlainTextLine text={quarantiningRow.name} />
+              {hasHiddenCharacters(quarantiningRow.name) &&
+                ` ${NAME_HAS_HIDDEN_CHARACTERS_MARK}`}
+            </p>
+            <p>
+              class: <PlainTextLine text={quarantiningRow.class} />
+            </p>
+            <p>
+              type: <PlainTextLine text={quarantiningRow.detectedType} />
+            </p>
+            <p>
+              size: <PlainTextLine text={String(quarantiningRow.size)} />
+            </p>
+            <p>
+              sha256: <PlainTextLine text={quarantiningRow.sha256} />
+            </p>
+            <p>
+              sha256 short: <PlainTextLine text={quarantiningRow.sha256Short} />
+            </p>
+            <p>
+              reason: <PlainTextLine text={formatWrongRootReason(quarantiningRow.reason)} />
+            </p>
+            <p>{QUARANTINE_SCOPE_LINE}</p>
+            <p>{APPROVAL_ACT_AS_LINE}</p>
+            <label htmlFor="agent-quarantine-gate">
+              Type the short digest (
+              <PlainTextLine text={quarantiningRow.sha256Short} />) to quarantine
+            </label>
+            <input
+              id="agent-quarantine-gate"
+              value={quarantineInput}
+              disabled={runActive || remedyBusy}
+              onChange={(event) => setQuarantineInput(event.target.value)}
+            />
+            <button
+              type="button"
+              onClick={() => runRemedy(quarantiningRow, 'quarantine')}
+              disabled={!quarantineConfirmed || runActive || remedyBusy}
+            >
+              Quarantine file
+            </button>
+          </section>
+        )}
+
+        {remedyUnanswered && (
+          // A remedy that has gone unanswered past the notice window. The
+          // section stays frozen -- the request cannot be withdrawn and the
+          // file may be part-way out of the project -- so what this line
+          // adds is the fact, not a way out (R3-042).
+          <p role="status" aria-label="Remedy unanswered">
+            {REMEDY_UNANSWERED_SENTENCE}
+          </p>
+        )}
+
+        {remedyResult !== null && (
+          <p role="status" aria-label="Remedy result">
+            <PlainTextLine text={remedyResult} />
           </p>
         )}
       </section>

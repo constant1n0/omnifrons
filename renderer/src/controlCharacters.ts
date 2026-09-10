@@ -19,6 +19,9 @@ const BIDI_EMBEDDING_MAX = 0x202e
 /** Explicit bidi isolates (LRI, RLI, FSI, PDI): U+2066-U+2069. */
 const BIDI_ISOLATE_MIN = 0x2066
 const BIDI_ISOLATE_MAX = 0x2069
+/** Line separator and paragraph separator: U+2028, U+2029. */
+const SEPARATOR_MIN = 0x2028
+const SEPARATOR_MAX = 0x2029
 
 function isInRange(codePoint: number, min: number, max: number): boolean {
   return codePoint >= min && codePoint <= max
@@ -40,13 +43,25 @@ function isInRange(codePoint: number, min: number, max: number): boolean {
  * stripping them can change how a word renders. This slice accepts that
  * cost for a uniform invisible-character defense across all untrusted
  * text; a future slice may need a narrower, script-aware allowance.
+ *
+ * U+2028 and U+2029 are stripped for a different reason than the rest, and
+ * a sharper one: CSS treats both as *forced line breaks* in every layout
+ * mode, so a producer-chosen string carrying one renders as more than one
+ * visual line. Every consumer of this module renders a single line whose
+ * other lines are the surface's own fixed copy -- the quarantine
+ * confirmation block most of all -- so a second line smuggled inside one
+ * untrusted string is indistinguishable from a sentence the product wrote.
+ * They carry no visible textual content of their own, so removing them is
+ * the same format-control removal RCS-001-R18 permits; the Rust outbox
+ * path began refusing this same character class in slice 5c.
  */
 function isFormatControlCodePoint(codePoint: number): boolean {
   return (
     isInRange(codePoint, ZERO_WIDTH_MIN, ZERO_WIDTH_MAX) ||
     isInRange(codePoint, DIRECTIONAL_MARK_MIN, DIRECTIONAL_MARK_MAX) ||
     isInRange(codePoint, BIDI_EMBEDDING_MIN, BIDI_EMBEDDING_MAX) ||
-    isInRange(codePoint, BIDI_ISOLATE_MIN, BIDI_ISOLATE_MAX)
+    isInRange(codePoint, BIDI_ISOLATE_MIN, BIDI_ISOLATE_MAX) ||
+    isInRange(codePoint, SEPARATOR_MIN, SEPARATOR_MAX)
   )
 }
 

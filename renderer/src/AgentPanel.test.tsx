@@ -16,11 +16,20 @@ import type {
   GuidancePreview,
   GuidanceStatus,
   HarnessFrame,
+  MisplacedRow,
   OutboxReason,
   OutboxStatus,
+  OutputDiscipline,
   Publication,
+  Remedy,
+  RemedyDetail,
+  RemedyOutcome,
+  ScanSummary,
+  ScopeMode,
   Snapshot,
   Workspace,
+  WrongRootReason,
+  WrongRootStatus,
 } from './ipc/harness'
 
 // The jsdom crypto polyfill and React Testing Library's `cleanup()` are
@@ -480,7 +489,7 @@ describe('AgentPanel', () => {
   it('shows the exact advisory scope badge text, and "sandbox" appears only inside it', async () => {
     await renderReady()
 
-    const badge = screen.getByTestId('agent-scope-badge')
+    const badge = screen.getByText('advisory scope — not a sandbox')
     expect(badge.textContent).toBe('advisory scope — not a sandbox')
 
     const sandboxMentions = Array.from(document.body.querySelectorAll('*')).filter(
@@ -5292,9 +5301,33 @@ function answerGuidanceFresh(cmd: string, args: Record<string, unknown>): unknow
 }
 
 /**
+ * A fresh project's wrong-root answers (`docs/spike-log.md` § Slice 5d, IPC
+ * shapes): the advisory report every built-in adapter's scope mode
+ * produces, both of its disclosures, no scan run and nothing standing.
+ * `undefined` for any other command, so a caller can fall through.
+ */
+function answerWrongRootFresh(cmd: string): unknown {
+  if (cmd === 'wrongroot_status') {
+    const status: WrongRootStatus = {
+      outputDiscipline: 'advisory',
+      scopeMode: 'advisory',
+      disclosures: [
+        'a write inside the project but outside the outbox is detected after the run, never prevented',
+        'a write outside the project is possible and is detected after the run, not prevented',
+      ],
+      scanned: false,
+      findings: 0,
+    }
+    return status
+  }
+  if (cmd === 'misplaced_list') return []
+  return undefined
+}
+
+/**
  * Mounts the panel over an active workspace with a valid outbox whose
  * policy declares the asset root `main`, an empty Catalog, and a fresh
- * project's guidance answers. `onCommand` answers everything else -- a
+ * project's guidance and wrong-root answers. `onCommand` answers everything else -- a
  * `harness_spawn`, a `candidates_list`, an approval -- and returns
  * `undefined` to fall through to the defaults. Every IPC call is recorded,
  * mount-time ones included.
@@ -5320,6 +5353,8 @@ function mountWithWorkspace(
     if (cmd === 'publications_list') return []
     const guidance = answerGuidanceFresh(cmd, args)
     if (guidance !== undefined) return guidance
+    const wrongRoot = answerWrongRootFresh(cmd)
+    if (wrongRoot !== undefined) return wrongRoot
     throw new Error(`unexpected command: ${cmd}`)
   })
   render(<AgentPanel />)
@@ -5970,10 +6005,18 @@ function writeBlockLines(): (string | null)[] {
   return Array.from(writeBlock().querySelectorAll('p')).map((line) => line.textContent)
 }
 
+/**
+ * The proposed block's own lines, queried through the block's accessible
+ * name rather than a test id (slice 5c review, R3-017): every child of the
+ * labelled container is one rendered line, so the query asserts what the
+ * test id did -- the lines, in order -- without a hook of its own.
+ */
+function proposedBlock(): HTMLElement {
+  return within(writeBlock()).getByLabelText('proposed block')
+}
+
 function proposedLines(): (string | null)[] {
-  return Array.from(writeBlock().querySelectorAll('[data-testid="guidance-proposed-line"]')).map(
-    (line) => line.textContent,
-  )
+  return Array.from(proposedBlock().children).map((line) => line.textContent)
 }
 
 const GATE_LABEL = /short digest \(.*\) to (write|create the file|remove|restore)$/
@@ -6198,8 +6241,7 @@ describe('AgentPanel guidance section (slice 5c, HAP-001 D18, R42)', () => {
       ACT_AS_LINE,
     ])
     expect(proposedLines()).toEqual(NOTE_LINES)
-    const proposed = block.querySelector('[data-testid="guidance-proposed"]') as HTMLElement
-    expectNoInteractiveElements(proposed)
+    expectNoInteractiveElements(proposedBlock())
     expect(block.querySelector('h1, h2, h3, a, script, ul, li, code, pre')).toBeNull()
     const walker = document.createTreeWalker(block, NodeFilter.SHOW_COMMENT)
     expect(walker.nextNode()).toBeNull()
@@ -7763,5 +7805,2986 @@ describe('AgentPanel guidance absent-file gate (slice 5c review, R3-016)', () =>
     }
     typeGate('e5a1b2c3')
     expect(finalButton('Write').disabled).toBe(false)
+  })
+})
+
+// -- Slice 5d: wrong roots, `misplaced`, and its three remedies --
+
+/** HAP-001-R34's disclosure, carried in every mode including `sandbox-enforced`. */
+const IN_PROJECT_DISCLOSURE =
+  'a write inside the project but outside the outbox is detected after the run, never prevented'
+
+/** HAP-001-R33's additional disclosure, carried under `advisory` scope only. */
+const OUTSIDE_PROJECT_DISCLOSURE =
+  'a write outside the project is possible and is detected after the run, not prevented'
+
+/** `wrongroot_status` for a project no scan has run over yet, under the advisory scope every built-in adapter declares. */
+function wrongRootStatusAdvisory(overrides: Partial<WrongRootStatus> = {}): WrongRootStatus {
+  return {
+    outputDiscipline: 'advisory',
+    scopeMode: 'advisory',
+    disclosures: [IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE],
+    scanned: false,
+    findings: 0,
+    ...overrides,
+  }
+}
+
+/** The report a hypothetical `sandbox-enforced` catalog produces: HAP-001-R34's disclosure alone, never zero. */
+const WRONG_ROOT_STATUS_ENFORCED: WrongRootStatus = {
+  outputDiscipline: 'enforced',
+  scopeMode: 'sandbox-enforced',
+  disclosures: [IN_PROJECT_DISCLOSURE],
+  scanned: true,
+  findings: 2,
+}
+
+function wrongRootsRegion(): HTMLElement {
+  return screen.getByRole('region', { name: 'Wrong roots' })
+}
+
+function outputDisciplineLine(): string | null {
+  return screen.queryByRole('status', { name: 'Output discipline' })?.textContent ?? null
+}
+
+function disclosureLines(): (string | null)[] {
+  const list = screen.queryByRole('list', { name: 'Output discipline disclosures' })
+  if (!list) return []
+  return Array.from(list.querySelectorAll('li')).map((line) => line.textContent)
+}
+
+/**
+ * Mounts over a workspace whose wrong-root answers are `mock`'s, with a
+ * fresh project's for anything unspecified, and `onCommand` answering the
+ * rest -- a scan, a remedy, a spawn -- first.
+ */
+function mountWrongRoots(
+  mock: { status?: WrongRootStatus | (() => unknown); rows?: MisplacedRow[] | (() => unknown) } = {},
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Call[] {
+  return mountWithWorkspace((cmd, args) => {
+    const own = onCommand?.(cmd, args)
+    if (own !== undefined) return own
+    if (cmd === 'wrongroot_status') {
+      return mock.status === undefined ? undefined : answerMock(mock.status)
+    }
+    if (cmd === 'misplaced_list') {
+      return mock.rows === undefined ? undefined : answerMock(mock.rows)
+    }
+    return undefined
+  })
+}
+
+describe('AgentPanel wrong roots section (slice 5d, HAP-001-R32, R33, R34)', () => {
+  it('renders a Wrong roots region beside the transcript, the Candidates region and the Guidance region -- never inside any of them (RCS-001-R6) -- opening with the advisory output-discipline line and every disclosure, one line each', async () => {
+    mountWrongRoots()
+
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(outputDisciplineLine()).toBe(
+      'output discipline: advisory (scope advisory) — a write outside the project root is not prevented; not scanned yet',
+    )
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE])
+
+    const region = wrongRootsRegion()
+    expect(screen.getByLabelText('Agent transcript').contains(region)).toBe(false)
+    expect(screen.getByRole('region', { name: 'Guidance' }).contains(region)).toBe(false)
+    expect(region.contains(screen.getByRole('region', { name: 'Guidance' }))).toBe(false)
+  })
+
+  it("renders the enforced report as a declaration the product does not verify -- never as a prevention it has confirmed, which would contradict this panel's own advisory badge -- with HAP-001-R34's disclosure alone beside the scan counts", async () => {
+    mountWrongRoots({ status: WRONG_ROOT_STATUS_ENFORCED })
+
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(outputDisciplineLine()).toBe(
+      'output discipline: enforced (scope sandbox-enforced) — the adapter declares that a write outside the project root is prevented; the product does not verify that claim; scanned, findings 2',
+    )
+    // The claim the old copy made, and the reason it could not stand: the
+    // discipline is derived from what adapters *declare*, nothing here
+    // checks it, and the panel's own badge says the opposite two regions
+    // above. Both halves are asserted -- that the surface no longer claims
+    // prevention, and that the badge it would have contradicted is present.
+    expect(outputDisciplineLine()).not.toContain('is prevented by the sandbox')
+    expect(screen.getByText('advisory scope — not a sandbox')).toBeTruthy()
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE])
+  })
+
+  it('renders every disclosure the report carries as text, however many and whatever they say: none is collapsed, truncated or hidden behind a toggle, and markup in one stays literal', async () => {
+    const extra = 'a third disclosure a later contract adds <b>bold</b>'
+    mountWrongRoots({
+      status: wrongRootStatusAdvisory({
+        disclosures: [IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE, extra],
+      }),
+    })
+
+    await waitFor(() => {
+      expect(disclosureLines()).toHaveLength(3)
+    })
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE, extra])
+    const region = wrongRootsRegion()
+    expect(region.querySelector('b')).toBeNull()
+    expect(region.querySelector('details')).toBeNull()
+  })
+})
+
+function outputDisciplineUnavailableLine(): string | null {
+  return (
+    screen.queryByRole('status', { name: 'Output discipline unavailable' })?.textContent ?? null
+  )
+}
+
+describe('AgentPanel disclosures do not depend on a fetch (slice 5d review, R1-010 / R3-026)', () => {
+  it('states HAP-001-R33 and R34 even when wrongroot_status rejects: the report is the thing that failed, and a disclosure a failed fetch can remove is not a disclosure', async () => {
+    // Measured before the fix, with the status rejecting: no discipline
+    // line, no disclosures, and no banner -- an automatic refresh is not a
+    // user act, so the rejection is silent by design -- while Scan stayed
+    // enabled and Quarantine stayed offered. The product went on offering
+    // the acts and stopped saying what it does not prevent.
+    mountWrongRoots({ status: () => Promise.reject({ code: 'unexpected', message: 'gone' }) })
+
+    await waitFor(() => {
+      expect(outputDisciplineUnavailableLine()).not.toBeNull()
+    })
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE])
+    // The absence of the report is itself stated, rather than left as a
+    // blank space that reads like a clean report.
+    expect(outputDisciplineUnavailableLine()).toBe(
+      'output discipline: not reported — the report could not be read; the disclosures below hold in every mode',
+    )
+    expect(outputDisciplineLine()).toBeNull()
+    // And the surface is still offering the acts, which is exactly why the
+    // disclosures have to be there.
+    expect(scanButton().disabled).toBe(false)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('falls back to the advisory pair -- never to silence, and never to the enforced line alone -- for a report that arrives carrying no disclosures at all', async () => {
+    mountWrongRoots({ status: wrongRootStatusAdvisory({ disclosures: [] }) })
+
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    // With no report to go on, the product cannot claim an enforcement
+    // nobody told it about, so it states the weaker, safer pair.
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE])
+  })
+
+  it('offers no quarantine without the disclosures standing beside it: with the status rejecting, a finding is still listed and remediable, and both disclosures are on the page', async () => {
+    mountWrongRoots({
+      status: () => Promise.reject({ code: 'unexpected', message: 'gone' }),
+      rows: [MISPLACED_REPORT],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(remedyButtons('docs/report.pdf')).toEqual(['Quarantine', 'Publish to outbox', 'Ignore'])
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE, OUTSIDE_PROJECT_DISCLOSURE])
+  })
+
+  it('strips control and bidi-override characters from a disclosure the report carries, which React\'s own escaping would not have done', async () => {
+    // The earlier content-security assertion here could not tell
+    // `PlainTextLine` from React's default escaping, because markup is all
+    // it tested and React escapes markup on its own. An ESC byte and a
+    // U+202E override are the fixture that separates them -- the same one
+    // the row-name test uses.
+    const esc = String.fromCharCode(0x1b)
+    const rlo = String.fromCodePoint(0x202e)
+    const hostile = `a later contract's <b>disclosure</b>${esc}[31m${rlo}denrevog`
+    mountWrongRoots({ status: wrongRootStatusAdvisory({ disclosures: [hostile] }) })
+
+    await waitFor(() => {
+      expect(disclosureLines()).toHaveLength(1)
+    })
+    const list = screen.getByRole('list', { name: 'Output discipline disclosures' })
+    expect(list.textContent).toContain("a later contract's <b>disclosure</b>")
+    expect(list.querySelector('b')).toBeNull()
+    expect(list.textContent).not.toContain(esc)
+    expect(list.textContent).not.toContain(rlo)
+  })
+})
+
+/** One `misplaced_list` row: a project-relative name, the facts from its own handle, the three remedies. */
+function misplacedRow(overrides: Partial<MisplacedRow> = {}): MisplacedRow {
+  return {
+    name: 'docs/report.pdf',
+    size: 4096,
+    sha256: 'ab'.repeat(32),
+    sha256Short: 'abababab',
+    detectedType: 'pdf',
+    class: 'generated-heavy',
+    reason: 'in-project-outside-outbox',
+    remedies: ['quarantine', 'publish', 'ignore'],
+    ...overrides,
+  }
+}
+
+const MISPLACED_REPORT = misplacedRow()
+const MISPLACED_BUNDLE = misplacedRow({
+  name: 'build/bundle.zip',
+  size: 90210,
+  sha256: 'cd'.repeat(32),
+  sha256Short: 'cdcdcdcd',
+  detectedType: 'zip',
+})
+
+/** `wrongroot_scan`'s answer for a walk that saw twelve files and left two findings standing. */
+const SCAN_SUMMARY: ScanSummary = {
+  scanned: 12,
+  findings: 2,
+  ignored: 1,
+  excluded: 3,
+  unreadable: 0,
+  truncated: false,
+}
+
+function scanButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Scan' }) as HTMLButtonElement
+}
+
+function scanLine(): string | null {
+  return screen.queryByRole('status', { name: 'Wrong roots scan' })?.textContent ?? null
+}
+
+describe('AgentPanel wrong roots scan (slice 5d)', () => {
+  it('clicking Scan calls wrongroot_scan with exactly {} and renders every count of the answer in a fixed order, zeros included, then refetches the status and the findings', async () => {
+    const calls = mountWrongRoots({ rows: [] }, (cmd) =>
+      cmd === 'wrongroot_scan' ? SCAN_SUMMARY : undefined,
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(scanLine()).toBeNull()
+    const before = calls.length
+
+    fireEvent.click(scanButton())
+
+    await waitFor(() => {
+      expect(scanLine()).not.toBeNull()
+    })
+    expect(scanLine()).toBe('scan: 12 scanned, 2 findings, 1 ignored, 3 excluded, 0 unreadable')
+    const after = calls.slice(before).map((call) => call.cmd)
+    expect(after[0]).toBe('wrongroot_scan')
+    expect(calls[before]?.args).toEqual({})
+    expect(after).toContain('misplaced_list')
+    expect(after).toContain('wrongroot_status')
+  })
+
+  it('says in fixed copy that a truncated scan stopped early and its list is incomplete, never letting a partial walk read as a complete one', async () => {
+    mountWrongRoots({ rows: [] }, (cmd) =>
+      cmd === 'wrongroot_scan' ? { ...SCAN_SUMMARY, scanned: 20000, truncated: true } : undefined,
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(scanButton())
+
+    await waitFor(() => {
+      expect(scanLine()).not.toBeNull()
+    })
+    expect(scanLine()).toBe(
+      'scan: 20000 scanned, 2 findings, 1 ignored, 3 excluded, 0 unreadable — the scan stopped early; the list is incomplete',
+    )
+  })
+
+  it('stays live while a run is active -- the scan observes, holds no handle and takes no lock, exactly as the shell\'s own run-end scan does -- and its click actually calls wrongroot_scan then', async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountWrongRoots({ rows: [] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      if (cmd === 'wrongroot_scan') return SCAN_SUMMARY
+      return undefined
+    })
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    await startRunOverWorkspace()
+
+    expect(scanButton().disabled).toBe(false)
+    const before = countCalls(calls, 'wrongroot_scan')
+    fireEvent.click(scanButton())
+
+    await waitFor(() => {
+      expect(countCalls(calls, 'wrongroot_scan')).toBe(before + 1)
+    })
+    expect(scanLine()).toBe('scan: 12 scanned, 2 findings, 1 ignored, 3 excluded, 0 unreadable')
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+  })
+
+  it('fires one wrongroot_scan per double-click: the second click lands on a scan already in flight and is refused', async () => {
+    let settle: (value: unknown) => void = () => {}
+    const calls = mountWrongRoots({ rows: [] }, (cmd) =>
+      cmd === 'wrongroot_scan'
+        ? new Promise((resolve) => {
+            settle = resolve as (value: unknown) => void
+          })
+        : undefined,
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(scanButton())
+    fireEvent.click(scanButton())
+
+    await waitFor(() => {
+      expect(countCalls(calls, 'wrongroot_scan')).toBe(1)
+    })
+    await act(async () => {
+      settle(SCAN_SUMMARY)
+      await Promise.resolve()
+    })
+    expect(countCalls(calls, 'wrongroot_scan')).toBe(1)
+  })
+})
+
+function misplacedTable(): HTMLElement {
+  return screen.getByRole('table', { name: 'Misplaced files' })
+}
+
+/** The Misplaced table's data rows, each as its cells' text. */
+function misplacedRows(): string[][] {
+  return Array.from(misplacedTable().querySelectorAll('tbody tr')).map((row) =>
+    Array.from(row.querySelectorAll('td')).map((cell) => cell.textContent ?? ''),
+  )
+}
+
+/** The Misplaced table's data row whose name cell reads `name`. */
+function misplacedTableRow(name: string): HTMLElement {
+  const row = Array.from(misplacedTable().querySelectorAll<HTMLElement>('tbody tr')).find(
+    (candidate) => candidate.querySelector('td')?.textContent === name,
+  )
+  if (!row) throw new Error(`no misplaced row named ${name}`)
+  return row
+}
+
+/** The remedy buttons offered for the row named `name`, in the order the row offers them. */
+function remedyButtons(name: string): string[] {
+  return Array.from(misplacedTableRow(name).querySelectorAll('button')).map(
+    (button) => button.textContent ?? '',
+  )
+}
+
+describe('AgentPanel misplaced table (slice 5d, HAP-001-R32)', () => {
+  it('renders one row per finding in walk order -- name, class, type, size, short digest, reason as fixed copy -- with the full digest nowhere in the table and no table at all while nothing is standing', async () => {
+    mountWrongRoots({ rows: [] })
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).toBeNull()
+    cleanup()
+    clearMocks()
+
+    mountWrongRoots({ rows: [MISPLACED_REPORT, MISPLACED_BUNDLE] })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(misplacedRows().map((cells) => cells.slice(0, 6))).toEqual([
+      [
+        'docs/report.pdf',
+        'generated-heavy',
+        'pdf',
+        '4096',
+        'abababab',
+        'inside the project, outside the outbox',
+      ],
+      [
+        'build/bundle.zip',
+        'generated-heavy',
+        'zip',
+        '90210',
+        'cdcdcdcd',
+        'inside the project, outside the outbox',
+      ],
+    ])
+    expect(misplacedTable().textContent).not.toContain('ab'.repeat(32))
+  })
+
+  it("never resolves a finding's name as a path or a link: a name carrying markup, a C0 control and a bidi override renders as the text it is, with no anchor and no href anywhere in the region", async () => {
+    const esc = String.fromCharCode(0x1b)
+    const rlo = String.fromCodePoint(0x202e)
+    const hostile = `docs/<b>x</b>${esc}[31m${rlo}fdp.report`
+    mountWrongRoots({ rows: [misplacedRow({ name: hostile })] })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    const region = wrongRootsRegion()
+    expect(region.textContent).toContain('docs/<b>x</b>')
+    expect(region.querySelector('b')).toBeNull()
+    expect(region.querySelector('a')).toBeNull()
+    expect(region.querySelector('[href]')).toBeNull()
+    expect(region.textContent).not.toContain(esc)
+    expect(region.textContent).not.toContain(rlo)
+  })
+
+  it("offers exactly the remedies the row's own remedies array carries, in its order, never a set of its own: a row offering one offers one button and a row offering none offers none", async () => {
+    mountWrongRoots({
+      rows: [
+        MISPLACED_REPORT,
+        misplacedRow({ name: 'a.pdf', sha256Short: '11111111', remedies: ['ignore'] }),
+        misplacedRow({ name: 'b.pdf', sha256Short: '22222222', remedies: [] }),
+      ],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(remedyButtons('docs/report.pdf')).toEqual(['Quarantine', 'Publish to outbox', 'Ignore'])
+    expect(remedyButtons('a.pdf')).toEqual(['Ignore'])
+    expect(remedyButtons('b.pdf')).toEqual([])
+  })
+})
+
+const QUARANTINE_SCOPE_LINE =
+  'the file will be MOVED out of the project into the quarantine directory, outside any workspace; this product then offers no way to list, open or restore it'
+
+const COPY_NEEDS_APPROVAL_SENTENCE =
+  'the copy is not published: approve it in the outbox listing like any other entry'
+
+const IGNORE_IS_PERMANENT_SENTENCE =
+  'this decision cannot be undone or reviewed from this product: nothing here lists what has been ignored'
+
+function quarantineBlock(): HTMLElement {
+  return screen.getByLabelText('Quarantine confirmation')
+}
+
+function quarantineBlockLines(): (string | null)[] {
+  return Array.from(quarantineBlock().querySelectorAll('p')).map((line) => line.textContent)
+}
+
+function quarantineGate(): HTMLInputElement {
+  return screen.getByLabelText(/^Type the short digest \(.*\) to quarantine$/) as HTMLInputElement
+}
+
+function quarantineButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Quarantine file' }) as HTMLButtonElement
+}
+
+function remedyResultLine(): string | null {
+  return screen.queryByRole('status', { name: 'Remedy result' })?.textContent ?? null
+}
+
+/** Why the findings table is empty, when it is empty for a reason other than "nothing is misplaced". */
+function misplacedUnavailableLine(): string | null {
+  return screen.queryByRole('status', { name: 'Misplaced files unavailable' })?.textContent ?? null
+}
+
+/**
+ * Why the findings table that *is* on the screen is short of the listing --
+ * a separate accessible name from the one above, because "there is no
+ * table" and "this table is incomplete" are different facts and a screen
+ * reader is told which one it has (R3-047).
+ */
+function misplacedIncompleteLine(): string | null {
+  return screen.queryByRole('status', { name: 'Misplaced files incomplete' })?.textContent ?? null
+}
+
+/** Mounts over one standing finding and clicks its Quarantine, returning the recorded calls. */
+async function openQuarantineBlock(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Promise<Call[]> {
+  const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, onCommand)
+  await screen.findByRole('table', { name: 'Misplaced files' })
+  fireEvent.click(within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }))
+  await screen.findByLabelText('Quarantine confirmation')
+  return calls
+}
+
+describe('AgentPanel quarantine remedy (slice 5d, HAP-001-R32; TM-001-R1/R7)', () => {
+  it("opens a confirmation block bound to the row -- its identity facts, the sentence saying the file will be MOVED out of the project and that the product then offers no way back to it, the act-as line, a gate naming the short digest, an empty input and a disabled button -- invoking nothing", async () => {
+    const calls = await openQuarantineBlock()
+
+    expect(calls.filter((call) => call.cmd === 'misplaced_remedy')).toHaveLength(0)
+    // The claim the line used to make. `docs/spike-log.md` § Slice 5d
+    // records reveal-only as honored by omission -- no flag is set, no
+    // permission is changed, and nothing lists a quarantined file -- so the
+    // block must not promise the file was left in a particular state.
+    expect(quarantineBlock().textContent).not.toContain('reveal-only')
+    expect(quarantineBlock().textContent).not.toContain('left unexecuted')
+    // Nor any claim about the file's own permissions: the copy path creates
+    // its destination `0o600` on unix while the rename path keeps whatever
+    // mode the file had, so no single sentence about them is true of a
+    // quarantine in general.
+    expect(quarantineBlock().textContent).not.toContain('permits')
+    expect(quarantineBlockLines()).toEqual([
+      'name: docs/report.pdf',
+      'class: generated-heavy',
+      'type: pdf',
+      'size: 4096',
+      `sha256: ${'ab'.repeat(32)}`,
+      'sha256 short: abababab',
+      'reason: inside the project, outside the outbox',
+      QUARANTINE_SCOPE_LINE,
+      'act as: device-local-user',
+    ])
+    expect(wrongRootsRegion().contains(quarantineBlock())).toBe(true)
+    expect(screen.getByLabelText('Agent transcript').contains(quarantineBlock())).toBe(false)
+    expect(quarantineGate().value).toBe('')
+    expect(quarantineButton().disabled).toBe(true)
+  })
+
+  it("enables the button only on an exact, case-sensitive match of the row's own short digest, and the click then calls misplaced_remedy with exactly { name, sha256, remedy } carrying the row's full digest -- never the typed value", async () => {
+    const calls = await openQuarantineBlock((cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'quarantine',
+            outcome: 'quarantined',
+            name: 'abababab-report.pdf',
+            sha256: 'ab'.repeat(32),
+            originalKept: false,
+            detail: 'renamed',
+          }
+        : undefined,
+    )
+
+    for (const wrong of [
+      'quarantine',
+      'ABABABAB',
+      'abababa',
+      'abababab1',
+      ' abababab',
+      'abababab ',
+      '',
+      'ab'.repeat(32),
+      'cdcdcdcd',
+    ]) {
+      fireEvent.change(quarantineGate(), { target: { value: wrong } })
+      expect(quarantineButton().disabled).toBe(true)
+    }
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(false)
+
+    fireEvent.click(quarantineButton())
+
+    await waitFor(() => {
+      expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+    })
+    const request = calls.find((call) => call.cmd === 'misplaced_remedy')
+    expect(request?.args).toEqual({
+      name: 'docs/report.pdf',
+      sha256: 'ab'.repeat(32),
+      remedy: 'quarantine',
+    })
+    expect(Object.keys(request!.args).sort()).toEqual(['name', 'remedy', 'sha256'])
+  })
+
+  it('nothing harness- or project-originated pre-fills or enables the gate (TM-001-R1): the digest the label itself names, a finding whose own name is that digest, and a programmatic input.value with no input event all leave the input empty and the button disabled; only typing enables it', async () => {
+    const calls = mountWrongRoots({
+      rows: [MISPLACED_REPORT, misplacedRow({ name: 'abababab', sha256Short: '33333333' })],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+
+    // The gate's own label names the digest it wants, and a row beside it
+    // is named the very same string: neither reaches the input.
+    expect(quarantineBlock().querySelector('label')?.textContent).toBe(
+      'Type the short digest (abababab) to quarantine',
+    )
+    expect(quarantineGate().value).toBe('')
+    expect(quarantineButton().disabled).toBe(true)
+
+    quarantineGate().value = 'abababab'
+    await flush()
+    expect(quarantineGate().value).toBe('abababab')
+    expect(quarantineButton().disabled).toBe(true)
+    // (React's value tracker reports a change event carrying the string
+    // already set on the node as no change, so the typed sequence passes
+    // through another value first -- a test-harness detail.)
+    fireEvent.change(quarantineGate(), { target: { value: '' } })
+    expect(quarantineButton().disabled).toBe(true)
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(false)
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+  })
+})
+
+describe('AgentPanel remedy outcomes (slice 5d, HAP-001-R28, R32)', () => {
+  it("makes plain that a completed quarantine took the original out of the project, names what it produced and says which move ran, then refetches the findings and the status", async () => {
+    const calls = await openQuarantineBlock((cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'quarantine',
+            outcome: 'quarantined',
+            name: 'abababab-report.pdf',
+            sha256: 'ab'.repeat(32),
+            originalKept: false,
+            detail: 'renamed',
+          }
+        : undefined,
+    )
+    const before = calls.length
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    fireEvent.click(quarantineButton())
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toBe(
+      'quarantine: moved into quarantine, outside any workspace; name abababab-report.pdf; the original is gone from the project; moved by rename',
+    )
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    const after = calls.slice(before).map((call) => call.cmd)
+    expect(after).toContain('misplaced_list')
+    expect(after).toContain('wrongroot_status')
+  })
+
+  it("says only that the remedy did not remove the original for each of HAP-001-R19's four residual details -- never that the file is still in the project, which three of the four contradict -- so the receipt and its own detail line cannot disagree", async () => {
+    // `originalKept: true` does not mean the file is where the user left
+    // it. The shell sets it for `original-already-gone` (the original is
+    // gone), `original-changed-during-the-move` (something else is at that
+    // name now) and `identity-check-unavailable` (nobody knows), because
+    // what it records is that *this remedy* did not remove it. The receipt
+    // used to read `the original is still in the project` beside each of
+    // those, contradicting the detail sentence on the very same line.
+    const expected: Record<string, string> = {
+      'unlink-failed': 'the copy stands and the original could not be removed',
+      'original-already-gone': 'the copy stands and the original was already gone',
+      'original-changed-during-the-move':
+        'the copy stands and the original changed during the move',
+      'identity-check-unavailable':
+        'the copy stands and this platform cannot prove the name still holds it',
+    }
+    for (const [detail, copy] of Object.entries(expected)) {
+      await openQuarantineBlock((cmd) =>
+        cmd === 'misplaced_remedy'
+          ? {
+              remedy: 'quarantine',
+              outcome: 'quarantined',
+              name: 'abababab-report.pdf',
+              sha256: 'ab'.repeat(32),
+              originalKept: true,
+              detail,
+            }
+          : undefined,
+      )
+      fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+      fireEvent.click(quarantineButton())
+
+      await waitFor(() => {
+        expect(remedyResultLine()).not.toBeNull()
+      })
+      expect(remedyResultLine()).toBe(
+        `quarantine: moved into quarantine, outside any workspace; name abababab-report.pdf; this remedy did not remove the original; ${copy}`,
+      )
+      expect(remedyResultLine()).not.toContain('the original is still in the project')
+      cleanup()
+      clearMocks()
+    }
+  })
+
+  it("says a renamed-unverified quarantine both moved the file out of the project and could not verify what arrived, so the delete remedy's failure branch cannot be read as a clean move", async () => {
+    // The ninth `detail` token, produced on the live quarantine path when
+    // the rename returned but the destination could not be re-opened and
+    // digested (`quarantine_detail` in `src-tauri/src/ipc/wrong_root.rs`).
+    // It carries `originalKept: false` -- a rename removes the original
+    // name whatever the verification then found -- and the destination
+    // name, so the receipt has to say the file is gone *and* that its
+    // arrival is unchecked. Either half alone misleads.
+    await openQuarantineBlock((cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'quarantine',
+            outcome: 'quarantined',
+            name: 'abababab-report.pdf',
+            sha256: 'ab'.repeat(32),
+            originalKept: false,
+            detail: 'renamed-unverified',
+          }
+        : undefined,
+    )
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    fireEvent.click(quarantineButton())
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toBe(
+      'quarantine: moved into quarantine, outside any workspace; name abababab-report.pdf; the original is gone from the project; moved by rename, but its arrival in quarantine could not be verified: the file is out of the project and nothing here has checked what arrived',
+    )
+    // It must not read as the plain `renamed` receipt, which claims a
+    // verified arrival this branch is exactly the absence of.
+    expect(remedyResultLine()).not.toBe(
+      'quarantine: moved into quarantine, outside any workspace; name abababab-report.pdf; the original is gone from the project; moved by rename',
+    )
+  })
+
+  it('Publish to outbox acts on a single click -- it keeps the original where it was found -- and its receipt says the original is still there and that the copy is not published until it is approved like any other outbox entry', async () => {
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'publish',
+            outcome: 'copied-to-outbox',
+            name: 'abababab-report.pdf',
+            sha256: 'ab'.repeat(32),
+            originalKept: true,
+            detail: null,
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+        name: 'Publish to outbox',
+      }),
+    )
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    expect(remedyResultLine()).toBe(
+      `publish: copied into the outbox as a new unattributed entry; name abababab-report.pdf; this remedy did not remove the original; ${COPY_NEEDS_APPROVAL_SENTENCE}`,
+    )
+    expect(calls.find((call) => call.cmd === 'misplaced_remedy')?.args).toEqual({
+      name: 'docs/report.pdf',
+      sha256: 'ab'.repeat(32),
+      remedy: 'publish',
+    })
+  })
+
+  it('Ignore acts on a single click too, and its receipt says the decision was recorded, that the file is not offered again until its content changes, that this remedy removed nothing, and that the suppression cannot be undone or reviewed from this product', async () => {
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'ignore',
+            outcome: 'ignored',
+            name: null,
+            sha256: 'ab'.repeat(32),
+            originalKept: true,
+            detail: null,
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }))
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toBe(
+      `ignore: the decision was recorded, and the file is not offered again until its content changes; this remedy did not remove the original; ${IGNORE_IS_PERMANENT_SENTENCE}`,
+    )
+    // One unconfirmed click suppresses a detection for that content
+    // permanently: `docs/spike-log.md` § Slice 5d records that the ignore
+    // ledger has no listing and no revocation command anywhere in the
+    // product. The remedy is not destructive to the file, which is why it
+    // is not gated -- it is destructive to the detection, and the receipt
+    // has to say so rather than let the user discover it by looking for an
+    // undo that does not exist.
+    expect(remedyResultLine()).toContain('cannot be undone')
+    expect(calls.find((call) => call.cmd === 'misplaced_remedy')?.args).toEqual({
+      name: 'docs/report.pdf',
+      sha256: 'ab'.repeat(32),
+      remedy: 'ignore',
+    })
+  })
+
+  it('fires one misplaced_remedy per double-click: the second click lands on a remedy already in flight and is refused, whichever remedy it names', async () => {
+    let settle: (value: unknown) => void = () => {}
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? new Promise((resolve) => {
+            settle = resolve as (value: unknown) => void
+          })
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    const row = misplacedTableRow('docs/report.pdf')
+    fireEvent.click(within(row).getByRole('button', { name: 'Ignore' }))
+    fireEvent.click(within(row).getByRole('button', { name: 'Ignore' }))
+    fireEvent.click(within(row).getByRole('button', { name: 'Publish to outbox' }))
+
+    await waitFor(() => {
+      expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+    })
+    await act(async () => {
+      settle({
+        remedy: 'ignore',
+        outcome: 'ignored',
+        name: null,
+        sha256: 'ab'.repeat(32),
+        originalKept: true,
+        detail: null,
+      })
+      await Promise.resolve()
+    })
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+  })
+})
+
+/** Delivers one run-end `misplaced` event carrying `payload`, as run 7's frame `seq`. */
+function deliverMisplaced(channel: LiveChannel, payload: ScanSummary = SCAN_SUMMARY, seq = 10) {
+  act(() => {
+    channel.onmessage({
+      stream: 'event',
+      body: { id: 7, seq, droppedBefore: 0, kind: 'misplaced', payload },
+    })
+  })
+}
+
+/** Every transcript row's text, in order. */
+function transcriptRows(): string[] {
+  return Array.from(screen.getByLabelText('Agent transcript').querySelectorAll('li')).map(
+    (row) => row.textContent ?? '',
+  )
+}
+
+describe('AgentPanel run-end misplaced frame (slice 5d)', () => {
+  it('renders a misplaced event as one transcript line carrying the same fixed copy as the scan summary, in its own row, and refetches the findings and the status the run-end scan produced', async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+    const before = calls.length
+
+    deliverMisplaced(channel)
+
+    expect(transcriptRows()).toEqual([
+      'you: do the thing',
+      'scan: 12 scanned, 2 findings, 1 ignored, 3 excluded, 0 unreadable',
+    ])
+    await waitFor(() => {
+      expect(calls.slice(before).map((call) => call.cmd)).toContain('misplaced_list')
+    })
+    expect(calls.slice(before).map((call) => call.cmd)).toContain('wrongroot_status')
+
+    await endRun(channel)
+  })
+
+  it('says a truncated run-end scan stopped early in the transcript too, with the same fixed copy the section uses, and renders every zero count as 0', async () => {
+    let channel: LiveChannel | undefined
+    mountWrongRoots({ rows: [] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+
+    deliverMisplaced(channel, {
+      scanned: 0,
+      findings: 0,
+      ignored: 0,
+      excluded: 0,
+      unreadable: 0,
+      truncated: true,
+    })
+
+    expect(transcriptRows()[1]).toBe(
+      'scan: 0 scanned, 0 findings, 0 ignored, 0 excluded, 0 unreadable — the scan stopped early; the list is incomplete',
+    )
+    await endRun(channel)
+  })
+
+  it('renders the fixed diagnostic a scan that could not run emits as a diagnostic, never as a misplaced line claiming nothing was found', async () => {
+    let channel: LiveChannel | undefined
+    mountWrongRoots({ rows: [] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+
+    act(() => {
+      channel!.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 10,
+          droppedBefore: 0,
+          kind: 'diagnostic',
+          payload: {
+            text: 'the project could not be scanned for output written outside the outbox',
+          },
+        },
+      })
+    })
+
+    expect(transcriptRows()[1]).toBe(
+      'diagnostic: the project could not be scanned for output written outside the outbox',
+    )
+    expect(transcriptRows()[1]).not.toContain('scan: 0 scanned')
+    await endRun(channel)
+  })
+})
+
+describe('AgentPanel wrong roots and the workspace (slice 5d; slice 5c review, R1-001)', () => {
+  it("resets the section on a workspace pick -- a real receipt of a DELETION, the scan line, an open quarantine block and its typed gate all go, since they are the previous project's -- and fetches the new project's status and findings afresh", async () => {
+    // The receipt has to be produced before the pick, not merely asserted
+    // absent after it. Asserting `remedyResultLine()` is null when no
+    // remedy ever ran is vacuous: it was null the whole time, and deleting
+    // the reset entirely left this test green -- which is how a previous
+    // project's DELETION receipt could survive under the next project with
+    // the suite reporting no problem at all. So: run a quarantine, watch
+    // the receipt say the file is gone, and only then pick.
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT, MISPLACED_BUNDLE] }, (cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'wrongroot_scan') return SCAN_SUMMARY
+      if (cmd === 'misplaced_remedy') {
+        return {
+          remedy: 'quarantine',
+          outcome: 'quarantined',
+          name: 'abababab-report.pdf',
+          sha256: 'ab'.repeat(32),
+          originalKept: false,
+          detail: 'renamed',
+        }
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(scanButton())
+    await waitFor(() => {
+      expect(scanLine()).not.toBeNull()
+    })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    fireEvent.click(quarantineButton())
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toContain('the original is gone from the project')
+
+    // A second block, open over the other finding, with its gate typed:
+    // the pick has to take that too, not just the receipt.
+    fireEvent.click(
+      within(misplacedTableRow('build/bundle.zip')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'cdcdcdcd' } })
+    expect(quarantineButton().disabled).toBe(false)
+    const before = calls.length
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+
+    expect(scanLine()).toBeNull()
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    expect(remedyResultLine()).toBeNull()
+    const after = calls.slice(before).map((call) => call.cmd)
+    expect(after).toContain('wrongroot_status')
+    expect(after).toContain('misplaced_list')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it("drops a wrongroot_scan that resolves after a workspace pick: the new project's section shows no scan line of the previous project's walk", async () => {
+    let resolveScan: (summary: ScanSummary) => void = () => {}
+    mountWrongRoots({ rows: [] }, (cmd) => {
+      if (cmd === 'wrongroot_scan') {
+        return new Promise<ScanSummary>((resolve) => {
+          resolveScan = resolve
+        })
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(scanButton())
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    resolveScan(SCAN_SUMMARY)
+    await flush()
+
+    expect(scanLine()).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('holds the workspace pick while a remedy is in flight, so a receipt for a file that has already left the project can never be stranded between two projects', async () => {
+    // The window this closes was reachable by ordinary clicking: confirm a
+    // quarantine, then pick another project while it runs. The file leaves
+    // the project either way -- the shell is already past the point of no
+    // return -- and the generation guard then drops the receipt, correctly,
+    // since posting it under the new project would read as a move inside
+    // *that* project. Correct and silent: the user is never told the file
+    // left. Holding the pick for the length of one remedy is the only
+    // answer that is neither wrong nor silent.
+    let resolveRemedy: (result: unknown) => void = () => {}
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
+      if (cmd === 'misplaced_remedy') {
+        return new Promise((resolve) => {
+          resolveRemedy = resolve as (result: unknown) => void
+        })
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+    )
+    await flush()
+
+    const pick = screen.getByRole('button', { name: 'Pick workspace' }) as HTMLButtonElement
+    expect(pick.disabled).toBe(true)
+    fireEvent.click(pick)
+    await flush()
+    expect(countCalls(calls, 'workspace_pick')).toBe(0)
+
+    resolveRemedy({
+      remedy: 'ignore',
+      outcome: 'ignored',
+      name: null,
+      sha256: 'ab'.repeat(32),
+      originalKept: true,
+      detail: null,
+    })
+    await flush()
+
+    // The receipt is posted, under the project it belongs to, and the pick
+    // is live again the moment the remedy is done.
+    expect(remedyResultLine()).toContain('ignore: the decision was recorded')
+    expect((screen.getByRole('button', { name: 'Pick workspace' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('refuses a workspace pick that lands before React has re-rendered the disabled button: the ref, not the attribute, is what holds the pick during a remedy', async () => {
+    // The `disabled` attribute is one render behind the click that starts
+    // the remedy. What actually has to hold the pick is `remedyBusyRef`,
+    // set synchronously in the same tick -- so the two clicks go out in a
+    // single `act` with no re-render between them, which is the only way to
+    // reach the handler's own guard rather than the attribute above it.
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
+      if (cmd === 'misplaced_remedy') {
+        return new Promise<never>(() => {
+          // Never settles: the remedy stays in flight for both clicks.
+        })
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    const ignore = within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+      name: 'Ignore',
+    })
+    const pick = screen.getByRole('button', { name: 'Pick workspace' }) as HTMLButtonElement
+    expect(pick.disabled).toBe(false)
+
+    act(() => {
+      ignore.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      pick.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+    expect(countCalls(calls, 'workspace_pick')).toBe(0)
+  })
+
+  it("drops a wrongroot_status that resolves after a workspace pick: a stale report never posts the previous project's scan counts under the new one", async () => {
+    // The generation guard is implemented in all four wrong-root paths and
+    // was proven in three of eight continuations -- `wrongroot_status` in
+    // neither of its two. It is the one that carries `scanned, findings n`,
+    // so a stale answer states, on the new project's own status line, how
+    // many findings the *previous* project had.
+    let resolveStatus: (status: WrongRootStatus) => void = () => {}
+    let picked = false
+    mountWrongRoots(
+      {
+        status: () =>
+          picked
+            ? wrongRootStatusAdvisory({ scanned: false, findings: 0 })
+            : new Promise<WrongRootStatus>((resolve) => {
+                resolveStatus = resolve
+              }),
+        rows: [],
+      },
+      (cmd) => {
+        if (cmd === 'workspace_pick') {
+          picked = true
+          return { displayPath: '/home/user/other', workArea: 'valid' }
+        }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(outputDisciplineUnavailableLine()).not.toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    resolveStatus(wrongRootStatusAdvisory({ scanned: true, findings: 7 }))
+    await flush()
+
+    expect(outputDisciplineLine()).not.toContain('findings 7')
+    expect(outputDisciplineLine()).toContain('not scanned yet')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('drops a wrongroot_status that *rejects* after a workspace pick too, leaving the new project\'s own report standing rather than clearing it', async () => {
+    let rejectStatus: (reason: unknown) => void = () => {}
+    let picked = false
+    mountWrongRoots(
+      {
+        status: () =>
+          picked
+            ? wrongRootStatusAdvisory({ scanned: true, findings: 1 })
+            : new Promise<WrongRootStatus>((_resolve, reject) => {
+                rejectStatus = reject
+              }),
+        rows: [],
+      },
+      (cmd) => {
+        if (cmd === 'workspace_pick') {
+          picked = true
+          return { displayPath: '/home/user/other', workArea: 'valid' }
+        }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(outputDisciplineUnavailableLine()).not.toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    rejectStatus({ code: 'unexpected', message: 'gone' })
+    await flush()
+
+    // The new project's report answered; the old project's rejection must
+    // not reach in and clear it.
+    expect(outputDisciplineLine()).toContain('scanned, findings 1')
+    expect(outputDisciplineUnavailableLine()).toBeNull()
+  })
+
+  it("drops a misplaced_list that *rejects* after a workspace pick: the previous project's failure never posts the 'could not be read' line over the new project's own answer", async () => {
+    let rejectList: (reason: unknown) => void = () => {}
+    let picked = false
+    mountWrongRoots(
+      {
+        rows: () =>
+          picked
+            ? [MISPLACED_BUNDLE]
+            : new Promise<MisplacedRow[]>((_resolve, reject) => {
+                rejectList = reject
+              }),
+      },
+      (cmd) => {
+        if (cmd === 'workspace_pick') {
+          picked = true
+          return { displayPath: '/home/user/other', workArea: 'valid' }
+        }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    rejectList({ code: 'unexpected', message: 'gone' })
+    await flush()
+
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    expect(misplacedRows().map((cells) => cells[0])).toEqual(['build/bundle.zip'])
+    expect(misplacedUnavailableLine()).toBeNull()
+  })
+
+  it("drops a misplaced_list that resolves after a workspace pick: one project's findings never stand in the next project's table", async () => {
+    let resolveList: (rows: MisplacedRow[]) => void = () => {}
+    let picked = false
+    mountWrongRoots(
+      {
+        rows: () =>
+          picked
+            ? []
+            : new Promise<MisplacedRow[]>((resolve) => {
+                resolveList = resolve
+              }),
+      },
+      (cmd) => {
+        if (cmd === 'workspace_pick') {
+          picked = true
+          return { displayPath: '/home/user/other', workArea: 'valid' }
+        }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    resolveList([MISPLACED_REPORT])
+    await flush()
+
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).toBeNull()
+  })
+})
+
+describe('AgentPanel wrong roots guards (slice 5d)', () => {
+  it("freezes every remedy, the open quarantine block's input and its final button while a run is active -- the shell refuses each remedy with run-active in the same window -- while Scan stays live; everything is live again once the run ends, with the typed gate surviving the run", async () => {
+    let channel: LiveChannel | undefined
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(false)
+
+    await startRunOverWorkspace()
+
+    const controls = () => {
+      const row = misplacedTableRow('docs/report.pdf')
+      return {
+        quarantine: (within(row).getByRole('button', { name: 'Quarantine' }) as HTMLButtonElement)
+          .disabled,
+        publish: (
+          within(row).getByRole('button', { name: 'Publish to outbox' }) as HTMLButtonElement
+        ).disabled,
+        ignore: (within(row).getByRole('button', { name: 'Ignore' }) as HTMLButtonElement).disabled,
+        gate: quarantineGate().disabled,
+        confirm: quarantineButton().disabled,
+        scan: scanButton().disabled,
+      }
+    }
+    expect(controls()).toEqual({
+      quarantine: true,
+      publish: true,
+      ignore: true,
+      gate: true,
+      confirm: true,
+      scan: false,
+    })
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+    expect(controls()).toEqual({
+      quarantine: false,
+      publish: false,
+      ignore: false,
+      gate: false,
+      confirm: false,
+      scan: false,
+    })
+    expect(quarantineGate().value).toBe('abababab')
+  })
+
+  it('refuses a remedy that lands in the same tick as Start, before React has re-rendered either the button or the handler: the run is active from the moment Start is clicked, and both halves of the freeze were one render behind it', async () => {
+    // The handler-side run-active guard could not be reached by any click
+    // while it read the render value: every entry point carries
+    // `disabled={runActive || ...}`, and React does not dispatch onClick on
+    // a disabled button, so deleting the guard left the whole suite green.
+    // The window it is *for* is this one -- `handleStart` sets `isSpawning`
+    // inside a click handler, so a second click batched into the same tick
+    // sees a stale `false` on the button and in the closure alike. Both
+    // clicks go out inside one `act`, which is the only way to keep the
+    // render batched and reach the handler with the button still enabled.
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
+      if (cmd === 'harness_spawn') {
+        return new Promise<number>(() => {
+          // Never settles: the run stays in its spawning window, which is
+          // exactly the window `handleStart` opens synchronously.
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+
+    const start = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+    const ignore = within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+      name: 'Ignore',
+    }) as HTMLButtonElement
+    expect(start.disabled).toBe(false)
+    expect(ignore.disabled).toBe(false)
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      ignore.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'harness_spawn')).toBe(1)
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+  })
+
+  it('a click on a frozen remedy during a run invokes nothing, belt and braces with the buttons\' own disabled', async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    await startRunOverWorkspace()
+
+    const row = misplacedTableRow('docs/report.pdf')
+    fireEvent.click(within(row).getByRole('button', { name: 'Ignore' }))
+    fireEvent.click(within(row).getByRole('button', { name: 'Publish to outbox' }))
+    fireEvent.click(within(row).getByRole('button', { name: 'Quarantine' }))
+    await flush()
+
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+  })
+})
+
+describe('AgentPanel wrong roots banners (slice 5d)', () => {
+  const codes: { code: string; message: string }[] = [
+    {
+      code: 'misplaced-unknown',
+      message: 'no scan reported that file at that digest; scan again and retry',
+    },
+    {
+      code: 'quarantine-unavailable',
+      message: 'the quarantine directory could not be used',
+    },
+    // `scan-failed` is not in this table: it is `wrongroot_scan`'s refusal,
+    // not a remedy's, and it has its own banner test below. Mixing it in
+    // here was part of why the reachable set was never actually counted.
+    { code: 'invalid-request', message: 'the digest is not 64 hex characters' },
+    { code: 'refused', message: "the file's content changed since it was found" },
+    {
+      code: 'outbox-unavailable',
+      message: 'an outbox entry of that name already exists with other content',
+    },
+    { code: 'work-area-invalid', message: 'the ignore ledger could not be written' },
+    { code: 'run-active', message: 'a run is active; approve or publish once it has ended' },
+    // HAP-001-R20's hard-link refusal, applied to a misplaced file
+    // (HAP-001-R32) -- reachable from **both** remedies, since
+    // `open_misplaced` raises it for the quarantine path and the copy-in
+    // raises it again for the publish path. It was on none of the three
+    // lists that were supposed to enumerate this command's codes: not the
+    // wrapper's `# Errors` JSDoc, not the wrapper tests, and not here.
+    { code: 'outbox-linked', message: "the file's link count is greater than one" },
+    { code: 'outbox-invalid', message: 'the outbox declaration could not be loaded' },
+    { code: 'workspace-unavailable', message: 'no workspace is active' },
+  ]
+
+  it('covers every code misplaced_remedy reaches, which is ten', () => {
+    // The number is the point: the wrapper's JSDoc named nine, the wrapper
+    // tests asserted seven, and this table asserted a different seven. One
+    // reachable refusal -- a security refusal -- was missing from all
+    // three, so no list here disagreed with any other loudly enough to be
+    // noticed.
+    expect(codes).toHaveLength(10)
+    expect(codes.map((entry) => entry.code).sort()).toEqual([
+      'invalid-request',
+      'misplaced-unknown',
+      'outbox-invalid',
+      'outbox-linked',
+      'outbox-unavailable',
+      'quarantine-unavailable',
+      'refused',
+      'run-active',
+      'work-area-invalid',
+      'workspace-unavailable',
+    ])
+  })
+
+  it.each(codes)(
+    'renders a $code rejection through the banner as "<code>: <message>" with no "untrusted" prefix and no detail rendered',
+    async ({ code, message }) => {
+      mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+        cmd === 'misplaced_remedy'
+          ? Promise.reject({ code, message, detail: { recordedSha256Short: 'deadbeef' } })
+          : undefined,
+      )
+      await screen.findByRole('table', { name: 'Misplaced files' })
+
+      fireEvent.click(
+        within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+      )
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(banner.textContent).not.toContain('untrusted')
+      expect(banner.textContent).not.toContain('deadbeef')
+    },
+  )
+
+  it('renders a scan-failed rejection from Scan the same way, and leaves no scan line claiming a walk that never ran', async () => {
+    mountWrongRoots({ rows: [] }, (cmd) =>
+      cmd === 'wrongroot_scan'
+        ? Promise.reject({ code: 'scan-failed', message: 'the project could not be scanned' })
+        : undefined,
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(scanButton())
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('scan-failed: the project could not be scanned')
+    expect(scanLine()).toBeNull()
+    expect(scanButton().disabled).toBe(false)
+  })
+
+  it('renders a non-ShellError rejection as "unexpected error" and nothing of its message', async () => {
+    mountWrongRoots({ rows: [] }, (cmd) =>
+      cmd === 'wrongroot_scan' ? Promise.reject(new Error('a stack trace nobody should read')) : undefined,
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(scanButton())
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('unexpected error')
+    expect(banner.textContent).not.toContain('stack trace')
+  })
+
+  it('keeps the table and the open block as they were on every rejection that is not misplaced-unknown, so the user can read the banner and retry the decision they had already made', async () => {
+    // The claim "a rejection keeps the table and the block" was in the
+    // spike log and untested: every banner case above clicks Ignore from
+    // the table with no block open, so nothing there could have noticed a
+    // rejection closing one.
+    const calls = await openQuarantineBlock((cmd) =>
+      cmd === 'misplaced_remedy'
+        ? Promise.reject({
+            code: 'quarantine-unavailable',
+            message: 'the quarantine directory could not be used',
+          })
+        : undefined,
+    )
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    fireEvent.click(quarantineButton())
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      'quarantine-unavailable: the quarantine directory could not be used',
+    )
+    // The block is still open, still bound to the same finding, with the
+    // typed gate intact and the button live -- everything the user needs to
+    // retry without reading and typing the digest again.
+    expect(screen.queryByLabelText('Quarantine confirmation')).not.toBeNull()
+    expect(quarantineBlockLines()[0]).toBe('name: docs/report.pdf')
+    expect(quarantineGate().value).toBe('abababab')
+    expect(quarantineButton().disabled).toBe(false)
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).not.toBeNull()
+
+    // And it really can be retried: a second click sends a second request.
+    const before = countCalls(calls, 'misplaced_remedy')
+    fireEvent.click(quarantineButton())
+    await waitFor(() => {
+      expect(countCalls(calls, 'misplaced_remedy')).toBe(before + 1)
+    })
+  })
+
+  it('clears the banner when a later act succeeds, so a refusal never outlives the attempt it refused', async () => {
+    let fail = true
+    mountWrongRoots({ rows: [] }, (cmd) => {
+      if (cmd !== 'wrongroot_scan') return undefined
+      return fail
+        ? Promise.reject({ code: 'scan-failed', message: 'the project could not be scanned' })
+        : SCAN_SUMMARY
+    })
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    fireEvent.click(scanButton())
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe('scan-failed: the project could not be scanned')
+
+    fail = false
+    fireEvent.click(scanButton())
+
+    await waitFor(() => {
+      expect(scanLine()).not.toBeNull()
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('closes a stale quarantine block on misplaced-unknown and refetches, since its facts name a finding the shell no longer reports', async () => {
+    const calls = await openQuarantineBlock((cmd) =>
+      cmd === 'misplaced_remedy'
+        ? Promise.reject({
+            code: 'misplaced-unknown',
+            message: 'no scan reported that file at that digest; scan again and retry',
+          })
+        : undefined,
+    )
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    const before = calls.length
+    fireEvent.click(quarantineButton())
+
+    await screen.findByRole('alert')
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    await waitFor(() => {
+      expect(calls.slice(before).map((call) => call.cmd)).toContain('misplaced_list')
+    })
+  })
+})
+
+describe('AgentPanel the open block is bound to an identity (slice 5d review, R3-028)', () => {
+  it('closes the confirmation when a run-end refetch reports the same name at different bytes, rather than swapping the identity facts under a decision the user is part-way through taking', async () => {
+    // The block was bound by name alone, and the section refetches on every
+    // scan and on every run-end `misplaced` frame -- a frame that arrives
+    // with the user doing nothing at all. A refetch returning the same name
+    // at other bytes therefore replaced the digest the user was reading and
+    // typing, inside an open confirmation that looked unchanged. The block
+    // is bound to the pair `misplaced_remedy` itself binds to, so it either
+    // still names the finding it was opened for or it is gone.
+    let channel: LiveChannel | undefined
+    let rows: MisplacedRow[] = [MISPLACED_REPORT]
+    mountWrongRoots({ rows: () => rows }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(false)
+
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+    // Same project-relative name, different content: a different finding.
+    rows = [misplacedRow({ sha256: 'ef'.repeat(32), sha256Short: 'efefefef' })]
+    deliverMisplaced(channel)
+    await waitFor(() => {
+      expect(misplacedRows()[0]?.[4]).toBe('efefefef')
+    })
+
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    await endRun(channel)
+  })
+
+  it('keeps the confirmation open across a refetch that reports the same finding at the same bytes, so an ordinary run-end frame does not throw away a decision in progress', async () => {
+    let channel: LiveChannel | undefined
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+    deliverMisplaced(channel)
+    await flush()
+
+    expect(screen.queryByLabelText('Quarantine confirmation')).not.toBeNull()
+    expect(quarantineGate().value).toBe('abababab')
+    await endRun(channel)
+  })
+})
+
+describe('AgentPanel names that do not render as themselves (slice 5d review, R1-011 / R1-012)', () => {
+  it('renders a name carrying U+2028 on one visual line: both separators are forced line breaks under CSS, so a producer could otherwise put a second line inside the delete confirmation and it would be indistinguishable from the block\'s own fixed sentences', async () => {
+    const lineSeparator = String.fromCodePoint(0x2028)
+    const paragraphSeparator = String.fromCodePoint(0x2029)
+    const hostile = `docs/report.pdf${lineSeparator}this line was written by the producer${paragraphSeparator}and so was this`
+    mountWrongRoots({ rows: [misplacedRow({ name: hostile })] })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(misplacedTable().querySelectorAll('button')[0] as HTMLElement)
+    await screen.findByLabelText('Quarantine confirmation')
+
+    const region = wrongRootsRegion()
+    expect(region.textContent).not.toContain(lineSeparator)
+    expect(region.textContent).not.toContain(paragraphSeparator)
+    // The textual content itself is kept -- RCS-001-R18 forbids removing
+    // it; only the two format controls go, so the smuggled sentences stay
+    // visibly part of the file name instead of standing as lines of their
+    // own.
+    expect(region.textContent).toContain('this line was written by the producer')
+    expect(quarantineBlockLines()[0]).toBe(
+      'name: docs/report.pdfthis line was written by the producerand so was this (this name contains hidden characters; compare by digest)',
+    )
+  })
+
+  it('marks a name whose displayed form is not its whole form, so two findings differing only by an invisible character are not left looking identical beside a delete button', async () => {
+    // Stripping happens for display only. Two names differing solely by a
+    // zero-width space render as the same string, and one of these rows is
+    // about to be offered Quarantine: after the fact the user cannot say
+    // which of the two left the project. The mark does not print the
+    // removed characters -- that would put them back on the screen -- it
+    // says the displayed name is not the whole name, which is what sends
+    // the user to the digest column.
+    const zeroWidth = String.fromCodePoint(0x200b)
+    mountWrongRoots({
+      rows: [
+        MISPLACED_REPORT,
+        misplacedRow({
+          name: `docs/report${zeroWidth}.pdf`,
+          sha256: 'cd'.repeat(32),
+          sha256Short: 'cdcdcdcd',
+        }),
+      ],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    const [plain, hidden] = misplacedRows()
+    expect(plain?.[0]).toBe('docs/report.pdf')
+    expect(hidden?.[0]).toBe(
+      'docs/report.pdf (this name contains hidden characters; compare by digest)',
+    )
+    // The mark is what makes the two rows tellable apart; the digests are
+    // what tells them apart.
+    expect(plain?.[0]).not.toBe(hidden?.[0])
+    expect(plain?.[4]).toBe('abababab')
+    expect(hidden?.[4]).toBe('cdcdcdcd')
+    expect(wrongRootsRegion().textContent).not.toContain(zeroWidth)
+  })
+
+  it('leaves an ordinary name unmarked, so the mark means something when it appears', async () => {
+    mountWrongRoots({ rows: [MISPLACED_REPORT] })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(misplacedRows()[0]?.[0]).toBe('docs/report.pdf')
+    expect(misplacedTable().textContent).not.toContain('hidden characters')
+  })
+})
+
+describe('AgentPanel wrong roots out-of-order fetches (slice 5d review, R3-022)', () => {
+  it('applies only the latest wrongroot_status when an earlier one resolves after it: an overtaken report would otherwise post older scan counts over newer ones', async () => {
+    // Both fetches belong to the same project, so the generation guard has
+    // nothing to say about this one -- the sequence number is the only
+    // thing that orders them. Deleting it left the suite green.
+    const settle: ((status: WrongRootStatus) => void)[] = []
+    mountWrongRoots(
+      {
+        status: () =>
+          new Promise<WrongRootStatus>((resolve) => {
+            settle.push(resolve)
+          }),
+        rows: [],
+      },
+      (cmd) => (cmd === 'wrongroot_scan' ? SCAN_SUMMARY : undefined),
+    )
+    await waitFor(() => {
+      expect(settle).toHaveLength(1)
+    })
+
+    // A scan refetches the status, so a second fetch is now in flight.
+    fireEvent.click(scanButton())
+    await waitFor(() => {
+      expect(settle).toHaveLength(2)
+    })
+
+    // The later fetch answers first, the earlier one second.
+    settle[1]?.(wrongRootStatusAdvisory({ scanned: true, findings: 3 }))
+    await flush()
+    settle[0]?.(wrongRootStatusAdvisory({ scanned: false, findings: 0 }))
+    await flush()
+
+    expect(outputDisciplineLine()).toContain('scanned, findings 3')
+    expect(outputDisciplineLine()).not.toContain('not scanned yet')
+  })
+
+  it('applies only the latest misplaced_list when an earlier one resolves after it: an overtaken listing would otherwise put findings the shell has already remedied back in the table', async () => {
+    const settle: ((rows: MisplacedRow[]) => void)[] = []
+    mountWrongRoots(
+      {
+        rows: () =>
+          new Promise<MisplacedRow[]>((resolve) => {
+            settle.push(resolve)
+          }),
+      },
+      (cmd) => (cmd === 'wrongroot_scan' ? SCAN_SUMMARY : undefined),
+    )
+    await waitFor(() => {
+      expect(settle).toHaveLength(1)
+    })
+
+    fireEvent.click(scanButton())
+    await waitFor(() => {
+      expect(settle).toHaveLength(2)
+    })
+
+    settle[1]?.([])
+    await flush()
+    settle[0]?.([MISPLACED_REPORT])
+    await flush()
+
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).toBeNull()
+    expect(misplacedUnavailableLine()).toBeNull()
+  })
+})
+
+describe('AgentPanel wrong roots unmount guards (slice 5d; slice 5c review, R3-001)', () => {
+  /**
+   * The four wrong-root commands, each reached the way the surface reaches
+   * it: a fetch on mount, the Scan button, or a remedy button. Mounts,
+   * drives the panel until `command` is in flight, and hands back the
+   * recorded calls and that one deferred promise's settle functions.
+   */
+  async function driveWrongRootInFlight(command: string): Promise<{
+    calls: Call[]
+    resolve: (value: unknown) => void
+    reject: (reason: unknown) => void
+  }> {
+    let resolve: (value: unknown) => void = () => {}
+    let reject: (reason: unknown) => void = () => {}
+    const deferred = (): Promise<never> =>
+      new Promise((settle, refuse) => {
+        resolve = settle as (value: unknown) => void
+        reject = refuse
+      })
+
+    if (command === 'wrongroot_status') {
+      const calls = mountWrongRoots({ status: () => deferred(), rows: [] })
+      await waitFor(() => {
+        expect(countCalls(calls, 'misplaced_list')).toBe(1)
+      })
+      return { calls, resolve, reject }
+    }
+    if (command === 'misplaced_list') {
+      const calls = mountWrongRoots({ rows: () => deferred() })
+      await waitFor(() => {
+        expect(outputDisciplineLine()).not.toBeNull()
+      })
+      return { calls, resolve, reject }
+    }
+    if (command === 'wrongroot_scan') {
+      const calls = mountWrongRoots({ rows: [] }, (cmd) =>
+        cmd === 'wrongroot_scan' ? deferred() : undefined,
+      )
+      await waitFor(() => {
+        expect(outputDisciplineLine()).not.toBeNull()
+      })
+      fireEvent.click(scanButton())
+      await waitFor(() => {
+        expect(countCalls(calls, 'wrongroot_scan')).toBe(1)
+      })
+      return { calls, resolve, reject }
+    }
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy' ? deferred() : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }))
+    await waitFor(() => {
+      expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+    })
+    return { calls, resolve, reject }
+  }
+
+  const UNMOUNT_ANSWERS: Record<string, unknown> = {
+    wrongroot_status: wrongRootStatusAdvisory(),
+    misplaced_list: [MISPLACED_REPORT],
+    wrongroot_scan: SCAN_SUMMARY,
+    misplaced_remedy: {
+      remedy: 'ignore',
+      outcome: 'ignored',
+      name: null,
+      sha256: 'ab'.repeat(32),
+      originalKept: true,
+      detail: null,
+    },
+  }
+
+  /**
+   * What each parameter of this test actually proves, stated because two of
+   * the four prove less than the name suggests.
+   *
+   * `wrongroot_scan` and `misplaced_remedy` both refetch on success, so
+   * "no IPC call after the unmount" has teeth for them: removing their
+   * `mountedRef` guard turns the refetch into two calls after `cleanup()`
+   * and this test goes red.
+   *
+   * `wrongroot_status` and `misplaced_list` issue no follow-up IPC at all
+   * -- their continuations only `setState` -- and React 19 makes a
+   * `setState` on an unmounted component a silent no-op with no warning.
+   * There is therefore nothing observable to assert for those two, and
+   * measurement confirms it: deleting `refreshMisplaced`'s `mountedRef`
+   * guard leaves the whole suite green. They are kept here for the "nothing
+   * thrown, no console.error" half, which is real, and their sequencing --
+   * the guard that *is* observable -- is covered by the out-of-order tests
+   * above rather than pretended at here.
+   */
+  it.each(['wrongroot_status', 'misplaced_list', 'wrongroot_scan', 'misplaced_remedy'])(
+    "%s's continuation no-ops after unmount, whether it resolves or rejects: nothing thrown and no console.error, and -- for the scan and the remedy, which refetch on success -- no IPC call after the unmount",
+    async (command) => {
+      for (const outcome of ['resolve', 'reject'] as const) {
+        const { calls, resolve, reject } = await driveWrongRootInFlight(command)
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const before = calls.length
+
+        cleanup()
+        if (outcome === 'resolve') resolve(UNMOUNT_ANSWERS[command])
+        else reject({ code: 'scan-failed', message: 'the project could not be scanned' })
+        await new Promise((settled) => {
+          setTimeout(settled, 0)
+        })
+
+        expect(consoleErrorSpy).not.toHaveBeenCalled()
+        expect(calls.length).toBe(before)
+        consoleErrorSpy.mockRestore()
+        clearMocks()
+      }
+    },
+  )
+})
+
+describe('AgentPanel wrong-root wire tokens it does not recognize (slice 5d review, R1-001)', () => {
+  /**
+   * Every one of these fields is a plain string on the wire. The renderer's
+   * unions are closed; the shell's are not, and a shell one version ahead
+   * puts a token here that no `case` matches. An exhaustive switch with no
+   * `default` returned `undefined`, which reaches `PlainTextLine` and throws
+   * `Array.from(undefined)` mid-render -- and with no boundary above these
+   * panels that throw unmounted the whole page, the approval surface and
+   * every freeze guard with it.
+   */
+  it('renders an unrecognized reason token as the raw token, inert, rather than throwing mid-render and taking the panel down', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({
+      rows: [misplacedRow({ reason: 'in-project-inside-some-later-arm' as WrongRootReason })],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(misplacedRows()[0]?.[5]).toBe('in-project-inside-some-later-arm')
+    // The surface is whole: the table stands, the region stands, and the
+    // remedies are still offered for the row.
+    expect(remedyButtons('docs/report.pdf')).toEqual(['Quarantine', 'Publish to outbox', 'Ignore'])
+    expect(screen.getByRole('region', { name: 'Wrong roots' })).toBeTruthy()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('renders an unrecognized detail token in the receipt as the raw token rather than throwing, so a remedy that has already run can still report what it did', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'ignore',
+            outcome: 'ignored',
+            name: null,
+            sha256: 'ab'.repeat(32),
+            originalKept: true,
+            detail: 'a-token-from-a-later-shell' as RemedyDetail,
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+    )
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toContain('a-token-from-a-later-shell')
+    expect(screen.getByRole('region', { name: 'Wrong roots' })).toBeTruthy()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('renders an unrecognized outcome token as the raw token rather than throwing', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'ignore',
+            outcome: 'archived-somewhere-new' as RemedyOutcome,
+            name: null,
+            sha256: 'ab'.repeat(32),
+            originalKept: true,
+            detail: null,
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+    )
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toContain('archived-somewhere-new')
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('renders an unrecognized output-discipline token and an unrecognized scope mode as their raw tokens, keeping the status line and the disclosures standing', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({
+      status: {
+        outputDiscipline: 'partially-enforced' as OutputDiscipline,
+        scopeMode: 'container-enforced' as ScopeMode,
+        disclosures: [IN_PROJECT_DISCLOSURE],
+        scanned: false,
+        findings: 0,
+      },
+    })
+
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(outputDisciplineLine()).toContain('partially-enforced')
+    expect(outputDisciplineLine()).toContain('container-enforced')
+    // The assertions above are not enough on their own, and measurement
+    // said so: the status line interpolates `status.outputDiscipline`
+    // verbatim *as well as* through the formatter, so `toContain` passed
+    // even with the formatter returning `undefined`. A formatter returning
+    // `undefined` into a template literal does not throw -- it renders the
+    // word `undefined` beside the token, which is the surface stating a
+    // fact about the user's project in a word the shell never sent. That
+    // is what this assertion catches.
+    expect(outputDisciplineLine()).not.toContain('undefined')
+    expect(outputDisciplineLine()).toBe(
+      'output discipline: partially-enforced (scope container-enforced) — partially-enforced; not scanned yet',
+    )
+    expect(disclosureLines()).toEqual([IN_PROJECT_DISCLOSURE])
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('drops a listing row that is not a finding -- the [{}] payload that threw "Cannot read properties of undefined (reading \'map\')" mid-render -- keeps the rows that are, and says the table is incomplete rather than passing a short list off as the whole one', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({
+      rows: () => [
+        MISPLACED_REPORT,
+        {},
+        { name: 'half.pdf' },
+        { ...MISPLACED_BUNDLE, remedies: null },
+        null,
+        'a finding',
+      ],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    // Exactly the one well-formed row, and a line saying the rest could not
+    // be read: a shortened table must never read as a shorter list of
+    // findings.
+    expect(misplacedRows().map((cells) => cells[0])).toEqual(['docs/report.pdf'])
+    expect(misplacedIncompleteLine()).toBe(
+      'some findings could not be read and are not listed; the table below is incomplete',
+    )
+    // Never the other name: the table is on the screen, so a screen reader
+    // must not be told the findings are unavailable (R3-047).
+    expect(misplacedUnavailableLine()).toBeNull()
+    expect(screen.getByRole('region', { name: 'Wrong roots' })).toBeTruthy()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('offers no button at all for a remedy token it does not recognize, and sends no misplaced_remedy for one: an unknown remedy is not assumed harmless just because it is unknown', async () => {
+    // The cell used to ask `remedy === 'quarantine' ? gated : one click`,
+    // so every token that was not that exact string got a one-click,
+    // ungated button -- the fail-open default, on the one surface in this
+    // product that deletes a file inside the user's project.
+    const calls = mountWrongRoots({
+      rows: [
+        misplacedRow({
+          remedies: ['purge', 'quarantine', 'shred', 'ignore'] as Remedy[],
+        }),
+      ],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(remedyButtons('docs/report.pdf')).toEqual(['Quarantine', 'Ignore'])
+    expect(misplacedTable().textContent).not.toContain('purge')
+    expect(misplacedTable().textContent).not.toContain('shred')
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+  })
+
+  it("sends nothing for a remedy the row's own remedies array does not carry, even when this renderer knows the token: the offered set is the row's, never the component's", async () => {
+    // Reached through the block, which is the one place a remedy is run
+    // from something other than the row's own button: open Quarantine over
+    // a row whose `remedies` was refetched without it, and the confirm
+    // button must send nothing even with the gate typed correctly.
+    let rows: MisplacedRow[] = [MISPLACED_REPORT]
+    const calls = mountWrongRoots({ rows: () => rows }, (cmd) =>
+      cmd === 'wrongroot_scan' ? SCAN_SUMMARY : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(false)
+
+    // The shell stops offering quarantine for this finding; the block is
+    // still open over the same identity, and its button is still enabled.
+    rows = [misplacedRow({ remedies: ['ignore'] })]
+    fireEvent.click(scanButton())
+    await waitFor(() => {
+      expect(scanLine()).not.toBeNull()
+    })
+    const before = countCalls(calls, 'misplaced_remedy')
+    if (screen.queryByLabelText('Quarantine confirmation') !== null) {
+      fireEvent.click(quarantineButton())
+      await flush()
+    }
+
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(before)
+  })
+})
+
+describe('AgentPanel quarantine gate refusals (slice 5d review, R3-018 / R1-015)', () => {
+  it('refuses to confirm a row whose short digest is empty: an empty input would otherwise match it, and the button that removes a file from the project would become clickable having asked for nothing', async () => {
+    const calls = mountWrongRoots({ rows: [misplacedRow({ sha256Short: '' })] })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+
+    // The input opens empty, which is exactly the value that would satisfy
+    // an empty expected digest.
+    expect(quarantineGate().value).toBe('')
+    expect(quarantineButton().disabled).toBe(true)
+    fireEvent.change(quarantineGate(), { target: { value: 'x' } })
+    fireEvent.change(quarantineGate(), { target: { value: '' } })
+    expect(quarantineButton().disabled).toBe(true)
+
+    fireEvent.click(quarantineButton())
+    await flush()
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+  })
+
+  it('refuses to confirm a row whose short digest is not a prefix of its full digest: the gate checks one fact and the request carries the other, and nothing had ever compared them', async () => {
+    // The user reads and types `sha256Short`; `misplaced_remedy` is sent
+    // `sha256`. If the two disagree, the user confirms one file and the
+    // shell acts on another. They are two views of one identity or the row
+    // is incoherent, and an incoherent row is refused.
+    const calls = mountWrongRoots({
+      rows: [misplacedRow({ sha256: 'ab'.repeat(32), sha256Short: 'cdcdcdcd' })],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+
+    // Typing exactly what the label asks for still does not enable it.
+    expect(quarantineBlock().querySelector('label')?.textContent).toBe(
+      'Type the short digest (cdcdcdcd) to quarantine',
+    )
+    fireEvent.change(quarantineGate(), { target: { value: 'cdcdcdcd' } })
+    expect(quarantineButton().disabled).toBe(true)
+
+    fireEvent.click(quarantineButton())
+    await flush()
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+  })
+
+  it('still confirms a coherent row, so the two refusals above are not simply refusing everything', async () => {
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'quarantine',
+            outcome: 'quarantined',
+            name: 'abababab-report.pdf',
+            sha256: 'ab'.repeat(32),
+            originalKept: false,
+            detail: 'renamed',
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+
+    expect(quarantineButton().disabled).toBe(false)
+    fireEvent.click(quarantineButton())
+    await waitFor(() => {
+      expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+    })
+  })
+
+  it("opens each row's gate empty and disabled, so a digest typed for one finding never stands as confirmation for another", async () => {
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT, MISPLACED_BUNDLE] })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(false)
+
+    fireEvent.click(
+      within(misplacedTableRow('build/bundle.zip')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await flush()
+
+    // The second block is about the second finding, and it starts from
+    // nothing: the first row's typed digest neither survives in the input
+    // nor confirms this one.
+    expect(quarantineBlockLines()[0]).toBe('name: build/bundle.zip')
+    expect(quarantineGate().value).toBe('')
+    expect(quarantineButton().disabled).toBe(true)
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    expect(quarantineButton().disabled).toBe(true)
+    fireEvent.change(quarantineGate(), { target: { value: 'cdcdcdcd' } })
+    expect(quarantineButton().disabled).toBe(false)
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+  })
+})
+
+describe('AgentPanel remedy outcome null branches (slice 5d review, R3-019 / R1-004)', () => {
+  it('states that whether the original was kept was not reported when the wire says null, rather than claiming either -- assuming true under-reports a deletion, and assuming false reports one that never happened', async () => {
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'quarantine',
+            outcome: 'quarantined',
+            name: null,
+            sha256: null,
+            originalKept: null,
+            detail: null,
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    fireEvent.click(quarantineButton())
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    // All three nullable fields absent: no produced name is named, and the
+    // deletion question is answered "not reported" rather than answered.
+    expect(remedyResultLine()).toBe(
+      'quarantine: moved into quarantine, outside any workspace; whether the original was kept was not reported',
+    )
+    expect(remedyResultLine()).not.toContain('the original is gone from the project')
+    expect(remedyResultLine()).not.toContain('this remedy did not remove the original')
+    expect(remedyResultLine()).not.toContain('name ')
+  })
+
+  it('names no produced file when name is null but still reports the deletion the shell did make', async () => {
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? {
+            remedy: 'quarantine',
+            outcome: 'quarantined',
+            name: null,
+            sha256: 'ab'.repeat(32),
+            originalKept: false,
+            detail: 'renamed',
+          }
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Quarantine' }),
+    )
+    await screen.findByLabelText('Quarantine confirmation')
+    fireEvent.change(quarantineGate(), { target: { value: 'abababab' } })
+    fireEvent.click(quarantineButton())
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toBe(
+      'quarantine: moved into quarantine, outside any workspace; the original is gone from the project; moved by rename',
+    )
+  })
+})
+
+describe('AgentPanel misplaced_list fail-safe (slice 5d)', () => {
+  it('renders no table, and no thrown render, for a misplaced_list payload that is not the list its DTO promises: the fail-safe-to-nothing discipline the panel already applies to a frame it does not recognize', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({ rows: () => null })
+
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).toBeNull()
+    expect(screen.getByRole('region', { name: 'Wrong roots' })).toBeTruthy()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel a failed listing is not a clean project (slice 5d review, R1-009)', () => {
+  it('says the findings could not be read when misplaced_list rejects, rather than rendering the empty table that a project with nothing misplaced renders', async () => {
+    // A rejection set an empty list, which renders no table at all --
+    // pixel-for-pixel what a clean project looks like. "I found nothing"
+    // and "I could not look" are opposite facts, and this is the one
+    // surface where the second silently rendering as the first is the whole
+    // failure: a detection surface that stops detecting and says nothing.
+    mountWrongRoots({ rows: () => Promise.reject({ code: 'unexpected', message: 'gone' }) })
+
+    await waitFor(() => {
+      expect(misplacedUnavailableLine()).not.toBeNull()
+    })
+    expect(misplacedUnavailableLine()).toBe(
+      'the findings could not be read; this is not a report that nothing is misplaced',
+    )
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).toBeNull()
+    expect(screen.getByRole('region', { name: 'Wrong roots' })).toBeTruthy()
+  })
+
+  it('says it for a payload that is not a list either, and does not say it for a project that genuinely has nothing misplaced', async () => {
+    mountWrongRoots({ rows: () => null })
+    await waitFor(() => {
+      expect(misplacedUnavailableLine()).not.toBeNull()
+    })
+    expect(misplacedUnavailableLine()).toContain('this is not a report that nothing is misplaced')
+    cleanup()
+    clearMocks()
+
+    // The other half, without which the line above would just be permanent
+    // furniture: an empty listing that *is* the shell's answer says nothing.
+    mountWrongRoots({ rows: [] })
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    expect(misplacedUnavailableLine()).toBeNull()
+    expect(screen.queryByRole('table', { name: 'Misplaced files' })).toBeNull()
+  })
+
+  it('is contradicted by nothing: a status line still reporting findings beside an unreadable listing keeps the line that says the listing failed', async () => {
+    // The worst reading of the old behaviour: `scanned, findings 2` on the
+    // status line, no table under it, and nothing to say the two disagree.
+    mountWrongRoots({
+      status: wrongRootStatusAdvisory({ scanned: true, findings: 2 }),
+      rows: () => Promise.reject({ code: 'unexpected', message: 'gone' }),
+    })
+
+    await waitFor(() => {
+      expect(misplacedUnavailableLine()).not.toBeNull()
+    })
+    expect(outputDisciplineLine()).toContain('scanned, findings 2')
+    expect(misplacedUnavailableLine()).toContain('this is not a report that nothing is misplaced')
+  })
+
+  it('clears the line once a later listing succeeds, so it never outlives the failure it reports', async () => {
+    let fail = true
+    mountWrongRoots(
+      {
+        rows: () =>
+          fail ? Promise.reject({ code: 'unexpected', message: 'gone' }) : [MISPLACED_REPORT],
+      },
+      (cmd) => (cmd === 'wrongroot_scan' ? SCAN_SUMMARY : undefined),
+    )
+    await waitFor(() => {
+      expect(misplacedUnavailableLine()).not.toBeNull()
+    })
+
+    fail = false
+    fireEvent.click(scanButton())
+
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    expect(misplacedUnavailableLine()).toBeNull()
+  })
+})
+
+describe('AgentPanel guidance_snapshots fail-safe (slice 5c review, R3-011)', () => {
+  it.each([null, undefined, { id: '0123456789abcdef' }, 'snapshots'])(
+    'renders no snapshots table, and no thrown render, for a guidance_snapshots payload that is not the list its DTO promises (%s): the panel does not simply trust this DTO, because a render-time throw takes the whole panel down with it, freeze guards included',
+    async (payload) => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      mountGuidance({ note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: () => payload })
+
+      await waitFor(() => {
+        expect(noteStatusLine()).not.toBeNull()
+      })
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).toBeNull()
+      // The rest of the section still stands: the failure is confined to
+      // the table it would have rendered.
+      expect(within(noteBlock()).getByRole('button', { name: 'Preview' })).toBeTruthy()
+      expect(screen.getByRole('region', { name: 'Guidance' })).toBeTruthy()
+      expect(consoleErrorSpy).not.toHaveBeenCalled()
+      consoleErrorSpy.mockRestore()
+      cleanup()
+      clearMocks()
+    },
+  )
+})
+
+describe('AgentPanel synchronous busy refs (slice 5c review, R3-014)', () => {
+  /**
+   * Two clicks with no React re-render between them. `fireEvent.click` is
+   * `act`-wrapped, so React flushes after the first click and the second
+   * one lands on an already-disabled button -- which exercises the
+   * `disabled` attribute, not the ref beneath it. Dispatching both inside a
+   * single `act` keeps the render batched, so the second click reaches the
+   * handler with the button still enabled: what refuses it then is the ref
+   * alone, which is the thing under test.
+   */
+  function doubleClickWithoutRerender(button: HTMLElement): void {
+    act(() => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+  }
+
+  it("refuses a second guidance_pin that lands before React has re-rendered the disabled button: the ref, not the attribute, is what makes a double-click pin once", async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd) =>
+        cmd === 'guidance_pin'
+          ? new Promise<Snapshot>(() => {
+              // Never settles: the pin stays in flight for both clicks.
+            })
+          : undefined,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    const pin = within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' })
+    expect((pin as HTMLButtonElement).disabled).toBe(false)
+    doubleClickWithoutRerender(pin)
+
+    await flush()
+    expect(countCalls(calls, 'guidance_pin')).toBe(1)
+  })
+
+  it('refuses a second guidance write that lands before React has re-rendered the disabled button: the write must happen once per confirmed gate, never twice', async () => {
+    const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      if (cmd === 'guidance_apply') {
+        return new Promise<GuidanceApplied>(() => {
+          // Never settles: the write stays in flight for both clicks.
+        })
+      }
+      return undefined
+    })
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    expect(finalButton('Write').disabled).toBe(false)
+
+    doubleClickWithoutRerender(finalButton('Write'))
+
+    await flush()
+    expect(countCalls(calls, 'guidance_apply')).toBe(1)
+  })
+
+  it('refuses a second wrong-root remedy that lands before React has re-rendered the disabled buttons: quarantine removes the original, so it must run once per choice', async () => {
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? new Promise(() => {
+            // Never settles: the remedy stays in flight for both clicks.
+          })
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    const ignore = within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+      name: 'Ignore',
+    })
+    expect((ignore as HTMLButtonElement).disabled).toBe(false)
+    doubleClickWithoutRerender(ignore)
+
+    await flush()
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+  })
+
+  it('refuses a second wrongroot_scan that lands before React has re-rendered the disabled button: one walk per click', async () => {
+    const calls = mountWrongRoots({ rows: [] }, (cmd) =>
+      cmd === 'wrongroot_scan'
+        ? new Promise(() => {
+            // Never settles: the scan stays in flight for both clicks.
+          })
+        : undefined,
+    )
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+
+    expect(scanButton().disabled).toBe(false)
+    doubleClickWithoutRerender(scanButton())
+
+    await flush()
+    expect(countCalls(calls, 'wrongroot_scan')).toBe(1)
+  })
+})
+
+describe('AgentPanel pin during a run (slice 5c review, R3-015)', () => {
+  it("actually pins while a run is active: the click calls guidance_pin with exactly { id, pinned }, the row takes the store's answer, and the kind's status is refetched -- the shell's own guidance_pin takes no supervisor, so freezing it would be stricter than the contract", async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd, args) => {
+        if (cmd === 'harness_spawn') {
+          channel = (args as { onFrame: LiveChannel }).onFrame
+          return 7
+        }
+        if (cmd === 'guidance_pin') return { ...SNAPSHOT_NEWEST, pinned: true }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    await startRunOverWorkspace()
+    const before = calls.length
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }))
+
+    await waitFor(() => {
+      expect(countCalls(calls, 'guidance_pin')).toBe(1)
+    })
+    expect(calls.find((call) => call.cmd === 'guidance_pin')?.args).toEqual({
+      id: '89abcdef01234567',
+      pinned: true,
+    })
+    await waitFor(() => {
+      expect(snapshotRows()[0]?.slice(6)).toEqual(['yes', 'Unpin Restore'])
+    })
+    expect(calls.slice(before).map((call) => call.cmd)).toContain('guidance_status')
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+  })
+})
+
+describe('AgentPanel one run per tick (slice 5d second review, R3-033 / R3-034)', () => {
+  /**
+   * Selects an adapter, an approval and a prompt on a panel
+   * `mountWithWorkspace` mounted, without clicking Start: the tests below
+   * dispatch their own clicks inside a single `act`.
+   */
+  async function armStart(): Promise<HTMLButtonElement> {
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+    expect(start.disabled).toBe(false)
+    return start
+  }
+
+  it('spawns once for two Start clicks that land in the same tick, and holds the process it spawned: the second spawn used to win the generation check, so the first child process got no active id, no Stop button and no transcript -- an orphan this surface could never reach again', async () => {
+    // `handleStart` set `runActiveRef` and never read it. Start carries
+    // `disabled={runActive || ...}` like every other entry point, and that
+    // attribute is one render behind a run that has just started, so two
+    // clicks batched into one tick both reached the handler with the button
+    // still enabled -- on the one entry point that starts a child process.
+    const spawned: number[] = []
+    const calls = mountWithWorkspace((cmd) => {
+      if (cmd === 'harness_spawn') {
+        const id = 7 + spawned.length
+        spawned.push(id)
+        return id
+      }
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      return undefined
+    })
+    await screen.findByLabelText('Adapter')
+    const start = await armStart()
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'harness_spawn')).toBe(1)
+    expect(spawned).toEqual([7])
+    // And the id the panel is holding is that one process, not a second one
+    // whose spawn the first click's generation would have been discarded
+    // for: Stop reaches the process this panel actually started.
+    await screen.findByText('running')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await waitFor(() => {
+      expect(countCalls(calls, 'harness_stop')).toBe(1)
+    })
+    expect(calls.find((call) => call.cmd === 'harness_stop')?.args).toEqual({
+      id: 7,
+      deadlineMs: 2000,
+    })
+  })
+
+  it('keeps every remedy frozen while any spawn this panel started is still pending, even once an earlier one has settled: the run-active flag falls when the last spawn settles, never when the first does', async () => {
+    // The two halves together. `runActive` is `isSpawning || activeId !==
+    // null`, and `isSpawning` was a boolean: a spawn whose generation the
+    // next Start had already replaced still cleared it in its own
+    // `finally`, the mirroring effect lowered the ref behind it, and the
+    // remedies came back while a process was live and a second spawn was
+    // still in flight. The Start guard stops the second spawn; the pending
+    // count is what makes the flag describe *every* spawn rather than the
+    // last one to settle.
+    let settleSecond: ((id: number) => void) | undefined
+    const spawned: number[] = []
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
+      if (cmd === 'harness_spawn') {
+        spawned.push(7 + spawned.length)
+        if (spawned.length === 1) return 7
+        return new Promise<number>((resolve) => {
+          settleSecond = resolve
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    const start = await armStart()
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    // The freeze first, because it is what this test is for: whatever
+    // happened to the second click, a spawn has settled and the remedies
+    // must still refuse. Asserted before the spawn count so that a
+    // regression in the freeze is reported as a freeze failure rather than
+    // masked by the count assertion firing first.
+    const row = misplacedTableRow('docs/report.pdf')
+    fireEvent.click(within(row).getByRole('button', { name: 'Ignore' }))
+    fireEvent.click(within(row).getByRole('button', { name: 'Quarantine' }))
+    await flush()
+
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    // And there was only ever one spawn to settle.
+    expect(countCalls(calls, 'harness_spawn')).toBe(1)
+    expect(settleSecond).toBeUndefined()
+  })
+})
+
+describe('AgentPanel a listing row is checked field by field (slice 5d second review, R3-035)', () => {
+  /**
+   * One entry per field `isMisplacedRow` checks, each carrying a value of
+   * the wrong type for that field alone.
+   *
+   * The fixture the original test used was `[{}]` and `{ name: 'half.pdf' }`
+   * -- rows missing everything, which only ever exercised the first check
+   * that happened to fail. Deleting any single field's check left the suite
+   * green, and the one for `sha256Short` mattered most: the cell renders it
+   * through `PlainTextLine`, which calls `Array.from(text)`, so a row
+   * without it threw mid-render and -- before the boundary -- took the whole
+   * panel with it. Each field gets its own row here, so each check is what
+   * the assertion is about.
+   */
+  const WRONG_TYPED_FIELDS: [keyof MisplacedRow, unknown][] = [
+    ['name', 42],
+    ['size', '4096'],
+    ['sha256', undefined],
+    ['sha256Short', undefined],
+    ['detectedType', null],
+    ['class', 7],
+    ['reason', undefined],
+    ['remedies', 'quarantine'],
+  ]
+
+  it.each(WRONG_TYPED_FIELDS)(
+    'drops a listing row whose %s is not the type the DTO promises, keeps the well-formed row beside it, and says the table is incomplete',
+    async (field, value) => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      mountWrongRoots({
+        rows: () => [{ ...MISPLACED_BUNDLE, [field]: value }, MISPLACED_REPORT],
+      })
+      await screen.findByRole('table', { name: 'Misplaced files' })
+
+      expect(misplacedRows().map((cells) => cells[0])).toEqual(['docs/report.pdf'])
+      expect(misplacedIncompleteLine()).toBe(
+        'some findings could not be read and are not listed; the table below is incomplete',
+      )
+      // The section is still standing, and nothing threw on the way: the
+      // half-populated row is refused, not repaired and not rendered.
+      expect(screen.getByRole('region', { name: 'Wrong roots' })).toBeTruthy()
+      expect(remedyButtons('docs/report.pdf')).toEqual([
+        'Quarantine',
+        'Publish to outbox',
+        'Ignore',
+      ])
+      expect(consoleErrorSpy).not.toHaveBeenCalled()
+      consoleErrorSpy.mockRestore()
+      cleanup()
+      clearMocks()
+    },
+  )
+
+  it("drops a row whose remedies array is a list of something other than tokens: a row this surface would offer buttons for is refused before it can offer one", async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({
+      rows: () => [{ ...MISPLACED_BUNDLE, remedies: ['quarantine', 7] }, MISPLACED_REPORT],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(misplacedRows().map((cells) => cells[0])).toEqual(['docs/report.pdf'])
+    expect(misplacedIncompleteLine()).not.toBeNull()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel a remedy clears the banner (slice 5d second review, R3-036)', () => {
+  it('clears a refusal when a later remedy succeeds, so a quarantine-unavailable banner never stands above the receipt of the Publish that worked', async () => {
+    // R3-030 was recorded as covered, and it is -- for `handleScan`. The
+    // scan and the remedies each call `setError(null)` on their own way in,
+    // and only the scan's had a test: deleting `runRemedy`'s left the whole
+    // suite green, with a refusal about the quarantine directory standing
+    // above a receipt saying a copy reached the outbox.
+    let fail = true
+    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
+      if (cmd !== 'misplaced_remedy') return undefined
+      return fail
+        ? Promise.reject({
+            code: 'quarantine-unavailable',
+            message: 'the quarantine directory could not be used',
+          })
+        : {
+            remedy: 'publish',
+            outcome: 'copied-to-outbox',
+            name: 'abababab-report.pdf',
+            sha256: 'ab'.repeat(32),
+            originalKept: true,
+            detail: null,
+          }
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+    )
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toBe(
+      'quarantine-unavailable: the quarantine directory could not be used',
+    )
+
+    fail = false
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+        name: 'Publish to outbox',
+      }),
+    )
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyResultLine()).toContain('copied into the outbox as a new unattributed entry')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+describe('AgentPanel a state frame is checked before it is read (slice 5d second review, R3-049)', () => {
+  /**
+   * The listing rows got a structural check this pass; the transcript's own
+   * `state` payload did not, and it is the one reachable from a live frame
+   * rather than from a fetch. `formatStateEventLine` called
+   * `payload.observations.map` at render, so a frame whose `observations`
+   * is not a list threw inside the transcript -- which closes the whole
+   * Agent panel, taking the wrong-roots table, the remedies, the freeze
+   * guards and Stop with it.
+   */
+  it.each([null, undefined, 'cwd: /work', { key: 'cwd', value: '/work' }, 7])(
+    'renders a state frame whose observations is %s as its phase plus a line saying some observations could not be read, rather than throwing mid-render',
+    async (observations) => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const channel = await startAndCaptureChannel()
+
+      act(() => {
+        channel.onmessage({
+          stream: 'event',
+          body: {
+            id: 7,
+            seq: 4,
+            droppedBefore: 0,
+            kind: 'state',
+            payload: { phase: 'init', subtype: null, observations },
+          },
+        } as unknown as HarnessFrame)
+      })
+
+      const transcript = screen.getByLabelText('Agent transcript')
+      expect(transcript.textContent).toContain(
+        'init, some observations could not be read and are not shown',
+      )
+      // The panel is still standing, which is the whole point: this frame
+      // used to take it down.
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
+      expect(consoleErrorSpy).not.toHaveBeenCalled()
+      consoleErrorSpy.mockRestore()
+      cleanup()
+      clearMocks()
+    },
+  )
+
+  it('keeps the observations it can read beside the notice for the ones it cannot, so a partly readable frame is neither dropped whole nor passed off as complete', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const channel = await startAndCaptureChannel()
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 4,
+          droppedBefore: 0,
+          kind: 'state',
+          payload: {
+            phase: 'finished',
+            subtype: 'success',
+            observations: [
+              { key: 'cwd', value: '/work' },
+              // One of each half missing, so neither field's check can be
+              // dropped without this line noticing: a `key`-less
+              // observation renders as `undefined: ...` and a `value`-less
+              // one as `...: undefined`, both of which are this surface
+              // stating a fact in a word the shell never sent.
+              { key: 'model' },
+              { value: 'only-a-value' },
+              null,
+              { key: 'tokens', value: '12' },
+            ],
+          },
+        },
+      } as unknown as HarnessFrame)
+    })
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.textContent).toContain(
+      'finished, success, cwd: /work, tokens: 12, some observations could not be read and are not shown',
+    )
+    expect(transcript.textContent).not.toContain('undefined')
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('says nothing about dropped observations for a frame whose observations are all readable, so the notice is never permanent furniture', async () => {
+    const channel = await startAndCaptureChannel()
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 4,
+          droppedBefore: 0,
+          kind: 'state',
+          payload: {
+            phase: 'init',
+            subtype: null,
+            observations: [{ key: 'cwd', value: '/work' }],
+          },
+        },
+      })
+    })
+
+    const transcript = screen.getByLabelText('Agent transcript')
+    expect(transcript.textContent).toContain('init, cwd: /work')
+    expect(transcript.textContent).not.toContain('could not be read')
+  })
+})
+
+describe('AgentPanel a remedy that does not answer (slice 5d second review, R3-042)', () => {
+  beforeEach(() => {
+    // `shouldAdvanceTime` keeps the fake clock following real time, so
+    // Testing Library's own `waitFor` polling still runs while
+    // `advanceTimersByTime` drives the notice window.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** The line stated while a remedy has been in flight past the notice window. */
+  function remedyUnansweredLine(): string | null {
+    return screen.queryByRole('status', { name: 'Remedy unanswered' })?.textContent ?? null
+  }
+
+  it('says the remedy has not answered once it has been in flight past the notice window, keeps every remedy and the workspace pick frozen because the request cannot be withdrawn, and takes the line back the moment it answers', async () => {
+    // `misplaced_remedy` takes `{ name, sha256, remedy }` and no deadline,
+    // unlike `harness_stop`, so the renderer has none to hand it and no way
+    // to withdraw a request already made. A shell that never settled left
+    // every remedy and the pick frozen for the session with nothing said.
+    // The freeze is right -- the file may be part-way out of the project --
+    // and the silence was not.
+    let settle: ((result: unknown) => void) | undefined
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) =>
+      cmd === 'misplaced_remedy'
+        ? new Promise((resolve) => {
+            settle = resolve
+          })
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    fireEvent.click(
+      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+    )
+
+    // Nothing said while the wait is still ordinary.
+    expect(remedyUnansweredLine()).toBeNull()
+
+    act(() => {
+      vi.advanceTimersByTime(10_000)
+    })
+
+    expect(remedyUnansweredLine()).toBe(
+      'the remedy has not answered yet; it may still be running, so nothing here can say whether the file has moved, and the findings stay frozen until it answers',
+    )
+    // And the freeze is still on, which is the half the notice does not
+    // change: the request is out, and this surface cannot take it back.
+    expect(remedyButtons('docs/report.pdf')).toEqual([
+      'Quarantine',
+      'Publish to outbox',
+      'Ignore',
+    ])
+    const row = misplacedTableRow('docs/report.pdf')
+    expect(
+      (within(row).getByRole('button', { name: 'Quarantine' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    expect(countCalls(calls, 'workspace_pick')).toBe(0)
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(1)
+
+    if (!settle) throw new Error('misplaced_remedy was not called')
+    await act(async () => {
+      settle?.({
+        remedy: 'ignore',
+        outcome: 'ignored',
+        name: null,
+        sha256: null,
+        originalKept: true,
+        detail: null,
+      })
+    })
+
+    await waitFor(() => {
+      expect(remedyResultLine()).not.toBeNull()
+    })
+    expect(remedyUnansweredLine()).toBeNull()
+  })
+})
+
+describe('AgentPanel duplicate remedy tokens (slice 5d second review, R3-052)', () => {
+  it('renders one button per entry of a row whose remedies array repeats a token, with no duplicate React key: nothing on the wire promises the tokens are distinct', async () => {
+    // A duplicate key is reported on `console.error`, which this suite
+    // treats as a failure signal -- so the assertion below is what catches
+    // the regression, not the button count.
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWrongRoots({
+      rows: [misplacedRow({ remedies: ['ignore', 'ignore', 'quarantine'] })],
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+
+    expect(remedyButtons('docs/report.pdf')).toEqual(['Ignore', 'Ignore', 'Quarantine'])
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel the other same-tick entry points (slice 5d second review, R3-037)', () => {
+  /**
+   * `runRemedy`'s synchronous ref read had a test; `openQuarantine`'s and
+   * `handlePickWorkspace`'s did not, and both could be deleted with the
+   * whole suite green. They are the same window on the same tick -- Start
+   * raises the run inside a click handler, and every button that reads
+   * `runActive` is one render behind it -- and one of them opens the
+   * confirmation block for the remedy that deletes a file.
+   */
+  async function armStartOver(rows: MisplacedRow[]): Promise<{
+    calls: Call[]
+    start: HTMLButtonElement
+  }> {
+    const calls = mountWrongRoots({ rows }, (cmd) =>
+      cmd === 'harness_spawn'
+        ? new Promise<number>(() => {
+            // Never settles: the run stays in its spawning window.
+          })
+        : undefined,
+    )
+    // The discipline line rather than the table: one of these tests mounts
+    // over a project with nothing misplaced, which renders no table at all.
+    await waitFor(() => {
+      expect(outputDisciplineLine()).not.toBeNull()
+    })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+    expect(start.disabled).toBe(false)
+    return { calls, start }
+  }
+
+  it('opens no quarantine confirmation for a click that lands in the same tick as Start: the block is the first step of the one remedy that deletes a file, and it must not open over a run that has just begun', async () => {
+    const { calls, start } = await armStartOver([MISPLACED_REPORT])
+    const quarantine = within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+      name: 'Quarantine',
+    }) as HTMLButtonElement
+    expect(quarantine.disabled).toBe(false)
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      quarantine.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    expect(countCalls(calls, 'harness_spawn')).toBe(1)
+  })
+
+  it('opens no workspace picker for a click that lands in the same tick as Start: the project must not move under a run that has just begun', async () => {
+    const { calls, start } = await armStartOver([])
+    const pick = screen.getByRole('button', { name: 'Pick workspace' }) as HTMLButtonElement
+    expect(pick.disabled).toBe(false)
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      pick.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'workspace_pick')).toBe(0)
+    expect(countCalls(calls, 'harness_spawn')).toBe(1)
   })
 })

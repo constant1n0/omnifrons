@@ -77,6 +77,18 @@ describe('stripControlCharacters', () => {
 
     expect(stripControlCharacters(input)).toBe('ab')
   })
+
+  it('strips the line separator and paragraph separator (U+2028, U+2029): CSS treats both as forced line breaks, so one inside a producer-chosen string renders as a second visual line beside the surface\'s own fixed sentences', () => {
+    const input = `a${allInRange(0x2028, 0x2029)}b`
+
+    expect(stripControlCharacters(input)).toBe('ab')
+  })
+
+  it('keeps the ordinary whitespace either side of them, so removing the separators does not run words together in a way the source never wrote', () => {
+    const input = `one ${String.fromCodePoint(0x2028)} two`
+
+    expect(stripControlCharacters(input)).toBe('one  two')
+  })
 })
 
 describe('PlainTextLine', () => {
