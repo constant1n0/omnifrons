@@ -465,3 +465,50 @@ fn detected_type_tokens_round_trip_through_parse() {
     assert_eq!(DetectedType::SevenZip.as_str(), "7z");
     assert_eq!(DetectedType::MachOExecutable.as_str(), "mach-o-executable");
 }
+
+/// R1-012: a project-relative path is bounded before it is displayed.
+/// HAP-001's acceptance list expects excessive length normalized or
+/// rejected before display, and nothing else bounds this value: a finding's
+/// name is chosen by whatever wrote the file, and without a cap it crosses
+/// IPC at whatever length the file system allowed.
+#[test]
+fn a_project_relative_path_is_bounded_in_length() {
+    use omnifrons_domain::outbox::{
+        MAX_PROJECT_RELATIVE_BYTES, MAX_PROJECT_RELATIVE_COMPONENT_BYTES, validate_project_relative,
+    };
+
+    // Each component takes `DisplayName`'s own cap, which is the cap every
+    // name that reaches a device or a surface already takes.
+    assert_eq!(
+        MAX_PROJECT_RELATIVE_COMPONENT_BYTES,
+        omnifrons_domain::publication::DisplayName::MAX_BYTES
+    );
+
+    let longest_component = "a".repeat(MAX_PROJECT_RELATIVE_COMPONENT_BYTES);
+    validate_project_relative(&format!("docs/{longest_component}"))
+        .expect("a component exactly at the cap is accepted");
+    assert_eq!(
+        validate_project_relative(&format!("docs/{longest_component}a")).unwrap_err(),
+        OutboxPathError::TooLong,
+        "one byte past the per-component cap is refused"
+    );
+
+    let mut at_the_cap = String::new();
+    while at_the_cap.len() + 8 <= MAX_PROJECT_RELATIVE_BYTES {
+        at_the_cap.push_str("aaaaaaa/");
+    }
+    while at_the_cap.len() < MAX_PROJECT_RELATIVE_BYTES {
+        at_the_cap.push('a');
+    }
+    assert_eq!(at_the_cap.len(), MAX_PROJECT_RELATIVE_BYTES);
+    validate_project_relative(&at_the_cap).expect("a path exactly at the cap is accepted");
+    assert_eq!(
+        validate_project_relative(&format!("{at_the_cap}c")).unwrap_err(),
+        OutboxPathError::TooLong,
+        "one byte past the whole-path cap is refused"
+    );
+    assert_eq!(
+        OutboxPathError::TooLong.to_string(),
+        "the outbox path is too long"
+    );
+}

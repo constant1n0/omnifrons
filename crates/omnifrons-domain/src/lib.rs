@@ -13,3 +13,4 @@ pub mod output;
 pub mod publication;
 pub mod scope;
 pub mod terminal;
+pub mod wrong_root;
