@@ -12,10 +12,15 @@ import type {
   ArtifactStateFrame,
   Candidate,
   Evidence,
+  GuidanceApplied,
+  GuidancePreview,
+  GuidanceStatus,
   HarnessFrame,
   OutboxReason,
   OutboxStatus,
   Publication,
+  Snapshot,
+  Workspace,
 } from './ipc/harness'
 
 // The jsdom crypto polyfill and React Testing Library's `cleanup()` are
@@ -4016,6 +4021,7 @@ const SAMPLE_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782401000,
+  handleHeld: true,
 }
 
 const APPROVED_REPORT_CELL = 'approved 23121521465ad9be — report.pdf, asset root main Publish'
@@ -4736,6 +4742,7 @@ const STRAY_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782402000,
+  handleHeld: true,
 }
 
 /** The unattributed row's registered publication. */
@@ -5247,5 +5254,2514 @@ describe('AgentPanel publish (slice 5b, HAP-001-R35)', () => {
 
     expect(consoleErrorSpy).not.toHaveBeenCalled()
     consoleErrorSpy.mockRestore()
+  })
+})
+
+// -- Slice 5c: the whole-outbox listing and the unattributed approval --
+
+type Call = { cmd: string; args: Record<string, unknown> }
+
+/** The active workspace of the slice 5c mounts: the shape `workspace_current` returns since slice 5b. */
+const WORKSPACE_ACTIVE: Workspace = { displayPath: '/home/user/project', workArea: 'valid' }
+
+const TEMPLATE_VERSION = 'hap-001-guidance-v1'
+
+/**
+ * A fresh project's guidance answers (`docs/spike-log.md` § Slice 5c, IPC
+ * shapes): both managed files absent, no snapshots -- what every slice 5c
+ * mount over a workspace answers unless a test says otherwise. `undefined`
+ * for any other command, so a caller can fall through.
+ */
+function answerGuidanceFresh(cmd: string, args: Record<string, unknown>): unknown {
+  if (cmd === 'guidance_status') {
+    const status: GuidanceStatus = {
+      kind: args.kind as GuidanceStatus['kind'],
+      file: args.kind === 'ignore' ? '.gitignore' : ((args.file as string | undefined) ?? 'AGENTS.md'),
+      exists: false,
+      managed: 'absent',
+      templateVersion: TEMPLATE_VERSION,
+      fileSha256: null,
+      fileSha256Short: null,
+      snapshots: 0,
+      pinned: 0,
+    }
+    return status
+  }
+  if (cmd === 'guidance_snapshots') return []
+  return undefined
+}
+
+/**
+ * Mounts the panel over an active workspace with a valid outbox whose
+ * policy declares the asset root `main`, an empty Catalog, and a fresh
+ * project's guidance answers. `onCommand` answers everything else -- a
+ * `harness_spawn`, a `candidates_list`, an approval -- and returns
+ * `undefined` to fall through to the defaults. Every IPC call is recorded,
+ * mount-time ones included.
+ */
+function mountWithWorkspace(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  options: { outbox?: OutboxStatus; workspace?: Workspace | null } = {},
+): Call[] {
+  const calls: Call[] = []
+  mockIPC((cmd, rawArgs) => {
+    const args = (rawArgs ?? {}) as Record<string, unknown>
+    calls.push({ cmd, args })
+    if (onCommand) {
+      const answer = onCommand(cmd, args)
+      if (answer !== undefined) return answer
+    }
+    if (cmd === 'workspace_current') {
+      return options.workspace === undefined ? WORKSPACE_ACTIVE : options.workspace
+    }
+    if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'outbox_status') return options.outbox ?? OUTBOX_STATUS_VALID
+    if (cmd === 'publications_list') return []
+    const guidance = answerGuidanceFresh(cmd, args)
+    if (guidance !== undefined) return guidance
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  render(<AgentPanel />)
+  return calls
+}
+
+/** Flushes the pending microtasks and a macrotask inside `act`, so every settled continuation has run. */
+async function flush(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+  })
+}
+
+const DROPPED_NAME = 'dropped.pdf'
+const DROPPED_SHA256 = `9d3f2a10${'e'.repeat(56)}`
+const DROPPED_SHORT = '9d3f2a10'
+const FORGOTTEN_STRAY_NAME = 'run-old/stray.png'
+
+/**
+ * `candidates_list {}` -- the whole outbox (`docs/spike-log.md` § Slice 5c,
+ * IPC shapes): an entry at the outbox root, one under a run subdirectory
+ * the shell no longer remembers (a location fact the name carries, never
+ * provenance), and a Markdown note the policy classes as portable text;
+ * every one unattributed, since no run's own proposal named it.
+ */
+const OUTBOX_CANDIDATES: Candidate[] = [
+  {
+    name: DROPPED_NAME,
+    size: 15,
+    sha256: DROPPED_SHA256,
+    sha256Short: DROPPED_SHORT,
+    detectedType: 'pdf',
+    class: 'generated-heavy',
+    attribution: { kind: 'unattributed' },
+    state: 'candidate',
+  },
+  {
+    name: FORGOTTEN_STRAY_NAME,
+    size: 8,
+    sha256: STRAY_SHA256,
+    sha256Short: '11111111',
+    detectedType: 'png',
+    class: 'generated-heavy',
+    attribution: { kind: 'unattributed' },
+    state: 'candidate',
+  },
+  {
+    name: 'notes.md',
+    size: 40,
+    sha256: 'f'.repeat(64),
+    sha256Short: 'ffffffff',
+    detectedType: 'markdown',
+    class: 'portable-text',
+    attribution: { kind: 'unattributed' },
+    state: 'candidate',
+  },
+]
+
+/**
+ * `artifact_approve { runId: null, … }`'s payload for the root entry
+ * (`docs/spike-log.md` § Slice 5c, IPC shapes): no run, the unattributed
+ * fact, nothing standing in for a producer, the re-opened handle held.
+ */
+const DROPPED_APPROVAL: ArtifactApproval = {
+  approvalId: '5f0c3b2a9e1d7c44',
+  publicationId: 'b'.repeat(64),
+  runId: null,
+  name: DROPPED_NAME,
+  displayName: 'dropped.pdf',
+  sha256Short: DROPPED_SHORT,
+  size: 15,
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  attribution: { kind: 'unattributed' },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1725782401000,
+  handleHeld: true,
+}
+
+const APPROVED_DROPPED_CELL = 'approved 5f0c3b2a9e1d7c44 — dropped.pdf, asset root main Publish'
+const NOT_HELD_MARK = 'handle: not held (cap reached)'
+
+function listOutboxButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'List outbox' }) as HTMLButtonElement
+}
+
+/**
+ * Mounts over a workspace whose whole-outbox inventory is
+ * `OUTBOX_CANDIDATES`, waits for List outbox to be live, clicks it, and
+ * waits for the table. `onCommand` answers the approval commands a test
+ * drives.
+ */
+async function listOutbox(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Promise<Call[]> {
+  const calls = mountWithWorkspace((cmd, args) => {
+    if (cmd === 'candidates_list') return OUTBOX_CANDIDATES
+    return onCommand?.(cmd, args)
+  })
+  await waitFor(() => {
+    expect(listOutboxButton().disabled).toBe(false)
+  })
+  fireEvent.click(listOutboxButton())
+  await screen.findByRole('region', { name: 'Candidates' })
+  return calls
+}
+
+/** Selects the adapter and approval, fills the prompt, and clicks Start on a panel `mountWithWorkspace` mounted. */
+async function startRunOverWorkspace(): Promise<void> {
+  await selectOption('Adapter', 'claude-code')
+  await selectOption('Approval', '42')
+  fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+  await screen.findByText('running')
+}
+
+describe('AgentPanel whole-outbox listing (slice 5c, HAP-001-R11, R12)', () => {
+  it('renders a "List outbox" button beside the outbox line: disabled while no workspace is active, enabled once one is, and invoking nothing until clicked', async () => {
+    mockIPC(defaultHandlers())
+    render(<AgentPanel />)
+    await screen.findByLabelText('Adapter')
+    expect(listOutboxButton().disabled).toBe(true)
+    cleanup()
+    clearMocks()
+
+    const calls = mountWithWorkspace()
+    await waitFor(() => {
+      expect(listOutboxButton().disabled).toBe(false)
+    })
+    expect(calls.filter((call) => call.cmd === 'candidates_list')).toHaveLength(0)
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+  })
+
+  it('clicking List outbox calls candidates_list with exactly {} -- no runId key -- and renders the Candidates table with the whole-outbox rows: a root entry, an entry under a forgotten run, every row unattributed, Approve only on the generated-heavy rows, and no summary line in the transcript', async () => {
+    const calls = await listOutbox()
+
+    const listings = calls.filter((call) => call.cmd === 'candidates_list')
+    expect(listings).toHaveLength(1)
+    expect(listings[0]?.args).toEqual({})
+    expect(Object.keys(listings[0]!.args)).toEqual([])
+    expect(candidateRows()).toEqual([
+      [DROPPED_NAME, '15', DROPPED_SHORT, 'pdf', 'generated-heavy', 'unattributed', 'candidate', 'Approve'],
+      [FORGOTTEN_STRAY_NAME, '8', '11111111', 'png', 'generated-heavy', 'unattributed', 'candidate', 'Approve'],
+      ['notes.md', '40', 'ffffffff', 'markdown', 'portable-text', 'unattributed', 'candidate', ''],
+    ])
+    expect(screen.getByLabelText('Agent transcript').querySelectorAll('li')).toHaveLength(0)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('Approve on a whole-outbox row opens the block with the row\'s facts, "attribution: unattributed", the destination from the outbox status, "scope: none" (no run, so no adapter), and the act-as line; the gate is the row\'s short digest, and the final button calls artifact_approve with exactly { runId: null, name, sha256 } -- the key present and null, the row\'s own full digest, never the typed value -- then the row shows the approved cell with Publish and the block closes', async () => {
+    const calls = await listOutbox((cmd) => {
+      if (cmd === 'artifact_approve') return DROPPED_APPROVAL
+      return undefined
+    })
+
+    const block = await openApproval(DROPPED_NAME)
+
+    expect(Array.from(block.querySelectorAll('p')).map((line) => line.textContent)).toEqual([
+      `name: ${DROPPED_NAME}`,
+      'class: generated-heavy',
+      'type: pdf',
+      'size: 15',
+      `sha256: ${DROPPED_SHA256}`,
+      `sha256 short: ${DROPPED_SHORT}`,
+      'attribution: unattributed',
+      'destination: asset root main',
+      'scope: none',
+      'act as: device-local-user',
+    ])
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest(DROPPED_SHA256)
+    expect(confirmButton().disabled).toBe(true)
+    typeDigest(DROPPED_SHORT)
+    expect(confirmButton().disabled).toBe(false)
+    fireEvent.click(confirmButton())
+
+    await waitFor(() => {
+      expect(actionCell(DROPPED_NAME)).toBe(APPROVED_DROPPED_CELL)
+    })
+    const approvals = calls.filter((call) => call.cmd === 'artifact_approve')
+    expect(approvals).toHaveLength(1)
+    expect(approvals[0]?.args).toEqual({ runId: null, name: DROPPED_NAME, sha256: DROPPED_SHA256 })
+    expect(Object.keys(approvals[0]!.args).sort()).toEqual(['name', 'runId', 'sha256'])
+    expect(approvals[0]?.args.runId).toBeNull()
+    expect(approvals[0]?.args.sha256).toHaveLength(64)
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+    expect(candidateRow(DROPPED_NAME).querySelector('mark')).toBeNull()
+    expect(within(candidateRow(DROPPED_NAME)).getByRole('button', { name: 'Publish' })).toBeTruthy()
+    expect(actionCell(FORGOTTEN_STRAY_NAME)).toBe('Approve')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('an entry under a forgotten run approves the same way, with runId null and its "<run id>/<file>" name sent exactly as listed -- the subdirectory a location fact, never a run id', async () => {
+    const calls = await listOutbox((cmd) => {
+      if (cmd === 'artifact_approve') {
+        return {
+          ...DROPPED_APPROVAL,
+          approvalId: '6a6a6a6a6a6a6a6a',
+          name: FORGOTTEN_STRAY_NAME,
+          displayName: 'stray.png',
+          sha256Short: '11111111',
+          size: 8,
+          detectedType: 'png',
+        }
+      }
+      return undefined
+    })
+
+    const block = await openApproval(FORGOTTEN_STRAY_NAME)
+    const lines = Array.from(block.querySelectorAll('p')).map((line) => line.textContent)
+    expect(lines).toContain(`name: ${FORGOTTEN_STRAY_NAME}`)
+    expect(lines).toContain('attribution: unattributed')
+    expect(lines).toContain('scope: none')
+    expect(lines.some((line) => line?.includes('run-old') && !line.startsWith('name:'))).toBe(false)
+    typeDigest('11111111')
+    fireEvent.click(confirmButton())
+
+    await waitFor(() => {
+      expect(actionCell(FORGOTTEN_STRAY_NAME)).toBe(
+        'approved 6a6a6a6a6a6a6a6a — stray.png, asset root main Publish',
+      )
+    })
+    expect(calls.filter((call) => call.cmd === 'artifact_approve')[0]?.args).toEqual({
+      runId: null,
+      name: FORGOTTEN_STRAY_NAME,
+      sha256: STRAY_SHA256,
+    })
+  })
+
+  it('renders "handle: not held (cap reached)" in a <mark> beside the approved cell when the approval reports handleHeld false, with Publish still offered (the publication re-opens the entry); nothing of the sort for handleHeld true', async () => {
+    await listOutbox((cmd) => {
+      if (cmd === 'artifact_approve') return { ...DROPPED_APPROVAL, handleHeld: false }
+      return undefined
+    })
+    await openApproval(DROPPED_NAME)
+    typeDigest(DROPPED_SHORT)
+    fireEvent.click(confirmButton())
+
+    await waitFor(() => {
+      expect(actionCell(DROPPED_NAME)).toBe(
+        `approved 5f0c3b2a9e1d7c44 — dropped.pdf, asset root main ${NOT_HELD_MARK} Publish`,
+      )
+    })
+    const row = candidateRow(DROPPED_NAME)
+    expect(row.querySelector('mark')?.textContent).toBe(NOT_HELD_MARK)
+    expect(within(row).getByRole('button', { name: 'Publish' }).hasAttribute('disabled')).toBe(
+      false,
+    )
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it.each([
+    {
+      code: 'integrity-mismatch',
+      message:
+        "the entry's digest differs from the digest the request names; it changed since it was listed",
+    },
+    { code: 'outbox-escape', message: 'the entry is not a regular file inside the outbox' },
+    { code: 'outbox-linked', message: "the entry's link count is greater than one" },
+    {
+      code: 'invalid-request',
+      message: 'the entry belongs to a remembered run; approve it through that run id',
+    },
+  ])(
+    'renders $code from a whole-outbox artifact_approve as a plain catalogue code with the shell\'s fixed message, no "untrusted"; the row keeps Approve, the block stays open with the typed digest kept and the final button enabled again',
+    async ({ code, message }) => {
+      await listOutbox((cmd) => {
+        if (cmd === 'artifact_approve') return Promise.reject({ code, message })
+        return undefined
+      })
+      await openApproval(DROPPED_NAME)
+      typeDigest(DROPPED_SHORT)
+      fireEvent.click(confirmButton())
+
+      const alert = await screen.findByRole('alert')
+      expect(alert.textContent).toBe(`${code}: ${message}`)
+      expect(alert.textContent).not.toContain('untrusted')
+      expect(actionCell(DROPPED_NAME)).toBe('Approve')
+      expect(screen.getByLabelText('Publication approval')).toBeTruthy()
+      expect(approvalInput().value).toBe(DROPPED_SHORT)
+      await waitFor(() => {
+        expect(confirmButton().disabled).toBe(false)
+      })
+    },
+  )
+
+  it('List outbox is disabled while a run is active and enabled once it ends, and a listing response landing after a Start is dropped: the run starts with no table, and its own inventory is applied normally afterwards', async () => {
+    let resolveListing: (rows: Candidate[]) => void = () => {}
+    let channel: LiveChannel | undefined
+    const calls = mountWithWorkspace((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      if (cmd === 'candidates_list') {
+        if (Object.keys(args).length === 0) {
+          return new Promise<Candidate[]>((resolve) => {
+            resolveListing = resolve
+          })
+        }
+        return SAMPLE_CANDIDATES
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(listOutboxButton().disabled).toBe(false)
+    })
+    fireEvent.click(listOutboxButton())
+    await waitFor(() => {
+      expect(calls.filter((call) => call.cmd === 'candidates_list')).toHaveLength(1)
+    })
+
+    await startRunOverWorkspace()
+    expect(listOutboxButton().disabled).toBe(true)
+    resolveListing(OUTBOX_CANDIDATES)
+    await flush()
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    expect(candidateRows().map((row) => row[0])).toEqual(SAMPLE_CANDIDATES.map((row) => row.name))
+    await endRun(channel)
+    expect(listOutboxButton().disabled).toBe(false)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a second List outbox replaces the rows and clears the approvals and the open block: a new inventory', async () => {
+    let listing = 0
+    await listOutbox((cmd) => {
+      if (cmd === 'artifact_approve') return DROPPED_APPROVAL
+      return undefined
+    })
+    await openApproval(DROPPED_NAME)
+    typeDigest(DROPPED_SHORT)
+    fireEvent.click(confirmButton())
+    await waitFor(() => {
+      expect(actionCell(DROPPED_NAME)).toBe(APPROVED_DROPPED_CELL)
+    })
+    await openApproval(FORGOTTEN_STRAY_NAME)
+    clearMocks()
+    mockIPC((cmd) => {
+      if (cmd === 'candidates_list') {
+        listing += 1
+        return [OUTBOX_CANDIDATES[0]!]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    fireEvent.click(listOutboxButton())
+
+    await waitFor(() => {
+      expect(candidateRows()).toHaveLength(1)
+    })
+    expect(listing).toBe(1)
+    expect(actionCell(DROPPED_NAME)).toBe('Approve')
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+  })
+
+  it('a listing rejection reaches the banner with no table (outbox-invalid, the shell\'s fixed message), and a rejection landing after unmount raises no console.error and renders nothing', async () => {
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'candidates_list') {
+        return Promise.reject({
+          code: 'outbox-invalid',
+          message: 'the classification policy could not be loaded',
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(listOutboxButton().disabled).toBe(false)
+    })
+    fireEvent.click(listOutboxButton())
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('outbox-invalid: the classification policy could not be loaded')
+    expect(screen.queryByRole('region', { name: 'Candidates' })).toBeNull()
+    cleanup()
+    clearMocks()
+
+    let rejectListing: (error: unknown) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'candidates_list') {
+        return new Promise((_resolve, reject) => {
+          rejectListing = reject
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(listOutboxButton().disabled).toBe(false)
+    })
+    fireEvent.click(listOutboxButton())
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    cleanup()
+    rejectListing({ code: 'outbox-invalid', message: 'the classification policy could not be loaded' })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+// -- Slice 5c: the guidance-note installer --
+
+const FILE_DIGEST = `3c1e9a07${'a'.repeat(56)}`
+const FILE_SHORT = '3c1e9a07'
+const IGNORE_DIGEST = `a71bc0d2${'c'.repeat(56)}`
+const IGNORE_SHORT = 'a71bc0d2'
+
+/** `guidance_status { kind: "guidance" }` with the note installed and current, one snapshot on record. */
+function noteStatus(overrides: Partial<GuidanceStatus> = {}): GuidanceStatus {
+  return {
+    kind: 'guidance',
+    file: 'AGENTS.md',
+    exists: true,
+    managed: 'current',
+    templateVersion: TEMPLATE_VERSION,
+    fileSha256: FILE_DIGEST,
+    fileSha256Short: FILE_SHORT,
+    snapshots: 1,
+    pinned: 0,
+    ...overrides,
+  }
+}
+
+/** The fresh project's note status: no file at all. */
+const NOTE_ABSENT = noteStatus({
+  exists: false,
+  managed: 'absent',
+  fileSha256: null,
+  fileSha256Short: null,
+  snapshots: 0,
+})
+
+/** `.gitignore` exists (the project's own rules) but carries no managed block yet. */
+const IGNORE_STATUS_CURRENT: GuidanceStatus = {
+  kind: 'ignore',
+  file: '.gitignore',
+  exists: true,
+  managed: 'current',
+  templateVersion: TEMPLATE_VERSION,
+  fileSha256: IGNORE_DIGEST,
+  fileSha256Short: IGNORE_SHORT,
+  snapshots: 0,
+  pinned: 0,
+}
+
+/**
+ * The note's block as the shell proposes it (`docs/spike-log.md` § Slice
+ * 5c, IPC shapes), abridged to two of HAP-001's seven bullets: the
+ * HTML-comment sentinels, the Markdown heading, a blank line, the bullets
+ * with the outbox path substituted -- text the renderer shows line by line
+ * and never interprets.
+ */
+const NOTE_LINES = [
+  `<!-- omnifrons:begin guidance ${TEMPLATE_VERSION} sha256:${'d'.repeat(64)} -->`,
+  '## Generated files',
+  '',
+  "- Write every generated file that is not a Markdown note — documents, images, audio, video, datasets, archives, exports — into `.omnifrons/outbox`, relative to this project's root. Create the directory if it does not exist.",
+  '- Keep Markdown notes where this project already keeps its notes, never in `.omnifrons/outbox`.',
+  '<!-- omnifrons:end guidance -->',
+]
+
+const IGNORE_LINES = [
+  `# omnifrons:begin ignore ${TEMPLATE_VERSION} sha256:${'b'.repeat(64)}`,
+  '/.omnifrons/outbox/',
+  '# omnifrons:end ignore',
+]
+
+/** `guidance_preview { kind: "guidance", file: "AGENTS.md" }` for an absent file: an insert that creates it. */
+function notePreview(overrides: Partial<GuidancePreview> = {}): GuidancePreview {
+  return {
+    kind: 'guidance',
+    file: 'AGENTS.md',
+    action: 'insert',
+    proposed: NOTE_LINES.join('\n'),
+    fileSha256: null,
+    fileSha256Short: null,
+    resultSha256Short: 'e5a1b2c3',
+    ...overrides,
+  }
+}
+
+/** The preview over an existing file carrying an outdated block: a replace, bound to the file's digest. */
+const PREVIEW_REPLACE = notePreview({
+  action: 'replace',
+  fileSha256: FILE_DIGEST,
+  fileSha256Short: FILE_SHORT,
+  resultSha256Short: '7d7d7d7d',
+})
+
+const IGNORE_PREVIEW: GuidancePreview = {
+  kind: 'ignore',
+  file: '.gitignore',
+  action: 'insert',
+  proposed: IGNORE_LINES.join('\n'),
+  fileSha256: IGNORE_DIGEST,
+  fileSha256Short: IGNORE_SHORT,
+  resultSha256Short: '0e9f4c31',
+}
+
+const APPLIED_REPLACE: GuidanceApplied = {
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  action: 'replace',
+  snapshotId: '0123456789abcdef',
+  resultSha256Short: '7d7d7d7d',
+}
+
+/** A removal that deleted the file Omnifrons created: no digest afterwards. */
+const APPLIED_REMOVE: GuidanceApplied = {
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  action: 'remove',
+  snapshotId: '89abcdef01234567',
+  resultSha256Short: null,
+}
+
+const SNAPSHOT_NEWEST: Snapshot = {
+  id: '89abcdef01234567',
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  existed: true,
+  sha256Short: FILE_SHORT,
+  size: 1512,
+  takenAt: 1725782402000,
+  pinned: false,
+}
+
+/** The snapshot of the file's absence, taken before the first insert, pinned. */
+const SNAPSHOT_OLDEST: Snapshot = {
+  id: '0123456789abcdef',
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  existed: false,
+  sha256Short: 'e3b0c442',
+  size: 0,
+  takenAt: 1725782401000,
+  pinned: true,
+}
+
+/** A snapshot of another guidance file: listed under the same kind, restorable only once that file is the one the status line shows. */
+const SNAPSHOT_OTHER_FILE: Snapshot = {
+  id: 'abcdefabcdefabcd',
+  kind: 'guidance',
+  file: 'CLAUDE.md',
+  existed: true,
+  sha256Short: '5e5e5e5e',
+  size: 300,
+  takenAt: 1725782400000,
+  pinned: false,
+}
+
+const NOTE_SNAPSHOTS = [SNAPSHOT_NEWEST, SNAPSHOT_OLDEST, SNAPSHOT_OTHER_FILE]
+
+const ADVISORY_LINE =
+  'advisory: the note and the ignore rule set expectations and enforce nothing — not containment'
+const SNAPSHOT_SENTENCE = 'a snapshot of the current file is taken before any write'
+const ACT_AS_LINE = 'act as: device-local-user'
+
+/** The removal surface's own disclosure of what a removal takes out (slice 5c review, R1-005). */
+const REMOVE_SCOPE_LINE =
+  'removes the managed block only; the file itself goes only when nothing else remains in it and Omnifrons created it'
+
+/** The restore surface's disclosure that the snapshot's bytes are never shown (slice 5c review, R1-002). */
+const RESTORE_BYTES_LINE =
+  "the snapshot's bytes are not shown here: only what the manifest records about them"
+
+/** The restore surface's disclosure that a snapshot of an absent file deletes (slice 5c review, R1-002). */
+const RESTORE_REMOVES_LINE =
+  'this snapshot recorded no file: restoring it REMOVES the file rather than writing bytes back'
+
+/** What each guidance command answers: a value, or a thunk (for a rejection or a deferred promise built lazily). */
+interface GuidanceMock {
+  note?: GuidanceStatus | (() => unknown)
+  ignore?: GuidanceStatus | (() => unknown)
+  noteSnapshots?: Snapshot[] | (() => unknown)
+  ignoreSnapshots?: Snapshot[] | (() => unknown)
+}
+
+function answerMock(answer: unknown): unknown {
+  return typeof answer === 'function' ? (answer as () => unknown)() : answer
+}
+
+/**
+ * Mounts over a workspace with the guidance answers in `mock` (a fresh
+ * project's for anything unspecified) and `onCommand` answering the rest
+ * -- previews, writes, pins, a spawn -- first.
+ */
+function mountGuidance(
+  mock: GuidanceMock = {},
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Call[] {
+  return mountWithWorkspace((cmd, args) => {
+    const own = onCommand?.(cmd, args)
+    if (own !== undefined) return own
+    if (cmd === 'guidance_status') {
+      const answer = args.kind === 'ignore' ? mock.ignore : mock.note
+      return answer === undefined ? undefined : answerMock(answer)
+    }
+    if (cmd === 'guidance_snapshots') {
+      const answer = args.kind === 'ignore' ? mock.ignoreSnapshots : mock.noteSnapshots
+      return answer === undefined ? undefined : answerMock(answer)
+    }
+    return undefined
+  })
+}
+
+function guidanceRegion(): HTMLElement {
+  return screen.getByRole('region', { name: 'Guidance' })
+}
+
+function noteBlock(): HTMLElement {
+  return screen.getByLabelText('Guidance note')
+}
+
+function ignoreBlock(): HTMLElement {
+  return screen.getByLabelText('Ignore rule')
+}
+
+function noteStatusLine(): string | null {
+  return screen.queryByRole('status', { name: 'Guidance note status' })?.textContent ?? null
+}
+
+function ignoreStatusLine(): string | null {
+  return screen.queryByRole('status', { name: 'Ignore rule status' })?.textContent ?? null
+}
+
+function fileInput(): HTMLInputElement {
+  return screen.getByLabelText('Guidance file') as HTMLInputElement
+}
+
+/** Types `name` into the guidance file input and commits it by leaving the field. */
+function commitFile(name: string): void {
+  fireEvent.change(fileInput(), { target: { value: name } })
+  fireEvent.blur(fileInput())
+}
+
+function writeBlock(): HTMLElement {
+  return screen.getByLabelText('Guidance write')
+}
+
+function writeBlockLines(): (string | null)[] {
+  return Array.from(writeBlock().querySelectorAll('p')).map((line) => line.textContent)
+}
+
+function proposedLines(): (string | null)[] {
+  return Array.from(writeBlock().querySelectorAll('[data-testid="guidance-proposed-line"]')).map(
+    (line) => line.textContent,
+  )
+}
+
+const GATE_LABEL = /short digest \(.*\) to (write|create the file|remove|restore)$/
+
+function gateInput(): HTMLInputElement {
+  return screen.getByLabelText(GATE_LABEL) as HTMLInputElement
+}
+
+function gateLabelText(): string {
+  return writeBlock().querySelector('label')?.textContent ?? ''
+}
+
+function typeGate(value: string): void {
+  fireEvent.change(gateInput(), { target: { value } })
+}
+
+function finalButton(name: 'Write' | 'Remove block' | 'Restore snapshot'): HTMLButtonElement {
+  return screen.getByRole('button', { name }) as HTMLButtonElement
+}
+
+function resultLine(): string | null {
+  return screen.queryByRole('status', { name: 'Guidance result' })?.textContent ?? null
+}
+
+/** Waits for both status lines, then clicks the note's Preview and waits for the block. */
+async function openNotePreview(): Promise<HTMLElement> {
+  await waitFor(() => {
+    expect(noteStatusLine()).not.toBeNull()
+  })
+  fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+  return screen.findByLabelText('Guidance write')
+}
+
+function snapshotRows(tableName = 'Guidance note snapshots'): string[][] {
+  const table = screen.getByRole('table', { name: tableName })
+  return Array.from(table.querySelectorAll('tbody tr')).map((row) =>
+    Array.from(row.querySelectorAll('td')).map((cell) => cell.textContent ?? ''),
+  )
+}
+
+function snapshotRow(id: string): HTMLElement {
+  const table = screen.getByRole('table', { name: 'Guidance note snapshots' })
+  const row = Array.from(table.querySelectorAll<HTMLElement>('tbody tr')).find(
+    (candidate) => candidate.querySelectorAll('td')[1]?.textContent === id,
+  )
+  if (!row) throw new Error(`no snapshot row ${id}`)
+  return row
+}
+
+function countCalls(calls: Call[], cmd: string): number {
+  return calls.filter((call) => call.cmd === cmd).length
+}
+
+describe('AgentPanel guidance section (slice 5c, HAP-001 D18, R42)', () => {
+  it('renders a Guidance region as a sibling of the transcript, the Candidates and the Publications regions -- never inside any of them -- with the fixed advisory line, the guidance file input defaulting to AGENTS.md, the fixed .gitignore line, Preview and Remove per kind, and on mount calls guidance_status for both kinds (exactly { kind: "guidance", file: "AGENTS.md" } and exactly { kind: "ignore" }) and guidance_snapshots for both', async () => {
+    const calls = await listOutbox()
+
+    const region = guidanceRegion()
+    expect(region.textContent).toContain(ADVISORY_LINE)
+    expect(fileInput().value).toBe('AGENTS.md')
+    expect(ignoreBlock().textContent).toContain('Ignore file: .gitignore')
+    for (const block of [noteBlock(), ignoreBlock()]) {
+      expect(within(block).getByRole('button', { name: 'Preview' })).toBeTruthy()
+      expect(within(block).getByRole('button', { name: 'Remove' })).toBeTruthy()
+      expect(region.contains(block)).toBe(true)
+    }
+    const transcript = screen.getByLabelText('Agent transcript')
+    const candidates = screen.getByRole('region', { name: 'Candidates' })
+    const publications = screen.getByRole('region', { name: 'Publications' })
+    for (const other of [transcript, candidates, publications]) {
+      expect(other.contains(region)).toBe(false)
+      expect(region.contains(other)).toBe(false)
+    }
+    expect(calls.filter((call) => call.cmd === 'guidance_status').map((call) => call.args)).toEqual(
+      [{ kind: 'guidance', file: 'AGENTS.md' }, { kind: 'ignore' }],
+    )
+    expect(
+      calls.filter((call) => call.cmd === 'guidance_snapshots').map((call) => call.args),
+    ).toEqual([{ kind: 'guidance' }, { kind: 'ignore' }])
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it("renders no status line and no alert while no workspace is active (the shell's workspace-unavailable on both fetches), with Preview and Remove disabled for both kinds", async () => {
+    mountWithWorkspace(
+      (cmd) => {
+        if (cmd === 'guidance_status' || cmd === 'guidance_snapshots') {
+          return Promise.reject(OUTBOX_NO_WORKSPACE)
+        }
+        return undefined
+      },
+      { workspace: null },
+    )
+    await screen.findByLabelText('Adapter')
+    await flush()
+
+    expect(noteStatusLine()).toBeNull()
+    expect(ignoreStatusLine()).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+    for (const block of [noteBlock(), ignoreBlock()]) {
+      expect(
+        (within(block).getByRole('button', { name: 'Preview' }) as HTMLButtonElement).disabled,
+      ).toBe(true)
+      expect(
+        (within(block).getByRole('button', { name: 'Remove' }) as HTMLButtonElement).disabled,
+      ).toBe(true)
+    }
+  })
+
+  it.each([
+    {
+      label: 'absent, no file',
+      status: NOTE_ABSENT,
+      line: 'AGENTS.md: block absent; file absent; snapshots 0, pinned 0',
+    },
+    {
+      label: 'absent, the file exists without a block',
+      status: noteStatus({ managed: 'absent', snapshots: 0 }),
+      line: 'AGENTS.md: block absent; file sha256 short 3c1e9a07; snapshots 0, pinned 0',
+    },
+    {
+      label: 'current',
+      status: noteStatus(),
+      line: 'AGENTS.md: block current; file sha256 short 3c1e9a07; snapshots 1, pinned 0',
+    },
+    {
+      label: 'outdated',
+      status: noteStatus({ managed: 'outdated', snapshots: 2, pinned: 1 }),
+      line: 'AGENTS.md: block outdated (template hap-001-guidance-v1); file sha256 short 3c1e9a07; snapshots 2, pinned 1',
+    },
+    {
+      label: 'modified',
+      status: noteStatus({ managed: 'modified' }),
+      line: 'AGENTS.md: block modified — resolve by hand or restore; file sha256 short 3c1e9a07; snapshots 1, pinned 0',
+    },
+    {
+      label: 'malformed',
+      status: noteStatus({ managed: 'malformed' }),
+      line: 'AGENTS.md: block malformed — resolve by hand; file sha256 short 3c1e9a07; snapshots 1, pinned 0',
+    },
+  ])(
+    'renders the note status line with fixed copy per managed token ($label): the file name, the block state, the short digest when the file exists, the snapshot and pinned counts',
+    async ({ status, line }) => {
+      mountGuidance({ note: status, ignore: IGNORE_STATUS_CURRENT })
+
+      await waitFor(() => {
+        expect(noteStatusLine()).toBe(line)
+      })
+      expect(ignoreStatusLine()).toBe(
+        '.gitignore: block current; file sha256 short a71bc0d2; snapshots 0, pinned 0',
+      )
+      expect(screen.queryByRole('alert')).toBeNull()
+    },
+  )
+
+  it('committing a new guidance file name (leaving the field, or Enter) refetches guidance_status with exactly { kind: "guidance", file: <name> } and shows that file\'s status; a response of an earlier fetch landing later is dropped, and the ignore kind is untouched', async () => {
+    let resolveFirst: (status: GuidanceStatus) => void = () => {}
+    let first = true
+    const calls = mountGuidance({
+      note: () => {
+        if (first) {
+          first = false
+          return new Promise<GuidanceStatus>((resolve) => {
+            resolveFirst = resolve
+          })
+        }
+        return undefined
+      },
+    })
+    // The second and later fetches answer through the fall-through: a fresh
+    // status naming the requested file.
+    await screen.findByLabelText('Guidance file')
+    expect(noteStatusLine()).toBeNull()
+
+    commitFile('CLAUDE.md')
+    await waitFor(() => {
+      expect(noteStatusLine()).toBe('CLAUDE.md: block absent; file absent; snapshots 0, pinned 0')
+    })
+    resolveFirst(noteStatus())
+    await flush()
+    expect(noteStatusLine()).toBe('CLAUDE.md: block absent; file absent; snapshots 0, pinned 0')
+
+    fireEvent.change(fileInput(), { target: { value: 'NOTES.md' } })
+    fireEvent.keyDown(fileInput(), { key: 'Enter' })
+    await waitFor(() => {
+      expect(noteStatusLine()).toBe('NOTES.md: block absent; file absent; snapshots 0, pinned 0')
+    })
+    expect(calls.filter((call) => call.cmd === 'guidance_status').map((call) => call.args)).toEqual(
+      [
+        { kind: 'guidance', file: 'AGENTS.md' },
+        { kind: 'ignore' },
+        { kind: 'guidance', file: 'CLAUDE.md' },
+        { kind: 'guidance', file: 'NOTES.md' },
+      ],
+    )
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('Preview calls guidance_preview with exactly { kind: "guidance", file } -- and nothing else -- and opens the write block inside the Guidance region: file, action, the proposed block one line per text line verbatim through plain text (the HTML-comment sentinels and the Markdown heading as text: no comment node, no heading, no anchor, nothing interactive), "file sha256 short: <short>", the fixed snapshot sentence, the act-as line, the label naming the file\'s short digest, an empty input and a disabled Write', async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ managed: 'outdated' }) },
+      (cmd) => (cmd === 'guidance_preview' ? PREVIEW_REPLACE : undefined),
+    )
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+    const before = calls.length
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+    const block = await screen.findByLabelText('Guidance write')
+
+    expect(calls.slice(before).map((call) => call.cmd)).toEqual(['guidance_preview'])
+    expect(calls[before]?.args).toEqual({ kind: 'guidance', file: 'AGENTS.md' })
+    expect(Object.keys(calls[before]!.args).sort()).toEqual(['file', 'kind'])
+    expect(guidanceRegion().contains(block)).toBe(true)
+    expect(screen.getByLabelText('Agent transcript').contains(block)).toBe(false)
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: replace',
+      'proposed:',
+      'file sha256 short: 3c1e9a07',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+    expect(proposedLines()).toEqual(NOTE_LINES)
+    const proposed = block.querySelector('[data-testid="guidance-proposed"]') as HTMLElement
+    expectNoInteractiveElements(proposed)
+    expect(block.querySelector('h1, h2, h3, a, script, ul, li, code, pre')).toBeNull()
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_COMMENT)
+    expect(walker.nextNode()).toBeNull()
+    expect(block.textContent).toContain('<!-- omnifrons:begin guidance ')
+    expect(block.textContent).toContain('## Generated files')
+    expect(gateLabelText()).toBe("Type the file's short digest (3c1e9a07) to write")
+    expect(gateInput().value).toBe('')
+    expect(finalButton('Write').disabled).toBe(true)
+  })
+
+  it('for an absent file the block reads "file: absent" and the label names the proposed block\'s short digest ("to create the file"); typing it enables Write, whose click sends fileSha256 null', async () => {
+    const calls = mountGuidance({ note: NOTE_ABSENT }, (cmd) => {
+      if (cmd === 'guidance_preview') return notePreview()
+      if (cmd === 'guidance_apply') {
+        return { ...APPLIED_REPLACE, action: 'insert', resultSha256Short: 'e5a1b2c3' }
+      }
+      return undefined
+    })
+    await openNotePreview()
+
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: insert',
+      'proposed:',
+      'file: absent',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+    expect(gateLabelText()).toBe(
+      "Type the proposed block's short digest (e5a1b2c3) to create the file",
+    )
+    typeGate('e5a1b2c3')
+    expect(finalButton('Write').disabled).toBe(false)
+    fireEvent.click(finalButton('Write'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written insert, snapshot 0123456789abcdef, result e5a1b2c3',
+      )
+    })
+    const applies = calls.filter((call) => call.cmd === 'guidance_apply')
+    expect(applies).toHaveLength(1)
+    expect(applies[0]?.args).toEqual({ kind: 'guidance', file: 'AGENTS.md', fileSha256: null })
+  })
+
+  it("enables Write only on an exact match of the gate digest: never the fixed phrase, uppercase hex, a 7- or 9-character prefix, a leading or trailing space (the shape a paste produces), the result digest of a file that exists, the full digest, or the other kind's digest", async () => {
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) =>
+      cmd === 'guidance_preview' ? PREVIEW_REPLACE : undefined,
+    )
+    await openNotePreview()
+
+    for (const wrong of [
+      'write',
+      '3C1E9A07',
+      '3c1e9a0',
+      '3c1e9a07a',
+      ' 3c1e9a07',
+      '3c1e9a07 ',
+      ' 3c1e9a07 ',
+      '7d7d7d7d',
+      FILE_DIGEST,
+      IGNORE_SHORT,
+    ]) {
+      typeGate(wrong)
+      expect(finalButton('Write').disabled).toBe(true)
+    }
+    typeGate(FILE_SHORT)
+    expect(finalButton('Write').disabled).toBe(false)
+  })
+
+  it('no harness- or content-originated value pre-fills or enables the gate (TM-001-R1): a publish proposal and a candidate row naming the very short digest, the digest shown in the label itself, and a programmatic input.value with no input event all leave the input empty and Write disabled; only typing enables it', async () => {
+    let channel: LiveChannel | undefined
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      if (cmd === 'candidates_list') return [{ ...OUTBOX_CANDIDATES[0]!, name: FILE_SHORT }]
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      return undefined
+    })
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+    // The harness's own proposal, naming the very digest the gate wants.
+    deliverPublishProposal(channel, [{ name: FILE_SHORT, sha256: FILE_DIGEST }])
+    await endRun(channel)
+    fireEvent.click(listOutboxButton())
+    await screen.findByRole('region', { name: 'Candidates' })
+    expect(candidateRows()[0]?.[0]).toBe(FILE_SHORT)
+
+    await openNotePreview()
+
+    expect(gateInput().value).toBe('')
+    expect(finalButton('Write').disabled).toBe(true)
+    gateInput().value = FILE_SHORT
+    await flush()
+    expect(gateInput().value).toBe(FILE_SHORT)
+    expect(finalButton('Write').disabled).toBe(true)
+    // (React's value tracker reports a change event carrying the string
+    // already set on the node as no change, so the typed sequence passes
+    // through another value first -- a test-harness detail.)
+    typeGate('')
+    expect(finalButton('Write').disabled).toBe(true)
+    typeGate(FILE_SHORT)
+    expect(finalButton('Write').disabled).toBe(false)
+  })
+
+  it('Write calls guidance_apply with exactly { kind: "guidance", file, fileSha256 } -- the preview\'s file and full 64-hex digest, never the typed value -- once per double-click, then shows "<kind label> <file>: written <action>, snapshot <id>, result <short>", closes the block, and refetches guidance_status and guidance_snapshots for that kind only', async () => {
+    let resolveApply: (applied: GuidanceApplied) => void = () => {}
+    let written = false
+    const calls = mountGuidance(
+      { note: () => noteStatus({ managed: written ? 'current' : 'outdated' }) },
+      (cmd) => {
+        if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+        if (cmd === 'guidance_apply') {
+          return new Promise<GuidanceApplied>((resolve) => {
+            resolveApply = resolve
+          })
+        }
+        return undefined
+      },
+    )
+    await openNotePreview()
+    const statusesBefore = countCalls(calls, 'guidance_status')
+    const snapshotsBefore = countCalls(calls, 'guidance_snapshots')
+    typeGate(FILE_SHORT)
+
+    fireEvent.click(finalButton('Write'))
+    fireEvent.click(finalButton('Write'))
+
+    await waitFor(() => {
+      expect(finalButton('Write').disabled).toBe(true)
+    })
+    expect(gateInput().disabled).toBe(true)
+    const applies = calls.filter((call) => call.cmd === 'guidance_apply')
+    expect(applies).toHaveLength(1)
+    expect(applies[0]?.args).toEqual({
+      kind: 'guidance',
+      file: 'AGENTS.md',
+      fileSha256: FILE_DIGEST,
+    })
+    expect(Object.keys(applies[0]!.args).sort()).toEqual(['file', 'fileSha256', 'kind'])
+    expect(applies[0]?.args.fileSha256).toHaveLength(64)
+    expect(applies[0]?.args.fileSha256).not.toBe(FILE_SHORT)
+
+    written = true
+    resolveApply(APPLIED_REPLACE)
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written replace, snapshot 0123456789abcdef, result 7d7d7d7d',
+      )
+    })
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('block current')
+    })
+    expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore + 1)
+    expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore + 1)
+    expect(
+      calls.filter((call) => call.cmd === 'guidance_status').at(-1)?.args,
+    ).toEqual({ kind: 'guidance', file: 'AGENTS.md' })
+    expect(calls.filter((call) => call.cmd === 'guidance_snapshots').at(-1)?.args).toEqual({
+      kind: 'guidance',
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a no-op write shows "<kind label> <file>: written no-op, snapshot none, result <short>"', async () => {
+    mountGuidance({ note: noteStatus() }, (cmd) => {
+      if (cmd === 'guidance_preview') {
+        return { ...PREVIEW_REPLACE, action: 'no-op', resultSha256Short: FILE_SHORT }
+      }
+      if (cmd === 'guidance_apply') {
+        return { ...APPLIED_REPLACE, action: 'no-op', snapshotId: null, resultSha256Short: FILE_SHORT }
+      }
+      return undefined
+    })
+    await openNotePreview()
+    expect(writeBlockLines()).toContain('action: no-op')
+    typeGate(FILE_SHORT)
+    fireEvent.click(finalButton('Write'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written no-op, snapshot none, result 3c1e9a07',
+      )
+    })
+  })
+
+  it('the ignore kind: Preview sends exactly { kind: "ignore" } with no file key, the block shows .gitignore and the three proposed lines verbatim, Write sends exactly { kind: "ignore", fileSha256 } with no file key, and the receipt names that kind and that file', async () => {
+    const calls = mountGuidance({ ignore: IGNORE_STATUS_CURRENT }, (cmd) => {
+      if (cmd === 'guidance_preview') return IGNORE_PREVIEW
+      if (cmd === 'guidance_apply') {
+        return {
+          kind: 'ignore',
+          file: '.gitignore',
+          action: 'insert',
+          snapshotId: 'fedcba9876543210',
+          resultSha256Short: '0e9f4c31',
+        }
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(ignoreStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(ignoreBlock()).getByRole('button', { name: 'Preview' }))
+    await screen.findByLabelText('Guidance write')
+
+    const previews = calls.filter((call) => call.cmd === 'guidance_preview')
+    expect(previews).toHaveLength(1)
+    expect(previews[0]?.args).toEqual({ kind: 'ignore' })
+    expect(Object.keys(previews[0]!.args)).toEqual(['kind'])
+    expect(writeBlockLines()).toEqual([
+      'file: .gitignore',
+      'action: insert',
+      'proposed:',
+      'file sha256 short: a71bc0d2',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+    expect(proposedLines()).toEqual(IGNORE_LINES)
+    expect(gateLabelText()).toBe("Type the file's short digest (a71bc0d2) to write")
+    typeGate(IGNORE_SHORT)
+    fireEvent.click(finalButton('Write'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Ignore rule .gitignore: written insert, snapshot fedcba9876543210, result 0e9f4c31',
+      )
+    })
+    const applies = calls.filter((call) => call.cmd === 'guidance_apply')
+    expect(applies[0]?.args).toEqual({ kind: 'ignore', fileSha256: IGNORE_DIGEST })
+    expect(Object.keys(applies[0]!.args).sort()).toEqual(['fileSha256', 'kind'])
+  })
+
+  it('Remove opens a remove block bound to the status -- file, "action: remove", what a removal takes out, the file\'s short digest, the snapshot sentence, the act-as line, the label "…to remove", a disabled "Remove block" -- invoking nothing; typing the digest enables it, and the click calls guidance_remove with exactly { kind, file, fileSha256 } from the status, shows the removal receipt and refetches', async () => {
+    let removed = false
+    const calls = mountGuidance(
+      { note: () => (removed ? NOTE_ABSENT : noteStatus()) },
+      (cmd) => (cmd === 'guidance_remove' ? APPLIED_REMOVE : undefined),
+    )
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+    const before = calls.length
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Remove' }))
+    await screen.findByLabelText('Guidance write')
+
+    expect(calls.length).toBe(before)
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: remove',
+      REMOVE_SCOPE_LINE,
+      'file sha256 short: 3c1e9a07',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+    expect(gateLabelText()).toBe("Type the file's short digest (3c1e9a07) to remove")
+    expect(finalButton('Remove block').disabled).toBe(true)
+    typeGate(FILE_SHORT)
+    expect(finalButton('Remove block').disabled).toBe(false)
+    removed = true
+    fireEvent.click(finalButton('Remove block'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written remove, snapshot 89abcdef01234567, result absent',
+      )
+    })
+    const removes = calls.filter((call) => call.cmd === 'guidance_remove')
+    expect(removes).toHaveLength(1)
+    expect(removes[0]?.args).toEqual({ kind: 'guidance', file: 'AGENTS.md', fileSha256: FILE_DIGEST })
+    expect(Object.keys(removes[0]!.args).sort()).toEqual(['file', 'fileSha256', 'kind'])
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    await waitFor(() => {
+      expect(noteStatusLine()).toBe('AGENTS.md: block absent; file absent; snapshots 0, pinned 0')
+    })
+  })
+
+  it.each([
+    { label: 'absent', status: NOTE_ABSENT, offered: false },
+    { label: 'current', status: noteStatus(), offered: true },
+    { label: 'outdated', status: noteStatus({ managed: 'outdated' }), offered: true },
+    { label: 'modified', status: noteStatus({ managed: 'modified' }), offered: false },
+    { label: 'malformed', status: noteStatus({ managed: 'malformed' }), offered: false },
+  ])(
+    'offers Remove only for a block the shell would remove ($label: $offered): current or outdated; never for an absent, modified or malformed block',
+    async ({ status, offered }) => {
+      mountGuidance({ note: status })
+      await waitFor(() => {
+        expect(noteStatusLine()).not.toBeNull()
+      })
+
+      const remove = within(noteBlock()).getByRole('button', { name: 'Remove' }) as HTMLButtonElement
+      expect(remove.disabled).toBe(!offered)
+    },
+  )
+})
+
+describe('AgentPanel guidance snapshots (slice 5c, HAP-001 D18)', () => {
+  it('renders a Snapshots table per kind that has any -- file, id, taken at, sha256 short, size, existed, pinned, action -- rows as listed (newest first), taken at as an ISO time, existed and pinned as yes/no, every cell plain text, Pin or Unpin by the row\'s flag, and Restore only on the snapshots of the file the status line shows; no table for an empty list', async () => {
+    mountGuidance({ note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS })
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    const table = screen.getByRole('table', { name: 'Guidance note snapshots' })
+    expect(noteBlock().contains(table)).toBe(true)
+    expect(Array.from(table.querySelectorAll('th')).map((header) => header.textContent)).toEqual([
+      'file',
+      'id',
+      'taken at',
+      'sha256 short',
+      'size',
+      'existed',
+      'pinned',
+      'action',
+    ])
+    expect(snapshotRows()).toEqual([
+      [
+        'AGENTS.md',
+        '89abcdef01234567',
+        new Date(1725782402000).toISOString(),
+        '3c1e9a07',
+        '1512',
+        'yes',
+        'no',
+        'Pin Restore',
+      ],
+      [
+        'AGENTS.md',
+        '0123456789abcdef',
+        new Date(1725782401000).toISOString(),
+        'e3b0c442',
+        '0',
+        'no',
+        'yes',
+        'Unpin Restore',
+      ],
+      [
+        'CLAUDE.md',
+        'abcdefabcdefabcd',
+        new Date(1725782400000).toISOString(),
+        '5e5e5e5e',
+        '300',
+        'yes',
+        'no',
+        'Pin',
+      ],
+    ])
+    for (const cell of Array.from(table.querySelectorAll<HTMLElement>('tbody td:not(:last-child)'))) {
+      expectNoInteractiveElements(cell)
+    }
+    expect(screen.queryByRole('table', { name: 'Ignore rule snapshots' })).toBeNull()
+  })
+
+  it('Pin and Unpin call guidance_pin with exactly { id, pinned } -- the opposite of the row\'s flag -- apply the returned snapshot to the row, and refetch the status for the pinned count', async () => {
+    let pinnedCount = 1
+    const calls = mountGuidance(
+      {
+        note: () => noteStatus({ snapshots: 3, pinned: pinnedCount }),
+        noteSnapshots: NOTE_SNAPSHOTS,
+      },
+      (cmd, args) => {
+        if (cmd === 'guidance_pin') {
+          const snapshot = NOTE_SNAPSHOTS.find((candidate) => candidate.id === args.id)!
+          pinnedCount += args.pinned ? 1 : -1
+          return { ...snapshot, pinned: args.pinned }
+        }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }))
+    await waitFor(() => {
+      expect(snapshotRows()[0]?.slice(6)).toEqual(['yes', 'Unpin Restore'])
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('pinned 2')
+    })
+    fireEvent.click(within(snapshotRow('0123456789abcdef')).getByRole('button', { name: 'Unpin' }))
+    await waitFor(() => {
+      expect(snapshotRows()[1]?.slice(6)).toEqual(['no', 'Pin Restore'])
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('pinned 1')
+    })
+
+    const pins = calls.filter((call) => call.cmd === 'guidance_pin').map((call) => call.args)
+    expect(pins).toEqual([
+      { id: '89abcdef01234567', pinned: true },
+      { id: '0123456789abcdef', pinned: false },
+    ])
+    expect(Object.keys(pins[0]!).sort()).toEqual(['id', 'pinned'])
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('Restore opens a restore block with the snapshot\'s facts, the two restore disclosures and the gate against the current file digest ("…to restore"); the click calls guidance_restore with exactly { id, fileSha256 } -- the status\'s full digest -- shows the restore receipt and refetches', async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd) =>
+        cmd === 'guidance_restore'
+          ? {
+              kind: 'guidance',
+              file: 'AGENTS.md',
+              action: 'restore',
+              snapshotId: 'fedcba9876543210',
+              resultSha256Short: null,
+            }
+          : undefined,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+    const before = calls.length
+
+    fireEvent.click(within(snapshotRow('0123456789abcdef')).getByRole('button', { name: 'Restore' }))
+    await screen.findByLabelText('Guidance write')
+
+    expect(calls.length).toBe(before)
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: restore',
+      `snapshot: 0123456789abcdef, taken at ${new Date(1725782401000).toISOString()}, sha256 short e3b0c442, size 0, existed no`,
+      RESTORE_BYTES_LINE,
+      RESTORE_REMOVES_LINE,
+      'file sha256 short: 3c1e9a07',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+    expect(gateLabelText()).toBe("Type the file's short digest (3c1e9a07) to restore")
+    expect(finalButton('Restore snapshot').disabled).toBe(true)
+    typeGate(FILE_SHORT)
+    expect(finalButton('Restore snapshot').disabled).toBe(false)
+    const statusesBefore = countCalls(calls, 'guidance_status')
+    fireEvent.click(finalButton('Restore snapshot'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written restore, snapshot fedcba9876543210, result absent',
+      )
+    })
+    const restores = calls.filter((call) => call.cmd === 'guidance_restore')
+    expect(restores).toHaveLength(1)
+    expect(restores[0]?.args).toEqual({ id: '0123456789abcdef', fileSha256: FILE_DIGEST })
+    expect(Object.keys(restores[0]!.args).sort()).toEqual(['fileSha256', 'id'])
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    await waitFor(() => {
+      expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore + 1)
+    })
+  })
+
+  it("for an absent file the restore gate is the snapshot's own short digest and the request carries fileSha256 null", async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ exists: false, managed: 'absent', fileSha256: null, fileSha256Short: null }), noteSnapshots: [SNAPSHOT_NEWEST] },
+      (cmd) =>
+        cmd === 'guidance_restore'
+          ? {
+              kind: 'guidance',
+              file: 'AGENTS.md',
+              action: 'restore',
+              snapshotId: 'fedcba9876543210',
+              resultSha256Short: FILE_SHORT,
+            }
+          : undefined,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Restore' }))
+    await screen.findByLabelText('Guidance write')
+
+    expect(writeBlockLines()).toContain('file: absent')
+    expect(gateLabelText()).toBe("Type the snapshot's short digest (3c1e9a07) to restore")
+    typeGate(FILE_SHORT)
+    fireEvent.click(finalButton('Restore snapshot'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written restore, snapshot fedcba9876543210, result 3c1e9a07',
+      )
+    })
+    expect(calls.filter((call) => call.cmd === 'guidance_restore')[0]?.args).toEqual({
+      id: '89abcdef01234567',
+      fileSha256: null,
+    })
+  })
+})
+
+describe('AgentPanel guidance codes and guards (slice 5c)', () => {
+  it.each([
+    {
+      code: 'guidance-file-invalid',
+      message: 'the guidance file must end in .md',
+    },
+    {
+      code: 'guidance-file-changed',
+      message: 'the managed file changed since it was shown; read its status again and retry',
+    },
+    {
+      code: 'guidance-block-modified',
+      message:
+        'the managed block was modified inside its sentinels; resolve it by hand or restore a snapshot',
+    },
+    {
+      code: 'guidance-block-malformed',
+      message:
+        "the managed block's sentinels are not one intact pair; resolve it by hand or restore a snapshot",
+    },
+    { code: 'guidance-unmanaged', message: 'the file carries no managed block' },
+    { code: 'snapshot-unavailable', message: 'the snapshot store could not be written' },
+    { code: 'run-active', message: 'a run is active; approve or publish once it has ended' },
+  ])(
+    'renders $code from guidance_apply through the banner as "<code>: <message>" with no "untrusted" and no detail; the block stays open with the typed digest kept and Write enabled again -- except guidance-file-changed, which refetches the status and snapshots and closes the block',
+    async ({ code, message }) => {
+      const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+        if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+        if (cmd === 'guidance_apply') return Promise.reject({ code, message })
+        return undefined
+      })
+      await openNotePreview()
+      const statusesBefore = countCalls(calls, 'guidance_status')
+      const snapshotsBefore = countCalls(calls, 'guidance_snapshots')
+      typeGate(FILE_SHORT)
+      fireEvent.click(finalButton('Write'))
+
+      const alert = await screen.findByRole('alert')
+      expect(alert.textContent).toBe(`${code}: ${message}`)
+      expect(alert.textContent).not.toContain('untrusted')
+      if (code === 'guidance-file-changed') {
+        expect(screen.queryByLabelText('Guidance write')).toBeNull()
+        await waitFor(() => {
+          expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore + 1)
+        })
+        expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore + 1)
+      } else {
+        expect(screen.getByLabelText('Guidance write')).toBeTruthy()
+        expect(gateInput().value).toBe(FILE_SHORT)
+        await waitFor(() => {
+          expect(finalButton('Write').disabled).toBe(false)
+        })
+        expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore)
+        expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore)
+      }
+    },
+  )
+
+  it('a guidance-file-invalid rejection of the status fetch for a committed file name reaches the banner with the rule\'s own message, never the name, and leaves the previous status line standing', async () => {
+    mountGuidance({
+      note: () => undefined,
+    }, (cmd, args) => {
+      if (cmd === 'guidance_status' && args.file === 'notes.txt') {
+        return Promise.reject({
+          code: 'guidance-file-invalid',
+          message: 'the guidance file must end in .md',
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).toBe('AGENTS.md: block absent; file absent; snapshots 0, pinned 0')
+    })
+
+    commitFile('notes.txt')
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('guidance-file-invalid: the guidance file must end in .md')
+    expect(alert.textContent).not.toContain('notes.txt')
+    expect(noteStatusLine()).toBe('AGENTS.md: block absent; file absent; snapshots 0, pinned 0')
+  })
+
+  it('shows only "unexpected error" when a guidance command rejects with a plain Error, never its message', async () => {
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') return Promise.reject(new Error('secret detail'))
+      return undefined
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('unexpected error')
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+  })
+
+  it('while a run is active Preview, Remove, Restore, an open block\'s input and its final button are frozen, while the file input and Pin stay live; everything is live again once the run ends', async () => {
+    let channel: LiveChannel | undefined
+    mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd, args) => {
+        if (cmd === 'harness_spawn') {
+          channel = (args as { onFrame: LiveChannel }).onFrame
+          return 7
+        }
+        if (cmd === 'guidance_preview') return { ...PREVIEW_REPLACE, action: 'no-op' }
+        return undefined
+      },
+    )
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    expect(finalButton('Write').disabled).toBe(false)
+
+    await startRunOverWorkspace()
+
+    const controls = () => ({
+      preview: (within(noteBlock()).getByRole('button', { name: 'Preview' }) as HTMLButtonElement)
+        .disabled,
+      remove: (within(noteBlock()).getByRole('button', { name: 'Remove' }) as HTMLButtonElement)
+        .disabled,
+      restore: (
+        within(snapshotRow('89abcdef01234567')).getByRole('button', {
+          name: 'Restore',
+        }) as HTMLButtonElement
+      ).disabled,
+      pin: (within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }) as HTMLButtonElement)
+        .disabled,
+      gate: gateInput().disabled,
+      write: finalButton('Write').disabled,
+      file: fileInput().disabled,
+    })
+    expect(controls()).toEqual({
+      preview: true,
+      remove: true,
+      restore: true,
+      pin: false,
+      gate: true,
+      write: true,
+      file: false,
+    })
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+    expect(controls()).toEqual({
+      preview: false,
+      remove: false,
+      restore: false,
+      pin: false,
+      gate: false,
+      write: false,
+      file: false,
+    })
+  })
+
+  /**
+   * The seven guidance commands, each reached the way the surface reaches
+   * it: a fetch on mount, a button, or a final button through a confirmed
+   * gate. Mounts, drives the panel until `command` is in flight, and hands
+   * back the recorded calls and that one deferred promise's settle
+   * functions (slice 5c review, R3-001).
+   */
+  async function driveGuidanceInFlight(command: string): Promise<{
+    calls: Call[]
+    resolve: (value: unknown) => void
+    reject: (reason: unknown) => void
+  }> {
+    let resolve: (value: unknown) => void = () => {}
+    let reject: (reason: unknown) => void = () => {}
+    const deferred = (): Promise<never> =>
+      new Promise((settle, refuse) => {
+        resolve = settle as (value: unknown) => void
+        reject = refuse
+      })
+    const answer = (cmd: string): unknown => (cmd === command ? deferred() : undefined)
+
+    if (command === 'guidance_status') {
+      const calls = mountGuidance({ note: () => deferred(), ignore: IGNORE_STATUS_CURRENT })
+      await waitFor(() => {
+        expect(ignoreStatusLine()).not.toBeNull()
+      })
+      return { calls, resolve, reject }
+    }
+    if (command === 'guidance_snapshots') {
+      const calls = mountGuidance({ note: noteStatus(), noteSnapshots: () => deferred() })
+      await waitFor(() => {
+        expect(noteStatusLine()).not.toBeNull()
+      })
+      return { calls, resolve, reject }
+    }
+    if (command === 'guidance_preview') {
+      const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, answer)
+      await waitFor(() => {
+        expect(noteStatusLine()).not.toBeNull()
+      })
+      fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+      await waitFor(() => {
+        expect(countCalls(calls, 'guidance_preview')).toBe(1)
+      })
+      return { calls, resolve, reject }
+    }
+    if (command === 'guidance_apply') {
+      const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) =>
+        cmd === 'guidance_preview' ? PREVIEW_REPLACE : answer(cmd),
+      )
+      await openNotePreview()
+      typeGate(FILE_SHORT)
+      fireEvent.click(finalButton('Write'))
+      await waitFor(() => {
+        expect(countCalls(calls, 'guidance_apply')).toBe(1)
+      })
+      return { calls, resolve, reject }
+    }
+    if (command === 'guidance_remove') {
+      const calls = mountGuidance({ note: noteStatus() }, answer)
+      await waitFor(() => {
+        expect(noteStatusLine()).not.toBeNull()
+      })
+      fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Remove' }))
+      await screen.findByLabelText('Guidance write')
+      typeGate(FILE_SHORT)
+      fireEvent.click(finalButton('Remove block'))
+      await waitFor(() => {
+        expect(countCalls(calls, 'guidance_remove')).toBe(1)
+      })
+      return { calls, resolve, reject }
+    }
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      answer,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+    if (command === 'guidance_restore') {
+      fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Restore' }))
+      await screen.findByLabelText('Guidance write')
+      typeGate(FILE_SHORT)
+      fireEvent.click(finalButton('Restore snapshot'))
+      await waitFor(() => {
+        expect(countCalls(calls, 'guidance_restore')).toBe(1)
+      })
+      return { calls, resolve, reject }
+    }
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }))
+    await waitFor(() => {
+      expect(countCalls(calls, 'guidance_pin')).toBe(1)
+    })
+    return { calls, resolve, reject }
+  }
+
+  /** What each guidance command answers when its continuation is settled after the unmount. */
+  const GUIDANCE_UNMOUNT_ANSWERS: Record<string, unknown> = {
+    guidance_status: noteStatus(),
+    guidance_snapshots: NOTE_SNAPSHOTS,
+    guidance_preview: PREVIEW_REPLACE,
+    guidance_apply: APPLIED_REPLACE,
+    guidance_remove: APPLIED_REMOVE,
+    guidance_restore: { ...APPLIED_REMOVE, action: 'restore' },
+    guidance_pin: { ...SNAPSHOT_NEWEST, pinned: true },
+  }
+
+  it.each([
+    'guidance_status',
+    'guidance_snapshots',
+    'guidance_preview',
+    'guidance_apply',
+    'guidance_remove',
+    'guidance_restore',
+    'guidance_pin',
+  ])(
+    "%s's continuation no-ops after unmount, whether it resolves or rejects: nothing thrown, no console.error, and no IPC call after the unmount (the success paths of the writing commands and of pin would otherwise refetch)",
+    async (command) => {
+      for (const outcome of ['resolve', 'reject'] as const) {
+        const { calls, resolve, reject } = await driveGuidanceInFlight(command)
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const before = calls.length
+
+        cleanup()
+        if (outcome === 'resolve') resolve(GUIDANCE_UNMOUNT_ANSWERS[command])
+        else reject({ code: 'snapshot-unavailable', message: 'a snapshot manifest is corrupt' })
+        await new Promise((settled) => {
+          setTimeout(settled, 0)
+        })
+
+        expect(consoleErrorSpy).not.toHaveBeenCalled()
+        expect(calls.length).toBe(before)
+        consoleErrorSpy.mockRestore()
+        clearMocks()
+      }
+    },
+  )
+
+  it("a workspace pick clears the completed write's result line: the receipt belongs to the project that was active when it was made", async () => {
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      if (cmd === 'guidance_apply') return APPLIED_REPLACE
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    fireEvent.click(finalButton('Write'))
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written replace, snapshot 0123456789abcdef, result 7d7d7d7d',
+      )
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+
+    await waitFor(() => {
+      expect(resultLine()).toBeNull()
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a workspace pick resets the section: the open block goes, both kinds\' status and snapshots are fetched again, and a pre-pick status response landing after the pick is dropped in favour of the post-pick one', async () => {
+    let resolveFirst: (status: GuidanceStatus) => void = () => {}
+    let fetches = 0
+    const calls = mountGuidance(
+      {
+        note: () => {
+          fetches += 1
+          if (fetches === 1) {
+            return new Promise<GuidanceStatus>((resolve) => {
+              resolveFirst = resolve
+            })
+          }
+          return noteStatus({ managed: 'outdated' })
+        },
+        ignore: IGNORE_STATUS_CURRENT,
+      },
+      (cmd) => {
+        if (cmd === 'guidance_preview') return IGNORE_PREVIEW
+        if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(ignoreStatusLine()).not.toBeNull()
+    })
+    fireEvent.click(within(ignoreBlock()).getByRole('button', { name: 'Preview' }))
+    await screen.findByLabelText('Guidance write')
+    const statusesBefore = countCalls(calls, 'guidance_status')
+    const snapshotsBefore = countCalls(calls, 'guidance_snapshots')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('block outdated')
+    })
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore + 2)
+    expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore + 2)
+    resolveFirst(NOTE_ABSENT)
+    await flush()
+    expect(noteStatusLine()).toContain('block outdated')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+describe('AgentPanel guidance content security (slice 5c, RCS-001, TM-001-R1)', () => {
+  const esc = String.fromCharCode(0x1b)
+  /** U+202E RIGHT-TO-LEFT OVERRIDE, built from its code point so no bidi control sits in this source file. */
+  const rlo = String.fromCodePoint(0x202e)
+
+  it('renders a managed file name carrying a literal <b>, a C0 byte and a bidi override in the status line, the block and the label as text: no <b>, no anchor, controls stripped; the proposed block carrying a script tag, a Markdown link, an HTML anchor and an HTML comment renders as text with no script, anchor, href or comment node anywhere in the region', async () => {
+    const hostile = `<b>AGENTS</b>${esc}x${rlo}.md`
+    const hostileProposed = [
+      '<!-- omnifrons:begin guidance hap-001-guidance-v1 sha256:00 -->',
+      '<script>alert(1)</script>',
+      '[click](http://example.invalid) <a href="http://example.invalid">x</a>',
+      `line${esc}[31mwith${rlo}controls`,
+      '<!-- omnifrons:end guidance -->',
+    ].join('\n')
+    mountGuidance({ note: noteStatus({ file: hostile }) }, (cmd) =>
+      cmd === 'guidance_preview'
+        ? { ...PREVIEW_REPLACE, file: hostile, proposed: hostileProposed }
+        : undefined,
+    )
+    await openNotePreview()
+
+    expect(noteStatusLine()).toBe(
+      '<b>AGENTS</b>x.md: block current; file sha256 short 3c1e9a07; snapshots 1, pinned 0',
+    )
+    expect(writeBlockLines()[0]).toBe('file: <b>AGENTS</b>x.md')
+    expect(proposedLines()).toEqual([
+      '<!-- omnifrons:begin guidance hap-001-guidance-v1 sha256:00 -->',
+      '<script>alert(1)</script>',
+      '[click](http://example.invalid) <a href="http://example.invalid">x</a>',
+      'line[31mwithcontrols',
+      '<!-- omnifrons:end guidance -->',
+    ])
+    const region = guidanceRegion()
+    expect(region.querySelector('b, a, script, [href]')).toBeNull()
+    const walker = document.createTreeWalker(region, NodeFilter.SHOW_COMMENT)
+    expect(walker.nextNode()).toBeNull()
+    expect(region.textContent).not.toContain(esc)
+    expect(region.textContent).not.toContain(rlo)
+    expect(gateLabelText()).toBe("Type the file's short digest (3c1e9a07) to write")
+  })
+})
+
+describe('AgentPanel guidance stale context (slice 5c review, R1-001)', () => {
+  it('drops a guidance_preview that resolves after a workspace pick: no block re-opens bound to the previous project\'s file, digest and gate', async () => {
+    let resolvePreview: (preview: GuidancePreview) => void = () => {}
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') {
+        return new Promise<GuidancePreview>((resolve) => {
+          resolvePreview = resolve
+        })
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+    await flush()
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    resolvePreview(PREVIEW_REPLACE)
+    await flush()
+
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('drops a guidance_preview that resolves after a different guidance file is committed, honouring the rule that a change of file closes a block bound to the previous one', async () => {
+    let resolvePreview: (preview: GuidancePreview) => void = () => {}
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd, args) => {
+      if (cmd === 'guidance_preview') {
+        return new Promise<GuidancePreview>((resolve) => {
+          resolvePreview = resolve
+        })
+      }
+      if (cmd === 'guidance_status' && args.file === 'CLAUDE.md') {
+        return noteStatus({ file: 'CLAUDE.md', managed: 'outdated' })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+    await flush()
+
+    commitFile('CLAUDE.md')
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('CLAUDE.md')
+    })
+    resolvePreview(PREVIEW_REPLACE)
+    await flush()
+
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+  })
+
+  it('drops a guidance_preview that rejects after a workspace pick: the previous project\'s refusal raises no banner over the new one', async () => {
+    let rejectPreview: (reason: unknown) => void = () => {}
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') {
+        return new Promise<GuidancePreview>((_resolve, reject) => {
+          rejectPreview = reject
+        })
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    rejectPreview({ code: 'guidance-block-malformed', message: 'the managed block is malformed' })
+    await flush()
+
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    expect(
+      (within(noteBlock()).getByRole('button', { name: 'Preview' }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+
+  it('drops a guidance_apply that resolves after a workspace pick: the previous project\'s receipt never appears under the new one, and no fetch is made for the project the section has left', async () => {
+    let resolveApply: (applied: GuidanceApplied) => void = () => {}
+    const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      if (cmd === 'guidance_apply') {
+        return new Promise<GuidanceApplied>((resolve) => {
+          resolveApply = resolve
+        })
+      }
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      return undefined
+    })
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    fireEvent.click(finalButton('Write'))
+    await waitFor(() => {
+      expect(countCalls(calls, 'guidance_apply')).toBe(1)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await waitFor(() => {
+      expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    })
+    const statusesAfterPick = countCalls(calls, 'guidance_status')
+    const snapshotsAfterPick = countCalls(calls, 'guidance_snapshots')
+    resolveApply(APPLIED_REPLACE)
+    await flush()
+
+    expect(resultLine()).toBeNull()
+    expect(countCalls(calls, 'guidance_status')).toBe(statusesAfterPick)
+    expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsAfterPick)
+  })
+})
+
+describe('AgentPanel guidance committed file name (slice 5c review, R1-004 / R3-005)', () => {
+  it('never lets a guidance file name the shell refused become the name a later automatic fetch reuses: after the refusal a Pin still asks about the committed file, and the status line, Preview, Remove and Restore all stand', async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd, args) => {
+        if (cmd === 'guidance_status' && args.file === '') {
+          return Promise.reject({
+            code: 'guidance-file-invalid',
+            message: 'the guidance file must end in .md',
+          })
+        }
+        if (cmd === 'guidance_pin') return { ...SNAPSHOT_NEWEST, pinned: true }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    commitFile('')
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('guidance-file-invalid: the guidance file must end in .md')
+    expect(noteStatusLine()).toContain('AGENTS.md: block current')
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }))
+    await waitFor(() => {
+      expect(countCalls(calls, 'guidance_pin')).toBe(1)
+    })
+    await flush()
+
+    expect(calls.filter((call) => call.cmd === 'guidance_status').at(-1)?.args).toEqual({
+      kind: 'guidance',
+      file: 'AGENTS.md',
+    })
+    expect(noteStatusLine()).toContain('AGENTS.md: block current')
+    expect(
+      (within(noteBlock()).getByRole('button', { name: 'Preview' }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+    expect(
+      (within(noteBlock()).getByRole('button', { name: 'Remove' }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+    expect(
+      within(snapshotRow('89abcdef01234567')).queryByRole('button', { name: 'Restore' }),
+    ).not.toBeNull()
+  })
+
+  it('follows the shell\'s own answer for the committed name: once a name is accepted the automatic fetches use it, and the refused draft left in the field never reaches the wire', async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd, args) => {
+        if (cmd === 'guidance_status' && args.file === 'notes.txt') {
+          return Promise.reject({
+            code: 'guidance-file-invalid',
+            message: 'the guidance file must end in .md',
+          })
+        }
+        if (cmd === 'guidance_status' && args.file === 'CLAUDE.md') {
+          return noteStatus({ file: 'CLAUDE.md', snapshots: 3, pinned: 1 })
+        }
+        if (cmd === 'guidance_pin') return { ...SNAPSHOT_NEWEST, pinned: true }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    commitFile('CLAUDE.md')
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('CLAUDE.md')
+    })
+    commitFile('notes.txt')
+    await screen.findByRole('alert')
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }))
+    await waitFor(() => {
+      expect(countCalls(calls, 'guidance_pin')).toBe(1)
+    })
+    await flush()
+
+    expect(calls.filter((call) => call.cmd === 'guidance_status').at(-1)?.args).toEqual({
+      kind: 'guidance',
+      file: 'CLAUDE.md',
+    })
+    expect(noteStatusLine()).toContain('CLAUDE.md')
+    expect(fileInput().value).toBe('notes.txt')
+  })
+})
+
+describe('AgentPanel guidance dead-end blocks (slice 5c review, R3-008)', () => {
+  it('offers no Remove for a current block whose status carries no short digest: the gate could never be typed and the block would have no way out', async () => {
+    mountGuidance({ note: noteStatus({ fileSha256: null, fileSha256Short: null }) })
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    expect(
+      (within(noteBlock()).getByRole('button', { name: 'Remove' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+  })
+})
+
+describe('AgentPanel guidance write receipt (slice 5c review, R1-003 / R3-007)', () => {
+  it('names the kind and the file in the receipt, and clears it when a guidance file name is committed, so a receipt can never sit under another file\'s status line', async () => {
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd, args) => {
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      if (cmd === 'guidance_apply') return APPLIED_REPLACE
+      if (cmd === 'guidance_status' && args.file === 'CLAUDE.md') {
+        return noteStatus({ file: 'CLAUDE.md' })
+      }
+      return undefined
+    })
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    fireEvent.click(finalButton('Write'))
+
+    await waitFor(() => {
+      expect(resultLine()).toBe(
+        'Guidance note AGENTS.md: written replace, snapshot 0123456789abcdef, result 7d7d7d7d',
+      )
+    })
+
+    commitFile('CLAUDE.md')
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('CLAUDE.md')
+    })
+    expect(resultLine()).toBeNull()
+  })
+})
+
+describe('AgentPanel guidance write disclosures (slice 5c review, R1-002 / R1-005)', () => {
+  it('states on the removal surface what a removal takes out: the managed block, and the file itself only when nothing else remains in it and Omnifrons created it', async () => {
+    mountGuidance({ note: noteStatus() })
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Remove' }))
+    await screen.findByLabelText('Guidance write')
+
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: remove',
+      REMOVE_SCOPE_LINE,
+      'file sha256 short: 3c1e9a07',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+  })
+
+  it('states on the restore surface that the snapshot\'s bytes are not shown, and, before the gate, that a snapshot recording no file REMOVES the file', async () => {
+    mountGuidance({ note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS })
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Restore' }))
+    await screen.findByLabelText('Guidance write')
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: restore',
+      `snapshot: 89abcdef01234567, taken at ${new Date(1725782402000).toISOString()}, sha256 short 3c1e9a07, size 1512, existed yes`,
+      RESTORE_BYTES_LINE,
+      'file sha256 short: 3c1e9a07',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+
+    fireEvent.click(within(snapshotRow('0123456789abcdef')).getByRole('button', { name: 'Restore' }))
+    await flush()
+    expect(writeBlockLines()).toEqual([
+      'file: AGENTS.md',
+      'action: restore',
+      `snapshot: 0123456789abcdef, taken at ${new Date(1725782401000).toISOString()}, sha256 short e3b0c442, size 0, existed no`,
+      RESTORE_BYTES_LINE,
+      RESTORE_REMOVES_LINE,
+      'file sha256 short: 3c1e9a07',
+      SNAPSHOT_SENTENCE,
+      ACT_AS_LINE,
+    ])
+    const removes = Array.from(writeBlock().querySelectorAll('p')).find(
+      (line) => line.textContent === RESTORE_REMOVES_LINE,
+    )!
+    const label = writeBlock().querySelector('label')!
+    expect(removes.compareDocumentPosition(label) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+})
+
+describe('AgentPanel guidance snapshot kind (slice 5c review, R1-006)', () => {
+  it('offers neither Pin nor Restore on a snapshot whose kind is not the block\'s: the block\'s facts bind the write, so a foreign kind is offered no action', async () => {
+    const foreign: Snapshot = { ...SNAPSHOT_NEWEST, id: 'ffffffffffffffff', kind: 'ignore' }
+    mountGuidance({
+      note: noteStatus({ snapshots: 2, pinned: 1 }),
+      noteSnapshots: [foreign, SNAPSHOT_OLDEST],
+    })
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    expect(snapshotRows().map((row) => row.at(-1))).toEqual(['', 'Unpin Restore'])
+  })
+})
+
+describe('AgentPanel whole-outbox listing shape (slice 5c review, R1-007)', () => {
+  it('renders a candidates_list payload that is not the list the contract promises as no rows, rather than throwing mid-render and taking the panel down', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWithWorkspace((cmd) => (cmd === 'candidates_list' ? null : undefined))
+    await waitFor(() => {
+      expect(listOutboxButton().disabled).toBe(false)
+    })
+
+    fireEvent.click(listOutboxButton())
+    await screen.findByRole('region', { name: 'Candidates' })
+
+    expect(candidateRows()).toEqual([])
+    expect(screen.getByLabelText('Agent transcript')).toBeTruthy()
+    expect(guidanceRegion()).toBeTruthy()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('AgentPanel guidance pin in flight (slice 5c review, R3-013)', () => {
+  it('fires one guidance_pin per double-click: the second click lands on a pin already in flight and is refused', async () => {
+    let resolvePin: (snapshot: Snapshot) => void = () => {}
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd) => {
+        if (cmd === 'guidance_pin') {
+          return new Promise<Snapshot>((resolve) => {
+            resolvePin = resolve
+          })
+        }
+        return undefined
+      },
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+
+    const pin = within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' })
+    fireEvent.click(pin)
+    fireEvent.click(pin)
+    await flush()
+
+    expect(countCalls(calls, 'guidance_pin')).toBe(1)
+    resolvePin({ ...SNAPSHOT_NEWEST, pinned: true })
+    await waitFor(() => {
+      expect(snapshotRows()[0]?.slice(6)).toEqual(['yes', 'Unpin Restore'])
+    })
+    expect(
+      (within(snapshotRow('89abcdef01234567')).getByRole('button', {
+        name: 'Unpin',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+})
+
+describe('AgentPanel guidance rejections beyond apply (slice 5c review, R3-003 / R3-004)', () => {
+  it.each([
+    {
+      command: 'guidance_remove',
+      button: 'Remove block' as const,
+      code: 'guidance-block-modified',
+      message:
+        'the managed block was modified inside its sentinels; resolve it by hand or restore a snapshot',
+      closes: false,
+    },
+    {
+      command: 'guidance_remove',
+      button: 'Remove block' as const,
+      code: 'guidance-file-changed',
+      message: 'the managed file changed since it was shown; read its status again and retry',
+      closes: true,
+    },
+    {
+      command: 'guidance_restore',
+      button: 'Restore snapshot' as const,
+      code: 'snapshot-unavailable',
+      message: 'the snapshot store could not be written',
+      closes: false,
+    },
+    {
+      command: 'guidance_restore',
+      button: 'Restore snapshot' as const,
+      code: 'guidance-file-changed',
+      message: 'the managed file changed since it was shown; read its status again and retry',
+      closes: true,
+    },
+  ])(
+    'renders $code from $command through the banner as "<code>: <message>" with no "untrusted"; the block stays open with the typed digest kept and the button enabled again -- except guidance-file-changed, which closes it and refetches that kind\'s status and snapshots',
+    async ({ command, button, code, message, closes }) => {
+      const calls = mountGuidance(
+        { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+        (cmd) => (cmd === command ? Promise.reject({ code, message }) : undefined),
+      )
+      await waitFor(() => {
+        expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+      })
+
+      if (command === 'guidance_remove') {
+        fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Remove' }))
+      } else {
+        fireEvent.click(
+          within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Restore' }),
+        )
+      }
+      await screen.findByLabelText('Guidance write')
+      const statusesBefore = countCalls(calls, 'guidance_status')
+      const snapshotsBefore = countCalls(calls, 'guidance_snapshots')
+      typeGate(FILE_SHORT)
+      fireEvent.click(finalButton(button))
+
+      const alert = await screen.findByRole('alert')
+      expect(alert.textContent).toBe(`${code}: ${message}`)
+      expect(alert.textContent).not.toContain('untrusted')
+      if (closes) {
+        expect(screen.queryByLabelText('Guidance write')).toBeNull()
+        await waitFor(() => {
+          expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore + 1)
+        })
+        expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore + 1)
+      } else {
+        expect(screen.getByLabelText('Guidance write')).toBeTruthy()
+        expect(gateInput().value).toBe(FILE_SHORT)
+        await waitFor(() => {
+          expect(finalButton(button).disabled).toBe(false)
+        })
+        expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore)
+        expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore)
+      }
+    },
+  )
+
+  it('renders a guidance_pin rejection through the banner as "<code>: <message>", leaves the row\'s flag as it was, refetches nothing, and offers Pin again', async () => {
+    const calls = mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd) =>
+        cmd === 'guidance_pin'
+          ? Promise.reject({
+              code: 'guidance-unmanaged',
+              message: 'no snapshot with that id is recorded for this project',
+            })
+          : undefined,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+    const statusesBefore = countCalls(calls, 'guidance_status')
+    const snapshotsBefore = countCalls(calls, 'guidance_snapshots')
+
+    fireEvent.click(within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Pin' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe(
+      'guidance-unmanaged: no snapshot with that id is recorded for this project',
+    )
+    expect(alert.textContent).not.toContain('untrusted')
+    expect(snapshotRows()[0]?.slice(6)).toEqual(['no', 'Pin Restore'])
+    expect(countCalls(calls, 'guidance_status')).toBe(statusesBefore)
+    expect(countCalls(calls, 'guidance_snapshots')).toBe(snapshotsBefore)
+    expect(
+      (within(snapshotRow('89abcdef01234567')).getByRole('button', {
+        name: 'Pin',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+
+  it('renders a guidance_preview rejected with a ShellError as "<code>: <message>" and leaves no block open', async () => {
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) =>
+      cmd === 'guidance_preview'
+        ? Promise.reject({
+            code: 'guidance-block-malformed',
+            message:
+              "the managed block's sentinels are not one intact pair; resolve it by hand or restore a snapshot",
+          })
+        : undefined,
+    )
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+
+    fireEvent.click(within(noteBlock()).getByRole('button', { name: 'Preview' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe(
+      "guidance-block-malformed: the managed block's sentinels are not one intact pair; resolve it by hand or restore a snapshot",
+    )
+    expect(alert.textContent).not.toContain('untrusted')
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+    await waitFor(() => {
+      expect(
+        (within(noteBlock()).getByRole('button', { name: 'Preview' }) as HTMLButtonElement).disabled,
+      ).toBe(false)
+    })
+  })
+})
+
+describe('AgentPanel guidance proposed-block lines (slice 5c review, R3-006)', () => {
+  it.each([
+    {
+      label: 'a trailing newline ends the last line rather than opening an empty one',
+      proposed: 'first\nsecond\n',
+      lines: ['first', 'second'],
+    },
+    {
+      label: 'an interior empty line is kept, since it is one',
+      proposed: 'first\n\nthird\n',
+      lines: ['first', '', 'third'],
+    },
+    {
+      label: 'a proposal with no trailing newline keeps its last line',
+      proposed: 'first\nsecond',
+      lines: ['first', 'second'],
+    },
+    { label: 'an empty proposal yields no lines at all', proposed: '', lines: [] },
+    {
+      label: "a CRLF file's carriage return is stripped by PlainTextLine, the control it is",
+      proposed: 'first\r\nsecond\r\n',
+      lines: ['first', 'second'],
+    },
+  ])('splits the proposed block into display lines: $label', async ({ proposed, lines }) => {
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) =>
+      cmd === 'guidance_preview' ? { ...PREVIEW_REPLACE, proposed } : undefined,
+    )
+    await openNotePreview()
+
+    expect(proposedLines()).toEqual(lines)
+    expect(writeBlock().textContent).not.toContain('\r')
+  })
+})
+
+describe('AgentPanel guidance per-kind independence (slice 5c review, R3-009)', () => {
+  const IGNORE_SNAPSHOT: Snapshot = {
+    id: '1111222233334444',
+    kind: 'ignore',
+    file: '.gitignore',
+    existed: true,
+    sha256Short: IGNORE_SHORT,
+    size: 90,
+    takenAt: 1725782403000,
+    pinned: false,
+  }
+
+  it("renders both kinds' snapshot tables at once and keeps them independent: a pin on one kind rewrites that kind's row and refetches that kind's status alone, leaving the other kind's table and status untouched", async () => {
+    const calls = mountGuidance(
+      {
+        note: noteStatus({ snapshots: 3, pinned: 1 }),
+        noteSnapshots: NOTE_SNAPSHOTS,
+        ignore: IGNORE_STATUS_CURRENT,
+        ignoreSnapshots: [IGNORE_SNAPSHOT],
+      },
+      (cmd, args) =>
+        cmd === 'guidance_pin'
+          ? { ...IGNORE_SNAPSHOT, pinned: args.pinned as boolean }
+          : undefined,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Ignore rule snapshots' })).not.toBeNull()
+    })
+
+    expect(snapshotRows('Guidance note snapshots')).toHaveLength(3)
+    expect(snapshotRows('Ignore rule snapshots')).toHaveLength(1)
+    const noteRowsBefore = snapshotRows('Guidance note snapshots')
+    const noteLineBefore = noteStatusLine()
+    const statuses = () => calls.filter((call) => call.cmd === 'guidance_status')
+    const before = statuses().length
+
+    fireEvent.click(
+      within(screen.getByRole('table', { name: 'Ignore rule snapshots' })).getByRole('button', {
+        name: 'Pin',
+      }),
+    )
+
+    await waitFor(() => {
+      expect(snapshotRows('Ignore rule snapshots')[0]?.[6]).toBe('yes')
+    })
+    expect(snapshotRows('Guidance note snapshots')).toEqual(noteRowsBefore)
+    expect(noteStatusLine()).toBe(noteLineBefore)
+    expect(statuses().slice(before).map((call) => call.args)).toEqual([{ kind: 'ignore' }])
+  })
+})
+
+describe('AgentPanel guidance same-file Restore (slice 5c review, R3-012)', () => {
+  it("gives a snapshot of another guidance file its Restore once that file is the one the status line shows, and takes it from the rows of the file the section has left", async () => {
+    mountGuidance(
+      { note: noteStatus({ snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd, args) =>
+        cmd === 'guidance_status' && args.file === 'CLAUDE.md'
+          ? noteStatus({ file: 'CLAUDE.md', snapshots: 3, pinned: 1 })
+          : undefined,
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+    expect(snapshotRows().map((row) => row.at(-1))).toEqual([
+      'Pin Restore',
+      'Unpin Restore',
+      'Pin',
+    ])
+
+    commitFile('CLAUDE.md')
+
+    await waitFor(() => {
+      expect(noteStatusLine()).toContain('CLAUDE.md')
+    })
+    expect(snapshotRows().map((row) => row.at(-1))).toEqual(['Pin', 'Unpin', 'Pin Restore'])
+  })
+})
+
+describe('AgentPanel guidance absent-file gate (slice 5c review, R3-016)', () => {
+  it("enables Write for a file the preview showed as absent only on an exact match of the proposed block's short digest: never the gate verb, uppercase hex, a 7- or 9-character prefix, a leading or trailing space, the empty string, or the digest of some other file", async () => {
+    mountGuidance({ note: NOTE_ABSENT }, (cmd) =>
+      cmd === 'guidance_preview' ? notePreview() : undefined,
+    )
+    await openNotePreview()
+    expect(gateLabelText()).toBe(
+      "Type the proposed block's short digest (e5a1b2c3) to create the file",
+    )
+
+    for (const wrong of [
+      'create the file',
+      'E5A1B2C3',
+      'e5a1b2c',
+      'e5a1b2c3a',
+      ' e5a1b2c3',
+      'e5a1b2c3 ',
+      '',
+      FILE_SHORT,
+      IGNORE_SHORT,
+    ]) {
+      typeGate(wrong)
+      expect(finalButton('Write').disabled).toBe(true)
+    }
+    typeGate('e5a1b2c3')
+    expect(finalButton('Write').disabled).toBe(false)
   })
 })

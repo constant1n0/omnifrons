@@ -333,6 +333,40 @@ export type ShellErrorCode =
    * a verdict on anything.
    */
   | 'run-active'
+  /**
+   * A guidance command named a file outside RCS-001's file-name rule (a
+   * path, a reserved device name, not Markdown), or the managed file is
+   * not a regular file, exceeds the size bound, is not valid UTF-8, could
+   * not be read or written, or did not read back as written (spike slice
+   * 5c, HAP-001 D18). The rule's own fixed message, never the name.
+   */
+  | 'guidance-file-invalid'
+  /**
+   * The managed file's digest (or its absence) differs from the
+   * `fileSha256` the request bound to: the surface is stale, nothing was
+   * written (spike slice 5c).
+   */
+  | 'guidance-file-changed'
+  /**
+   * The managed block was edited inside its sentinels; Omnifrons neither
+   * replaces nor removes it -- the user resolves by hand or restores a
+   * snapshot (spike slice 5c).
+   */
+  | 'guidance-block-modified'
+  /** The managed block's sentinels are not one intact pair (spike slice 5c). */
+  | 'guidance-block-malformed'
+  /**
+   * `guidance_remove` found no managed block, or `guidance_restore` or
+   * `guidance_pin` named a snapshot this project does not hold (spike
+   * slice 5c).
+   */
+  | 'guidance-unmanaged'
+  /**
+   * The snapshot store under the work area could not be read, is corrupt
+   * (a corrupt manifest fails the whole listing), or could not be written
+   * (spike slice 5c).
+   */
+  | 'snapshot-unavailable'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {
@@ -778,7 +812,14 @@ export interface PortableReference {
 export interface ArtifactApproval {
   approvalId: ArtifactApprovalId
   publicationId: PublicationId
-  runId: string
+  /**
+   * The run whose run-end inventory listed the candidate; `null` for an
+   * approval made from the whole-outbox inventory (`artifactApprove` with
+   * `runId` null, spike slice 5c), which lists without a run -- the run
+   * subdirectory such an entry sits under, if any, is a location fact its
+   * `name` carries, never provenance (HAP-001-R11).
+   */
+  runId: string | null
   name: string
   displayName: string
   sha256Short: string
@@ -789,6 +830,14 @@ export interface ArtifactApproval {
   assetRootId: string
   actAs: ActAs
   approvedAt: number
+  /**
+   * Whether the entry's handle is held for the publication that follows
+   * (HAP-001-R17): `false` when HAP-001 D22's cap left no room for it, in
+   * which case the publication re-opens the entry under the single-handle
+   * discipline when its turn comes -- said on the wire rather than left
+   * silent (spike slice 5c). The approval stands either way.
+   */
+  handleHeld: boolean
 }
 
 /**
@@ -830,27 +879,38 @@ export type ArtifactStateFrame = {
 }
 
 /**
- * Approve one candidate of a remembered run for publication, by the run
- * id, the entry name exactly as `candidatesList` listed it, and the
- * entry's full 64-hex digest -- the row's own `Candidate.sha256`, the
- * identity fact the shell listed, never a typed value or a proposal's
- * digest (`docs/spike-log.md` § Slice 5b). The shell looks the entry up in
- * its own run-end inventory and refuses a digest that does not match it,
- * a refused entry, or a class other than `generated-heavy`; the returned
+ * Approve one candidate for publication, by the run id (or `null`), the
+ * entry name exactly as `candidatesList` listed it, and the entry's full
+ * 64-hex digest -- the row's own `Candidate.sha256`, the identity fact the
+ * shell listed, never a typed value or a proposal's digest
+ * (`docs/spike-log.md` § Slice 5b). With a run id the shell looks the entry
+ * up in its own run-end inventory; with `runId` null (spike slice 5c) the
+ * entry is one the whole-outbox inventory listed -- at the outbox root, or
+ * under a run subdirectory no remembered run's inventory covers -- and the
+ * shell re-opens it once under the single-handle discipline, requires the
+ * digest taken from that handle to equal the request's, and approves it
+ * as unattributed with no run and no launch provenance (HAP-001-R11, R15,
+ * R16, R22). Either way the shell refuses a digest that does not match, a
+ * refused entry, or a class other than `generated-heavy`, and the returned
  * approval carries the identity-bound facts the surface showed. Invokes
- * `artifact_approve` with exactly `{ runId, name, sha256 }` -- no
- * path-shaped key.
+ * `artifact_approve` with exactly `{ runId, name, sha256 }` -- the `runId`
+ * key present and `null` for the whole-outbox path; no path-shaped key.
  *
  * # Errors
  * Rejects with `refused` (an entry that cannot be approved, or a digest
- * that does not match), `destination-invalid` (the project declares no
- * asset root), `work-area-invalid`, `invalid-request` (an unknown run or
- * name, or a digest that is not 64 hex characters), `outbox-invalid`,
+ * that does not match its inventory), `destination-invalid` (the project
+ * declares no asset root), `work-area-invalid`, `invalid-request` (an
+ * unknown run or name, a digest that is not 64 hex characters, or, with
+ * `runId` null, an entry of a run the shell still remembers with its
+ * inventory: "approve it through that run id"), `outbox-invalid`,
  * `run-active` (a supervised process is still running), or
- * `workspace-unavailable`.
+ * `workspace-unavailable`; and, with `runId` null, `integrity-mismatch`
+ * (the re-opened entry's digest differs from the request's: it changed
+ * since it was listed), `outbox-escape` (not a regular file inside the
+ * outbox), or `outbox-linked` (a link count above one).
  */
 export async function artifactApprove(
-  runId: string,
+  runId: string | null,
   name: string,
   sha256: string,
 ): Promise<ArtifactApproval> {
@@ -899,4 +959,251 @@ export async function artifactPublish(
  */
 export async function publicationsList(): Promise<Publication[]> {
   return invoke('publications_list')
+}
+
+// -- Slice 5c: the guidance-note installer --
+
+/**
+ * The closed set of files the installer manages (`docs/spike-log.md` §
+ * Slice 5c), mirroring `dto.rs`'s `ManagedFileKindDto`: `guidance` is the
+ * project's agent guidance file -- a user-named Markdown file at the
+ * workspace root, `AGENTS.md` by default -- carrying HAP-001's fixed note
+ * (HAP-001-R42, D18); `ignore` is the fixed `.gitignore` at the root,
+ * carrying the one outbox ignore rule.
+ */
+export type GuidanceKind = 'guidance' | 'ignore'
+
+/**
+ * The managed block's state in the file, mirroring `dto.rs`'s
+ * `ManagedStatusTag` -- the token only: `absent` (no block, or no file),
+ * `current` (this template version, intact), `outdated` (an earlier
+ * version, or this version rendered for another outbox path, intact),
+ * `modified` (edited inside its sentinels: neither replaced nor removed),
+ * `malformed` (the sentinels are not one intact pair).
+ */
+export type ManagedStatus = 'absent' | 'current' | 'outdated' | 'modified' | 'malformed'
+
+/**
+ * What a guidance command did or would do, mirroring `dto.rs`'s
+ * `GuidanceActionTag`: a preview or an apply reports `insert`, `replace`,
+ * or `no-op`; a removal reports `remove` and a restore `restore`.
+ */
+export type GuidanceAction = 'insert' | 'replace' | 'no-op' | 'remove' | 'restore'
+
+/** A snapshot id, as it crosses IPC: 16 lowercase hex characters. Opaque: never parsed by the renderer. */
+export type SnapshotId = string
+
+/**
+ * `guidance_status`'s payload (`docs/spike-log.md` § Slice 5c): the managed
+ * file's name at the workspace root, whether it exists, the block's state,
+ * the template version an apply would write, the file's full 64-hex digest
+ * -- what an apply or a removal binds to; `null` while the file does not
+ * exist -- beside its short form, and the snapshot counts. Mirrors
+ * `GuidanceStatusDto` field-for-field. Never a device path.
+ */
+export interface GuidanceStatus {
+  kind: GuidanceKind
+  file: string
+  exists: boolean
+  managed: ManagedStatus
+  templateVersion: string
+  fileSha256: string | null
+  fileSha256Short: string | null
+  snapshots: number
+  pinned: number
+}
+
+/**
+ * `guidance_preview`'s payload (`docs/spike-log.md` § Slice 5c): the
+ * proposal the user disposes of (HAP-001 D18) -- the block exactly as it
+ * would be written, in the file's own line ending (`proposed`: display-only
+ * text, never inserted as markup and never read as an instruction), the
+ * action an apply would take, the file's full digest an apply must bind
+ * to (`null` for an absent file) beside its short form, and the short
+ * digest of the whole file afterwards. Mirrors `GuidancePreviewDto`
+ * field-for-field. Never a device path.
+ */
+export interface GuidancePreview {
+  kind: GuidanceKind
+  file: string
+  action: GuidanceAction
+  proposed: string
+  fileSha256: string | null
+  fileSha256Short: string | null
+  resultSha256Short: string
+}
+
+/**
+ * The payload of `guidance_apply`, `guidance_remove`, and
+ * `guidance_restore` (`docs/spike-log.md` § Slice 5c): what was done, the
+ * snapshot taken before the write (`null` for a no-op), and the short
+ * digest of the whole file afterwards (`null` once the file was removed, or
+ * a snapshot of an absent file was restored). Mirrors `GuidanceAppliedDto`
+ * field-for-field. Never a device path.
+ */
+export interface GuidanceApplied {
+  kind: GuidanceKind
+  file: string
+  action: GuidanceAction
+  snapshotId: SnapshotId | null
+  resultSha256Short: string | null
+}
+
+/**
+ * One snapshot, as `guidance_snapshots` lists it (`docs/spike-log.md` §
+ * Slice 5c): its id, the kind and file it recorded, whether the file
+ * existed, the short digest and size of the bytes recorded, the instant as
+ * ms since the epoch, and whether it is pinned. Mirrors `SnapshotDto`
+ * field-for-field. Never a device path.
+ */
+export interface Snapshot {
+  id: SnapshotId
+  kind: GuidanceKind
+  file: string
+  existed: boolean
+  sha256Short: string
+  size: number
+  takenAt: number
+  pinned: boolean
+}
+
+/**
+ * The target of a guidance command as it crosses IPC: the `file` key is
+ * present only when a file was named, so a request for the `ignore` kind
+ * -- which always manages `.gitignore` and takes no file -- crosses as
+ * exactly `{ kind: 'ignore' }` (the `candidatesList` discipline: the key
+ * absent, not `undefined`).
+ */
+function guidanceTarget(kind: GuidanceKind, file: string | undefined): Record<string, unknown> {
+  return file === undefined ? { kind } : { kind, file }
+}
+
+/**
+ * The managed file's state (`docs/spike-log.md` § Slice 5c). Read-only:
+ * nothing is written or snapshotted. Invokes `guidance_status` with exactly
+ * `{ kind, file }`, or `{ kind }` when no file is named (the shell defaults
+ * the guidance file to `AGENTS.md`, and ignores `file` for `ignore`).
+ *
+ * # Errors
+ * Rejects with `guidance-file-invalid` (a name outside the file-name rule,
+ * or a file that is not a regular UTF-8 file within the size bound),
+ * `outbox-invalid` (the policy declaring the outbox path could not be
+ * loaded), `work-area-invalid`, `snapshot-unavailable`, or
+ * `workspace-unavailable` if no workspace is active.
+ */
+export async function guidanceStatus(kind: GuidanceKind, file?: string): Promise<GuidanceStatus> {
+  return invoke('guidance_status', guidanceTarget(kind, file))
+}
+
+/**
+ * The proposal: what `guidanceApply` would write (HAP-001 D18; the system
+ * proposes, the user disposes). Read-only: nothing is written or
+ * snapshotted. Invokes `guidance_preview` with exactly `{ kind, file }`, or
+ * `{ kind }` when no file is named.
+ *
+ * # Errors
+ * Rejects with `guidance-file-invalid`, `guidance-block-modified`,
+ * `guidance-block-malformed`, `outbox-invalid`, `work-area-invalid`, or
+ * `workspace-unavailable` if no workspace is active.
+ */
+export async function guidancePreview(kind: GuidanceKind, file?: string): Promise<GuidancePreview> {
+  return invoke('guidance_preview', guidanceTarget(kind, file))
+}
+
+/**
+ * The approved write (HAP-001-R42, D18): the managed block inserted or
+ * replaced, after a snapshot of the current file, bound to `fileSha256` --
+ * the full 64-hex digest the surface showed, or `null` for a file it showed
+ * as absent; never a typed value. Invokes `guidance_apply` with exactly
+ * `{ kind, file, fileSha256 }`, or `{ kind, fileSha256 }` when no file is
+ * named (the `ignore` kind).
+ *
+ * # Errors
+ * Rejects with `guidance-file-changed` (the file's digest, or its absence,
+ * differs from `fileSha256`: nothing written), `guidance-file-invalid`,
+ * `guidance-block-modified`, `guidance-block-malformed`,
+ * `snapshot-unavailable`, `outbox-invalid`, `work-area-invalid`,
+ * `invalid-request` (a `fileSha256` that is not 64 hex characters),
+ * `run-active` (a supervised process is still running), or
+ * `workspace-unavailable`.
+ */
+export async function guidanceApply(
+  kind: GuidanceKind,
+  file: string | undefined,
+  fileSha256: string | null,
+): Promise<GuidanceApplied> {
+  return invoke('guidance_apply', { ...guidanceTarget(kind, file), fileSha256 })
+}
+
+/**
+ * The removal of the lines Omnifrons owns -- the managed block and one
+ * adjacent blank line, and the file itself when Omnifrons created it --
+ * after a snapshot, bound to `fileSha256` like `guidanceApply`. Invokes
+ * `guidance_remove` with exactly `{ kind, file, fileSha256 }`, or
+ * `{ kind, fileSha256 }` when no file is named.
+ *
+ * # Errors
+ * Rejects with `guidance-unmanaged` (the file carries no managed block),
+ * `guidance-file-changed`, `guidance-file-invalid`,
+ * `guidance-block-modified`, `guidance-block-malformed`,
+ * `snapshot-unavailable`, `work-area-invalid`, `invalid-request`,
+ * `run-active`, or `workspace-unavailable`.
+ */
+export async function guidanceRemove(
+  kind: GuidanceKind,
+  file: string | undefined,
+  fileSha256: string | null,
+): Promise<GuidanceApplied> {
+  return invoke('guidance_remove', { ...guidanceTarget(kind, file), fileSha256 })
+}
+
+/**
+ * Every snapshot of `kind` for the active project, newest first
+ * (`docs/spike-log.md` § Slice 5c). Read-only. Invokes `guidance_snapshots`
+ * with exactly `{ kind }`.
+ *
+ * # Errors
+ * Rejects with `snapshot-unavailable` (the store could not be read, or a
+ * manifest is corrupt, which fails the whole listing), `work-area-invalid`,
+ * or `workspace-unavailable` if no workspace is active.
+ */
+export async function guidanceSnapshots(kind: GuidanceKind): Promise<Snapshot[]> {
+  return invoke('guidance_snapshots', { kind })
+}
+
+/**
+ * Pin or unpin a snapshot: a pinned snapshot is never pruned. Invokes
+ * `guidance_pin` with exactly `{ id, pinned }` and resolves with the
+ * snapshot as it now stands.
+ *
+ * # Errors
+ * Rejects with `guidance-unmanaged` (no snapshot with that id is recorded
+ * for this project), `snapshot-unavailable`, `work-area-invalid`,
+ * `invalid-request` (an id that is not 16 hex characters), or
+ * `workspace-unavailable`.
+ */
+export async function guidancePin(id: SnapshotId, pinned: boolean): Promise<Snapshot> {
+  return invoke('guidance_pin', { id, pinned })
+}
+
+/**
+ * Restore a snapshot: the current state of the snapshot's file is
+ * snapshotted first, then the recorded bytes are written back (or the file
+ * removed, for a snapshot of an absent file), bound to `fileSha256` -- the
+ * full digest of the snapshot's file as the surface showed it, or `null`
+ * for a file it showed as absent. Invokes `guidance_restore` with exactly
+ * `{ id, fileSha256 }`.
+ *
+ * # Errors
+ * Rejects with `guidance-unmanaged` (no snapshot with that id),
+ * `guidance-file-changed`, `guidance-file-invalid`, `snapshot-unavailable`
+ * (the store could not be read, or the snapshot's bytes fail its manifest
+ * digest), `work-area-invalid`, `invalid-request`, `run-active`, or
+ * `workspace-unavailable`.
+ */
+export async function guidanceRestore(
+  id: SnapshotId,
+  fileSha256: string | null,
+): Promise<GuidanceApplied> {
+  return invoke('guidance_restore', { id, fileSha256 })
 }

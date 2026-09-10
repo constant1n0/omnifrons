@@ -7,6 +7,13 @@ import {
   artifactApprove,
   artifactPublish,
   candidatesList,
+  guidanceApply,
+  guidancePin,
+  guidancePreview,
+  guidanceRemove,
+  guidanceRestore,
+  guidanceSnapshots,
+  guidanceStatus,
   harnessSpawn,
   harnessStop,
   isShellError,
@@ -27,6 +34,10 @@ import {
   type Candidate,
   type CandidateState,
   type CandidatesSummary,
+  type GuidanceAction,
+  type GuidanceApplied,
+  type GuidanceKind,
+  type GuidanceStatus,
   type HarnessFrame,
   type Observation,
   type OutboxReason,
@@ -38,6 +49,7 @@ import {
   type ScopeMode,
   type ShellError,
   type ShellErrorCode,
+  type Snapshot,
   type TerminalActionKind,
   type TerminalDropCounts,
   type WorkAreaState,
@@ -486,6 +498,29 @@ function formatScopeMode(mode: ScopeMode | null): string {
 }
 
 /**
+ * The scope fact of the approval block for `inventory`: `none` for the
+ * whole-outbox listing (slice 5c) -- no run produced it, so there is no
+ * adapter whose scope mode could apply, and nothing enforces anything over
+ * an unmediated producer (HAP-001 § Unmediated producers) -- else the scope
+ * mode of the adapter the run was started with, through
+ * {@link formatScopeMode}.
+ */
+function formatScopeFact(inventory: CandidatesInventory, adapter: AdapterDescriptor | null): string {
+  if (inventory.runId === null) return 'none'
+  return formatScopeMode(adapter?.scopeMode ?? null)
+}
+
+/**
+ * The marker beside an approved row whose handle is not held (slice 5c;
+ * HAP-001-R17, D22): the cap left no room for it, the approval stands on
+ * the facts verified from the re-opened handle, and the publication re-opens
+ * the entry under the single-handle discipline when its turn comes -- a
+ * degraded fact said on the surface rather than left silent, like the
+ * `refused` and dropped-frames markers. Fixed copy, never wire text.
+ */
+const HANDLE_NOT_HELD_MARK = 'handle: not held (cap reached)'
+
+/**
  * Whether a candidates row offers approval (spike default): a validated
  * `candidate` of the `generated-heavy` class carrying its full digest --
  * attributed or unattributed alike, HAP-001 admitting an unattributed entry
@@ -548,11 +583,14 @@ function formatApprovedCell(approval: ArtifactApproval): string {
 }
 
 /**
- * One run's inventory as the panel keeps it: the run id the shell minted
- * (the key of an approval request, never a path) and the rows.
+ * One inventory as the panel keeps it: the run id the shell minted (the key
+ * of an approval request, never a path) and the rows -- or, for the
+ * whole-outbox listing (slice 5c), no run id at all: `candidates_list {}`
+ * lists without a run, every row unattributed, and an approval made from
+ * it names no run (`artifact_approve` with `runId` null).
  */
 interface CandidatesInventory {
-  runId: string
+  runId: string | null
   rows: Candidate[]
   /**
    * The adapter the run was started with, for the approval block's scope
@@ -800,6 +838,317 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
   )
 }
 
+// -- Slice 5c: the guidance-note installer (HAP-001 D18, R42) --
+
+/**
+ * The guidance file the installer proposes by default, mirroring the
+ * shell's own `DEFAULT_GUIDANCE_FILE`. The user may name another Markdown
+ * file at the workspace root; the shell alone decides what it accepts, and
+ * refuses anything else with `guidance-file-invalid`.
+ */
+const DEFAULT_GUIDANCE_FILE = 'AGENTS.md'
+
+/** The one file the `ignore` kind manages, fixed by the shell -- shown, never typed. */
+const IGNORE_FILE = '.gitignore'
+
+/**
+ * The section's standing disclaimer (HAP-001 § Agent guidance note): the
+ * note asks a producer to write its heavy output into the outbox and the
+ * ignore rule keeps that outbox out of the project's history -- neither
+ * confines anything. Containment, if it ever exists, is the sandbox's job,
+ * never a sentence in a Markdown file. Fixed copy, never wire text.
+ */
+const GUIDANCE_ADVISORY_LINE =
+  'advisory: the note and the ignore rule set expectations and enforce nothing — not containment'
+
+/**
+ * Stated on the write surface before the decision: every guidance write is
+ * preceded by a snapshot of the file as it stands, so the act is
+ * reversible from the Snapshots table beside it. Fixed copy.
+ */
+const GUIDANCE_SNAPSHOT_SENTENCE = 'a snapshot of the current file is taken before any write'
+
+/**
+ * Stated on the removal surface before the decision (slice 5c review,
+ * R1-005): unlike an apply, opening a Remove previews nothing, so the
+ * surface says in words what `guidance_remove` takes out -- exactly the
+ * lines between the sentinels, and the file itself only when nothing else
+ * is left in it and Omnifrons is the one that created it (the shell's own
+ * `plan_remove`). Nothing outside the block is ever removed, so no
+ * user-authored bytes are lost, and {@link GUIDANCE_SNAPSHOT_SENTENCE}
+ * beside it says a snapshot precedes the act either way. Fixed copy.
+ */
+const GUIDANCE_REMOVE_SCOPE_LINE =
+  'removes the managed block only; the file itself goes only when nothing else remains in it and Omnifrons created it'
+
+/**
+ * Stated on the restore surface before the decision (slice 5c review,
+ * R1-002): a restore is the one write here into user-owned, version-tracked
+ * content whose bytes the surface never shows. The block reports what the
+ * manifest records about the snapshot -- its digest, its size, whether the
+ * file existed -- and there is no command on the wire that returns a
+ * snapshot's content, so the surface says so rather than implying the facts
+ * beside it are the bytes. Fixed copy.
+ */
+const GUIDANCE_RESTORE_BYTES_LINE =
+  "the snapshot's bytes are not shown here: only what the manifest records about them"
+
+/**
+ * Stated on the restore surface, before the gate, whenever the snapshot
+ * records that the file did not exist (slice 5c review, R1-002): restoring
+ * it writes no bytes back at all -- it removes the file, whatever the file
+ * now holds. Neither the `restore` action token nor the `Restore snapshot`
+ * button says that, so this line does. Fixed copy.
+ */
+const GUIDANCE_RESTORE_REMOVES_LINE =
+  'this snapshot recorded no file: restoring it REMOVES the file rather than writing bytes back'
+
+/** The visible label of a managed kind's block, chosen by an exhaustive switch over the closed set. */
+function guidanceBlockLabel(kind: GuidanceKind): string {
+  switch (kind) {
+    case 'guidance':
+      return 'Guidance note'
+    case 'ignore':
+      return 'Ignore rule'
+  }
+}
+
+/**
+ * The managed block's state, fixed copy per closed `managed` token through
+ * an exhaustive switch -- never the raw token echoed, except where the
+ * token itself is the fact (`absent`, `current`, `outdated`). `outdated`
+ * also names the template version an apply would write, which is the only
+ * wire value in this line besides the file name and the digest.
+ * `modified` and `malformed` say what the user must do, since Omnifrons
+ * refuses to overwrite either.
+ */
+function formatManagedBlockState(status: GuidanceStatus): string {
+  switch (status.managed) {
+    case 'absent':
+      return 'block absent'
+    case 'current':
+      return 'block current'
+    case 'outdated':
+      return `block outdated (template ${status.templateVersion})`
+    case 'modified':
+      return 'block modified — resolve by hand or restore'
+    case 'malformed':
+      return 'block malformed — resolve by hand'
+  }
+}
+
+/**
+ * One managed file's status line: the file the shell named, the block's
+ * state, the file's short digest -- the fact the typed gate stands in for
+ * -- or its absence, and the snapshot counts. The whole line renders
+ * through {@link PlainTextLine}: the file name is project-originated text.
+ */
+function formatGuidanceStatusLine(status: GuidanceStatus): string {
+  const digest =
+    status.fileSha256Short === null
+      ? 'file absent'
+      : `file sha256 short ${status.fileSha256Short}`
+  return `${status.file}: ${formatManagedBlockState(status)}; ${digest}; snapshots ${status.snapshots}, pinned ${status.pinned}`
+}
+
+/**
+ * A guidance action token, transcribed verbatim through an exhaustive
+ * switch (`docs/target-architecture.md` invariant 8, as
+ * {@link formatCandidateState} does), so a new action cannot render
+ * unlabelled.
+ */
+function formatGuidanceAction(action: GuidanceAction): string {
+  switch (action) {
+    case 'insert':
+      return 'insert'
+    case 'replace':
+      return 'replace'
+    case 'no-op':
+      return 'no-op'
+    case 'remove':
+      return 'remove'
+    case 'restore':
+      return 'restore'
+  }
+}
+
+/** A boolean wire fact as the one-word cell the snapshots table shows. */
+function formatYesNo(value: boolean): string {
+  return value ? 'yes' : 'no'
+}
+
+/**
+ * A snapshot's instant as an ISO 8601 time. A `takenAt` that is not a
+ * representable instant -- which the shell never sends -- reads as a null
+ * fact rather than throwing during render.
+ */
+function formatSnapshotInstant(takenAt: number): string {
+  const instant = new Date(takenAt)
+  return Number.isNaN(instant.getTime()) ? NULL_FACT : instant.toISOString()
+}
+
+/** The restore block's snapshot fact: everything the manifest records about the bytes it would write back. */
+function formatSnapshotFact(snapshot: Snapshot): string {
+  return `snapshot: ${snapshot.id}, taken at ${formatSnapshotInstant(snapshot.takenAt)}, sha256 short ${snapshot.sha256Short}, size ${snapshot.size}, existed ${formatYesNo(snapshot.existed)}`
+}
+
+/**
+ * The result of a completed guidance write: the kind and the file it was
+ * written to -- both carried by `GuidanceApplied`, and both named here
+ * because the section has one result line shared by the two kinds (slice 5c
+ * review, R1-003/R3-007) -- then what was done, the snapshot taken before it
+ * (`none` for a no-op, which snapshots nothing), and the file's short digest
+ * afterwards (`absent` once the file is gone). The whole line renders
+ * through {@link PlainTextLine}: the file name is project-originated text.
+ */
+function formatGuidanceResultLine(applied: GuidanceApplied): string {
+  const snapshot = applied.snapshotId ?? 'none'
+  const result = applied.resultSha256Short ?? 'absent'
+  return `${guidanceBlockLabel(applied.kind)} ${applied.file}: written ${formatGuidanceAction(applied.action)}, snapshot ${snapshot}, result ${result}`
+}
+
+/**
+ * Whether Remove may be offered for this status: only an intact block the
+ * shell wrote -- `current` or `outdated` -- and only when the file has a
+ * short digest for the gate to name. There is nothing of Omnifrons' to
+ * remove from an `absent` file, and a `modified` or `malformed` block is the
+ * user's to resolve (or to restore from a snapshot), never Omnifrons' to
+ * delete. The digest condition is the surface's own (slice 5c review,
+ * R3-008): a `current` status with no short digest is a state the shell does
+ * not produce, but were one to arrive, opening a block on it would show a
+ * gate with nothing to type, no button that could ever be enabled and no
+ * Cancel -- a dead end. It is refused at the offer instead.
+ */
+function isGuidanceBlockRemovable(status: GuidanceStatus): boolean {
+  if (status.fileSha256Short === null) return false
+  return status.managed === 'current' || status.managed === 'outdated'
+}
+
+/**
+ * The proposed block's own lines, split *before* any of it reaches
+ * {@link PlainTextLine} -- which strips every C0 control including `\n`, so
+ * a newline passed through it would silently join two lines into one (the
+ * same rule {@link splitTerminalLines} follows for framed terminal text). A
+ * trailing newline ends the last line rather than opening an empty one; an
+ * interior empty line is kept, since it is one; a `\r` of a CRLF file is
+ * stripped as the control character it is.
+ */
+function splitProposedLines(proposed: string): string[] {
+  if (proposed === '') return []
+  const lines = proposed.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+/** Whose short digest the write block's typed gate names. */
+type GuidanceGateSubject = "file's" | "proposed block's" | "snapshot's"
+
+/** The act the write block's typed gate stands in for. */
+type GuidanceGateVerb = 'write' | 'create the file' | 'remove' | 'restore'
+
+/**
+ * The facts a pending guidance write is bound to, captured when the block
+ * opens and never re-derived afterwards: the managed file as the shell
+ * named it, the action, the full digest the request binds to (`null` for a
+ * file the surface showed as absent) beside its short form, and the exact
+ * value that must be typed before the final button does anything. The
+ * request never carries the typed value -- it is a gate, standing in for
+ * having read the evidence (TM-001-R1), exactly as the slice 2 approval
+ * gate does.
+ */
+interface GuidanceWriteBase {
+  kind: GuidanceKind
+  file: string
+  action: GuidanceAction
+  fileSha256: string | null
+  fileSha256Short: string | null
+  gate: string
+  gateSubject: GuidanceGateSubject
+  gateVerb: GuidanceGateVerb
+}
+
+/**
+ * One pending write, by the command its final button invokes: an apply
+ * carries the proposed block it would write (display-only text, never
+ * markup and never an instruction -- HAP-001-R22: no content path may
+ * approve or trigger anything), a removal carries nothing extra, and a
+ * restore carries the snapshot whose bytes it would write back.
+ */
+type GuidanceWrite =
+  | (GuidanceWriteBase & { command: 'apply'; proposed: string })
+  | (GuidanceWriteBase & { command: 'remove' })
+  | (GuidanceWriteBase & { command: 'restore'; snapshot: Snapshot })
+
+/** The final button's name, one per command through an exhaustive switch. */
+function guidanceWriteButtonName(write: GuidanceWrite): string {
+  switch (write.command) {
+    case 'apply':
+      return 'Write'
+    case 'remove':
+      return 'Remove block'
+    case 'restore':
+      return 'Restore snapshot'
+  }
+}
+
+/**
+ * Invokes the command this write stands for, with exactly the target the
+ * block showed: the `file` key only for the `guidance` kind (the `ignore`
+ * kind always manages `.gitignore` and takes no file), and the full digest
+ * the surface bound to -- never anything the user typed.
+ */
+function invokeGuidanceWrite(write: GuidanceWrite): Promise<GuidanceApplied> {
+  const file = write.kind === 'guidance' ? write.file : undefined
+  switch (write.command) {
+    case 'apply':
+      return guidanceApply(write.kind, file, write.fileSha256)
+    case 'remove':
+      return guidanceRemove(write.kind, file, write.fileSha256)
+    case 'restore':
+      return guidanceRestore(write.snapshot.id, write.fileSha256)
+  }
+}
+
+/**
+ * Whether `input` confirms `write`: an exact, case-sensitive match against
+ * the short digest the block shows, and nothing else -- not the fixed
+ * phrase, not the full digest, not another kind's, and not the same digest
+ * with the space a paste leaves on it. An empty gate confirms nothing; it
+ * is kept as a last line, not as the defence -- a block with no digest to
+ * type is refused at the offer instead ({@link isGuidanceBlockRemovable},
+ * slice 5c review, R3-008), so it never opens.
+ */
+function isGuidanceConfirmed(write: GuidanceWrite, input: string): boolean {
+  return write.gate !== '' && input === write.gate
+}
+
+/** One managed kind's fetched state: its status, and every snapshot recorded for it. */
+interface ManagedFileState {
+  status: GuidanceStatus | null
+  snapshots: Snapshot[]
+}
+
+const EMPTY_MANAGED_FILE: ManagedFileState = { status: null, snapshots: [] }
+
+const EMPTY_GUIDANCE: Record<GuidanceKind, ManagedFileState> = {
+  guidance: EMPTY_MANAGED_FILE,
+  ignore: EMPTY_MANAGED_FILE,
+}
+
+/**
+ * Replaces one kind's state, written out per kind rather than with a
+ * computed key so the record's type is preserved exactly.
+ */
+function withManagedFile(
+  previous: Record<GuidanceKind, ManagedFileState>,
+  kind: GuidanceKind,
+  update: (state: ManagedFileState) => ManagedFileState,
+): Record<GuidanceKind, ManagedFileState> {
+  return kind === 'guidance'
+    ? { ...previous, guidance: update(previous.guidance) }
+    : { ...previous, ignore: update(previous.ignore) }
+}
+
 /**
  * First built-in harness adapter control panel (`docs/spike-log.md` §
  * Slice 3): pick a workspace, pick a built-in adapter and an approved
@@ -966,6 +1315,173 @@ export function AgentPanel() {
     refreshPublications()
   }, [refreshPublications])
 
+  /**
+   * Each managed kind's state (slice 5c, HAP-001 D18): the guidance note
+   * the user named at the workspace root and the fixed `.gitignore`, with
+   * the snapshots recorded for each. `null` status means unknown -- no
+   * workspace, or a fetch that did not answer -- and renders no status line.
+   */
+  const [managed, setManaged] = useState<Record<GuidanceKind, ManagedFileState>>(EMPTY_GUIDANCE)
+
+  /**
+   * The guidance file the section is currently about: the last name the
+   * shell itself answered for, kept as a ref so the stable fetch callbacks
+   * below never close over a stale name. It follows the shell's own answer
+   * and never the typed draft (slice 5c review, R1-004/R3-005): a name the
+   * shell refuses with `guidance-file-invalid` must not become the name the
+   * automatic fetches reuse with `surfaceError: false`, where the same
+   * rejection would be swallowed and the section's status line, Preview,
+   * Remove and every Restore would silently vanish. The input's own draft is
+   * `guidanceFileDraft` state; leaving the field or pressing Enter commits
+   * it, and only an accepted commit moves this ref.
+   */
+  const guidanceFileRef = useRef(DEFAULT_GUIDANCE_FILE)
+  const [guidanceFileDraft, setGuidanceFileDraft] = useState(DEFAULT_GUIDANCE_FILE)
+
+  /**
+   * The generation of the guidance section's context: the workspace it is
+   * about and the file name it is about. Bumped by a workspace pick and by
+   * a committed file name, the same generation guard `spawnGenerationRef`
+   * puts on a run's continuations (slice 5c review, R1-001). A
+   * `guidance_preview` that resolves after either has moved is dropped
+   * rather than opening a write block bound to the previous project's file,
+   * digest and gate -- facts the shell's own `fileSha256` binding cannot
+   * tell apart when two projects share a byte-identical `AGENTS.md` from
+   * one template.
+   */
+  const guidanceContextRef = useRef(0)
+
+  /**
+   * The sequence number of the most recently *started* `guidance_status`
+   * and `guidance_snapshots` fetch, per kind -- the same sequenced-fetch
+   * pattern as `outbox_status` above (R3-008), counted per kind so the two
+   * kinds' fetches never invalidate each other. A response that is no
+   * longer the latest for its kind is silently dropped.
+   */
+  const latestGuidanceStatusRef = useRef<Record<GuidanceKind, number>>({ guidance: 0, ignore: 0 })
+  const latestGuidanceSnapshotsRef = useRef<Record<GuidanceKind, number>>({
+    guidance: 0,
+    ignore: 0,
+  })
+
+  /**
+   * Fetches one kind's status. `surfaceError` separates the two callers:
+   * an automatic refresh -- on mount, after a workspace pick, after a
+   * write -- is not a user act, so a rejection only clears the line (no
+   * workspace is the ordinary case, and the missing workspace is already
+   * visible); a refresh the user asked for by committing a file name shows
+   * the rule's own message in the banner and leaves the previous line
+   * standing, since nothing about the previously shown file changed.
+   */
+  const fetchGuidanceStatus = useCallback(
+    (kind: GuidanceKind, file: string | undefined, surfaceError: boolean) => {
+      const requestId = (latestGuidanceStatusRef.current[kind] += 1)
+      guidanceStatus(kind, file)
+        .then((status) => {
+          if (!mountedRef.current) return
+          if (requestId !== latestGuidanceStatusRef.current[kind]) return
+          // The committed name follows the shell's own answer, never the
+          // typed draft (R1-004/R3-005): a refused name never gets this far,
+          // so it can never become the name a later automatic fetch reuses.
+          if (kind === 'guidance') guidanceFileRef.current = status.file
+          setManaged((previous) => withManagedFile(previous, kind, (state) => ({ ...state, status })))
+        })
+        .catch((statusError: unknown) => {
+          if (!mountedRef.current) return
+          if (requestId !== latestGuidanceStatusRef.current[kind]) return
+          if (!surfaceError) {
+            setManaged((previous) =>
+              withManagedFile(previous, kind, (state) => ({ ...state, status: null })),
+            )
+            return
+          }
+          setError(isShellError(statusError) ? statusError : 'unexpected')
+        })
+    },
+    [],
+  )
+
+  /**
+   * Fetches one kind's snapshots, newest first. Sequenced per kind like the
+   * status fetch. Every caller is an automatic refresh -- the listing is
+   * never a user act of its own -- so a rejection empties the table
+   * silently rather than raising a banner the user cannot act on; a
+   * command the user *did* ask for reports its own `snapshot-unavailable`.
+   */
+  const fetchGuidanceSnapshots = useCallback((kind: GuidanceKind) => {
+    const requestId = (latestGuidanceSnapshotsRef.current[kind] += 1)
+    guidanceSnapshots(kind)
+      .then((snapshots) => {
+        if (!mountedRef.current) return
+        if (requestId !== latestGuidanceSnapshotsRef.current[kind]) return
+        // A payload that is not the list the contract promises renders as
+        // no table rather than throwing mid-render and taking the whole
+        // panel down with it -- the same fail-safe-to-nothing discipline
+        // `handleFrame` applies to a frame it does not recognize.
+        const listed = Array.isArray(snapshots) ? snapshots : []
+        setManaged((previous) =>
+          withManagedFile(previous, kind, (state) => ({ ...state, snapshots: listed })),
+        )
+      })
+      .catch(() => {
+        if (!mountedRef.current) return
+        if (requestId !== latestGuidanceSnapshotsRef.current[kind]) return
+        setManaged((previous) => withManagedFile(previous, kind, (state) => ({ ...state, snapshots: [] })))
+      })
+  }, [])
+
+  /**
+   * Both kinds' status and snapshots: on mount, and again after a
+   * successful workspace pick (the managed files are the project's, like
+   * its outbox and its Catalog). The guidance kind is asked about the
+   * committed file name; the ignore kind takes no file at all.
+   */
+  const refreshGuidance = useCallback(() => {
+    fetchGuidanceStatus('guidance', guidanceFileRef.current, false)
+    fetchGuidanceStatus('ignore', undefined, false)
+    fetchGuidanceSnapshots('guidance')
+    fetchGuidanceSnapshots('ignore')
+  }, [fetchGuidanceStatus, fetchGuidanceSnapshots])
+
+  useEffect(() => {
+    refreshGuidance()
+  }, [refreshGuidance])
+
+  /** The pending guidance write the user is disposing of, or `null` while no block is open. */
+  const [guidanceWrite, setGuidanceWrite] = useState<GuidanceWrite | null>(null)
+
+  /**
+   * The digest the user has typed into the guidance write block. Only ever
+   * set from the input's own change events -- never from a proposal, a file
+   * name, a candidate, or any other harness-originated string (TM-001-R1).
+   */
+  const [guidanceInput, setGuidanceInput] = useState('')
+
+  /** The last completed write's result line, or `null` while none has completed since the section was reset. */
+  const [guidanceResult, setGuidanceResult] = useState<string | null>(null)
+
+  /** True while a guidance preview, apply, removal or restore is in flight (one at a time). */
+  const [guidanceBusy, setGuidanceBusy] = useState(false)
+
+  /**
+   * The same flag as `guidanceBusy`, set synchronously so a second click
+   * landing before React has re-rendered the disabled button is still
+   * refused -- the write must happen once per confirmed gate, never twice.
+   */
+  const guidanceBusyRef = useRef(false)
+
+  /**
+   * True while a `guidance_pin` is in flight. Pin has its own flag rather
+   * than sharing `guidanceBusy`, because it stays live while a run is active
+   * and writes no project file -- but it is still one at a time (slice 5c
+   * review, R3-013): a double-click must pin once, and with only one call in
+   * flight no slow answer can land on top of a newer one. The ref is set
+   * synchronously so the second click of a double-click is refused before
+   * React has re-rendered the disabled button.
+   */
+  const guidancePinBusyRef = useRef(false)
+  const [guidancePinBusy, setGuidancePinBusy] = useState(false)
+
   useEffect(() => {
     adaptersList()
       .then((list) => {
@@ -1096,6 +1612,9 @@ export function AgentPanel() {
   /** True while an `artifact_approve` call is in flight (one at a time). */
   const [isApproving, setIsApproving] = useState(false)
 
+  /** True while a whole-outbox `candidates_list` is in flight (slice 5c). */
+  const [isListingOutbox, setIsListingOutbox] = useState(false)
+
   const handleFrame = useCallback((generation: number, frame: HarnessFrame) => {
     if (!mountedRef.current) return
     // Stale-channel guard (R1-001/R3-001): every `harnessSpawn` wires a
@@ -1204,6 +1723,17 @@ export function AgentPanel() {
       // is the project's too, so its publications are fetched afresh.
       refreshOutboxStatus()
       refreshPublications()
+      // The managed files are the project's as well: the open write block
+      // and the last result belong to the project that was active when
+      // they were made, so the section is reset before both kinds are
+      // fetched afresh (slice 5c). The context generation bumps with the
+      // reset, so a preview still in flight for the previous project opens
+      // no block over the new one (R1-001).
+      guidanceContextRef.current += 1
+      setGuidanceWrite(null)
+      setGuidanceInput('')
+      setGuidanceResult(null)
+      refreshGuidance()
     } catch (pickError: unknown) {
       if (!mountedRef.current) return
       if (isShellError(pickError) && pickError.code === 'no-workspace') {
@@ -1296,6 +1826,291 @@ export function AgentPanel() {
       // (R3-006): the supervisor never confirmed a terminal state.
       if (!mountedRef.current) return
       setError(isShellError(stopError) ? stopError : 'unexpected')
+    }
+  }
+
+  /**
+   * Lists the whole outbox (slice 5c; HAP-001-R11, R12): every entry at the
+   * outbox root and one level down, as `candidates_list {}` inventories it
+   * without a run -- unattributed, a proposal only -- applied as the
+   * candidates table with no run id, so an approval made from it names no
+   * run. Sequenced like the run-end fetch and gated on the spawn
+   * generation, so a response landing after a Start -- which cleared the
+   * table for the new run -- is dropped rather than dressing that run in an
+   * unrelated listing. Frozen while a run is active, belt and braces with
+   * the button's own `disabled`.
+   */
+  async function handleListOutbox() {
+    if (runActive || isListingOutbox) return
+    const generation = spawnGenerationRef.current
+    const requestId = (latestCandidatesRequestRef.current += 1)
+    setError(null)
+    setIsListingOutbox(true)
+    try {
+      const rows = await candidatesList()
+      if (!mountedRef.current) return
+      if (generation !== spawnGenerationRef.current) return
+      if (requestId !== latestCandidatesRequestRef.current) return
+      // A new inventory, like a run's: a clean slate for the rows'
+      // publication progress and the approval block. A payload that is not
+      // the list the contract promises becomes no rows rather than throwing
+      // mid-render and taking the whole panel down with it (slice 5c review,
+      // R1-007) -- the fail-safe-to-nothing discipline `handleFrame` and
+      // `fetchGuidanceSnapshots` already apply.
+      appliedInventoryRef.current += 1
+      setCandidates({ runId: null, rows: Array.isArray(rows) ? rows : [], adapterId: null })
+      setRowPublications(EMPTY_ROW_PUBLICATIONS)
+      setApprovingName(null)
+      setApprovalInput('')
+    } catch (listError: unknown) {
+      if (!mountedRef.current) return
+      if (generation !== spawnGenerationRef.current) return
+      if (requestId !== latestCandidatesRequestRef.current) return
+      setError(isShellError(listError) ? listError : 'unexpected')
+    } finally {
+      if (mountedRef.current) setIsListingOutbox(false)
+    }
+  }
+
+  /**
+   * The target one guidance command names: the committed file for the
+   * `guidance` kind, nothing at all for `ignore` -- which always manages
+   * `.gitignore` and whose request crosses IPC as exactly `{ kind }`.
+   */
+  function guidanceRequestFile(kind: GuidanceKind, file: string): string | undefined {
+    return kind === 'guidance' ? file : undefined
+  }
+
+  /**
+   * Commits the guidance file name the user typed (leaving the field, or
+   * Enter): asks the shell about that file and shows what it answers. A
+   * name the shell refuses reaches the banner with the rule's own message
+   * -- never the name -- and leaves the previously shown file's status
+   * standing; `guidanceFileRef` moves only when the shell answers, so a
+   * refusal cannot poison the automatic fetches (R1-004/R3-005). An open
+   * write block is bound to the file it was opened for, so a change of file
+   * closes it rather than letting it write to a name whose facts are no
+   * longer on screen -- and the context generation bumps with it, so a
+   * preview still in flight for the previous name opens nothing either
+   * (R1-001). The last write's receipt goes too: it names a file, and that
+   * file is no longer the one the section is about (R1-003/R3-007).
+   */
+  function commitGuidanceFile() {
+    const name = guidanceFileDraft
+    if (name === guidanceFileRef.current) return
+    guidanceContextRef.current += 1
+    setGuidanceWrite(null)
+    setGuidanceInput('')
+    setGuidanceResult(null)
+    setError(null)
+    fetchGuidanceStatus('guidance', name, true)
+  }
+
+  /**
+   * The proposal (HAP-001 D18: the system proposes, the user disposes):
+   * asks the shell what an apply would write and opens the write block on
+   * the answer. Read-only -- nothing is written or snapshotted -- and the
+   * block it opens invokes nothing until the typed gate confirms. The gate
+   * is the file's own short digest when the file exists, and the proposed
+   * block's own when it does not (there is no file digest to have read).
+   * Frozen while a run is active, belt and braces with the button's
+   * `disabled`.
+   *
+   * The answer is applied only while the section is still about the same
+   * workspace and the same file (R1-001): a preview in flight when the user
+   * picks a workspace or commits another name resolves after the section has
+   * been reset, and re-opening the block then would bind a write to the
+   * previous project's file, digest and gate inside the new project's
+   * section. The rejection path is dropped the same way -- a refusal that
+   * belongs to a context the user has left names no act to retry.
+   */
+  async function handleGuidancePreview(kind: GuidanceKind) {
+    if (runActive || guidanceBusyRef.current) return
+    const status = managed[kind].status
+    if (status === null) return
+
+    const context = guidanceContextRef.current
+    guidanceBusyRef.current = true
+    setGuidanceBusy(true)
+    setError(null)
+    try {
+      const preview = await guidancePreview(kind, guidanceRequestFile(kind, status.file))
+      if (!mountedRef.current) return
+      if (context !== guidanceContextRef.current) return
+      // The file's own short digest is the gate whenever the file exists;
+      // for a file that does not, there is no such digest to have read, so
+      // the proposal's own result digest stands in for it.
+      const short = preview.fileSha256Short
+      setGuidanceWrite({
+        command: 'apply',
+        kind,
+        file: preview.file,
+        action: preview.action,
+        proposed: preview.proposed,
+        fileSha256: preview.fileSha256,
+        fileSha256Short: short,
+        gate: short ?? preview.resultSha256Short,
+        gateSubject: short === null ? "proposed block's" : "file's",
+        gateVerb: short === null ? 'create the file' : 'write',
+      })
+      setGuidanceInput('')
+      setGuidanceResult(null)
+    } catch (previewError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== guidanceContextRef.current) return
+      setGuidanceWrite(null)
+      setError(isShellError(previewError) ? previewError : 'unexpected')
+    } finally {
+      guidanceBusyRef.current = false
+      if (mountedRef.current) setGuidanceBusy(false)
+    }
+  }
+
+  /**
+   * Opens the removal block for `kind`, bound to the status the section
+   * already shows -- the file, its full digest, its short form as the gate.
+   * Invokes nothing: a removal has no proposal to fetch, since what it
+   * removes is the block the status line already reports.
+   */
+  function openGuidanceRemove(kind: GuidanceKind) {
+    if (runActive || guidanceBusyRef.current) return
+    const status = managed[kind].status
+    if (status === null || !isGuidanceBlockRemovable(status)) return
+    setGuidanceWrite({
+      command: 'remove',
+      kind,
+      file: status.file,
+      action: 'remove',
+      fileSha256: status.fileSha256,
+      fileSha256Short: status.fileSha256Short,
+      gate: status.fileSha256Short ?? '',
+      gateSubject: "file's",
+      gateVerb: 'remove',
+    })
+    setGuidanceInput('')
+    setGuidanceResult(null)
+  }
+
+  /**
+   * Opens the restore block for one snapshot, bound to the current state of
+   * the file it recorded: the gate is that file's short digest, so the act
+   * stands in for having read what is about to be overwritten -- or, for a
+   * file the surface shows as absent, the snapshot's own short digest,
+   * since there is no current file to have read. Only a snapshot of the
+   * file the status line shows -- and of this very kind (R1-006) -- is
+   * restorable, and it invokes nothing until the gate confirms.
+   */
+  function openGuidanceRestore(kind: GuidanceKind, snapshot: Snapshot) {
+    if (runActive || guidanceBusyRef.current) return
+    const status = managed[kind].status
+    if (status === null || snapshot.kind !== kind || snapshot.file !== status.file) return
+    const short = status.fileSha256Short
+    setGuidanceWrite({
+      command: 'restore',
+      kind,
+      file: status.file,
+      action: 'restore',
+      snapshot,
+      fileSha256: status.fileSha256,
+      fileSha256Short: short,
+      gate: short ?? snapshot.sha256Short,
+      gateSubject: short === null ? "snapshot's" : "file's",
+      gateVerb: 'restore',
+    })
+    setGuidanceInput('')
+    setGuidanceResult(null)
+  }
+
+  /**
+   * The write itself (HAP-001 D18, R42; TM-001-R1/R7): only the user's
+   * click on the final button reaches here, and only once the typed short
+   * digest confirms the block -- re-checked here rather than trusted to the
+   * button's `disabled`. The request carries the digest the shell itself
+   * reported, never the typed value; the shell verifies it against the file
+   * on disk and refuses with `guidance-file-changed` if it moved.
+   *
+   * A refusal keeps the block open with the typed gate intact, so the user
+   * can read the banner and try again -- except `guidance-file-changed`,
+   * where the facts the block was bound to are stale by definition: the
+   * block closes and the section is fetched afresh.
+   *
+   * Both continuations carry the same context guard the preview does
+   * (R1-001): a write in flight when the user picks a workspace or commits
+   * another file name has already reached the shell for the project it was
+   * bound to, but its receipt names a file, and posting it under the section
+   * the user has moved to would read as a write into *that* project.
+   */
+  async function handleGuidanceWrite() {
+    if (runActive || guidanceBusyRef.current) return
+    const write = guidanceWrite
+    if (write === null) return
+    if (!isGuidanceConfirmed(write, guidanceInput)) return
+
+    const context = guidanceContextRef.current
+    guidanceBusyRef.current = true
+    setGuidanceBusy(true)
+    setError(null)
+    try {
+      const applied = await invokeGuidanceWrite(write)
+      if (!mountedRef.current) return
+      if (context !== guidanceContextRef.current) return
+      setGuidanceWrite(null)
+      setGuidanceInput('')
+      setGuidanceResult(formatGuidanceResultLine(applied))
+      // The file and the store both moved: this kind's status and
+      // snapshots are fetched afresh, and only this kind's.
+      fetchGuidanceStatus(write.kind, guidanceRequestFile(write.kind, write.file), false)
+      fetchGuidanceSnapshots(write.kind)
+    } catch (writeError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== guidanceContextRef.current) return
+      setError(isShellError(writeError) ? writeError : 'unexpected')
+      if (isShellError(writeError) && writeError.code === 'guidance-file-changed') {
+        setGuidanceWrite(null)
+        setGuidanceInput('')
+        fetchGuidanceStatus(write.kind, guidanceRequestFile(write.kind, write.file), false)
+        fetchGuidanceSnapshots(write.kind)
+      }
+    } finally {
+      guidanceBusyRef.current = false
+      if (mountedRef.current) setGuidanceBusy(false)
+    }
+  }
+
+  /**
+   * Pins or unpins one snapshot: a pinned snapshot is never pruned. The
+   * store's own answer replaces the row, and the kind's status is fetched
+   * afresh for its pinned count -- the listing is not, so the answer is not
+   * immediately overwritten by a re-read of the same rows. Unlike every
+   * other guidance command this one writes no project file, so it stays
+   * live while a run is active, as the shell's own `guidance_pin` does --
+   * but only one at a time (R3-013), so a double-click pins once and no
+   * slow answer lands on top of a newer one.
+   */
+  async function handleGuidancePin(kind: GuidanceKind, snapshot: Snapshot) {
+    if (guidancePinBusyRef.current) return
+    if (snapshot.kind !== kind) return
+    guidancePinBusyRef.current = true
+    setGuidancePinBusy(true)
+    setError(null)
+    try {
+      const updated = await guidancePin(snapshot.id, !snapshot.pinned)
+      if (!mountedRef.current) return
+      setManaged((previous) =>
+        withManagedFile(previous, kind, (state) => ({
+          ...state,
+          snapshots: state.snapshots.map((recorded) =>
+            recorded.id === updated.id ? updated : recorded,
+          ),
+        })),
+      )
+      fetchGuidanceStatus(kind, guidanceRequestFile(kind, guidanceFileRef.current), false)
+    } catch (pinError: unknown) {
+      if (!mountedRef.current) return
+      setError(isShellError(pinError) ? pinError : 'unexpected')
+    } finally {
+      guidancePinBusyRef.current = false
+      if (mountedRef.current) setGuidancePinBusy(false)
     }
   }
 
@@ -1442,6 +2257,129 @@ export function AgentPanel() {
   /** The work area's status line, or `null` while no workspace is active or its work area is valid. */
   const workAreaLine = workspace === null ? null : formatWorkAreaLine(workspace.workArea)
 
+  /** Whether the typed gate confirms the open guidance write block. */
+  const guidanceConfirmed =
+    guidanceWrite !== null && isGuidanceConfirmed(guidanceWrite, guidanceInput)
+
+  /**
+   * One managed kind's block (slice 5c): its own header -- the editable
+   * file name for the guidance note, the fixed `.gitignore` line for the
+   * ignore rule -- the status line, Preview and Remove, and the Snapshots
+   * table once the kind has any. Every fact renders through
+   * {@link PlainTextLine}; nothing here writes anything until the write
+   * block's typed gate confirms it.
+   */
+  function renderGuidanceBlock(kind: GuidanceKind, header: ReactNode): ReactNode {
+    const { status, snapshots } = managed[kind]
+    const label = guidanceBlockLabel(kind)
+    const frozen = runActive || guidanceBusy
+    return (
+      <div aria-label={label}>
+        {header}
+        {status && (
+          <p role="status" aria-label={`${label} status`}>
+            <PlainTextLine text={formatGuidanceStatusLine(status)} />
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => handleGuidancePreview(kind)}
+          disabled={status === null || frozen}
+        >
+          Preview
+        </button>
+        <button
+          type="button"
+          onClick={() => openGuidanceRemove(kind)}
+          disabled={status === null || !isGuidanceBlockRemovable(status) || frozen}
+        >
+          Remove
+        </button>
+        {snapshots.length > 0 && (
+          <table aria-label={`${label} snapshots`}>
+            <thead>
+              <tr>
+                <th>file</th>
+                <th>id</th>
+                <th>taken at</th>
+                <th>sha256 short</th>
+                <th>size</th>
+                <th>existed</th>
+                <th>pinned</th>
+                <th>action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {snapshots.map((snapshot) => (
+                <tr key={snapshot.id}>
+                  <td>
+                    <PlainTextLine text={snapshot.file} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={snapshot.id} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={formatSnapshotInstant(snapshot.takenAt)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={snapshot.sha256Short} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={String(snapshot.size)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={formatYesNo(snapshot.existed)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={formatYesNo(snapshot.pinned)} />
+                  </td>
+                  <td>
+                    {/*
+                      Every action here is offered only for a snapshot of
+                      this very kind (slice 5c review, R1-006). The two file
+                      spaces cannot collide today -- the shell lists each
+                      kind's snapshots separately -- so this is defence in
+                      depth on a surface whose whole point is that the
+                      block's facts bind the write.
+                    */}
+                    {snapshot.kind === kind && (
+                      <button
+                        type="button"
+                        onClick={() => handleGuidancePin(kind, snapshot)}
+                        disabled={guidancePinBusy}
+                      >
+                        {snapshot.pinned ? 'Unpin' : 'Pin'}
+                      </button>
+                    )}
+                    {/*
+                      A snapshot of another file is listed -- it is this
+                      kind's history -- but restoring it would write a file
+                      whose current state the block cannot show, so it is
+                      offered only once that file is the one the status line
+                      reports.
+                    */}
+                    {snapshot.kind === kind && status !== null && snapshot.file === status.file && (
+                      <>
+                        {' '}
+                        <button
+                          type="button"
+                          onClick={() => openGuidanceRestore(kind, snapshot)}
+                          disabled={frozen}
+                        >
+                          Restore
+                        </button>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    )
+  }
+
   /**
    * A row's action cell (slice 5b): Approve for an approvable row with no
    * progress yet; once approved, the approval's facts and Publish; once
@@ -1473,7 +2411,13 @@ export function AgentPanel() {
     }
     return (
       <>
-        <PlainTextLine text={formatApprovedCell(progress.approval)} />{' '}
+        <PlainTextLine text={formatApprovedCell(progress.approval)} />
+        {!progress.approval.handleHeld && (
+          <>
+            {' '}
+            <mark>{HANDLE_NOT_HELD_MARK}</mark>
+          </>
+        )}{' '}
         <button
           type="button"
           onClick={() => handlePublish(candidate.name)}
@@ -1565,6 +2509,20 @@ export function AgentPanel() {
             {workAreaLine}
           </p>
         )}
+        {/*
+          The whole-outbox inventory (slice 5c): what unmediated producers
+          left at the outbox root or under a run subdirectory the shell no
+          longer remembers, listed without a run and approvable as
+          unattributed. Live only over an active workspace and never during
+          a run, since Start clears the table for the run's own inventory.
+        */}
+        <button
+          type="button"
+          onClick={handleListOutbox}
+          disabled={runActive || workspace === null || isListingOutbox}
+        >
+          List outbox
+        </button>
       </div>
 
       <div>
@@ -1720,8 +2678,7 @@ export function AgentPanel() {
                 destination: <PlainTextLine text={formatDestinationFact(outbox)} />
               </p>
               <p>
-                scope:{' '}
-                <PlainTextLine text={formatScopeMode(inventoryAdapter?.scopeMode ?? null)} />
+                scope: <PlainTextLine text={formatScopeFact(candidates, inventoryAdapter)} />
               </p>
               <p>{APPROVAL_ACT_AS_LINE}</p>
               <label htmlFor="agent-approval-confirm-input">
@@ -1747,6 +2704,117 @@ export function AgentPanel() {
           )}
         </section>
       )}
+
+      {/*
+        The guidance-note installer (slice 5c; HAP-001 D18, R42): a sibling
+        of the transcript, the candidates table and the Publications table,
+        never inside any of them (RCS-001-R6). The system proposes -- a
+        preview of the exact block it would write -- and the user disposes,
+        through a typed short-digest gate over the file's own digest. The
+        proposed block is display-only text throughout: nothing here reads
+        it as an instruction and nothing renders it as markup, so no content
+        path can approve or trigger anything (HAP-001-R22, TM-001-R1).
+      */}
+      <section aria-label="Guidance">
+        <p>{GUIDANCE_ADVISORY_LINE}</p>
+
+        {renderGuidanceBlock(
+          'guidance',
+          <>
+            <label htmlFor="agent-guidance-file">Guidance file</label>
+            <input
+              id="agent-guidance-file"
+              value={guidanceFileDraft}
+              onChange={(event) => setGuidanceFileDraft(event.target.value)}
+              onBlur={commitGuidanceFile}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') commitGuidanceFile()
+              }}
+            />
+          </>,
+        )}
+
+        {renderGuidanceBlock('ignore', <p>{`Ignore file: ${IGNORE_FILE}`}</p>)}
+
+        {guidanceWrite && (
+          // The write surface: the facts the request is bound to, the
+          // proposed block one line per text line, the reversibility
+          // sentence, the act-as identity, and a digest-typed confirmation
+          // the user fills. Nothing here is pre-filled from any
+          // harness-originated value (TM-001-R1), and the request carries
+          // the shell's own digest, never the typed one.
+          <div aria-label="Guidance write" data-testid="guidance-write">
+            <p>
+              file: <PlainTextLine text={guidanceWrite.file} />
+            </p>
+            <p>
+              action: <PlainTextLine text={formatGuidanceAction(guidanceWrite.action)} />
+            </p>
+            {guidanceWrite.command === 'apply' && (
+              <>
+                <p>proposed:</p>
+                <div data-testid="guidance-proposed">
+                  {splitProposedLines(guidanceWrite.proposed).map((line, index) => (
+                    // An index key is sound here: the list is derived once
+                    // from an immutable proposal and is never reordered or
+                    // edited.
+                    <div key={index} data-testid="guidance-proposed-line">
+                      <PlainTextLine text={line} />
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {guidanceWrite.command === 'remove' && <p>{GUIDANCE_REMOVE_SCOPE_LINE}</p>}
+            {guidanceWrite.command === 'restore' && (
+              // The snapshot's recorded facts, then the two disclosures the
+              // facts alone do not carry (R1-002): that its bytes are never
+              // shown, and -- when it recorded no file -- that restoring it
+              // deletes rather than writes. Both stand before the gate.
+              <>
+                <p>
+                  <PlainTextLine text={formatSnapshotFact(guidanceWrite.snapshot)} />
+                </p>
+                <p>{GUIDANCE_RESTORE_BYTES_LINE}</p>
+                {!guidanceWrite.snapshot.existed && <p>{GUIDANCE_RESTORE_REMOVES_LINE}</p>}
+              </>
+            )}
+            {guidanceWrite.fileSha256Short === null ? (
+              <p>file: absent</p>
+            ) : (
+              <p>
+                file sha256 short: <PlainTextLine text={guidanceWrite.fileSha256Short} />
+              </p>
+            )}
+            <p>{GUIDANCE_SNAPSHOT_SENTENCE}</p>
+            <p>{APPROVAL_ACT_AS_LINE}</p>
+            <label htmlFor="agent-guidance-gate">
+              {`Type the ${guidanceWrite.gateSubject} short digest (`}
+              <PlainTextLine text={guidanceWrite.gate} />
+              {`) to ${guidanceWrite.gateVerb}`}
+            </label>
+            <input
+              id="agent-guidance-gate"
+              value={guidanceInput}
+              disabled={runActive || guidanceBusy}
+              onChange={(event) => setGuidanceInput(event.target.value)}
+            />
+            <button
+              type="button"
+              onClick={handleGuidanceWrite}
+              disabled={!guidanceConfirmed || runActive || guidanceBusy}
+            >
+              {guidanceWriteButtonName(guidanceWrite)}
+            </button>
+          </div>
+        )}
+
+        {guidanceResult !== null && (
+          <p role="status" aria-label="Guidance result">
+            <PlainTextLine text={guidanceResult} />
+          </p>
+        )}
+      </section>
 
       {publications && (
         // The project's Catalog as this device sees it (`docs/spike-log.md`

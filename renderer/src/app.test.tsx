@@ -42,24 +42,31 @@ const BUILT_IN_ADAPTERS: AdapterDescriptor[] = [
 
 // `ApprovalSurface` and `AgentPanel` (both mounted by `App`) each call
 // `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`,
-// `adapters_list`, `outbox_status` and `publications_list` -- mock all six
-// here, for every test, so this module's IPC surface is deterministic
-// rather than leaving `invoke` unmocked, which throws a bare `TypeError`
-// (no `__TAURI_INTERNALS__` in this jsdom environment) instead of a proper
-// `ShellError` rejection (R3-003). Any other command is a real error in
-// this file's tests, so it rejects with a fixed, catalogue `ShellError`
-// rather than throwing.
+// `adapters_list`, `outbox_status`, `publications_list` and -- since slice
+// 5c -- `guidance_status` and `guidance_snapshots` for both managed kinds
+// -- mock all of them here, for every test, so this module's IPC surface is
+// deterministic rather than leaving `invoke` unmocked, which throws a bare
+// `TypeError` (no `__TAURI_INTERNALS__` in this jsdom environment) instead
+// of a proper `ShellError` rejection (R3-003). Any other command is a real
+// error in this file's tests, so it rejects with a fixed, catalogue
+// `ShellError` rather than throwing.
 beforeEach(() => {
   mockIPC((cmd) => {
     if (cmd === 'approvals_list') return []
     if (cmd === 'workspace_current') return null
     if (cmd === 'adapters_list') return BUILT_IN_ADAPTERS
-    // No workspace is active in this mock, so `outbox_status` and
-    // `publications_list` answer the way the shell does (`docs/spike-log.md`
-    // § Slice 5 and § Slice 5b, IPC shapes): the same `workspace-unavailable`
+    // No workspace is active in this mock, so the four project-scoped
+    // fetches answer the way the shell does (`docs/spike-log.md` § Slice 5,
+    // § Slice 5b and § Slice 5c, IPC shapes): the same `workspace-unavailable`
     // rejection an adapter launch gets, which `AgentPanel` meets with no
-    // status line, no publications table, and no alert.
-    if (cmd === 'outbox_status' || cmd === 'publications_list') {
+    // status line, no publications table, no guidance status line, and no
+    // alert.
+    if (
+      cmd === 'outbox_status' ||
+      cmd === 'publications_list' ||
+      cmd === 'guidance_status' ||
+      cmd === 'guidance_snapshots'
+    ) {
       return Promise.reject({
         code: 'workspace-unavailable',
         message: 'no workspace has been picked yet',

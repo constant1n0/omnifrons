@@ -10,6 +10,13 @@ import {
   executableApprove,
   executablePickAndProbe,
   executableRevoke,
+  guidanceApply,
+  guidancePin,
+  guidancePreview,
+  guidanceRemove,
+  guidanceRestore,
+  guidanceSnapshots,
+  guidanceStatus,
   harnessObserve,
   harnessSpawn,
   harnessStop,
@@ -27,12 +34,19 @@ import {
   type Availability,
   type Candidate,
   type Evidence,
+  type GuidanceAction,
+  type GuidanceApplied,
+  type GuidanceKind,
+  type GuidancePreview,
+  type GuidanceStatus,
   type HarnessFrame,
+  type ManagedStatus,
   type OutboxStatus,
   type ProviderState,
   type Publication,
   type ShellError,
   type ShellErrorCode,
+  type Snapshot,
 } from './harness'
 
 // The jsdom crypto polyfill is installed once for every test file by
@@ -1060,6 +1074,7 @@ const SAMPLE_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782401000,
+  handleHeld: true,
 }
 
 /** A `registered` publication: the reference is AEC-001's `ref`, the locator the Catalog identity. */
@@ -1110,6 +1125,8 @@ describe('artifactApprove (slice 5b)', () => {
     for (const key of Object.keys(capturedArgs!)) {
       expect(key.toLowerCase()).not.toContain('path')
     }
+    // Fourteen keys since slice 5c: `handleHeld` joined the thirteen of
+    // slice 5b (`docs/spike-log.md` § Slice 5c, IPC shapes).
     expect(Object.keys(approval).sort()).toEqual([
       'actAs',
       'approvalId',
@@ -1119,6 +1136,7 @@ describe('artifactApprove (slice 5b)', () => {
       'class',
       'detectedType',
       'displayName',
+      'handleHeld',
       'name',
       'publicationId',
       'runId',
@@ -1403,7 +1421,7 @@ describe('slice 5b closed sets', () => {
     expect(availabilities.map(availabilityLabel)).toEqual(availabilities)
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes among the thirty-two -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes and the six slice 5c codes among the thirty-eight -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
     function codeLabel(code: ShellErrorCode): string {
       switch (code) {
         case 'unknown-process':
@@ -1438,6 +1456,12 @@ describe('slice 5b closed sets', () => {
         case 'refused':
         case 'catalog-unavailable':
         case 'run-active':
+        case 'guidance-file-invalid':
+        case 'guidance-file-changed':
+        case 'guidance-block-modified':
+        case 'guidance-block-malformed':
+        case 'guidance-unmanaged':
+        case 'snapshot-unavailable':
           return code
         default: {
           const unreachable: never = code
@@ -1479,10 +1503,571 @@ describe('slice 5b closed sets', () => {
       'refused',
       'catalog-unavailable',
       'run-active',
+      'guidance-file-invalid',
+      'guidance-file-changed',
+      'guidance-block-modified',
+      'guidance-block-malformed',
+      'guidance-unmanaged',
+      'snapshot-unavailable',
     ]
-    expect(new Set(codes).size).toBe(32)
+    expect(new Set(codes).size).toBe(38)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
+  })
+})
+
+// -- Slice 5c: the unattributed approval and the guidance-note installer --
+
+/**
+ * Mocks one command, recording the args object it was invoked with, and
+ * rejects every other command as a test error. `args()` is the captured
+ * object -- the exact object `invoke` was handed, no serialization in
+ * between (see `harness.ts`'s module comment).
+ */
+function mockCommand(
+  command: string,
+  answer: () => unknown,
+): { args: () => Record<string, unknown> } {
+  let captured: Record<string, unknown> | undefined
+  mockIPC((cmd, args) => {
+    if (cmd === command) {
+      captured = args as Record<string, unknown>
+      return answer()
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  return {
+    args: () => {
+      if (!captured) throw new Error(`${command} was not invoked`)
+      return captured
+    },
+  }
+}
+
+/** No request or payload key of this surface may be path-shaped (HAP-001-R5): names at the workspace root, tokens, digests, ids only. */
+function expectNoPathShapedKey(args: object): void {
+  for (const key of Object.keys(args)) {
+    expect(key.toLowerCase()).not.toContain('path')
+  }
+}
+
+/** The digest of an entry the whole-outbox inventory listed at the outbox root. */
+const DROPPED_DIGEST = `9d3f2a10${'e'.repeat(56)}`
+
+/**
+ * `artifact_approve { runId: null, … }`'s payload (`docs/spike-log.md` §
+ * Slice 5c, IPC shapes): no run, the unattributed fact, nothing standing
+ * in for a producer, and `handleHeld` saying the re-opened handle is held
+ * for the publication.
+ */
+const UNATTRIBUTED_ARTIFACT_APPROVAL: ArtifactApproval = {
+  approvalId: '5f0c3b2a9e1d7c44',
+  publicationId: PUBLICATION_ID,
+  runId: null,
+  name: 'dropped.pdf',
+  displayName: 'dropped.pdf',
+  sha256Short: '9d3f2a10',
+  size: 15,
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  attribution: { kind: 'unattributed' },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1725782401000,
+  handleHeld: true,
+}
+
+const TEMPLATE_VERSION = 'hap-001-guidance-v1'
+const FILE_DIGEST = `3c1e9a07${'a'.repeat(56)}`
+
+/** `guidance_status { kind: "guidance" }` for a fresh project: the file does not exist. */
+const GUIDANCE_STATUS_ABSENT: GuidanceStatus = {
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  exists: false,
+  managed: 'absent',
+  templateVersion: TEMPLATE_VERSION,
+  fileSha256: null,
+  fileSha256Short: null,
+  snapshots: 0,
+  pinned: 0,
+}
+
+/** The same status once the note is installed: the full digest an apply or a removal binds to, beside its short form. */
+const GUIDANCE_STATUS_CURRENT: GuidanceStatus = {
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  exists: true,
+  managed: 'current',
+  templateVersion: TEMPLATE_VERSION,
+  fileSha256: FILE_DIGEST,
+  fileSha256Short: '3c1e9a07',
+  snapshots: 1,
+  pinned: 0,
+}
+
+/** The ignore rule's block as the shell proposes it: the sentinels around the one rule (`docs/spike-log.md` § Slice 5c, IPC shapes). */
+const IGNORE_PROPOSED = `# omnifrons:begin ignore ${TEMPLATE_VERSION} sha256:${'b'.repeat(64)}\n/.omnifrons/outbox/\n# omnifrons:end ignore`
+
+const IGNORE_PREVIEW: GuidancePreview = {
+  kind: 'ignore',
+  file: '.gitignore',
+  action: 'insert',
+  proposed: IGNORE_PROPOSED,
+  fileSha256: `a71bc0d2${'c'.repeat(56)}`,
+  fileSha256Short: 'a71bc0d2',
+  resultSha256Short: '0e9f4c31',
+}
+
+/** The note's block, abridged to its shape: the HTML-comment sentinels around the Markdown template. */
+const GUIDANCE_PROPOSED = `<!-- omnifrons:begin guidance ${TEMPLATE_VERSION} sha256:${'d'.repeat(64)} -->\n## Generated files\n\n- Write every generated file that is not a Markdown note into \`.omnifrons/outbox\`, relative to this project's root.\n<!-- omnifrons:end guidance -->`
+
+const GUIDANCE_PREVIEW: GuidancePreview = {
+  kind: 'guidance',
+  file: 'CLAUDE.md',
+  action: 'insert',
+  proposed: GUIDANCE_PROPOSED,
+  fileSha256: null,
+  fileSha256Short: null,
+  resultSha256Short: '3c1e9a07',
+}
+
+const APPLIED_INSERT: GuidanceApplied = {
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  action: 'insert',
+  snapshotId: '0123456789abcdef',
+  resultSha256Short: '3c1e9a07',
+}
+
+/** A removal that deleted the file Omnifrons created: no digest afterwards. */
+const APPLIED_REMOVE: GuidanceApplied = {
+  kind: 'guidance',
+  file: 'AGENTS.md',
+  action: 'remove',
+  snapshotId: '89abcdef01234567',
+  resultSha256Short: null,
+}
+
+/** `guidance_snapshots { kind: "guidance" }`: newest first, the older one of an absent file and pinned. */
+const SNAPSHOTS: Snapshot[] = [
+  {
+    id: '89abcdef01234567',
+    kind: 'guidance',
+    file: 'AGENTS.md',
+    existed: true,
+    sha256Short: '3c1e9a07',
+    size: 1512,
+    takenAt: 1725782402000,
+    pinned: false,
+  },
+  {
+    id: '0123456789abcdef',
+    kind: 'guidance',
+    file: 'AGENTS.md',
+    existed: false,
+    sha256Short: 'e3b0c442',
+    size: 0,
+    takenAt: 1725782401000,
+    pinned: true,
+  },
+]
+
+describe('artifactApprove with runId null (slice 5c)', () => {
+  it('invokes artifact_approve with exactly { runId: null, name, sha256 } -- the key present and null, the full 64-hex digest -- and returns the unattributed approval verbatim: runId null, the bare unattributed kind, handleHeld, fourteen keys, no path-shaped key', async () => {
+    const mock = mockCommand('artifact_approve', () => UNATTRIBUTED_ARTIFACT_APPROVAL)
+
+    const approval = await artifactApprove(null, 'dropped.pdf', DROPPED_DIGEST)
+
+    expect(mock.args()).toEqual({ runId: null, name: 'dropped.pdf', sha256: DROPPED_DIGEST })
+    expect(Object.keys(mock.args()).sort()).toEqual(['name', 'runId', 'sha256'])
+    expect(mock.args().runId).toBeNull()
+    expect(mock.args().sha256).toHaveLength(64)
+    expectNoPathShapedKey(mock.args())
+    expect(approval).toEqual(UNATTRIBUTED_ARTIFACT_APPROVAL)
+    expect(approval.runId).toBeNull()
+    expect(approval.attribution).toEqual({ kind: 'unattributed' })
+    expect(approval.handleHeld).toBe(true)
+    expect(Object.keys(approval)).toHaveLength(14)
+  })
+
+  it('returns handleHeld false verbatim when the D22 cap left no room for the re-opened handle -- for a run entry too', async () => {
+    const unheld: ArtifactApproval = { ...SAMPLE_ARTIFACT_APPROVAL, handleHeld: false }
+    mockCommand('artifact_approve', () => unheld)
+
+    const approval = await artifactApprove(RUN_ID, `${RUN_ID}/report.pdf`, REPORT_DIGEST)
+
+    expect(approval.handleHeld).toBe(false)
+    expect(approval.runId).toBe(RUN_ID)
+  })
+
+  it("rejects with the typed integrity-mismatch, outbox-escape and invalid-request ShellErrors of the whole-outbox path, each with the shell's fixed message", async () => {
+    const errors: ShellError[] = [
+      {
+        code: 'integrity-mismatch',
+        message:
+          "the entry's digest differs from the digest the request names; it changed since it was listed",
+      },
+      { code: 'outbox-escape', message: 'the entry is not a regular file inside the outbox' },
+      {
+        code: 'invalid-request',
+        message: 'the entry belongs to a remembered run; approve it through that run id',
+      },
+    ]
+    for (const error of errors) {
+      mockCommand('artifact_approve', () => Promise.reject(error))
+
+      await expect(artifactApprove(null, 'dropped.pdf', DROPPED_DIGEST)).rejects.toMatchObject(
+        error,
+      )
+      expect(isShellError(error)).toBe(true)
+      clearMocks()
+    }
+  })
+})
+
+describe('guidanceStatus (slice 5c)', () => {
+  it('invokes guidance_status with exactly { kind, file } for the guidance kind and returns the status verbatim: nine keys, the full digest beside its short form, no path-shaped key', async () => {
+    const mock = mockCommand('guidance_status', () => GUIDANCE_STATUS_CURRENT)
+
+    const status = await guidanceStatus('guidance', 'AGENTS.md')
+
+    expect(mock.args()).toEqual({ kind: 'guidance', file: 'AGENTS.md' })
+    expect(Object.keys(mock.args()).sort()).toEqual(['file', 'kind'])
+    expectNoPathShapedKey(mock.args())
+    expect(status).toEqual(GUIDANCE_STATUS_CURRENT)
+    expect(Object.keys(status).sort()).toEqual([
+      'exists',
+      'file',
+      'fileSha256',
+      'fileSha256Short',
+      'kind',
+      'managed',
+      'pinned',
+      'snapshots',
+      'templateVersion',
+    ])
+    expect(status.fileSha256).toHaveLength(64)
+    expect(status.fileSha256Short).toBe(status.fileSha256?.slice(0, 8))
+  })
+
+  it('invokes guidance_status with exactly { kind: "ignore" } when no file is given -- the key absent, not undefined -- and returns an absent status with its null digests verbatim', async () => {
+    const absent: GuidanceStatus = { ...GUIDANCE_STATUS_ABSENT, kind: 'ignore', file: '.gitignore' }
+    const mock = mockCommand('guidance_status', () => absent)
+
+    const status = await guidanceStatus('ignore')
+
+    expect(mock.args()).toEqual({ kind: 'ignore' })
+    expect(Object.keys(mock.args())).toEqual(['kind'])
+    expect(status).toEqual(absent)
+    expect(status.fileSha256).toBeNull()
+    expect(status.fileSha256Short).toBeNull()
+    expect(status.exists).toBe(false)
+  })
+})
+
+describe('guidancePreview (slice 5c)', () => {
+  it('invokes guidance_preview with exactly { kind, file } and returns the proposal verbatim: seven keys, proposed the block text with its sentinels untouched, fileSha256 null for an absent file', async () => {
+    const mock = mockCommand('guidance_preview', () => GUIDANCE_PREVIEW)
+
+    const preview = await guidancePreview('guidance', 'CLAUDE.md')
+
+    expect(mock.args()).toEqual({ kind: 'guidance', file: 'CLAUDE.md' })
+    expectNoPathShapedKey(mock.args())
+    expect(preview).toEqual(GUIDANCE_PREVIEW)
+    expect(Object.keys(preview).sort()).toEqual([
+      'action',
+      'file',
+      'fileSha256',
+      'fileSha256Short',
+      'kind',
+      'proposed',
+      'resultSha256Short',
+    ])
+    expect(preview.proposed).toBe(GUIDANCE_PROPOSED)
+    expect(preview.proposed.startsWith('<!-- omnifrons:begin guidance ')).toBe(true)
+    expect(preview.proposed.endsWith('<!-- omnifrons:end guidance -->')).toBe(true)
+    expect(preview.fileSha256).toBeNull()
+  })
+
+  it('invokes guidance_preview with exactly { kind: "ignore" } for the ignore kind and returns the ignore proposal verbatim, its three lines intact', async () => {
+    const mock = mockCommand('guidance_preview', () => IGNORE_PREVIEW)
+
+    const preview = await guidancePreview('ignore')
+
+    expect(mock.args()).toEqual({ kind: 'ignore' })
+    expect(Object.keys(mock.args())).toEqual(['kind'])
+    expect(preview).toEqual(IGNORE_PREVIEW)
+    expect(preview.proposed.split('\n')).toEqual([
+      `# omnifrons:begin ignore ${TEMPLATE_VERSION} sha256:${'b'.repeat(64)}`,
+      '/.omnifrons/outbox/',
+      '# omnifrons:end ignore',
+    ])
+  })
+})
+
+describe('guidanceApply and guidanceRemove (slice 5c)', () => {
+  it('invokes guidance_apply with exactly { kind, file, fileSha256: null } for a file the surface showed as absent and returns the applied payload verbatim: five keys, the snapshot id 16 hex', async () => {
+    const mock = mockCommand('guidance_apply', () => APPLIED_INSERT)
+
+    const applied = await guidanceApply('guidance', 'AGENTS.md', null)
+
+    expect(mock.args()).toEqual({ kind: 'guidance', file: 'AGENTS.md', fileSha256: null })
+    expect(Object.keys(mock.args()).sort()).toEqual(['file', 'fileSha256', 'kind'])
+    expectNoPathShapedKey(mock.args())
+    expect(applied).toEqual(APPLIED_INSERT)
+    expect(Object.keys(applied).sort()).toEqual([
+      'action',
+      'file',
+      'kind',
+      'resultSha256Short',
+      'snapshotId',
+    ])
+    expect(applied.snapshotId).toHaveLength(16)
+  })
+
+  it('invokes guidance_apply with the full 64-hex fileSha256 the surface showed, and for the ignore kind with exactly { kind: "ignore", fileSha256 } and no file key', async () => {
+    const noOp: GuidanceApplied = {
+      ...APPLIED_INSERT,
+      action: 'no-op',
+      snapshotId: null,
+      resultSha256Short: '3c1e9a07',
+    }
+    let mock = mockCommand('guidance_apply', () => noOp)
+    const applied = await guidanceApply('guidance', 'AGENTS.md', FILE_DIGEST)
+    expect(mock.args()).toEqual({ kind: 'guidance', file: 'AGENTS.md', fileSha256: FILE_DIGEST })
+    expect(mock.args().fileSha256).toHaveLength(64)
+    expect(applied).toEqual(noOp)
+    expect(applied.snapshotId).toBeNull()
+    clearMocks()
+
+    const ignoreApplied: GuidanceApplied = {
+      kind: 'ignore',
+      file: '.gitignore',
+      action: 'insert',
+      snapshotId: 'fedcba9876543210',
+      resultSha256Short: '0e9f4c31',
+    }
+    mock = mockCommand('guidance_apply', () => ignoreApplied)
+    const ignoreDigest = `a71bc0d2${'c'.repeat(56)}`
+    await guidanceApply('ignore', undefined, ignoreDigest)
+    expect(mock.args()).toEqual({ kind: 'ignore', fileSha256: ignoreDigest })
+    expect(Object.keys(mock.args()).sort()).toEqual(['fileSha256', 'kind'])
+  })
+
+  it('invokes guidance_remove with exactly { kind, file, fileSha256 } and returns the removal verbatim, resultSha256Short null once the file is gone', async () => {
+    const mock = mockCommand('guidance_remove', () => APPLIED_REMOVE)
+
+    const removed = await guidanceRemove('guidance', 'AGENTS.md', FILE_DIGEST)
+
+    expect(mock.args()).toEqual({ kind: 'guidance', file: 'AGENTS.md', fileSha256: FILE_DIGEST })
+    expect(Object.keys(mock.args()).sort()).toEqual(['file', 'fileSha256', 'kind'])
+    expectNoPathShapedKey(mock.args())
+    expect(removed).toEqual(APPLIED_REMOVE)
+    expect(removed.action).toBe('remove')
+    expect(removed.resultSha256Short).toBeNull()
+  })
+})
+
+describe('guidanceSnapshots, guidancePin and guidanceRestore (slice 5c)', () => {
+  it('invokes guidance_snapshots with exactly { kind } and returns the list verbatim, newest first, eight keys per snapshot, no path-shaped key', async () => {
+    const mock = mockCommand('guidance_snapshots', () => SNAPSHOTS)
+
+    const snapshots = await guidanceSnapshots('guidance')
+
+    expect(mock.args()).toEqual({ kind: 'guidance' })
+    expect(Object.keys(mock.args())).toEqual(['kind'])
+    expect(snapshots).toEqual(SNAPSHOTS)
+    expect(snapshots.map((snapshot) => snapshot.takenAt)).toEqual([1725782402000, 1725782401000])
+    expect(Object.keys(snapshots[0]!).sort()).toEqual([
+      'existed',
+      'file',
+      'id',
+      'kind',
+      'pinned',
+      'sha256Short',
+      'size',
+      'takenAt',
+    ])
+    for (const snapshot of snapshots) {
+      expectNoPathShapedKey(snapshot)
+      expect(snapshot.id).toMatch(/^[0-9a-f]{16}$/)
+    }
+  })
+
+  it('invokes guidance_pin with exactly { id, pinned } and returns the updated snapshot verbatim', async () => {
+    const pinned: Snapshot = { ...SNAPSHOTS[0]!, pinned: true }
+    const mock = mockCommand('guidance_pin', () => pinned)
+
+    const snapshot = await guidancePin('89abcdef01234567', true)
+
+    expect(mock.args()).toEqual({ id: '89abcdef01234567', pinned: true })
+    expect(Object.keys(mock.args()).sort()).toEqual(['id', 'pinned'])
+    expect(snapshot).toEqual(pinned)
+    expect(snapshot.pinned).toBe(true)
+  })
+
+  it('invokes guidance_restore with exactly { id, fileSha256 } -- null for an absent file, else the full 64-hex digest -- and returns the restore verbatim', async () => {
+    const restored: GuidanceApplied = {
+      kind: 'guidance',
+      file: 'AGENTS.md',
+      action: 'restore',
+      snapshotId: 'fedcba9876543210',
+      resultSha256Short: null,
+    }
+    let mock = mockCommand('guidance_restore', () => restored)
+    const first = await guidanceRestore('0123456789abcdef', null)
+    expect(mock.args()).toEqual({ id: '0123456789abcdef', fileSha256: null })
+    expect(Object.keys(mock.args()).sort()).toEqual(['fileSha256', 'id'])
+    expectNoPathShapedKey(mock.args())
+    expect(first).toEqual(restored)
+    expect(first.action).toBe('restore')
+    clearMocks()
+
+    mock = mockCommand('guidance_restore', () => ({ ...restored, resultSha256Short: '3c1e9a07' }))
+    const second = await guidanceRestore('0123456789abcdef', FILE_DIGEST)
+    expect(mock.args()).toEqual({ id: '0123456789abcdef', fileSha256: FILE_DIGEST })
+    expect(mock.args().fileSha256).toHaveLength(64)
+    expect(second.resultSha256Short).toBe('3c1e9a07')
+  })
+})
+
+describe('ShellErrorCode guidance codes (slice 5c)', () => {
+  it("rejects each guidance command with the typed ShellError of its own catalogue: the six new codes with the shell's fixed messages, plus run-active on the writing commands, none carrying detail", async () => {
+    const cases: { command: string; call: () => Promise<unknown>; error: ShellError }[] = [
+      {
+        command: 'guidance_status',
+        call: () => guidanceStatus('guidance', 'notes.txt'),
+        error: {
+          code: 'guidance-file-invalid',
+          message: 'the guidance file must end in .md',
+        },
+      },
+      {
+        command: 'guidance_apply',
+        call: () => guidanceApply('guidance', 'AGENTS.md', FILE_DIGEST),
+        error: {
+          code: 'guidance-file-changed',
+          message: 'the managed file changed since it was shown; read its status again and retry',
+        },
+      },
+      {
+        command: 'guidance_apply',
+        call: () => guidanceApply('guidance', 'AGENTS.md', FILE_DIGEST),
+        error: {
+          code: 'guidance-block-modified',
+          message:
+            'the managed block was modified inside its sentinels; resolve it by hand or restore a snapshot',
+        },
+      },
+      {
+        command: 'guidance_remove',
+        call: () => guidanceRemove('guidance', 'AGENTS.md', FILE_DIGEST),
+        error: {
+          code: 'guidance-block-malformed',
+          message:
+            "the managed block's sentinels are not one intact pair; resolve it by hand or restore a snapshot",
+        },
+      },
+      {
+        command: 'guidance_remove',
+        call: () => guidanceRemove('guidance', 'AGENTS.md', FILE_DIGEST),
+        error: { code: 'guidance-unmanaged', message: 'the file carries no managed block' },
+      },
+      {
+        command: 'guidance_pin',
+        call: () => guidancePin('0000000000000000', true),
+        error: {
+          code: 'guidance-unmanaged',
+          message: 'no snapshot with that id is recorded for this project',
+        },
+      },
+      {
+        command: 'guidance_snapshots',
+        call: () => guidanceSnapshots('ignore'),
+        error: { code: 'snapshot-unavailable', message: 'a snapshot manifest is corrupt' },
+      },
+      {
+        command: 'guidance_restore',
+        call: () => guidanceRestore('0123456789abcdef', null),
+        error: {
+          code: 'run-active',
+          message: 'a run is active; approve or publish once it has ended',
+        },
+      },
+    ]
+    for (const { command, call, error } of cases) {
+      mockCommand(command, () => Promise.reject(error))
+
+      // The awaited rejection itself, not the fixture that produced it
+      // (slice 5c review, R3-018): asserting against `error` would make
+      // "none carrying detail" a property of this table rather than of what
+      // the wrapper rejects with, and a partial match would not catch a
+      // wrapper that added a key of its own.
+      const rejected: unknown = await call().then(
+        () => {
+          throw new Error(`${command} resolved instead of rejecting`)
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(Object.keys(rejected as object).sort()).toEqual(['code', 'message'])
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+      clearMocks()
+    }
+  })
+})
+
+describe('slice 5c closed sets', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: switches over GuidanceKind (two tokens), ManagedStatus (five) and GuidanceAction (five) with never defaults compile, and at runtime map each token to itself', () => {
+    function kindLabel(kind: GuidanceKind): string {
+      switch (kind) {
+        case 'guidance':
+        case 'ignore':
+          return kind
+        default: {
+          const unreachable: never = kind
+          return unreachable
+        }
+      }
+    }
+    function managedLabel(status: ManagedStatus): string {
+      switch (status) {
+        case 'absent':
+        case 'current':
+        case 'outdated':
+        case 'modified':
+        case 'malformed':
+          return status
+        default: {
+          const unreachable: never = status
+          return unreachable
+        }
+      }
+    }
+    function actionLabel(action: GuidanceAction): string {
+      switch (action) {
+        case 'insert':
+        case 'replace':
+        case 'no-op':
+        case 'remove':
+        case 'restore':
+          return action
+        default: {
+          const unreachable: never = action
+          return unreachable
+        }
+      }
+    }
+
+    const kinds: GuidanceKind[] = ['guidance', 'ignore']
+    const statuses: ManagedStatus[] = ['absent', 'current', 'outdated', 'modified', 'malformed']
+    const actions: GuidanceAction[] = ['insert', 'replace', 'no-op', 'remove', 'restore']
+    expect(kinds.map(kindLabel)).toEqual(kinds)
+    expect(statuses.map(managedLabel)).toEqual(statuses)
+    expect(actions.map(actionLabel)).toEqual(actions)
   })
 })
