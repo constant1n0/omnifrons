@@ -11,6 +11,7 @@ mod health;
 mod ipc;
 mod outbox_state;
 mod publication_state;
+mod wrong_root_state;
 
 use adapter_state::AdapterState;
 use executable_state::ExecutableState;
@@ -25,10 +26,12 @@ use ipc::guidance::{
     guidance_snapshots, guidance_status,
 };
 use ipc::publication::{artifact_approve, artifact_publish, publications_list};
+use ipc::wrong_root::{misplaced_list, misplaced_remedy, wrongroot_scan, wrongroot_status};
 use omnifrons_supervisor::TokioProcessSupervisor;
 use outbox_state::OutboxState;
 use publication_state::PublicationState;
 use tauri::Manager as _;
+use wrong_root_state::WrongRootState;
 
 /// Typed IPC command: the renderer's only way to read this shell's
 /// name, version, and process-supervision containment status.
@@ -97,6 +100,11 @@ pub fn run() {
             // inventory, and the bounded per-run table
             // (`docs/spike-log.md` § Slice 5).
             app.manage(OutboxState::new());
+
+            // The wrong-root surface: the findings of the most recent
+            // scan for the active workspace, recomputed and never
+            // persisted (`docs/spike-log.md` § Slice 5d).
+            app.manage(std::sync::Arc::new(WrongRootState::new()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -123,6 +131,10 @@ pub fn run() {
             guidance_snapshots,
             guidance_pin,
             guidance_restore,
+            wrongroot_status,
+            wrongroot_scan,
+            misplaced_list,
+            misplaced_remedy,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

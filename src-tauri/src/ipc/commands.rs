@@ -387,8 +387,29 @@ fn forward_adapter_output(
         // proposals and inventories the subdirectory at run end
         // (`docs/spike-log.md` § Slice 5).
         let outbox_state = app.state::<OutboxState>();
-        let tracker =
-            RunEndTracker::new(Arc::clone(&outbox_state.runs), id, outbox_state.inventory);
+        // Spike slice 5d: the run-end wrong-root scan (HAP-001 D16) rides
+        // the same tracker, when a workspace is active to walk.
+        let scan = app
+            .state::<AdapterState>()
+            .active_workspace
+            .lock()
+            .expect("active workspace mutex poisoned by a prior panic")
+            .clone()
+            .map(|workspace| RunEndScan {
+                workspace,
+                work_area: app.state::<PublicationState>().work_area.clone(),
+                policy_store: outbox_state.policy_store,
+                state: Arc::clone(&app.state::<Arc<crate::wrong_root_state::WrongRootState>>()),
+            });
+        let tracker = match scan {
+            Some(scan) => RunEndTracker::with_wrong_root_scan(
+                Arc::clone(&outbox_state.runs),
+                id,
+                outbox_state.inventory,
+                scan,
+            ),
+            None => RunEndTracker::new(Arc::clone(&outbox_state.runs), id, outbox_state.inventory),
+        };
         let mut sequencer = AdapterWireSequencer::with_outbox(id_dto, tracker);
         match forwarder_for(adapter.describe().transport_class) {
             ForwarderKind::Line => {
@@ -568,6 +589,23 @@ struct RunEndTracker {
     runs: Arc<Mutex<RunTable>>,
     id: ProcessId,
     inventory: FsOutboxInventory,
+    /// The wrong-root scan attached to this launch (spike slice 5d,
+    /// HAP-001 D16): `None` for a launch with no active workspace, and in
+    /// this module's own tests of the outbox half alone.
+    scan: Option<RunEndScan>,
+}
+
+/// What the run-end wrong-root scan needs, captured when the forwarder
+/// thread starts so `finish` never touches Tauri state (spike slice 5d).
+struct RunEndScan {
+    /// The active workspace root the scan walks.
+    workspace: omnifrons_app::WorkspaceRoot,
+    /// The configured product work area, holding the ignore ledger.
+    work_area: std::path::PathBuf,
+    /// Loads the project's classification policy.
+    policy_store: omnifrons_adapters::JsonOutboxPolicyStore,
+    /// Where the findings are left for `misplaced_list`.
+    state: Arc<crate::wrong_root_state::WrongRootState>,
 }
 
 impl RunEndTracker {
@@ -576,6 +614,51 @@ impl RunEndTracker {
             runs,
             id,
             inventory,
+            scan: None,
+        }
+    }
+
+    /// A tracker that also runs the wrong-root scan at run end.
+    fn with_wrong_root_scan(
+        runs: Arc<Mutex<RunTable>>,
+        id: ProcessId,
+        inventory: FsOutboxInventory,
+        scan: RunEndScan,
+    ) -> Self {
+        Self {
+            runs,
+            id,
+            inventory,
+            scan: Some(scan),
+        }
+    }
+
+    /// The wrong-root scan's own event, appended after `candidates` and
+    /// before the terminal `state` frame: counts only, never a name and
+    /// never a path (HAP-001-R5, RCS-001-R14). A scan that could not run
+    /// is a fixed diagnostic, never a claim that nothing was misplaced.
+    fn misplaced_events(&self) -> Vec<AdapterEventDto> {
+        let Some(scan) = &self.scan else {
+            return Vec::new();
+        };
+        match crate::ipc::wrong_root::scan_project(
+            scan.policy_store,
+            &scan.workspace,
+            &scan.work_area,
+            &scan.state,
+        ) {
+            Ok(summary) => vec![AdapterEventDto::Misplaced {
+                scanned: summary.scanned,
+                findings: summary.findings,
+                ignored: summary.ignored,
+                excluded: summary.excluded,
+                unreadable: summary.unreadable,
+                truncated: summary.truncated,
+            }],
+            Err(_) => vec![AdapterEventDto::Diagnostic {
+                text: "the project could not be scanned for output written outside the outbox"
+                    .to_string(),
+            }],
         }
     }
 
@@ -595,19 +678,23 @@ impl RunEndTracker {
     /// The run ended: inventory its subdirectory and produce, in order,
     /// one `diagnostic` for proposed entries counted beyond the per-run
     /// cap, one `diagnostic` per recorded proposal naming a digest no entry
-    /// carries, the `candidates` summary, and -- only if the record was
+    /// carries, the `candidates` summary, -- only if the record was
     /// gone by the time the inventory completed -- one `diagnostic` saying
-    /// how many candidates were not retained. Empty for a launch with no
-    /// record. Two phases under two lock scopes ([`Self::snapshot`], then
+    /// how many candidates were not retained, and finally, when a
+    /// workspace is active, the wrong-root scan's own `misplaced` counts
+    /// (spike slice 5d). Only the outbox half is empty for a launch with
+    /// no record; the scan runs either way. Two phases under two lock scopes ([`Self::snapshot`], then
     /// the inventory on a duplicate of the held handle outside the lock,
     /// then [`Self::conclude`]), so a concurrent `candidates_list` never
     /// waits on file hashing.
     fn finish(&self) -> Vec<AdapterEventDto> {
-        match self.snapshot() {
+        let mut events = match self.snapshot() {
             RunEndPhase::NoRecord => Vec::new(),
             RunEndPhase::HandleUnavailable => vec![inventory_failed_diagnostic()],
             RunEndPhase::Ready(input) => self.conclude(*input),
-        }
+        };
+        events.extend(self.misplaced_events());
+        events
     }
 
     /// Phase one, under the table's lock: what the inventory needs from
@@ -1350,7 +1437,7 @@ fn outbox_status_for(project: &WorkspaceRoot, store: JsonOutboxPolicyStore) -> O
 /// `outbox-invalid` if the policy cannot be loaded or the declaration
 /// resolves outside the project or is a link; `outbox-unavailable` if the
 /// outbox cannot be opened or listed.
-fn inventory_whole_outbox(
+pub(crate) fn inventory_whole_outbox(
     project: &WorkspaceRoot,
     store: JsonOutboxPolicyStore,
     preparer: FsRunOutboxPreparer,
@@ -1737,6 +1824,7 @@ pub async fn workspace_pick(app: AppHandle) -> Result<WorkspaceDto, ShellError> 
         &app.state::<AdapterState>(),
         &app.state::<OutboxState>(),
         &app.state::<PublicationState>(),
+        &app.state::<std::sync::Arc<crate::wrong_root_state::WrongRootState>>(),
         workspace,
     ))
 }
@@ -1774,6 +1862,7 @@ fn activate_workspace(
     adapter_state: &AdapterState,
     outbox_state: &OutboxState,
     publication_state: &PublicationState,
+    wrong_root_state: &crate::wrong_root_state::WrongRootState,
     workspace: WorkspaceRoot,
 ) -> WorkspaceDto {
     let dto = WorkspaceDto::new(&workspace, work_area_state(publication_state, &workspace));
@@ -1783,10 +1872,15 @@ fn activate_workspace(
         .expect("active workspace mutex poisoned by a prior panic");
     if slot.as_ref() != Some(&workspace) {
         let forgotten = outbox_state.forget_runs();
+        // Spike slice 5d: a `misplaced` finding is a detection condition
+        // about one project, recomputed by every scan and never persisted,
+        // so it goes with the run records.
+        let scan_forgotten = wrong_root_state.clear();
         tracing::debug!(
             forgotten,
+            scan_forgotten,
             "the active workspace changed; the previous workspace's run records were forgotten \
-             and their handles released"
+             and their handles released, and its wrong-root scan was discarded"
         );
     }
     *slot = Some(workspace);
@@ -2195,6 +2289,7 @@ mod tests {
                     AdapterEventDto::TerminalDrops { .. } => "terminal-drops",
                     AdapterEventDto::ArtifactPublish { .. } => "artifact-publish",
                     AdapterEventDto::Candidates { .. } => "candidates",
+                    AdapterEventDto::Misplaced { .. } => "misplaced",
                 };
                 (*seq, *dropped_before, kind)
             }
@@ -3012,6 +3107,203 @@ mod tests {
         assert_eq!(candidates[1].entry.attribution, Attribution::Unattributed);
     }
 
+    /// Spike slice 5d, HAP-001 D16 at the post-run-scan half of its
+    /// default: the run-end wrong-root scan rides one frame after
+    /// `candidates` and one before the terminal `state` frame, with a
+    /// contiguous `seq`, carrying counts only -- never a name and never a
+    /// path -- and it leaves the findings where `misplaced_list` reads
+    /// them.
+    #[test]
+    fn run_end_emits_misplaced_after_candidates_and_before_the_state_frame() {
+        use crate::ipc::dto::AdapterEventDto;
+
+        let project = TempProject::new("run-end-misplaced");
+        let device = TempProject::new("run-end-misplaced-device");
+        let id = omnifrons_app::ProcessId(31);
+        let (runs, _run_path) = prepared_run(&project, id, "run-misplaced-1");
+
+        // A heavy file the harness wrote into the project instead of the
+        // outbox: the exact case HAP-001-R32 calls misplaced.
+        std::fs::create_dir_all(project.0.join("docs")).expect("fixture dir");
+        let bytes = [b"%PDF-1.7\n".as_slice(), &[3u8; 64]].concat();
+        std::fs::write(project.0.join("docs/stray.pdf"), &bytes).expect("fixture file");
+
+        let wrong_root = std::sync::Arc::new(crate::wrong_root_state::WrongRootState::new());
+        let tracker = super::RunEndTracker::with_wrong_root_scan(
+            std::sync::Arc::clone(&runs),
+            id,
+            omnifrons_adapters::FsOutboxInventory::new(),
+            super::RunEndScan {
+                workspace: project.workspace(),
+                work_area: device.0.join("work-area"),
+                policy_store: omnifrons_adapters::JsonOutboxPolicyStore::new(),
+                state: std::sync::Arc::clone(&wrong_root),
+            },
+        );
+        let mut sequencer = AdapterWireSequencer::with_outbox(ProcessIdDto(31), tracker);
+        let emitted = drive_publishing(&mut sequencer, vec![state_frame(0, 0)]);
+
+        let summary: Vec<_> = emitted.iter().map(summarize).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, 0, "candidates"),
+                (1, 0, "misplaced"),
+                (2, 0, "terminal")
+            ],
+            "misplaced rides after candidates and before the terminal state frame"
+        );
+        match &emitted[1] {
+            HarnessFrame::Event {
+                event:
+                    AdapterEventDto::Misplaced {
+                        scanned,
+                        findings,
+                        ignored,
+                        truncated,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(*findings, 1, "the stray heavy file is the one finding");
+                assert_eq!(*ignored, 0);
+                assert!(*scanned >= 1);
+                assert!(!*truncated);
+            }
+            other => panic!("expected the misplaced event, got {other:?}"),
+        }
+        let wire = serde_json::to_string(&emitted).expect("frames serialize");
+        assert!(
+            !wire.contains("stray.pdf") && !wire.contains(project.0.to_string_lossy().as_ref()),
+            "the run-end event carries counts only: no name and no path"
+        );
+        assert_eq!(
+            wrong_root
+                .findings(Some(&crate::ipc::wrong_root::project_identity_of(
+                    &project.workspace()
+                )))
+                .len(),
+            1,
+            "the scan leaves its findings where misplaced_list reads them"
+        );
+    }
+
+    /// R3-011: a run-end scan that could not run emits the fixed
+    /// `diagnostic` in the `misplaced` frame's place -- never a claim that
+    /// nothing was misplaced. The text is fixed and carries no path.
+    #[test]
+    fn a_run_end_scan_that_cannot_run_emits_the_fixed_diagnostic_and_never_a_clean_claim() {
+        use crate::ipc::dto::AdapterEventDto;
+
+        let project = TempProject::new("run-end-scan-failed");
+        let id = omnifrons_app::ProcessId(41);
+        let (runs, _run_path) = prepared_run(&project, id, "run-scan-failed-1");
+
+        let wrong_root = std::sync::Arc::new(crate::wrong_root_state::WrongRootState::new());
+        let tracker = super::RunEndTracker::with_wrong_root_scan(
+            std::sync::Arc::clone(&runs),
+            id,
+            omnifrons_adapters::FsOutboxInventory::new(),
+            super::RunEndScan {
+                workspace: project.workspace(),
+                // Inside the project: HAP-001-R7 refuses it, so the scan
+                // cannot run at all.
+                work_area: project.0.join("inside-work-area"),
+                policy_store: omnifrons_adapters::JsonOutboxPolicyStore::new(),
+                state: std::sync::Arc::clone(&wrong_root),
+            },
+        );
+        let mut sequencer = AdapterWireSequencer::with_outbox(ProcessIdDto(41), tracker);
+        let emitted = drive_publishing(&mut sequencer, vec![state_frame(0, 0)]);
+
+        let summary: Vec<_> = emitted.iter().map(summarize).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, 0, "candidates"),
+                (1, 0, "diagnostic"),
+                (2, 0, "terminal")
+            ],
+            "the diagnostic takes the misplaced frame's place, in the same position"
+        );
+        match &emitted[1] {
+            HarnessFrame::Event {
+                event: AdapterEventDto::Diagnostic { text },
+                ..
+            } => assert_eq!(
+                text, "the project could not be scanned for output written outside the outbox",
+                "the diagnostic is fixed text, never a path and never a reason a caller composed"
+            ),
+            other => panic!("expected the fixed diagnostic, got {other:?}"),
+        }
+        assert!(
+            !emitted
+                .iter()
+                .any(|frame| matches!(summarize(frame).2, "misplaced")),
+            "a scan that did not run never claims a count"
+        );
+        assert_eq!(
+            wrong_root.summary(Some(&crate::ipc::wrong_root::project_identity_of(
+                &project.workspace()
+            ))),
+            (false, 0),
+            "and it records nothing"
+        );
+    }
+
+    /// R3-011: a launch with **no** run record still scans. The outbox half
+    /// is empty for such a launch -- no `candidates` frame at all -- so
+    /// `misplaced` becomes the first event of the launch, and its `seq`
+    /// still runs contiguously into the terminal frame. Nothing asserted
+    /// that ordering before, and "after candidates" is not a rule that can
+    /// be checked when there are none.
+    #[test]
+    fn a_launch_with_no_record_still_emits_misplaced_as_its_first_event() {
+        use crate::ipc::dto::AdapterEventDto;
+
+        let project = TempProject::new("run-end-no-record");
+        let device = TempProject::new("run-end-no-record-device");
+        std::fs::create_dir_all(project.0.join("docs")).expect("fixture dir");
+        std::fs::write(
+            project.0.join("docs/stray.pdf"),
+            [b"%PDF-1.7\n".as_slice(), &[4u8; 64]].concat(),
+        )
+        .expect("fixture file");
+
+        // No `prepared_run`: the table has no record for this id at all.
+        let runs = std::sync::Arc::new(std::sync::Mutex::new(super::RunTable::default()));
+        let id = omnifrons_app::ProcessId(42);
+        let wrong_root = std::sync::Arc::new(crate::wrong_root_state::WrongRootState::new());
+        let tracker = super::RunEndTracker::with_wrong_root_scan(
+            std::sync::Arc::clone(&runs),
+            id,
+            omnifrons_adapters::FsOutboxInventory::new(),
+            super::RunEndScan {
+                workspace: project.workspace(),
+                work_area: device.0.join("work-area"),
+                policy_store: omnifrons_adapters::JsonOutboxPolicyStore::new(),
+                state: std::sync::Arc::clone(&wrong_root),
+            },
+        );
+        let mut sequencer = AdapterWireSequencer::with_outbox(ProcessIdDto(42), tracker);
+        let emitted = drive_publishing(&mut sequencer, vec![state_frame(0, 0)]);
+
+        let summary: Vec<_> = emitted.iter().map(summarize).collect();
+        assert_eq!(
+            summary,
+            vec![(0, 0, "misplaced"), (1, 0, "terminal")],
+            "with no record there is no candidates frame, and misplaced still precedes terminal \
+             on a contiguous seq"
+        );
+        match &emitted[0] {
+            HarnessFrame::Event {
+                event: AdapterEventDto::Misplaced { findings, .. },
+                ..
+            } => assert_eq!(*findings, 1),
+            other => panic!("expected the misplaced event, got {other:?}"),
+        }
+    }
+
     /// A proposal naming a digest no entry carries is surfaced as a
     /// `diagnostic` event before the `candidates` summary, naming the
     /// proposed name and the digest's short prefix only.
@@ -3686,10 +3978,12 @@ mod tests {
         let outbox_state = crate::outbox_state::OutboxState::new();
         let publication_state = crate::publication_state::PublicationState::under(&device.0);
 
+        let wrong_root = crate::wrong_root_state::WrongRootState::new();
         let dto = super::activate_workspace(
             &adapter_state,
             &outbox_state,
             &publication_state,
+            &wrong_root,
             project_a.workspace(),
         );
         assert_eq!(
@@ -3712,6 +4006,7 @@ mod tests {
             &adapter_state,
             &outbox_state,
             &publication_state,
+            &wrong_root,
             project_b.workspace(),
         );
 
@@ -3738,6 +4033,57 @@ mod tests {
         );
     }
 
+    /// Spike slice 5d: a wrong-root finding is a fact about *one* project,
+    /// recomputed and never persisted, so a workspace change forgets the
+    /// whole scan -- one project's misplaced files never speak for the
+    /// next.
+    #[test]
+    fn picking_a_different_workspace_forgets_the_previous_workspaces_scan() {
+        let project_a = TempProject::new("activate-scan-a");
+        let project_b = TempProject::new("activate-scan-b");
+        let device = TempProject::new("activate-scan-device");
+        let adapter_state = crate::adapter_state::AdapterState::new();
+        let outbox_state = crate::outbox_state::OutboxState::new();
+        let publication_state = crate::publication_state::PublicationState::under(&device.0);
+        let wrong_root = crate::wrong_root_state::WrongRootState::new();
+
+        super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &publication_state,
+            &wrong_root,
+            project_a.workspace(),
+        );
+        std::fs::create_dir_all(project_a.0.join("docs")).expect("fixture dir");
+        std::fs::write(
+            project_a.0.join("docs/stray.pdf"),
+            [b"%PDF-1.7\n".as_slice(), &[5u8; 32]].concat(),
+        )
+        .expect("fixture file");
+        crate::ipc::wrong_root::wrong_root_scan_for(
+            &outbox_state,
+            &project_a.workspace(),
+            &publication_state,
+            &wrong_root,
+        )
+        .expect("scan");
+        let identity = crate::ipc::wrong_root::project_identity_of(&project_a.workspace());
+        assert_eq!(wrong_root.summary(Some(&identity)), (true, 1));
+
+        super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &publication_state,
+            &wrong_root,
+            project_b.workspace(),
+        );
+        assert_eq!(
+            wrong_root.summary(Some(&identity)),
+            (false, 0),
+            "the previous workspace's scan is forgotten entirely"
+        );
+    }
+
     /// R1-010: picking the workspace that is already active is not a
     /// change -- its runs and handles are kept.
     #[test]
@@ -3747,10 +4093,12 @@ mod tests {
         let adapter_state = crate::adapter_state::AdapterState::new();
         let outbox_state = crate::outbox_state::OutboxState::new();
         let publication_state = crate::publication_state::PublicationState::under(&device.0);
+        let wrong_root = crate::wrong_root_state::WrongRootState::new();
         super::activate_workspace(
             &adapter_state,
             &outbox_state,
             &publication_state,
+            &wrong_root,
             project.workspace(),
         );
         let id = omnifrons_app::ProcessId(33);
@@ -3763,6 +4111,7 @@ mod tests {
             &adapter_state,
             &outbox_state,
             &publication_state,
+            &wrong_root,
             project.workspace(),
         );
 
@@ -3784,8 +4133,13 @@ mod tests {
 
         let inside =
             crate::publication_state::PublicationState::under(&project.0.join(".omnifrons"));
-        let dto =
-            super::activate_workspace(&adapter_state, &outbox_state, &inside, project.workspace());
+        let dto = super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &inside,
+            &crate::wrong_root_state::WrongRootState::new(),
+            project.workspace(),
+        );
         assert_eq!(
             dto.work_area,
             crate::ipc::dto::WorkAreaStateTag::WorkAreaInvalid
@@ -3796,8 +4150,13 @@ mod tests {
         );
 
         let outside = crate::publication_state::PublicationState::under(&device.0);
-        let dto =
-            super::activate_workspace(&adapter_state, &outbox_state, &outside, project.workspace());
+        let dto = super::activate_workspace(
+            &adapter_state,
+            &outbox_state,
+            &outside,
+            &crate::wrong_root_state::WrongRootState::new(),
+            project.workspace(),
+        );
         assert_eq!(dto.work_area, crate::ipc::dto::WorkAreaStateTag::Valid);
         assert!(
             !device.0.join("work-area").exists(),

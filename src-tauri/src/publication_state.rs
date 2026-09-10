@@ -31,6 +31,13 @@ pub const WORK_AREA_DIR: &str = "work-area";
 /// directory; each asset root identity is one subdirectory of it.
 pub const ASSET_ROOTS_DIR: &str = "asset-roots";
 
+/// The quarantine directory's name under the application-data directory
+/// (spike slice 5d, RCS-001-R10 and its D3): a **sibling** of the work
+/// area, never inside it -- HAP-001 fixes the work area's contents as the
+/// journal, the recovery entries, and the snapshots, and a quarantined
+/// file is none of those.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
 /// This shell's managed state for the publication surface: the configured
 /// paths, re-validated at every use, and the surface lock.
 #[derive(Debug)]
@@ -40,6 +47,11 @@ pub struct PublicationState {
     /// The parent of every device asset path: `<asset_roots>/<asset root
     /// id>` is where an asset root's contents are materialized.
     pub asset_roots: PathBuf,
+    /// The configured quarantine directory (spike slice 5d): RCS-001's
+    /// landing place for content the product holds but never executes,
+    /// re-canonicalized and re-checked against the active workspace at
+    /// every use like the work area.
+    pub quarantine: PathBuf,
     /// The publication surface lock: held across a whole approve, publish,
     /// or list, so the Catalog's replay-then-append is never interleaved.
     surface: Mutex<()>,
@@ -54,6 +66,7 @@ impl PublicationState {
         Self {
             work_area: app_local_data_dir.join(WORK_AREA_DIR),
             asset_roots: app_local_data_dir.join(ASSET_ROOTS_DIR),
+            quarantine: app_local_data_dir.join(QUARANTINE_DIR),
             surface: Mutex::new(()),
         }
     }
@@ -73,7 +86,7 @@ impl PublicationState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSET_ROOTS_DIR, PublicationState, WORK_AREA_DIR};
+    use super::{ASSET_ROOTS_DIR, PublicationState, QUARANTINE_DIR, WORK_AREA_DIR};
 
     #[test]
     fn the_default_paths_sit_under_the_application_data_directory() {
@@ -83,6 +96,14 @@ mod tests {
         assert_eq!(state.asset_roots, base.join(ASSET_ROOTS_DIR));
         assert_eq!(WORK_AREA_DIR, "work-area");
         assert_eq!(ASSET_ROOTS_DIR, "asset-roots");
+        // Spike slice 5d: the quarantine directory is a sibling of the
+        // work area, never inside it (RCS-001 D3).
+        assert_eq!(state.quarantine, base.join(QUARANTINE_DIR));
+        assert_eq!(QUARANTINE_DIR, "quarantine");
+        assert!(
+            !state.quarantine.starts_with(&state.work_area),
+            "the quarantine directory is a sibling of the work area, not part of it"
+        );
     }
 
     /// The surface lock is one lock: a second take waits for the first

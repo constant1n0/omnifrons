@@ -329,12 +329,14 @@ pub struct ProposedEntryDto {
 /// literal `kind`/`payload` field names [`HarnessFrame::Event`] flattens
 /// this into come from here.
 ///
-/// Two kinds are the shell's own rather than an adapter's (spike slice 5):
-/// `artifact-publish` is the typed proposal a line agent recognized, and
-/// `candidates` is emitted once per adapter launch at run end, before the
-/// terminal `state` frame, summarizing the run subdirectory's inventory
-/// by state and attribution -- counts only, never a path
-/// (`docs/spike-log.md` § Slice 5).
+/// Three kinds are the shell's own rather than an adapter's:
+/// `artifact-publish` is the typed proposal a line agent recognized
+/// (spike slice 5); `candidates` is emitted once per adapter launch at run
+/// end, before the terminal `state` frame, summarizing the run
+/// subdirectory's inventory by state and attribution; and `misplaced`
+/// (spike slice 5d) follows it with the wrong-root scan's own counts --
+/// HAP-001 D16's post-run scan. Both carry counts only, never a name and
+/// never a path (`docs/spike-log.md` § Slice 5, § Slice 5d).
 ///
 /// `Unknown::raw` is rendered as a plain (lossily decoded) string, never
 /// base64 or a byte array: every `raw` this slice's own adapters ever
@@ -405,6 +407,14 @@ pub enum AdapterEventDto {
         unattributed: u32,
         unreadable: u32,
         unmatched_proposals: u32,
+    },
+    Misplaced {
+        scanned: u32,
+        findings: u32,
+        ignored: u32,
+        excluded: u32,
+        unreadable: u32,
+        truncated: bool,
     },
 }
 
@@ -1218,6 +1228,173 @@ impl SnapshotDto {
     }
 }
 
+/// [`omnifrons_domain::wrong_root::OutputDiscipline`], as it crosses IPC
+/// (spike slice 5d, HAP-001-R33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputDisciplineTag {
+    Enforced,
+    Advisory,
+}
+
+impl From<omnifrons_domain::wrong_root::OutputDiscipline> for OutputDisciplineTag {
+    fn from(discipline: omnifrons_domain::wrong_root::OutputDiscipline) -> Self {
+        use omnifrons_domain::wrong_root::OutputDiscipline;
+        match discipline {
+            OutputDiscipline::Enforced => Self::Enforced,
+            OutputDiscipline::Advisory => Self::Advisory,
+        }
+    }
+}
+
+/// `wrongroot_status`'s payload (spike slice 5d): the output-discipline
+/// label the active scope reports, the scope mode it was derived from,
+/// every disclosure HAP-001-R33 and R34 fix -- carried as text so the
+/// renderer states them verbatim rather than composing its own -- and
+/// whether a scan has run in this session, with how many findings it left
+/// standing. Never a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrongRootStatusDto {
+    pub output_discipline: OutputDisciplineTag,
+    pub scope_mode: ScopeModeDto,
+    pub disclosures: Vec<String>,
+    pub scanned: bool,
+    pub findings: u32,
+}
+
+impl WrongRootStatusDto {
+    /// The status for `discipline` under `mode`, with the disclosures the
+    /// domain fixes.
+    #[must_use]
+    pub fn of(
+        discipline: omnifrons_domain::wrong_root::OutputDiscipline,
+        mode: omnifrons_domain::scope::ScopeMode,
+        scanned: bool,
+        findings: u32,
+    ) -> Self {
+        Self {
+            output_discipline: discipline.into(),
+            scope_mode: mode.into(),
+            disclosures: discipline
+                .disclosures()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            scanned,
+            findings,
+        }
+    }
+}
+
+/// One `misplaced` file, as `misplaced_list` returns it (spike slice 5d):
+/// the project-relative name it was found at -- producer-supplied text a
+/// consumer renders as plain text only -- the facts taken from its own
+/// handle, why it is misplaced, and the three remedies HAP-001-R32 offers.
+/// Never a device path (RCS-001-R14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MisplacedDto {
+    pub name: String,
+    pub size: u64,
+    /// The full 64-hex content digest: the identity fact
+    /// `misplaced_remedy` names the finding by, exactly as
+    /// `artifact_approve` names a candidate.
+    pub sha256: String,
+    pub sha256_short: String,
+    pub detected_type: String,
+    pub class: String,
+    pub reason: String,
+    pub remedies: Vec<String>,
+}
+
+impl MisplacedDto {
+    /// The row for `finding`.
+    #[must_use]
+    pub fn from_finding(finding: &omnifrons_domain::wrong_root::MisplacedFinding) -> Self {
+        Self {
+            name: finding.name().to_string(),
+            size: finding.size,
+            sha256: finding.digest.to_hex(),
+            sha256_short: finding.digest.short_hex(),
+            detected_type: finding.detected_type.as_str().to_string(),
+            class: finding.class.as_str().to_string(),
+            reason: finding.reason.as_str().to_string(),
+            remedies: omnifrons_domain::wrong_root::Remedy::ALL
+                .iter()
+                .map(|remedy| remedy.as_str().to_string())
+                .collect(),
+        }
+    }
+}
+
+/// `wrongroot_scan`'s payload (spike slice 5d): what the walk saw. Counts
+/// only; the findings themselves come from `misplaced_list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MisplacedScanDto {
+    pub scanned: u32,
+    pub findings: u32,
+    pub ignored: u32,
+    pub excluded: u32,
+    pub unreadable: u32,
+    pub truncated: bool,
+}
+
+/// [`omnifrons_domain::wrong_root::Remedy`], as it crosses IPC: the
+/// closed set of three, and nothing else (HAP-001-R32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemedyTag {
+    Quarantine,
+    Publish,
+    Ignore,
+}
+
+impl From<RemedyTag> for omnifrons_domain::wrong_root::Remedy {
+    fn from(tag: RemedyTag) -> Self {
+        match tag {
+            RemedyTag::Quarantine => Self::Quarantine,
+            RemedyTag::Publish => Self::Publish,
+            RemedyTag::Ignore => Self::Ignore,
+        }
+    }
+}
+
+/// What a remedy actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemedyOutcomeTag {
+    /// The file was moved into the quarantine directory.
+    Quarantined,
+    /// The file's bytes were copied into the outbox as a new unattributed
+    /// entry; nothing is published until that entry is approved.
+    CopiedToOutbox,
+    /// The decision was recorded against the file's name and digest.
+    Ignored,
+}
+
+/// `misplaced_remedy`'s payload (spike slice 5d): which remedy ran, what
+/// it did, and -- for the two that produce something -- the logical name
+/// of what it produced and that thing's digest. `name` is a quarantined
+/// file's sanitized name or the new outbox entry's name, one component
+/// either way; never a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MisplacedRemedyDto {
+    pub remedy: RemedyTag,
+    pub outcome: RemedyOutcomeTag,
+    pub name: Option<String>,
+    pub sha256: Option<String>,
+    /// Quarantine only: whether the original was kept because this
+    /// platform could not prove the name still held it or could not
+    /// remove it (HAP-001-R19's residual, stated rather than silent).
+    pub original_kept: Option<bool>,
+    /// A fixed token qualifying the outcome (why the original was kept,
+    /// or which move ran); never free text and never a path.
+    pub detail: Option<String>,
+}
+
 /// The closed set of error codes a failed IPC command reports. Fixed and
 /// exhaustive: every value the renderer can compare against structurally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1345,6 +1522,19 @@ pub enum ShellErrorCode {
     /// The snapshot store under the work area could not be read, is
     /// corrupt, or could not be written (spike slice 5c).
     SnapshotUnavailable,
+    /// `misplaced_remedy` named a finding this shell's last scan did not
+    /// report, or reported at a different digest: the surface is stale and
+    /// nothing was moved, copied, or recorded (spike slice 5d,
+    /// HAP-001-R32).
+    MisplacedUnknown,
+    /// The quarantine directory resolves inside a registered workspace
+    /// root, could not be created owner-only, or could not be written; the
+    /// file stays exactly where it was found (spike slice 5d,
+    /// RCS-001-R10).
+    QuarantineUnavailable,
+    /// The wrong-root scan could not walk the active workspace root, so no
+    /// verdict is claimed for it (spike slice 5d).
+    ScanFailed,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -3057,5 +3247,218 @@ mod tests {
                 "observedSha256Short": "bbbbbbbb",
             })
         );
+    }
+
+    // -- Slice 5d: wrong-root detection, the three remedies, and the
+    // run-end `misplaced` event --
+
+    /// `wrongroot_status`'s payload: the output-discipline label, every
+    /// disclosure HAP-001-R33 and R34 fix, and whether a scan has run.
+    /// Never a path.
+    #[test]
+    fn wrong_root_status_dto_json_shape() {
+        let dto = super::WrongRootStatusDto::of(
+            omnifrons_domain::wrong_root::OutputDiscipline::Advisory,
+            omnifrons_domain::scope::ScopeMode::Advisory,
+            false,
+            0,
+        );
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "outputDiscipline": "advisory",
+                "scopeMode": "advisory",
+                "disclosures": [
+                    "a write inside the project but outside the outbox is detected after the \
+                     run, never prevented",
+                    "a write outside the project is possible and is detected after the run, \
+                     not prevented",
+                ],
+                "scanned": false,
+                "findings": 0,
+            })
+        );
+        let enforced = super::WrongRootStatusDto::of(
+            omnifrons_domain::wrong_root::OutputDiscipline::Enforced,
+            omnifrons_domain::scope::ScopeMode::SandboxEnforced,
+            true,
+            2,
+        );
+        assert_eq!(
+            json(&enforced)["outputDiscipline"],
+            serde_json::json!("enforced")
+        );
+        assert_eq!(
+            json(&enforced)["disclosures"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1,
+            "HAP-001-R34's disclosure is carried even under sandbox-enforced scope"
+        );
+    }
+
+    /// `misplaced_list`'s row: the project-relative name, the facts taken
+    /// from the file's own handle, the reason, and the three remedies --
+    /// never a device path (RCS-001-R14).
+    #[test]
+    fn misplaced_dto_json_shape() {
+        let finding = omnifrons_domain::wrong_root::MisplacedFinding::new(
+            "docs/report.pdf",
+            4096,
+            omnifrons_domain::executable::Sha256Digest([0xab; 32]),
+            omnifrons_domain::outbox::DetectedType::Pdf,
+            omnifrons_domain::outbox::ArtifactClass::GeneratedHeavy,
+            omnifrons_domain::wrong_root::WrongRootReason::InProjectOutsideOutbox,
+        )
+        .expect("a project-relative name");
+        assert_eq!(
+            json(&super::MisplacedDto::from_finding(&finding)),
+            serde_json::json!({
+                "name": "docs/report.pdf",
+                "size": 4096,
+                "sha256": "ab".repeat(32),
+                "sha256Short": "abababab",
+                "detectedType": "pdf",
+                "class": "generated-heavy",
+                "reason": "in-project-outside-outbox",
+                "remedies": ["quarantine", "publish", "ignore"],
+            })
+        );
+    }
+
+    /// The run-end `misplaced` event: counts only, never a name or a path.
+    #[test]
+    fn misplaced_event_frame_json_shape() {
+        let frame = HarnessFrame::event_dto(
+            ProcessIdDto(42),
+            10,
+            0,
+            super::AdapterEventDto::Misplaced {
+                scanned: 12,
+                findings: 2,
+                ignored: 1,
+                excluded: 3,
+                unreadable: 0,
+                truncated: false,
+            },
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 10, "droppedBefore": 0,
+                    "kind": "misplaced",
+                    "payload": {
+                        "scanned": 12, "findings": 2, "ignored": 1,
+                        "excluded": 3, "unreadable": 0, "truncated": false
+                    }
+                }
+            })
+        );
+    }
+
+    /// `misplaced_remedy`'s payload, one shape per remedy.
+    ///
+    /// Each fixture is the shape the command actually emits (R3-021): a
+    /// quarantine always carries its fixed `detail` token, an ignore always
+    /// carries the digest it bound to and `originalKept: true`, and a
+    /// publish carries the new entry's name with a null `detail`. A fixture
+    /// that contradicts its producer pins a wire nothing sends.
+    #[test]
+    fn misplaced_remedy_dto_json_shape() {
+        let quarantined = super::MisplacedRemedyDto {
+            remedy: super::RemedyTag::Quarantine,
+            outcome: super::RemedyOutcomeTag::Quarantined,
+            name: Some("abababab-report.pdf".to_string()),
+            sha256: Some("ab".repeat(32)),
+            original_kept: Some(false),
+            detail: Some("renamed".to_string()),
+        };
+        assert_eq!(
+            json(&quarantined),
+            serde_json::json!({
+                "remedy": "quarantine",
+                "outcome": "quarantined",
+                "name": "abababab-report.pdf",
+                "sha256": "ab".repeat(32),
+                "originalKept": false,
+                "detail": "renamed",
+            })
+        );
+        let published = super::MisplacedRemedyDto {
+            remedy: super::RemedyTag::Publish,
+            outcome: super::RemedyOutcomeTag::CopiedToOutbox,
+            name: Some("abababab-report.pdf".to_string()),
+            sha256: Some("ab".repeat(32)),
+            original_kept: Some(true),
+            detail: None,
+        };
+        assert_eq!(
+            json(&published),
+            serde_json::json!({
+                "remedy": "publish",
+                "outcome": "copied-to-outbox",
+                "name": "abababab-report.pdf",
+                "sha256": "ab".repeat(32),
+                "originalKept": true,
+                "detail": null,
+            })
+        );
+        let ignored = super::MisplacedRemedyDto {
+            remedy: super::RemedyTag::Ignore,
+            outcome: super::RemedyOutcomeTag::Ignored,
+            name: None,
+            sha256: Some("ab".repeat(32)),
+            original_kept: Some(true),
+            detail: None,
+        };
+        assert_eq!(
+            json(&ignored),
+            serde_json::json!({
+                "remedy": "ignore",
+                "outcome": "ignored",
+                "name": null,
+                "sha256": "ab".repeat(32),
+                "originalKept": true,
+                "detail": null,
+            })
+        );
+    }
+
+    /// `misplaced_remedy`'s `remedy` field parses the three tokens and
+    /// nothing else.
+    #[test]
+    fn remedy_tag_deserializes_from_kebab_case_only() {
+        for remedy in omnifrons_domain::wrong_root::Remedy::ALL {
+            let parsed: super::RemedyTag =
+                serde_json::from_str(&format!("\"{}\"", remedy.as_str())).expect("token");
+            assert_eq!(json(&parsed), serde_json::json!(remedy.as_str()));
+        }
+        assert!(serde_json::from_str::<super::RemedyTag>("\"delete\"").is_err());
+        assert!(serde_json::from_str::<super::RemedyTag>("\"Quarantine\"").is_err());
+    }
+
+    /// The three slice-5d error codes each render as their documented
+    /// kebab-case token.
+    #[test]
+    fn slice_5d_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::MisplacedUnknown, "misplaced-unknown"),
+            (
+                ShellErrorCode::QuarantineUnavailable,
+                "quarantine-unavailable",
+            ),
+            (ShellErrorCode::ScanFailed, "scan-failed"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+            assert!(
+                !error.message.contains('/') && !error.message.contains('\\'),
+                "a catalogue message never carries a path separator"
+            );
+        }
     }
 }

@@ -5,3 +5,4 @@ pub mod commands;
 pub mod dto;
 pub mod guidance;
 pub mod publication;
+pub mod wrong_root;
