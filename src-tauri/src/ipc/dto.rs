@@ -857,7 +857,12 @@ impl PortableReferenceDto {
 pub struct ArtifactApprovalDto {
     pub approval_id: String,
     pub publication_id: String,
-    pub run_id: String,
+    /// The run whose run-end inventory listed the candidate; `null` for an
+    /// approval made from the whole-outbox inventory (`artifact_approve`
+    /// with `runId: null`, spike slice 5c), which lists without a run --
+    /// the run subdirectory such an entry sits under, if any, is a location
+    /// fact its `name` carries, never provenance (HAP-001-R11).
+    pub run_id: Option<String>,
     pub name: String,
     pub display_name: String,
     pub sha256_short: String,
@@ -868,16 +873,28 @@ pub struct ArtifactApprovalDto {
     pub asset_root_id: String,
     pub act_as: ActAsTag,
     pub approved_at: u64,
+    /// Whether the entry's handle is held for the publication that follows
+    /// (HAP-001-R17): `false` when HAP-001 D22's cap left no room for it,
+    /// in which case the publication re-opens the entry under the
+    /// single-handle discipline when its turn comes -- said here rather
+    /// than left silent (spike slice 5c).
+    pub handle_held: bool,
 }
 
 impl ArtifactApprovalDto {
     #[must_use]
-    pub fn from_approval(approval: &omnifrons_domain::publication::ArtifactApproval) -> Self {
+    pub fn from_approval(
+        approval: &omnifrons_domain::publication::ArtifactApproval,
+        handle_held: bool,
+    ) -> Self {
         use omnifrons_domain::outbox::Attribution;
         Self {
             approval_id: approval.approval_id.to_hex(),
             publication_id: approval.publication_id.to_hex(),
-            run_id: approval.run_id.as_str().to_string(),
+            run_id: approval
+                .run_id
+                .as_ref()
+                .map(|run_id| run_id.as_str().to_string()),
             name: approval.name.clone(),
             display_name: approval.display_name.as_str().to_string(),
             sha256_short: approval.digest.short_hex(),
@@ -893,6 +910,7 @@ impl ArtifactApprovalDto {
             asset_root_id: approval.asset_root_id.as_str().to_string(),
             act_as: ActAsTag::DeviceLocalUser,
             approved_at: system_time_to_millis(approval.approved_at),
+            handle_held,
         }
     }
 }
@@ -1001,6 +1019,205 @@ impl ArtifactStateFrame {
     }
 }
 
+/// [`omnifrons_domain::guidance::ManagedFileKind`], as it crosses IPC
+/// both ways (spike slice 5c): the `kind` of every guidance command,
+/// `"guidance"` or `"ignore"` and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedFileKindDto {
+    Guidance,
+    Ignore,
+}
+
+impl From<omnifrons_domain::guidance::ManagedFileKind> for ManagedFileKindDto {
+    fn from(kind: omnifrons_domain::guidance::ManagedFileKind) -> Self {
+        use omnifrons_domain::guidance::ManagedFileKind;
+        match kind {
+            ManagedFileKind::Guidance => Self::Guidance,
+            ManagedFileKind::Ignore => Self::Ignore,
+        }
+    }
+}
+
+impl From<ManagedFileKindDto> for omnifrons_domain::guidance::ManagedFileKind {
+    fn from(kind: ManagedFileKindDto) -> Self {
+        match kind {
+            ManagedFileKindDto::Guidance => Self::Guidance,
+            ManagedFileKindDto::Ignore => Self::Ignore,
+        }
+    }
+}
+
+/// [`omnifrons_domain::guidance::ManagedStatus`], as it crosses IPC: the
+/// token only (an outdated block's own version stays inside the shell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedStatusTag {
+    Absent,
+    Current,
+    Outdated,
+    Modified,
+    Malformed,
+}
+
+impl From<&omnifrons_domain::guidance::ManagedStatus> for ManagedStatusTag {
+    fn from(status: &omnifrons_domain::guidance::ManagedStatus) -> Self {
+        use omnifrons_domain::guidance::ManagedStatus;
+        match status {
+            ManagedStatus::Absent => Self::Absent,
+            ManagedStatus::Current => Self::Current,
+            ManagedStatus::Outdated { .. } => Self::Outdated,
+            ManagedStatus::Modified => Self::Modified,
+            ManagedStatus::Malformed => Self::Malformed,
+        }
+    }
+}
+
+/// What a guidance command did or would do (spike slice 5c): the apply
+/// plan's `insert`, `replace`, and `no-op`, plus the `remove` and
+/// `restore` outcomes of the commands of those names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuidanceActionTag {
+    Insert,
+    Replace,
+    NoOp,
+    Remove,
+    Restore,
+}
+
+impl From<omnifrons_domain::guidance::ApplyAction> for GuidanceActionTag {
+    fn from(action: omnifrons_domain::guidance::ApplyAction) -> Self {
+        use omnifrons_domain::guidance::ApplyAction;
+        match action {
+            ApplyAction::Insert => Self::Insert,
+            ApplyAction::Replace => Self::Replace,
+            ApplyAction::NoOp => Self::NoOp,
+        }
+    }
+}
+
+/// `guidance_status`'s payload (spike slice 5c): the managed file's name
+/// at the workspace root, whether it exists, the block's state, the
+/// template version the product would write, the file's full digest
+/// (what an apply or a removal binds to) beside its short form, and the
+/// snapshot counts. Never a device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuidanceStatusDto {
+    pub kind: ManagedFileKindDto,
+    pub file: String,
+    pub exists: bool,
+    pub managed: ManagedStatusTag,
+    pub template_version: String,
+    pub file_sha256: Option<String>,
+    pub file_sha256_short: Option<String>,
+    pub snapshots: u32,
+    pub pinned: u32,
+}
+
+impl GuidanceStatusDto {
+    #[must_use]
+    pub fn from_status(
+        kind: omnifrons_domain::guidance::ManagedFileKind,
+        status: &omnifrons_app::guidance::GuidanceStatus,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            file: status.file.clone(),
+            exists: status.exists,
+            managed: ManagedStatusTag::from(&status.managed),
+            template_version: omnifrons_domain::guidance::GUIDANCE_TEMPLATE_VERSION.to_string(),
+            file_sha256: status.file_sha256.map(|digest| digest.to_hex()),
+            file_sha256_short: status.file_sha256.map(|digest| digest.short_hex()),
+            snapshots: u32::try_from(status.snapshots).unwrap_or(u32::MAX),
+            pinned: u32::try_from(status.pinned).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// `guidance_preview`'s payload (spike slice 5c): the proposal the user
+/// disposes of (HAP-001 D18) -- the block as it would be written, the
+/// action, the file digest an apply must bind to, and the short digest of
+/// the whole file afterwards. Never a device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuidancePreviewDto {
+    pub kind: ManagedFileKindDto,
+    pub file: String,
+    pub action: GuidanceActionTag,
+    pub proposed: String,
+    pub file_sha256: Option<String>,
+    pub file_sha256_short: Option<String>,
+    pub result_sha256_short: String,
+}
+
+impl GuidancePreviewDto {
+    #[must_use]
+    pub fn from_preview(
+        kind: omnifrons_domain::guidance::ManagedFileKind,
+        preview: &omnifrons_app::guidance::GuidancePreview,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            file: preview.file.clone(),
+            action: preview.action.into(),
+            proposed: preview.proposed_block.clone(),
+            file_sha256: preview.file_sha256.map(|digest| digest.to_hex()),
+            file_sha256_short: preview.file_sha256.map(|digest| digest.short_hex()),
+            result_sha256_short: preview.result_sha256.short_hex(),
+        }
+    }
+}
+
+/// The payload of `guidance_apply`, `guidance_remove`, and
+/// `guidance_restore` (spike slice 5c): what was done, the snapshot taken
+/// before the write (`null` for a no-op), and the short digest of the
+/// whole file afterwards (`null` when the file was removed). Never a
+/// device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuidanceAppliedDto {
+    pub kind: ManagedFileKindDto,
+    pub file: String,
+    pub action: GuidanceActionTag,
+    pub snapshot_id: Option<String>,
+    pub result_sha256_short: Option<String>,
+}
+
+/// One snapshot, as `guidance_snapshots` lists it (spike slice 5c): its
+/// 16-hex id, the kind and file it recorded, whether the file existed,
+/// the short digest and size of the bytes recorded, the instant as ms
+/// since the epoch, and whether it is pinned. Never a device path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDto {
+    pub id: String,
+    pub kind: ManagedFileKindDto,
+    pub file: String,
+    pub existed: bool,
+    pub sha256_short: String,
+    pub size: u64,
+    pub taken_at: u64,
+    pub pinned: bool,
+}
+
+impl SnapshotDto {
+    #[must_use]
+    pub fn from_manifest(manifest: &omnifrons_app::snapshot_store::SnapshotManifest) -> Self {
+        Self {
+            id: manifest.id.to_hex(),
+            kind: manifest.kind.into(),
+            file: manifest.file.clone(),
+            existed: manifest.existed,
+            sha256_short: manifest.sha256.short_hex(),
+            size: manifest.size,
+            taken_at: system_time_to_millis(manifest.taken_at),
+            pinned: manifest.pinned,
+        }
+    }
+}
+
 /// The closed set of error codes a failed IPC command reports. Fixed and
 /// exhaustive: every value the renderer can compare against structurally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1104,6 +1321,30 @@ pub enum ShellErrorCode {
     /// mirroring the renderer's own guard so direct IPC cannot bypass it
     /// (spike slice 5b, renderer risk review R1-001).
     RunActive,
+    /// A guidance command named a file outside RCS-001's file-name rule
+    /// (a path, a reserved device name, not Markdown), or the managed file
+    /// is not a regular file, exceeds the size bound, is not valid UTF-8,
+    /// could not be read or written, or did not read back as written
+    /// (spike slice 5c, HAP-001 D18).
+    GuidanceFileInvalid,
+    /// The managed file's digest (or its absence) differs from the
+    /// `fileSha256` the request bound to: the surface is stale, nothing
+    /// was written (spike slice 5c).
+    GuidanceFileChanged,
+    /// The managed block was edited inside its sentinels; Omnifrons
+    /// neither replaces nor removes it -- the user resolves by hand or
+    /// restores a snapshot (spike slice 5c).
+    GuidanceBlockModified,
+    /// The managed block's sentinels are not one intact pair (spike slice
+    /// 5c).
+    GuidanceBlockMalformed,
+    /// `guidance_remove` found no managed block, or `guidance_restore` or
+    /// `guidance_pin` named a snapshot this project does not hold (spike
+    /// slice 5c).
+    GuidanceUnmanaged,
+    /// The snapshot store under the work area could not be read, is
+    /// corrupt, or could not be written (spike slice 5c).
+    SnapshotUnavailable,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -2393,7 +2634,7 @@ mod tests {
         let dto = super::ArtifactApprovalDto {
             approval_id: "0123456789abcdef".to_string(),
             publication_id: "ab".repeat(32),
-            run_id: "run-1".to_string(),
+            run_id: Some("run-1".to_string()),
             name: "run-1/report.pdf".to_string(),
             display_name: "report.pdf".to_string(),
             sha256_short: "abababab".to_string(),
@@ -2406,6 +2647,7 @@ mod tests {
             asset_root_id: "main".to_string(),
             act_as: super::ActAsTag::DeviceLocalUser,
             approved_at: 1_725_782_401_000,
+            handle_held: true,
         };
         assert_eq!(
             json(&dto),
@@ -2423,7 +2665,52 @@ mod tests {
                 "assetRootId": "main",
                 "actAs": "device-local-user",
                 "approvedAt": 1_725_782_401_000u64,
+                "handleHeld": true,
             })
+        );
+    }
+
+    /// An approval made from the whole-outbox inventory (spike slice 5c)
+    /// names no run: `runId` is `null`, the attribution is the
+    /// unattributed fact, and `handleHeld` says whether the re-opened
+    /// handle is held for the publication (false once the D22 cap is
+    /// full). The slice-5b shape is unchanged when a run is present.
+    #[test]
+    fn artifact_approval_dto_json_shape_for_a_whole_outbox_approval_has_a_null_run() {
+        let dto = super::ArtifactApprovalDto {
+            approval_id: "0123456789abcdef".to_string(),
+            publication_id: "ab".repeat(32),
+            run_id: None,
+            name: "dropped.pdf".to_string(),
+            display_name: "dropped.pdf".to_string(),
+            sha256_short: "abababab".to_string(),
+            size: 15,
+            detected_type: "pdf".to_string(),
+            class: "generated-heavy".to_string(),
+            attribution: super::AttributionDto::Unattributed,
+            asset_root_id: "main".to_string(),
+            act_as: super::ActAsTag::DeviceLocalUser,
+            approved_at: 1_725_782_401_000,
+            handle_held: false,
+        };
+        let value = json(&dto);
+        assert_eq!(value["runId"], serde_json::Value::Null);
+        assert_eq!(
+            value["attribution"],
+            serde_json::json!({"kind": "unattributed"})
+        );
+        assert_eq!(value["handleHeld"], serde_json::json!(false));
+        assert_eq!(value["name"], serde_json::json!("dropped.pdf"));
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.len(),
+            14,
+            "the thirteen slice-5b keys plus handleHeld, none a path: {keys:?}"
         );
     }
 
@@ -2546,6 +2833,192 @@ mod tests {
             let error = ShellError::new(code, "message");
             assert_eq!(json(&error)["code"], serde_json::json!(token));
         }
+    }
+
+    /// The six slice-5c error codes each render as their documented
+    /// kebab-case token.
+    #[test]
+    fn slice_5c_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::GuidanceFileInvalid, "guidance-file-invalid"),
+            (ShellErrorCode::GuidanceFileChanged, "guidance-file-changed"),
+            (
+                ShellErrorCode::GuidanceBlockModified,
+                "guidance-block-modified",
+            ),
+            (
+                ShellErrorCode::GuidanceBlockMalformed,
+                "guidance-block-malformed",
+            ),
+            (ShellErrorCode::GuidanceUnmanaged, "guidance-unmanaged"),
+            (ShellErrorCode::SnapshotUnavailable, "snapshot-unavailable"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+        }
+    }
+
+    /// `kind` on every guidance command is `"guidance"` or `"ignore"` and
+    /// nothing else.
+    #[test]
+    fn managed_file_kind_dto_deserializes_from_kebab_case_only() {
+        let guidance: super::ManagedFileKindDto =
+            serde_json::from_str("\"guidance\"").expect("guidance");
+        assert_eq!(guidance, super::ManagedFileKindDto::Guidance);
+        let ignore: super::ManagedFileKindDto = serde_json::from_str("\"ignore\"").expect("ignore");
+        assert_eq!(ignore, super::ManagedFileKindDto::Ignore);
+        assert!(serde_json::from_str::<super::ManagedFileKindDto>("\"other\"").is_err());
+        assert!(serde_json::from_str::<super::ManagedFileKindDto>("\"Guidance\"").is_err());
+        for kind in omnifrons_domain::guidance::ManagedFileKind::ALL {
+            assert_eq!(
+                json(&super::ManagedFileKindDto::from(kind)),
+                serde_json::json!(kind.as_str())
+            );
+            assert_eq!(
+                omnifrons_domain::guidance::ManagedFileKind::from(super::ManagedFileKindDto::from(
+                    kind
+                )),
+                kind
+            );
+        }
+    }
+
+    /// The status and preview payloads (spike slice 5c): camelCase keys,
+    /// fixed tokens, the digests short except the full `fileSha256` a
+    /// request binds to -- never a path.
+    #[test]
+    fn guidance_status_and_preview_dto_json_shapes() {
+        let status = super::GuidanceStatusDto {
+            kind: super::ManagedFileKindDto::Guidance,
+            file: "AGENTS.md".to_string(),
+            exists: true,
+            managed: super::ManagedStatusTag::Outdated,
+            template_version: "hap-001-guidance-v1".to_string(),
+            file_sha256: Some("ab".repeat(32)),
+            file_sha256_short: Some("abababab".to_string()),
+            snapshots: 2,
+            pinned: 1,
+        };
+        assert_eq!(
+            json(&status),
+            serde_json::json!({
+                "kind": "guidance",
+                "file": "AGENTS.md",
+                "exists": true,
+                "managed": "outdated",
+                "templateVersion": "hap-001-guidance-v1",
+                "fileSha256": "ab".repeat(32),
+                "fileSha256Short": "abababab",
+                "snapshots": 2,
+                "pinned": 1,
+            })
+        );
+        for (status, token) in [
+            (omnifrons_domain::guidance::ManagedStatus::Absent, "absent"),
+            (
+                omnifrons_domain::guidance::ManagedStatus::Current,
+                "current",
+            ),
+            (
+                omnifrons_domain::guidance::ManagedStatus::Outdated {
+                    version: "v0".to_string(),
+                },
+                "outdated",
+            ),
+            (
+                omnifrons_domain::guidance::ManagedStatus::Modified,
+                "modified",
+            ),
+            (
+                omnifrons_domain::guidance::ManagedStatus::Malformed,
+                "malformed",
+            ),
+        ] {
+            assert_eq!(
+                json(&super::ManagedStatusTag::from(&status)),
+                serde_json::json!(token)
+            );
+        }
+
+        let preview = super::GuidancePreviewDto {
+            kind: super::ManagedFileKindDto::Ignore,
+            file: ".gitignore".to_string(),
+            action: super::GuidanceActionTag::Insert,
+            proposed: "# omnifrons:begin ignore ...".to_string(),
+            file_sha256: None,
+            file_sha256_short: None,
+            result_sha256_short: "cdcdcdcd".to_string(),
+        };
+        assert_eq!(
+            json(&preview),
+            serde_json::json!({
+                "kind": "ignore",
+                "file": ".gitignore",
+                "action": "insert",
+                "proposed": "# omnifrons:begin ignore ...",
+                "fileSha256": null,
+                "fileSha256Short": null,
+                "resultSha256Short": "cdcdcdcd",
+            })
+        );
+        for (action, token) in [
+            (super::GuidanceActionTag::Insert, "insert"),
+            (super::GuidanceActionTag::Replace, "replace"),
+            (super::GuidanceActionTag::NoOp, "no-op"),
+            (super::GuidanceActionTag::Remove, "remove"),
+            (super::GuidanceActionTag::Restore, "restore"),
+        ] {
+            assert_eq!(json(&action), serde_json::json!(token));
+        }
+    }
+
+    /// The applied and snapshot payloads (spike slice 5c): ids as 16 hex,
+    /// short digests, instants as ms since the epoch, a removed file's
+    /// digest `null` -- never a path.
+    #[test]
+    fn guidance_applied_and_snapshot_dto_json_shapes() {
+        let applied = super::GuidanceAppliedDto {
+            kind: super::ManagedFileKindDto::Guidance,
+            file: "AGENTS.md".to_string(),
+            action: super::GuidanceActionTag::Remove,
+            snapshot_id: Some("0123456789abcdef".to_string()),
+            result_sha256_short: None,
+        };
+        assert_eq!(
+            json(&applied),
+            serde_json::json!({
+                "kind": "guidance",
+                "file": "AGENTS.md",
+                "action": "remove",
+                "snapshotId": "0123456789abcdef",
+                "resultSha256Short": null,
+            })
+        );
+
+        let snapshot = super::SnapshotDto {
+            id: "0123456789abcdef".to_string(),
+            kind: super::ManagedFileKindDto::Guidance,
+            file: "AGENTS.md".to_string(),
+            existed: false,
+            sha256_short: "e3b0c442".to_string(),
+            size: 0,
+            taken_at: 1_725_782_401_000,
+            pinned: true,
+        };
+        assert_eq!(
+            json(&snapshot),
+            serde_json::json!({
+                "id": "0123456789abcdef",
+                "kind": "guidance",
+                "file": "AGENTS.md",
+                "existed": false,
+                "sha256Short": "e3b0c442",
+                "size": 0,
+                "takenAt": 1_725_782_401_000u64,
+                "pinned": true,
+            })
+        );
     }
 
     /// `duplicate-publication` acknowledges the existing record in

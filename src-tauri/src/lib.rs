@@ -20,6 +20,10 @@ use ipc::commands::{
     executable_revoke, harness_observe, harness_spawn, harness_stop, outbox_status,
     workspace_current, workspace_pick,
 };
+use ipc::guidance::{
+    guidance_apply, guidance_pin, guidance_preview, guidance_remove, guidance_restore,
+    guidance_snapshots, guidance_status,
+};
 use ipc::publication::{artifact_approve, artifact_publish, publications_list};
 use omnifrons_supervisor::TokioProcessSupervisor;
 use outbox_state::OutboxState;
@@ -112,6 +116,13 @@ pub fn run() {
             artifact_approve,
             artifact_publish,
             publications_list,
+            guidance_status,
+            guidance_preview,
+            guidance_apply,
+            guidance_remove,
+            guidance_snapshots,
+            guidance_pin,
+            guidance_restore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

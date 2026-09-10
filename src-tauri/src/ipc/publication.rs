@@ -11,8 +11,19 @@
 //!
 //! The device paths never cross IPC (HAP-001-R5): a command returns
 //! logical identities, states, and the portable reference only.
+//!
+//! As of spike slice 5c an entry the whole-outbox inventory listed -- at
+//! the outbox root, or under a run subdirectory no remembered run's
+//! inventory covers -- is approvable too (`artifact_approve` with `runId:
+//! null`): the entry is re-opened once at approval time under the
+//! single-handle discipline, the approval binds the facts taken from that
+//! handle, the handle is held for the publication under the same D22 cap
+//! as a run entry's, and the record carries `producer: unattributed` with
+//! the run subdirectory, when there was one, as a location fact only
+//! (HAP-001-R11, R12, R17, R22, R36).
 
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -23,9 +34,10 @@ use omnifrons_adapters::{
 use omnifrons_app::blob_store::{BlobStoreError, DestinationError, DeviceAssetPath};
 use omnifrons_app::catalog_store::{CatalogStore as _, CatalogStoreError};
 use omnifrons_app::content_hasher::{
-    derive_artifact_approval_id, derive_project_identity, derive_publication_identity,
+    ContentHasher, derive_artifact_approval_id, derive_project_identity,
+    derive_publication_identity,
 };
-use omnifrons_app::outbox_policy::OutboxPolicyStore as _;
+use omnifrons_app::outbox_policy::{ArtifactClassifier as _, OutboxPolicyStore as _};
 use omnifrons_app::publication::{
     CandidateSource, PublishError, PublishPorts, Published, StateEvent, acknowledge_registered,
     journal_failure, publish, recover,
@@ -34,11 +46,12 @@ use omnifrons_app::publication_journal::{
     JournalError, PublicationJournal as _, find_approval, pending_registrations,
 };
 use omnifrons_app::run_outbox::{
-    CandidateProbe, CandidateProber as _, OutboxInventory as _, RunOutboxPreparer as _,
+    CandidateProbe, CandidateProber as _, DirectoryHandle, OutboxInventory as _, PrepareError,
+    RunOutboxPreparer as _,
 };
 use omnifrons_app::work_area::{WorkAreaError, WorkAreaRoot};
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
-use omnifrons_domain::outbox::{ArtifactClass, CandidateState, RunId};
+use omnifrons_domain::outbox::{ArtifactClass, Attribution, CandidateState, OutboxPath, RunId};
 use omnifrons_domain::publication::{
     ArtifactApproval, ArtifactApprovalId, ArtifactState, DisplayName, JournalEntry, JournalStep,
     ProjectIdentity, StepOutcome,
@@ -186,21 +199,24 @@ impl RunActivity for TokioProcessSupervisor {
     }
 }
 
-/// The fixed refusal while a run is active.
-fn run_active() -> ShellError {
+/// The fixed refusal while a run is active, shared with the guidance
+/// installer's writing commands (spike slice 5c).
+pub(crate) fn run_active() -> ShellError {
     ShellError::new(
         ShellErrorCode::RunActive,
         "a run is active; approve or publish once it has ended",
     )
 }
 
-/// `artifact_approve`'s request: the candidate named by its run, its
+/// `artifact_approve`'s request: the candidate named by the run whose
+/// run-end inventory listed it -- or by no run at all, for an entry the
+/// whole-outbox inventory listed (`runId: null`; spike slice 5c) -- its
 /// outbox-relative name as `candidates_list` listed it, and its full
 /// digest (HAP-001-R22: the approval binds identity facts, never a name
 /// alone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApproveRequest {
-    pub run_id: String,
+    pub run_id: Option<String>,
     pub name: String,
     pub sha256: String,
 }
@@ -213,31 +229,94 @@ fn refused(message: &str) -> ShellError {
     ShellError::new(ShellErrorCode::Refused, message)
 }
 
-/// The entry's own file name within its run subdirectory: the part of the
-/// outbox-relative name after `<run id>/`.
-fn file_name_of(approval: &ArtifactApproval) -> OsString {
-    let prefix = format!("{}/", approval.run_id);
-    OsString::from(
-        approval
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&approval.name),
-    )
+/// Where an outbox-relative name points: the run subdirectory it names as
+/// a prefix, if any, and the entry's own file name within that directory
+/// -- the shape the inventories build (`<run id>/<file>` one level down,
+/// `<file>` at the outbox root; HAP-001 D20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntryLocation {
+    under_run: Option<RunId>,
+    file_name: String,
+}
+
+impl EntryLocation {
+    /// Parse `name` as an inventory spells it: at most one `/`, a run id
+    /// before it, and one file-name component that is not empty, `.`, or
+    /// `..` and carries no separator on any platform.
+    fn parse(name: &str) -> Option<Self> {
+        let (under_run, file_name) = match name.split_once('/') {
+            Some((prefix, rest)) => (Some(RunId::new(prefix).ok()?), rest),
+            None => (None, name),
+        };
+        if matches!(file_name, "" | "." | "..") || file_name.contains(['/', '\\']) {
+            return None;
+        }
+        Some(Self {
+            under_run,
+            file_name: file_name.to_string(),
+        })
+    }
+
+    /// Where an approved entry sits: under the listing run's subdirectory
+    /// when the approval names one, else where its name says.
+    fn of(approval: &ArtifactApproval) -> Option<Self> {
+        match &approval.run_id {
+            Some(run_id) => {
+                let prefix = format!("{run_id}/");
+                let file_name = approval
+                    .name
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&approval.name);
+                Some(Self {
+                    under_run: Some(run_id.clone()),
+                    file_name: file_name.to_string(),
+                })
+            }
+            None => Self::parse(&approval.name),
+        }
+    }
+
+    /// The entry's own name within its directory.
+    fn file_name(&self) -> OsString {
+        OsString::from(&self.file_name)
+    }
+}
+
+/// Whether, and where, an approved entry's handle is held once the
+/// approval is recorded.
+enum Held {
+    /// A listed entry: the run record holds the handle, or the D22 cap
+    /// released it.
+    ByRun(bool),
+    /// A whole-outbox entry: the source re-opened at approval time, to be
+    /// held by the table for the publication.
+    Source(CandidateSource),
 }
 
 /// Approve the candidate `request` names for publication (HAP-001-R22,
-/// D3): an explicit, per-artifact action bound to the identity facts the
-/// run-end inventory took from the entry's handle. The approval is the
-/// publication journal's first entry for the publication, written under
-/// the work area after its re-check (HAP-001-R7).
+/// D3): an explicit, per-artifact action bound to identity facts taken
+/// from the entry's handle -- the run-end inventory's, when the request
+/// names the run that listed it, or, for an entry the whole-outbox
+/// inventory listed (`runId: null`; spike slice 5c), facts taken from the
+/// entry re-opened once, now, under the single-handle discipline
+/// (HAP-001-R15, R16, R20). The approval is the publication journal's
+/// first entry for the publication, written under the work area after its
+/// re-check (HAP-001-R7); a re-opened handle is then held for the
+/// publication and counted against HAP-001 D22's cap (HAP-001-R17).
 ///
 /// # Errors
 ///
-/// `invalid-request` for a run, name, or digest that names nothing;
-/// `refused` for an entry refused at validation, a digest that does not
-/// match, or any class but `generated-heavy`; `destination-invalid` when
-/// the project's policy declares no asset root; `work-area-invalid` when
-/// the work area fails its check or the journal cannot be written.
+/// `invalid-request` for a run, name, or digest that names nothing, or for
+/// a whole-outbox request naming an entry of a run the table remembers
+/// with its inventory; `refused` for an entry refused at validation, a
+/// listed digest that does not match, or any class but `generated-heavy`;
+/// `integrity-mismatch` when a re-opened entry's digest differs from the
+/// request's; `outbox-escape` and `outbox-linked` when the re-opened entry
+/// is not a regular file with a link count of one; `destination-invalid`
+/// when the project's policy declares no asset root; `outbox-invalid` and
+/// `outbox-unavailable` when the outbox cannot be opened for a re-open;
+/// `work-area-invalid` when the work area fails its check or the journal
+/// cannot be written.
 pub fn approve_candidate(
     outbox: &OutboxState,
     workspace: &omnifrons_app::WorkspaceRoot,
@@ -254,70 +333,26 @@ pub fn approve_candidate(
     if run_activity.any_running() {
         return Err(run_active());
     }
-    let run_id = RunId::new(&request.run_id).map_err(|_| invalid("the run id is not valid"))?;
     let digest = Sha256Digest::from_hex(&request.sha256)
         .ok_or_else(|| invalid("the digest is not 64 hex characters"))?;
     let hasher = Sha2Hasher::new();
     let project = derive_project_identity(&hasher, workspace);
 
-    let approval = {
-        let runs = outbox
-            .runs
-            .lock()
-            .expect("run table mutex poisoned by a prior panic");
-        let record = runs
-            .find_by_run_id(&run_id)
-            .ok_or_else(|| invalid("no run with that id is remembered"))?;
-        let candidates = record.candidates().ok_or_else(|| {
-            invalid("the run has not ended yet, so its subdirectory has not been inventoried")
-        })?;
-        let candidate = candidates
-            .iter()
-            .find(|candidate| candidate.entry.name == request.name)
-            .ok_or_else(|| invalid("no candidate with that name is listed for the run"))?;
-        if candidate.state != CandidateState::Candidate {
-            return Err(refused(
-                "the entry was refused at validation and cannot be approved",
-            ));
-        }
-        if candidate.entry.digest != digest {
-            return Err(refused(
-                "the candidate's digest does not match the approval request",
-            ));
-        }
-        if candidate.entry.class != ArtifactClass::GeneratedHeavy {
-            return Err(refused(
-                "only a generated-heavy candidate can be approved for publication",
-            ));
-        }
-        let asset_root_id = record
-            .policy()
-            .asset_root_id()
-            .cloned()
-            .ok_or_else(|| ShellError::from(DestinationError::Unconfigured))?;
-        let publication_id = derive_publication_identity(&hasher, &project, &digest);
-        let file_name = request
-            .name
-            .strip_prefix(&format!("{run_id}/"))
-            .unwrap_or(&request.name);
-        ArtifactApproval {
-            approval_id: derive_artifact_approval_id(&hasher, &publication_id, now),
-            publication_id,
-            project,
-            run_id: run_id.clone(),
-            name: request.name.clone(),
-            display_name: DisplayName::sanitize(file_name),
+    let (approval, held) = if let Some(token) = &request.run_id {
+        let (approval, held_by_run) =
+            approve_listed_entry(outbox, &hasher, &project, token, &request.name, digest, now)?;
+        (approval, Held::ByRun(held_by_run))
+    } else {
+        let (approval, source) = approve_whole_outbox_entry(
+            outbox,
+            workspace,
+            &hasher,
+            &project,
+            &request.name,
             digest,
-            size: candidate.entry.size,
-            detected_type: candidate.entry.detected_type,
-            class: candidate.entry.class,
-            attribution: candidate.entry.attribution.clone(),
-            asset_root_id,
-            adapter_id: record.adapter_id().cloned(),
-            executable_approval: record.executable_approval(),
-            approver: DeviceLocalUser,
-            approved_at: now,
-        }
+            now,
+        )?;
+        (approval, Held::Source(source))
     };
 
     // HAP-001-R7: the work area is checked before anything is recorded.
@@ -332,13 +367,254 @@ pub fn approve_candidate(
         ));
     }
     journal.append(&JournalEntry::Approved(Box::new(approval.clone())))?;
-    Ok(ArtifactApprovalDto::from_approval(&approval))
+    let handle_held = match held {
+        Held::ByRun(held) => held,
+        Held::Source(source) => hold_for_publication(&outbox.runs, approval.approval_id, source),
+    };
+    Ok(ArtifactApprovalDto::from_approval(&approval, handle_held))
 }
 
-/// Where a publication's bytes come from: the handle the run record held
-/// since validation, or -- when the record holds none (the D22 cap, an
-/// evicted record) -- a fresh open under the single-handle discipline
-/// (HAP-001-R15, R17) whose facts must equal the approved ones.
+/// The run-inventory path: the candidate is looked up in the remembered
+/// run's run-end inventory by its listed name, and the approval binds the
+/// facts that inventory took from the entry's handle, with the launch's
+/// provenance the record kept. Whether the record still holds the handle
+/// rides back with the approval.
+fn approve_listed_entry(
+    outbox: &OutboxState,
+    hasher: &dyn ContentHasher,
+    project: &ProjectIdentity,
+    token: &str,
+    name: &str,
+    digest: Sha256Digest,
+    now: SystemTime,
+) -> Result<(ArtifactApproval, bool), ShellError> {
+    let run_id = RunId::new(token).map_err(|_| invalid("the run id is not valid"))?;
+    let runs = outbox
+        .runs
+        .lock()
+        .expect("run table mutex poisoned by a prior panic");
+    let record = runs
+        .find_by_run_id(&run_id)
+        .ok_or_else(|| invalid("no run with that id is remembered"))?;
+    let candidates = record.candidates().ok_or_else(|| {
+        invalid("the run has not ended yet, so its subdirectory has not been inventoried")
+    })?;
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.entry.name == name)
+        .ok_or_else(|| invalid("no candidate with that name is listed for the run"))?;
+    if candidate.state != CandidateState::Candidate {
+        return Err(refused(
+            "the entry was refused at validation and cannot be approved",
+        ));
+    }
+    if candidate.entry.digest != digest {
+        return Err(refused(
+            "the candidate's digest does not match the approval request",
+        ));
+    }
+    if candidate.entry.class != ArtifactClass::GeneratedHeavy {
+        return Err(refused(
+            "only a generated-heavy candidate can be approved for publication",
+        ));
+    }
+    let asset_root_id = record
+        .policy()
+        .asset_root_id()
+        .cloned()
+        .ok_or_else(|| ShellError::from(DestinationError::Unconfigured))?;
+    let publication_id = derive_publication_identity(hasher, project, &digest);
+    let file_name = name.strip_prefix(&format!("{run_id}/")).unwrap_or(name);
+    let approval = ArtifactApproval {
+        approval_id: derive_artifact_approval_id(hasher, &publication_id, now),
+        publication_id,
+        project: *project,
+        run_id: Some(run_id),
+        name: name.to_string(),
+        display_name: DisplayName::sanitize(file_name),
+        digest,
+        size: candidate.entry.size,
+        detected_type: candidate.entry.detected_type,
+        class: candidate.entry.class,
+        attribution: candidate.entry.attribution.clone(),
+        asset_root_id,
+        adapter_id: record.adapter_id().cloned(),
+        executable_approval: record.executable_approval(),
+        approver: DeviceLocalUser,
+        approved_at: now,
+    };
+    Ok((approval, candidate.handle.is_some()))
+}
+
+/// The whole-outbox path (`runId: null`; spike slice 5c): the entry named
+/// relative to the outbox is re-opened once under the single-handle
+/// discipline -- one no-follow open relative to the outbox (or run
+/// subdirectory) handle, a regular file with a link count of one, the
+/// digest from that handle, which must equal the request's -- and the
+/// approval binds the facts so taken, as unattributed, with no run and no
+/// launch provenance (HAP-001-R11, R15, R16, R20, R22). An entry of a run
+/// the table remembers with its inventory is refused here: that
+/// inventory's attribution and provenance are the ones to approve under.
+/// Returns the approval and the source to hold for its publication.
+fn approve_whole_outbox_entry(
+    outbox: &OutboxState,
+    workspace: &omnifrons_app::WorkspaceRoot,
+    hasher: &dyn ContentHasher,
+    project: &ProjectIdentity,
+    name: &str,
+    digest: Sha256Digest,
+    now: SystemTime,
+) -> Result<(ArtifactApproval, CandidateSource), ShellError> {
+    let location = EntryLocation::parse(name)
+        .ok_or_else(|| invalid("the entry name is not one the outbox inventory lists"))?;
+    if let Some(run_id) = &location.under_run {
+        let runs = outbox
+            .runs
+            .lock()
+            .expect("run table mutex poisoned by a prior panic");
+        if runs
+            .find_by_run_id(run_id)
+            .is_some_and(|record| record.candidates().is_some())
+        {
+            return Err(invalid(
+                "the entry belongs to a remembered run; approve it through that run id",
+            ));
+        }
+    }
+    let policy = outbox.policy_store.load(workspace)?;
+    let asset_root_id = policy
+        .asset_root_id()
+        .cloned()
+        .ok_or_else(|| ShellError::from(DestinationError::Unconfigured))?;
+    let (dir, dir_path) = open_entry_directory(outbox, workspace, policy.outbox(), &location)?;
+    let file_name = location.file_name();
+    let regular = match FsCandidateProber::new().probe(&dir, &dir_path, &file_name) {
+        CandidateProbe::Regular(regular) if regular.digest == digest => regular,
+        CandidateProbe::Regular(_) => {
+            return Err(ShellError::new(
+                ShellErrorCode::IntegrityMismatch,
+                "the entry's digest differs from the digest the request names; it changed since \
+                 it was listed",
+            ));
+        }
+        CandidateProbe::Escape(_) => {
+            return Err(ShellError::new(
+                ShellErrorCode::OutboxEscape,
+                "the entry is not a regular file inside the outbox",
+            ));
+        }
+        CandidateProbe::Linked { .. } => {
+            return Err(ShellError::new(
+                ShellErrorCode::OutboxLinked,
+                "the entry's link count is greater than one",
+            ));
+        }
+        CandidateProbe::Unreadable => {
+            return Err(invalid(
+                "no entry with that name could be opened under the outbox",
+            ));
+        }
+    };
+    let class = policy.classify(&location.file_name, regular.detected_type, regular.size);
+    if class != ArtifactClass::GeneratedHeavy {
+        return Err(refused(
+            "only a generated-heavy candidate can be approved for publication",
+        ));
+    }
+    let publication_id = derive_publication_identity(hasher, project, &digest);
+    let approval = ArtifactApproval {
+        approval_id: derive_artifact_approval_id(hasher, &publication_id, now),
+        publication_id,
+        project: *project,
+        run_id: None,
+        name: name.to_string(),
+        display_name: DisplayName::sanitize(&location.file_name),
+        digest,
+        size: regular.size,
+        detected_type: regular.detected_type,
+        class,
+        attribution: Attribution::Unattributed,
+        asset_root_id,
+        adapter_id: None,
+        executable_approval: None,
+        approver: DeviceLocalUser,
+        approved_at: now,
+    };
+    Ok((
+        approval,
+        CandidateSource {
+            dir,
+            dir_path,
+            file_name,
+            handle: regular.handle,
+        },
+    ))
+}
+
+/// Open the directory `location`'s entry sits in, relative to the outbox
+/// handle: the outbox itself for a root entry, else the run subdirectory
+/// opened without following a link at its name (HAP-001-R15).
+fn open_entry_directory(
+    outbox: &OutboxState,
+    workspace: &omnifrons_app::WorkspaceRoot,
+    declared: &OutboxPath,
+    location: &EntryLocation,
+) -> Result<(DirectoryHandle, PathBuf), ShellError> {
+    let opened = match outbox.preparer.open_outbox(workspace, declared, false) {
+        Ok(opened) => opened,
+        Err(PrepareError::OutboxMissing) => {
+            return Err(invalid(
+                "the outbox does not exist yet, so no entry can be listed in it",
+            ));
+        }
+        Err(PrepareError::Declaration(error)) => return Err(ShellError::from(error)),
+        Err(error) => return Err(ShellError::from(error)),
+    };
+    match &location.under_run {
+        None => Ok((opened.handle, opened.path)),
+        Some(run_id) => {
+            let dir = outbox
+                .inventory
+                .open_subdirectory(&opened.handle, &opened.path, OsStr::new(run_id.as_str()))
+                .map_err(|_| invalid("no run subdirectory with that name exists in the outbox"))?;
+            Ok((dir, opened.path.join(run_id.as_str())))
+        }
+    }
+}
+
+/// Hold `source` for the approval's publication, counted against HAP-001
+/// D22's cap with every run record's held candidates. When the cap has no
+/// room the handle is released here, explicitly, and the fact rides the
+/// payload as `handleHeld: false` -- never silent: the publication
+/// re-opens the entry when its turn comes (HAP-001-R17).
+fn hold_for_publication(
+    runs: &Arc<Mutex<RunTable>>,
+    id: ArtifactApprovalId,
+    source: CandidateSource,
+) -> bool {
+    let mut runs = runs
+        .lock()
+        .expect("run table mutex poisoned by a prior panic");
+    match runs.hold_approved(id, source) {
+        Ok(()) => true,
+        Err(source) => {
+            drop(source);
+            tracing::debug!(
+                approval_id = %id.to_hex(),
+                "the held-handle cap is full; the approved entry's handle was released and the \
+                 entry will be re-opened at publication"
+            );
+            false
+        }
+    }
+}
+
+/// Where a publication's bytes come from: the handle held since approval
+/// -- by the run record for a listed entry, by the table for a
+/// whole-outbox approval (spike slice 5c) -- or, when nothing holds one
+/// (the D22 cap, an evicted record, a workspace change), a fresh open under
+/// the single-handle discipline (HAP-001-R15, R17) whose facts must equal
+/// the approved ones.
 fn acquire_source(
     outbox: &OutboxState,
     workspace: &omnifrons_app::WorkspaceRoot,
@@ -347,29 +623,23 @@ fn acquire_source(
     now: SystemTime,
     on_state: &mut dyn FnMut(ArtifactStateFrame),
 ) -> Result<CandidateSource, ShellError> {
-    let file_name = file_name_of(approval);
-    if let Some(source) = take_held_source(&outbox.runs, approval, &file_name)? {
+    let location = EntryLocation::of(approval);
+    if let Some(location) = &location
+        && let Some(source) = take_held_source(&outbox.runs, approval, location)?
+    {
         return Ok(source);
     }
 
     // The re-open path: the outbox, then the run subdirectory relative to
-    // it, then one no-follow open of the entry.
+    // it when the entry sits under one, then one no-follow open of the
+    // entry.
     let policy = outbox.policy_store.load(workspace)?;
-    let opened = outbox
-        .preparer
-        .open_outbox(workspace, policy.outbox(), false)
-        .ok();
-    let dir = opened.as_ref().and_then(|opened| {
-        outbox
-            .inventory
-            .open_subdirectory(
-                &opened.handle,
-                &opened.path,
-                OsStr::new(approval.run_id.as_str()),
-            )
+    let reopened = location.as_ref().and_then(|location| {
+        open_entry_directory(outbox, workspace, policy.outbox(), location)
             .ok()
+            .map(|(dir, dir_path)| (dir, dir_path, location.file_name()))
     });
-    let (Some(opened), Some(dir)) = (opened, dir) else {
+    let Some((dir, dir_path, file_name)) = reopened else {
         return Err(fail_before_publish(
             journal,
             approval,
@@ -381,7 +651,6 @@ fn acquire_source(
             refused("the entry could not be re-opened under the outbox"),
         ));
     };
-    let dir_path = opened.path.join(approval.run_id.as_str());
     match FsCandidateProber::new().probe(&dir, &dir_path, &file_name) {
         CandidateProbe::Regular(regular)
             if regular.digest == approval.digest
@@ -444,18 +713,22 @@ fn acquire_source(
     }
 }
 
-/// The held handle from the run record, if the record still holds one for
-/// the approved entry, with a duplicate of the run subdirectory handle it
-/// is opened relative to.
+/// The handle held since approval, if any: the run record's for a listed
+/// entry, with a duplicate of the run subdirectory handle it was opened
+/// relative to, or the table's for a whole-outbox approval (spike slice
+/// 5c). Either way the publication transaction becomes the handle's owner.
 fn take_held_source(
     runs: &Arc<Mutex<RunTable>>,
     approval: &ArtifactApproval,
-    file_name: &OsStr,
+    location: &EntryLocation,
 ) -> Result<Option<CandidateSource>, ShellError> {
     let mut runs = runs
         .lock()
         .expect("run table mutex poisoned by a prior panic");
-    let Some(record) = runs.find_by_run_id_mut(&approval.run_id) else {
+    let Some(run_id) = &approval.run_id else {
+        return Ok(runs.take_approved(approval.approval_id));
+    };
+    let Some(record) = runs.find_by_run_id_mut(run_id) else {
         return Ok(None);
     };
     let Some(handle) = record.take_candidate_handle(&approval.name) else {
@@ -467,7 +740,7 @@ fn take_held_source(
     Ok(Some(CandidateSource {
         dir: subdirectory.handle,
         dir_path: subdirectory.path,
-        file_name: file_name.to_os_string(),
+        file_name: location.file_name(),
         handle,
     }))
 }
@@ -698,8 +971,10 @@ pub fn publications_for(
     Ok(listed)
 }
 
-/// Approve a candidate entry of a remembered run for publication
-/// (HAP-001-R22, D3).
+/// Approve a candidate entry for publication (HAP-001-R22, D3): one a
+/// remembered run's run-end inventory listed (`runId`), or one the
+/// whole-outbox inventory listed (`runId` absent or `null`; spike slice
+/// 5c).
 ///
 /// # Errors
 ///
@@ -708,7 +983,7 @@ pub fn publications_for(
 #[tauri::command]
 pub async fn artifact_approve(
     app: AppHandle,
-    run_id: String,
+    run_id: Option<String>,
     name: String,
     sha256: String,
 ) -> Result<ArtifactApprovalDto, ShellError> {
@@ -974,7 +1249,7 @@ mod tests {
                 &Idle,
                 now,
                 &ApproveRequest {
-                    run_id: self.run_id.as_str().to_string(),
+                    run_id: Some(self.run_id.as_str().to_string()),
                     name: format!("{}/{name}", self.run_id),
                     sha256: hex(bytes),
                 },
@@ -1062,7 +1337,7 @@ mod tests {
     fn approving_an_attributed_candidate_records_and_returns_its_facts() {
         let fixture = Fixture::new("approve");
         let dto = fixture.approve("report.pdf", PDF).expect("approved");
-        assert_eq!(dto.run_id, "run-1");
+        assert_eq!(dto.run_id.as_deref(), Some("run-1"));
         assert_eq!(dto.name, "run-1/report.pdf");
         assert_eq!(dto.display_name, "report.pdf");
         assert_eq!(dto.sha256_short, hex(PDF)[..8]);
@@ -1179,7 +1454,7 @@ mod tests {
             &Idle,
             Fixture::now(),
             &ApproveRequest {
-                run_id: "run-2".to_string(),
+                run_id: Some("run-2".to_string()),
                 name: "run-2/link.pdf".to_string(),
                 sha256: "00".repeat(32),
             },
@@ -1218,7 +1493,7 @@ mod tests {
                 &Idle,
                 Fixture::now(),
                 &ApproveRequest {
-                    run_id: run_id.to_string(),
+                    run_id: Some(run_id.to_string()),
                     name: name.to_string(),
                     sha256,
                 },
@@ -1660,7 +1935,7 @@ mod tests {
     fn approving_and_publishing_are_refused_while_a_run_is_active() {
         let fixture = Fixture::new("run-active");
         let request = ApproveRequest {
-            run_id: "run-1".to_string(),
+            run_id: Some("run-1".to_string()),
             name: "run-1/report.pdf".to_string(),
             sha256: hex(PDF),
         };
@@ -1727,7 +2002,7 @@ mod tests {
             .spawn(ProcessSpec::new("sleep").with_args(["30"]))
             .expect("spawn a live child");
         let request = ApproveRequest {
-            run_id: "run-1".to_string(),
+            run_id: Some("run-1".to_string()),
             name: "run-1/report.pdf".to_string(),
             sha256: hex(PDF),
         };
@@ -1801,5 +2076,396 @@ mod tests {
             "A's entry untouched"
         );
         assert_eq!(fixture.copies(), 0, "nothing copied");
+    }
+
+    // -- approval from the whole-outbox inventory (spike slice 5c,
+    // HAP-001-R11, R12, R17, R22) --
+
+    impl Fixture {
+        /// The project's outbox directory.
+        fn outbox_dir(&self) -> PathBuf {
+            self.project.path().join(".omnifrons/outbox")
+        }
+
+        /// How many candidate handles the table holds right now.
+        fn held_handles(&self) -> usize {
+            self.outbox.runs.lock().expect("table").held_handles()
+        }
+
+        /// Approve an entry the whole-outbox inventory listed: no run.
+        fn approve_unattributed(
+            &self,
+            name: &str,
+            sha256: &str,
+        ) -> Result<ArtifactApprovalDto, ShellError> {
+            approve_candidate(
+                &self.outbox,
+                &self.workspace(),
+                &self.publication,
+                &Idle,
+                Self::now(),
+                &ApproveRequest {
+                    run_id: None,
+                    name: name.to_string(),
+                    sha256: sha256.to_string(),
+                },
+            )
+        }
+
+        /// The first Catalog record line, parsed.
+        fn first_record(&self) -> serde_json::Value {
+            serde_json::from_str(self.catalog_text().lines().next().expect("a record line"))
+                .expect("json")
+        }
+    }
+
+    /// An outbox-root entry -- listed by `candidates_list {}` with no run
+    /// -- is approved with `runId: null`: the entry is re-opened once under
+    /// the single-handle discipline, its digest from that handle must equal
+    /// the request's, the approval records the unattributed fact and no
+    /// run, the re-opened handle is held and counted against the D22 cap,
+    /// and its publication takes that handle and registers
+    /// `producer: unattributed`, found under no run.
+    #[test]
+    fn approving_an_unattributed_root_entry_holds_its_handle_and_publishes_unattributed() {
+        let fixture = Fixture::new("unattributed-root");
+        std::fs::write(fixture.outbox_dir().join("dropped.pdf"), PDF).expect("root entry");
+        let held_before = fixture.held_handles();
+        let dto = fixture
+            .approve_unattributed("dropped.pdf", &hex(PDF))
+            .expect("approved");
+        assert_eq!(dto.run_id, None);
+        assert_eq!(dto.name, "dropped.pdf");
+        assert_eq!(dto.display_name, "dropped.pdf");
+        assert_eq!(dto.attribution, AttributionDto::Unattributed);
+        assert_eq!(dto.class, "generated-heavy");
+        assert_eq!(dto.detected_type, "pdf");
+        assert_eq!(dto.sha256_short, hex(PDF)[..8]);
+        assert!(
+            dto.handle_held,
+            "the re-opened handle is held for the publication"
+        );
+        assert_eq!(
+            fixture.held_handles(),
+            held_before + 1,
+            "the cap counts the re-opened handle"
+        );
+        let line: serde_json::Value =
+            serde_json::from_str(fixture.journal_text().lines().next().expect("line"))
+                .expect("json");
+        assert_eq!(line["runId"], serde_json::Value::Null);
+        assert_eq!(
+            line["attribution"],
+            serde_json::json!({"kind": "unattributed"})
+        );
+        assert_eq!(line["adapterId"], serde_json::Value::Null);
+        assert_eq!(line["executableApprovalId"], serde_json::Value::Null);
+
+        let (result, frames) = fixture.publish(&dto.approval_id);
+        let published = result.expect("registered");
+        assert_eq!(published.state, ArtifactStateTag::Registered);
+        assert_eq!(
+            states(&frames),
+            vec![
+                ArtifactStateTag::PublishedLocal,
+                ArtifactStateTag::Registered
+            ]
+        );
+        assert_eq!(
+            fixture.held_handles(),
+            held_before,
+            "the publication took the held handle"
+        );
+        assert_eq!(
+            fixture.first_record()["record"]["provenance"]["producer"],
+            serde_json::json!({"kind": "unattributed", "foundUnderRunId": null})
+        );
+        // R3-003: unix removes the entry through the directory handle;
+        // elsewhere the identity check is unverifiable and the entry stays
+        // (disclosed), exactly as the run-entry publication above.
+        #[cfg(unix)]
+        assert!(!fixture.outbox_dir().join("dropped.pdf").exists());
+        #[cfg(not(unix))]
+        assert!(fixture.outbox_dir().join("dropped.pdf").exists());
+    }
+
+    /// An entry under a run subdirectory the table does not remember is
+    /// approved the same way; the subdirectory is a location fact the name
+    /// carries -- never provenance -- recorded on the Catalog record as
+    /// `foundUnderRunId` while the approval itself names no run
+    /// (HAP-001-R11, R36).
+    #[test]
+    fn approving_an_entry_under_a_forgotten_run_records_its_subdirectory_as_a_location_fact() {
+        let fixture = Fixture::new("unattributed-forgotten");
+        let forgotten = fixture.outbox_dir().join("run-old");
+        std::fs::create_dir(&forgotten).expect("a subdirectory the table never remembered");
+        std::fs::write(forgotten.join("stray.png"), PNG).expect("entry");
+        let dto = fixture
+            .approve_unattributed("run-old/stray.png", &hex(PNG))
+            .expect("approved");
+        assert_eq!(dto.run_id, None);
+        assert_eq!(dto.name, "run-old/stray.png");
+        assert_eq!(dto.display_name, "stray.png");
+        assert_eq!(dto.attribution, AttributionDto::Unattributed);
+        let (result, _) = fixture.publish(&dto.approval_id);
+        assert_eq!(
+            result.expect("registered").state,
+            ArtifactStateTag::Registered
+        );
+        assert_eq!(
+            fixture.first_record()["record"]["provenance"]["producer"],
+            serde_json::json!({"kind": "unattributed", "foundUnderRunId": "run-old"})
+        );
+    }
+
+    /// R3-004 (slice 5c reliability review): a run the table remembers but
+    /// has not inventoried -- it has not ended yet, or its inventory failed
+    /// -- is treated as forgotten by the whole-outbox path, since there is
+    /// no attribution to approve under. The entry is approved unattributed
+    /// and its subdirectory rides the record as `foundUnderRunId`, a
+    /// location fact only; the run's adapter and executable approval, which
+    /// the record does hold, stand in nowhere (HAP-001-R11, R36).
+    #[test]
+    fn approving_an_entry_of_a_remembered_run_with_no_inventory_is_unattributed() {
+        let fixture = Fixture::new("unattributed-not-inventoried");
+        let run_id = RunId::new("run-2").expect("valid");
+        let workspace = fixture.workspace();
+        let policy = omnifrons_app::outbox_policy::OutboxPolicyStore::load(
+            &fixture.outbox.policy_store,
+            &workspace,
+        )
+        .expect("policy loads");
+        let prepared = fixture
+            .outbox
+            .preparer
+            .prepare(&workspace, &OutboxPath::default_path(), &run_id)
+            .expect("prepare");
+        std::fs::write(prepared.path.join("dropped.pdf"), PDF).expect("entry");
+        {
+            let mut runs = fixture.outbox.runs.lock().expect("table");
+            // Remembered, never inventoried: no candidates are stored.
+            runs.insert(
+                ProcessId(9),
+                RunRecord::with_provenance(
+                    prepared,
+                    policy,
+                    Some(AdapterId::claude_code()),
+                    Some(ApprovalId(42)),
+                ),
+            );
+        }
+        let dto = fixture
+            .approve_unattributed("run-2/dropped.pdf", &hex(PDF))
+            .expect("approved");
+        assert_eq!(dto.run_id, None);
+        assert_eq!(dto.name, "run-2/dropped.pdf");
+        assert_eq!(dto.display_name, "dropped.pdf");
+        assert_eq!(dto.attribution, AttributionDto::Unattributed);
+        let line: serde_json::Value =
+            serde_json::from_str(fixture.journal_text().lines().next().expect("line"))
+                .expect("json");
+        assert_eq!(line["runId"], serde_json::Value::Null);
+        assert_eq!(
+            line["attribution"],
+            serde_json::json!({"kind": "unattributed"})
+        );
+        assert_eq!(line["adapterId"], serde_json::Value::Null);
+        assert_eq!(line["executableApprovalId"], serde_json::Value::Null);
+
+        let (result, _) = fixture.publish(&dto.approval_id);
+        assert_eq!(
+            result.expect("registered").state,
+            ArtifactStateTag::Registered
+        );
+        assert_eq!(
+            fixture.first_record()["record"]["provenance"]["producer"],
+            serde_json::json!({"kind": "unattributed", "foundUnderRunId": "run-2"})
+        );
+    }
+
+    /// HAP-001-R20: an entry whose link count is greater than one is
+    /// refused as `outbox-linked` from its re-opened handle -- the bytes
+    /// are reachable under a second name, so the outbox does not own them
+    /// alone. Nothing is journaled and no handle is held (R3-002).
+    #[cfg(unix)] // the link count is read from the handle on unix only
+    #[test]
+    fn approving_with_no_run_refuses_an_entry_a_second_link_reaches() {
+        let fixture = Fixture::new("unattributed-linked");
+        let entry = fixture.outbox_dir().join("dropped.pdf");
+        std::fs::write(&entry, PDF).expect("root entry");
+        std::fs::hard_link(&entry, fixture.outbox_dir().join("also-dropped.pdf"))
+            .expect("a second link to the same bytes");
+        let held_before = fixture.held_handles();
+        let error = fixture
+            .approve_unattributed("dropped.pdf", &hex(PDF))
+            .expect_err("refused");
+        assert_eq!(error.code, ShellErrorCode::OutboxLinked);
+        assert!(!error.message.contains('/'), "{}", error.message);
+        assert!(fixture.journal_text().is_empty(), "nothing recorded");
+        assert_eq!(fixture.held_handles(), held_before, "no handle held");
+        assert!(entry.exists(), "the entry is left where it was");
+    }
+
+    /// The Windows counterpart of the test above: `std` exposes no link
+    /// count through a handle there, so the same fixture is an ordinary
+    /// candidate and the approval stands. `outbox-linked` cannot be
+    /// produced off unix -- the residual slices 5a, 5b, and 5c disclose.
+    ///
+    /// The second link may or may not exist on this platform (R1-005):
+    /// `CreateHardLinkW` needs NTFS or `ReFS` on a single volume and is
+    /// refused on FAT, `exFAT`, or a mapped network temp, and the fixture
+    /// sits under the system temp directory. This test asserts the
+    /// *absence* of link detection, so a link that could not be created
+    /// costs it nothing -- the approval must succeed, be unattributed, and
+    /// hold its handle either way -- and a fixture that the filesystem
+    /// refuses must not be read as a product failure.
+    #[cfg(not(unix))]
+    #[test]
+    fn approving_with_no_run_cannot_see_a_second_link_off_unix() {
+        let fixture = Fixture::new("unattributed-linked-other");
+        let entry = fixture.outbox_dir().join("dropped.pdf");
+        std::fs::write(&entry, PDF).expect("root entry");
+        // Tolerated, never required: see the note above.
+        let _ = std::fs::hard_link(&entry, fixture.outbox_dir().join("also-dropped.pdf"));
+        let dto = fixture
+            .approve_unattributed("dropped.pdf", &hex(PDF))
+            .expect("approved: the link count is invisible here");
+        assert_eq!(dto.attribution, AttributionDto::Unattributed);
+        assert!(dto.handle_held);
+    }
+
+    /// HAP-001-R22 binds the approval to the digest the listing showed: an
+    /// entry rewritten between the listing and the approval is refused as
+    /// `integrity-mismatch` from its re-opened handle; nothing is recorded
+    /// and no handle is held.
+    #[test]
+    fn approving_with_no_run_refuses_a_digest_that_changed_since_the_listing() {
+        let fixture = Fixture::new("unattributed-changed");
+        std::fs::write(fixture.outbox_dir().join("dropped.pdf"), PDF).expect("entry");
+        let listed = hex(PDF);
+        std::fs::write(
+            fixture.outbox_dir().join("dropped.pdf"),
+            b"%PDF-1.7\nrewritten after the listing\n",
+        )
+        .expect("rewrite");
+        let held_before = fixture.held_handles();
+        let error = fixture
+            .approve_unattributed("dropped.pdf", &listed)
+            .expect_err("refused");
+        assert_eq!(error.code, ShellErrorCode::IntegrityMismatch);
+        assert!(!error.message.contains('/'), "{}", error.message);
+        assert!(fixture.journal_text().is_empty(), "nothing recorded");
+        assert_eq!(fixture.held_handles(), held_before, "no handle held");
+    }
+
+    /// A link planted at the name is never dereferenced: the no-follow open
+    /// refuses it as `outbox-escape` (HAP-001-R15), and nothing is recorded.
+    #[cfg(unix)] // a symbolic link fixture
+    #[test]
+    fn approving_with_no_run_refuses_a_link_planted_at_the_name() {
+        let fixture = Fixture::new("unattributed-link");
+        std::os::unix::fs::symlink(
+            fixture.project.path().join("elsewhere.pdf"),
+            fixture.outbox_dir().join("link.pdf"),
+        )
+        .expect("plant a link");
+        let error = fixture
+            .approve_unattributed("link.pdf", &hex(PDF))
+            .expect_err("refused");
+        assert_eq!(error.code, ShellErrorCode::OutboxEscape);
+        assert!(!error.message.contains('/'), "{}", error.message);
+        assert!(fixture.journal_text().is_empty(), "nothing recorded");
+    }
+
+    /// HAP-001 D22: with 32 handles already held across the remembered
+    /// runs, an unattributed approval is still recorded -- its facts were
+    /// verified from the re-opened handle -- but the handle is released,
+    /// the payload says so, and the publication re-opens the entry when its
+    /// turn comes (HAP-001-R17).
+    #[test]
+    fn an_unattributed_approval_beyond_the_handle_cap_is_recorded_without_a_held_handle() {
+        use omnifrons_app::run_outbox::MAX_HELD_HANDLES;
+        let fixture = Fixture::new("unattributed-cap");
+        // The remembered run holds three entries; fill it to the cap.
+        for n in 0..(MAX_HELD_HANDLES - 3) {
+            std::fs::write(
+                fixture.run_dir.join(format!("filler-{n}.pdf")),
+                format!("%PDF-1.7\nfiller {n}\n"),
+            )
+            .expect("filler");
+        }
+        fixture.restore_candidates(false);
+        assert_eq!(fixture.held_handles(), MAX_HELD_HANDLES);
+        std::fs::write(fixture.outbox_dir().join("dropped.pdf"), PDF).expect("root entry");
+        let dto = fixture
+            .approve_unattributed("dropped.pdf", &hex(PDF))
+            .expect("approved beyond the cap");
+        assert!(
+            !dto.handle_held,
+            "the cap is full: the handle is released, not held, and the payload says so"
+        );
+        assert_eq!(fixture.held_handles(), MAX_HELD_HANDLES);
+        assert_eq!(fixture.journal_text().lines().count(), 1, "recorded");
+        let (result, frames) = fixture.publish(&dto.approval_id);
+        assert_eq!(
+            result.expect("re-opened and registered").state,
+            ArtifactStateTag::Registered
+        );
+        assert_eq!(
+            states(&frames),
+            vec![
+                ArtifactStateTag::PublishedLocal,
+                ArtifactStateTag::Registered
+            ]
+        );
+    }
+
+    /// An entry of a run the table remembers with its inventory is approved
+    /// through that run id, so its attribution and provenance are the
+    /// inventory's: `runId: null` for it is `invalid-request`; so are a
+    /// traversal, a deeper path, an empty component, and a name nothing in
+    /// the outbox carries.
+    #[test]
+    fn approving_with_no_run_refuses_a_remembered_runs_entry_and_malformed_names() {
+        let fixture = Fixture::new("unattributed-invalid");
+        for name in [
+            "run-1/report.pdf",
+            "../report.pdf",
+            "run-1/deeper/report.pdf",
+            "missing.pdf",
+            ".",
+            "..",
+            "",
+            "run-1/",
+            "/report.pdf",
+            "run-1\\report.pdf",
+        ] {
+            let error = fixture
+                .approve_unattributed(name, &hex(PDF))
+                .expect_err(name);
+            assert_eq!(
+                error.code,
+                ShellErrorCode::InvalidRequest,
+                "{name}: {}",
+                error.message
+            );
+            assert!(!error.message.contains('/'), "{}", error.message);
+        }
+        assert!(fixture.journal_text().is_empty(), "nothing recorded");
+    }
+
+    /// A workspace change releases every held handle, the unattributed
+    /// approvals' included (spike slice 5 R1-010, extended).
+    #[test]
+    fn forgetting_the_runs_releases_the_held_unattributed_handles_too() {
+        let fixture = Fixture::new("unattributed-forget");
+        std::fs::write(fixture.outbox_dir().join("dropped.pdf"), PDF).expect("root entry");
+        let held_before = fixture.held_handles();
+        fixture
+            .approve_unattributed("dropped.pdf", &hex(PDF))
+            .expect("approved");
+        assert_eq!(fixture.held_handles(), held_before + 1);
+        fixture.outbox.forget_runs();
+        assert_eq!(fixture.held_handles(), 0);
     }
 }

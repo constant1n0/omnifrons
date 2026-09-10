@@ -7,6 +7,12 @@
 //! session*: picking a different workspace clears it
 //! (`OutboxState::forget_runs`), so one project's runs and handles never
 //! count against the next project's budget.
+//!
+//! As of spike slice 5c the table also holds the handles of approvals made
+//! from the whole-outbox inventory (`artifact_approve` with `runId: null`):
+//! each entry re-opened at approval time under the single-handle discipline
+//! is kept until its publication takes it (HAP-001-R17) and counted against
+//! the same D22 cap as every run record's held candidates.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,12 +22,14 @@ use std::time::SystemTime;
 use omnifrons_adapters::{FsOutboxInventory, FsRunOutboxPreparer, JsonOutboxPolicyStore};
 use omnifrons_app::ProcessId;
 use omnifrons_app::outbox_policy::OutboxPolicy;
+use omnifrons_app::publication::CandidateSource;
 use omnifrons_app::run_outbox::{
     Candidate, MAX_HELD_HANDLES, PreparedRunSubdirectory, cap_held_handles,
 };
 use omnifrons_domain::adapter::AdapterId;
 use omnifrons_domain::executable::ApprovalId;
 use omnifrons_domain::outbox::{PublishProposal, RunId};
+use omnifrons_domain::publication::ArtifactApprovalId;
 
 /// The maximum number of run records remembered at once. Bounded so a
 /// long session cannot grow the table -- and the handles the records hold
@@ -234,6 +242,14 @@ impl RunRecord {
 pub struct RunTable {
     order: VecDeque<ProcessId>,
     entries: HashMap<ProcessId, RunRecord>,
+    /// The sources held for approvals made from the whole-outbox
+    /// inventory (spike slice 5c), by approval id: the entry re-opened at
+    /// approval time under the single-handle discipline, with the
+    /// directory it was opened relative to, kept until its publication
+    /// takes it (HAP-001-R17). Bounded by HAP-001 D22's cap, which counts
+    /// these handles with every run record's held candidates:
+    /// [`Self::hold_approved`] hands a source back rather than exceed it.
+    approved: HashMap<ArtifactApprovalId, CandidateSource>,
 }
 
 impl RunTable {
@@ -276,22 +292,60 @@ impl RunTable {
             .find(|record| record.run_id() == run_id)
     }
 
-    /// How many candidate handles are held across every remembered run --
-    /// the figure HAP-001 D22's cap bounds, per active workspace within a
-    /// shell session (the table is cleared when the workspace changes).
+    /// How many candidate handles are held across every remembered run and
+    /// every approval made from the whole-outbox inventory -- the figure
+    /// HAP-001 D22's cap bounds, per active workspace within a shell
+    /// session (the table is cleared when the workspace changes).
     #[must_use]
     pub fn held_handles(&self) -> usize {
-        self.entries.values().map(RunRecord::held_handles).sum()
+        self.entries
+            .values()
+            .map(RunRecord::held_handles)
+            .sum::<usize>()
+            + self.approved.len()
     }
 
-    /// Forget every remembered run, releasing every held handle with it:
-    /// the active workspace changed, and the records belonged to the
-    /// previous one. Returns how many records were forgotten.
+    /// Forget every remembered run and every held approval source,
+    /// releasing every held handle with them: the active workspace
+    /// changed, and they belonged to the previous one. Returns how many run
+    /// records were forgotten.
     pub fn clear(&mut self) -> usize {
         let forgotten = self.entries.len();
         self.entries.clear();
         self.order.clear();
+        self.approved.clear();
         forgotten
+    }
+
+    /// Hold `source` -- the entry re-opened for the approval `id` made from
+    /// the whole-outbox inventory -- until its publication takes it,
+    /// counted against HAP-001 D22's cap with every run record's held
+    /// candidates. When the cap has no room the source is handed back as
+    /// the `Err`, so the caller releases it explicitly and says so rather
+    /// than losing it silently; the approval stands either way, and the
+    /// publication re-opens the entry under HAP-001-R15 when its turn
+    /// comes (HAP-001-R17).
+    ///
+    /// # Errors
+    ///
+    /// Returns `source` itself when the cap is full.
+    pub fn hold_approved(
+        &mut self,
+        id: ArtifactApprovalId,
+        source: CandidateSource,
+    ) -> Result<(), CandidateSource> {
+        if self.held_handles() >= MAX_HELD_HANDLES {
+            return Err(source);
+        }
+        self.approved.insert(id, source);
+        Ok(())
+    }
+
+    /// Take the source held for the approval `id`, if any: the publication
+    /// transaction becomes the handle's owner, and nothing stays held for
+    /// that approval.
+    pub fn take_approved(&mut self, id: ArtifactApprovalId) -> Option<CandidateSource> {
+        self.approved.remove(&id)
     }
 
     /// Store `candidates` as `id`'s run-end inventory, keeping at most the
@@ -662,6 +716,113 @@ mod tests {
         assert!(table.get(ProcessId(1)).is_none());
         assert!(table.get(ProcessId(2)).is_none());
         assert_eq!(table.clear(), 0, "clearing an empty table forgets nothing");
+    }
+
+    /// Open a directory handle for a fixture. Windows refuses a plain
+    /// `File::open` on a directory: `FILE_FLAG_BACKUP_SEMANTICS` is
+    /// required, as the production preparer documents.
+    #[cfg(unix)]
+    fn open_dir(path: &std::path::Path) -> omnifrons_app::run_outbox::DirectoryHandle {
+        omnifrons_app::run_outbox::DirectoryHandle::new(
+            std::fs::File::open(path).expect("open the directory"),
+        )
+    }
+
+    #[cfg(windows)]
+    fn open_dir(path: &std::path::Path) -> omnifrons_app::run_outbox::DirectoryHandle {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("open the directory");
+        omnifrons_app::run_outbox::DirectoryHandle::new(file)
+    }
+
+    /// A source with a real (content-irrelevant) held handle, opened
+    /// relative to the project directory.
+    fn held_source(
+        project: &TempProject,
+        fixtures: &mut FixtureFiles,
+        n: u8,
+    ) -> omnifrons_app::publication::CandidateSource {
+        let path = project.0.join(format!("f{n}.pdf"));
+        let handle = std::fs::File::create(&path).expect("fixture handle");
+        fixtures.0.push(path);
+        omnifrons_app::publication::CandidateSource {
+            dir: open_dir(&project.0),
+            dir_path: project.0.clone(),
+            file_name: std::ffi::OsString::from(format!("f{n}.pdf")),
+            handle,
+        }
+    }
+
+    /// Spike slice 5c: a handle held for an approval made from the
+    /// whole-outbox inventory counts against the D22 cap with the run
+    /// records' handles, is refused -- and handed back -- when the cap has
+    /// no room, leaves nothing for a run ending afterwards, is taken by its
+    /// publication exactly once, and is released with everything else by
+    /// `clear`.
+    #[test]
+    fn held_approvals_count_against_the_cap_and_are_handed_back_when_it_is_full() {
+        use omnifrons_app::run_outbox::MAX_HELD_HANDLES;
+        use omnifrons_domain::publication::ArtifactApprovalId;
+        let project = TempProject::new("approved");
+        let mut fixtures = FixtureFiles::default();
+        let mut table = RunTable::default();
+        table.insert(ProcessId(1), record(&project, "run-a"));
+        table
+            .store_candidates(
+                ProcessId(1),
+                (0..30).map(|n| held_candidate(&mut fixtures, n)).collect(),
+            )
+            .expect("remembered");
+        assert_eq!(table.held_handles(), 30);
+
+        let (first, second, third) = (
+            ArtifactApprovalId(1),
+            ArtifactApprovalId(2),
+            ArtifactApprovalId(3),
+        );
+        assert!(
+            table
+                .hold_approved(first, held_source(&project, &mut fixtures, 40))
+                .is_ok()
+        );
+        assert!(
+            table
+                .hold_approved(second, held_source(&project, &mut fixtures, 41))
+                .is_ok()
+        );
+        assert_eq!(table.held_handles(), MAX_HELD_HANDLES);
+        let handed_back = table
+            .hold_approved(third, held_source(&project, &mut fixtures, 42))
+            .expect_err("the cap has no room: the source comes back");
+        assert_eq!(
+            handed_back.file_name,
+            std::ffi::OsString::from("f42.pdf"),
+            "the very source, untouched"
+        );
+        drop(handed_back);
+        assert_eq!(table.held_handles(), MAX_HELD_HANDLES);
+
+        // A run ending now keeps nothing: every slot is taken.
+        table.insert(ProcessId(2), record(&project, "run-b"));
+        let released = table
+            .store_candidates(
+                ProcessId(2),
+                (50..52).map(|n| held_candidate(&mut fixtures, n)).collect(),
+            )
+            .expect("remembered");
+        assert_eq!(released, 2, "the approvals' handles count too");
+
+        assert!(table.take_approved(first).is_some());
+        assert!(table.take_approved(first).is_none(), "taken once");
+        assert_eq!(table.held_handles(), MAX_HELD_HANDLES - 1);
+        table.clear();
+        assert_eq!(table.held_handles(), 0);
+        assert!(table.take_approved(second).is_none(), "cleared");
     }
 
     /// The sequence part of a run id is process-wide, never per state or

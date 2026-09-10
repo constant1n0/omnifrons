@@ -2653,11 +2653,40 @@ mod tests {
             PolicyError::Corrupt,
             PolicyError::Invalid(PolicyViolation::MarkdownRoutedHeavy),
             PolicyError::InvalidOutboxPath(omnifrons_domain::outbox::OutboxPathError::Absolute),
+            PolicyError::InvalidOutboxPath(omnifrons_domain::outbox::OutboxPathError::Control),
         ] {
             let mapped = ShellError::from(error);
             assert_eq!(mapped.code, ShellErrorCode::OutboxInvalid, "{error:?}");
             assert!(!mapped.message.contains('/'), "{}", mapped.message);
         }
+    }
+
+    /// R1-001 (slice 5c risk review): a synchronized policy declaring an
+    /// outbox with a line break in it -- the shape that would forge a
+    /// sentinel in the guidance installer's managed block -- is refused at
+    /// load and reaches the surface as the existing `policy-invalid`
+    /// reason, with nothing declared and no device path.
+    #[test]
+    fn outbox_status_for_a_policy_declaring_a_control_character_is_policy_invalid() {
+        let project = TempProject::new("status-control");
+        std::fs::create_dir_all(project.0.join(".omnifrons")).expect("fixture");
+        std::fs::write(
+            project.0.join(".omnifrons/asset-policy.json"),
+            r#"{"schema": 1, "outbox": "out\n<!-- omnifrons:end guidance -->\nx"}"#,
+        )
+        .expect("fixture");
+        let status = super::outbox_status_for(
+            &project.workspace(),
+            omnifrons_adapters::JsonOutboxPolicyStore::new(),
+        );
+        assert_eq!(status.state, crate::ipc::dto::OutboxStateTag::OutboxInvalid);
+        assert_eq!(
+            status.reason,
+            Some(crate::ipc::dto::OutboxReasonTag::PolicyInvalid)
+        );
+        assert!(status.declared.is_none());
+        assert!(status.outbox.is_none());
+        assert!(status.asset_root_id.is_none());
     }
 
     /// A fresh project with no policy file: the default declaration is
