@@ -26,6 +26,12 @@ pub const RECOVERY_DIR: &str = "recovery";
 /// (spike slice 5c, HAP-001 D18): one subdirectory per project identity.
 pub const SNAPSHOTS_DIR: &str = "snapshots";
 
+/// The wrong-root ignore ledger's directory under the work area (spike
+/// slice 5d, HAP-001 § Wrong-root detection and remedies): the one durable
+/// fact a remedy leaves behind. `misplaced` itself is recomputed by every
+/// scan and never persisted.
+pub const IGNORE_DIR: &str = "ignore";
+
 /// Why a work area could not be opened or fails its re-check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WorkAreaError {
@@ -100,7 +106,7 @@ fn projected_canonical(path: &Path) -> Result<PathBuf, ContainmentError> {
 
 /// Refuse `path` if its projected canonical form is, or lies under, any of
 /// `workspaces`, without creating anything.
-fn refuse_inside_workspaces(
+pub(crate) fn refuse_inside_workspaces(
     path: &Path,
     workspaces: &[&WorkspaceRoot],
 ) -> Result<(), ContainmentError> {
@@ -140,7 +146,7 @@ pub(crate) fn create_owner_only_dir(dir: &Path) -> std::io::Result<()> {
 /// Whether `dir` is owner-only. Always true where the platform expresses
 /// no such permission (the disclosed Windows residual).
 #[cfg(unix)]
-fn is_owner_only(dir: &Path) -> std::io::Result<bool> {
+pub(crate) fn is_owner_only(dir: &Path) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = std::fs::metadata(dir)?.permissions().mode();
     // No group or other bit set: the low six bits (0o077) are zero.
@@ -151,7 +157,7 @@ fn is_owner_only(dir: &Path) -> std::io::Result<bool> {
 /// can fail reading metadata; this one cannot, and wraps on purpose.
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)]
-fn is_owner_only(_dir: &Path) -> std::io::Result<bool> {
+pub(crate) fn is_owner_only(_dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
@@ -163,7 +169,7 @@ pub struct WorkAreaRoot {
 
 impl WorkAreaRoot {
     /// Open the work area configured at `configured`, creating it and its
-    /// `journal/`, `recovery/`, and `snapshots/` subdirectories
+    /// `journal/`, `recovery/`, `snapshots/`, and `ignore/` subdirectories
     /// (owner-only) when missing, after checking that it does not resolve
     /// inside any of `workspaces` (HAP-001-R7 at configuration time).
     /// Nothing is created when the check fails.
@@ -179,7 +185,7 @@ impl WorkAreaRoot {
         refuse_inside_workspaces(configured, workspaces).map_err(WorkAreaError::from)?;
         create_owner_only_dir(configured).map_err(|_| WorkAreaError::Unusable)?;
         let path = canonical_outside_workspaces(configured, workspaces)?;
-        for sub in [JOURNAL_DIR, RECOVERY_DIR, SNAPSHOTS_DIR] {
+        for sub in [JOURNAL_DIR, RECOVERY_DIR, SNAPSHOTS_DIR, IGNORE_DIR] {
             create_owner_only_dir(&path.join(sub)).map_err(|_| WorkAreaError::Unusable)?;
         }
         let root = Self { path };
@@ -188,6 +194,7 @@ impl WorkAreaRoot {
             root.journal_dir(),
             root.recovery_dir(),
             root.snapshots_dir(),
+            root.ignore_dir(),
         ] {
             if !is_owner_only(&dir).map_err(|_| WorkAreaError::Unusable)? {
                 return Err(WorkAreaError::NotOwnerOnly);
@@ -254,6 +261,12 @@ impl WorkAreaRoot {
     #[must_use]
     pub fn snapshots_dir(&self) -> PathBuf {
         self.path.join(SNAPSHOTS_DIR)
+    }
+
+    /// The wrong-root ignore ledger's directory (spike slice 5d).
+    #[must_use]
+    pub fn ignore_dir(&self) -> PathBuf {
+        self.path.join(IGNORE_DIR)
     }
 }
 

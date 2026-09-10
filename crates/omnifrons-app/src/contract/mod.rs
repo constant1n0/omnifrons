@@ -7,3 +7,4 @@ pub mod harness_adapter;
 pub mod process_supervisor;
 pub mod publication;
 pub mod run_outbox;
+pub mod wrong_root;

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::blob_store::{DestinationError, DeviceAssetPath};
 use omnifrons_app::work_area::{
-    JOURNAL_DIR, RECOVERY_DIR, SNAPSHOTS_DIR, WorkAreaError, WorkAreaRoot,
+    IGNORE_DIR, JOURNAL_DIR, RECOVERY_DIR, SNAPSHOTS_DIR, WorkAreaError, WorkAreaRoot,
 };
 
 /// A drop-guard temp directory.
@@ -67,10 +67,14 @@ fn opening_a_work_area_creates_it_with_its_journal_and_recovery_directories() {
         work_area.snapshots_dir(),
         work_area.path().join(SNAPSHOTS_DIR)
     );
+    // Spike slice 5d: the wrong-root ignore ledger, the one durable fact a
+    // remedy leaves behind, joins them.
+    assert!(work_area.ignore_dir().is_dir());
+    assert_eq!(work_area.ignore_dir(), work_area.path().join(IGNORE_DIR));
     assert_eq!(
         std::fs::read_dir(work_area.path()).expect("list").count(),
-        3,
-        "the work area holds journal/, recovery/, and snapshots/ and nothing else"
+        4,
+        "the work area holds journal/, recovery/, snapshots/, and ignore/ and nothing else"
     );
 }
 
