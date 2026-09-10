@@ -51,15 +51,21 @@ impl FsCandidateProber {
 }
 
 /// What opening an entry without following links yielded, before any
-/// fact is read from it.
-enum Opened {
+/// fact is read from it. Shared with `fs_wrong_root_scanner`, which opens
+/// a worktree file under exactly this discipline (spike slice 5d).
+pub(crate) enum Opened {
     File(File),
     Refused(CandidateProbe),
+    /// The process or the system has no file descriptor left: not a fact
+    /// about this entry at all, and never to be reported as one (spike
+    /// slice 5d, R1-002 -- a walk that folds exhaustion into "unreadable"
+    /// loses findings while still calling its report complete).
+    Exhausted,
 }
 
 /// Unix: `openat` relative to the held directory, no-follow, non-blocking.
 #[cfg(unix)]
-fn open_entry(dir: &DirectoryHandle, _dir_path: &Path, name: &OsStr) -> Opened {
+pub(crate) fn open_entry(dir: &DirectoryHandle, _dir_path: &Path, name: &OsStr) -> Opened {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
@@ -72,6 +78,8 @@ fn open_entry(dir: &DirectoryHandle, _dir_path: &Path, name: &OsStr) -> Opened {
         Ok(fd) => Opened::File(File::from(fd)),
         // A symbolic link at the name: refused without dereferencing.
         Err(Errno::ELOOP) => Opened::Refused(CandidateProbe::Escape(EscapeReason::Link)),
+        // No descriptor left, in this process or in the system.
+        Err(Errno::EMFILE | Errno::ENFILE) => Opened::Exhausted,
         // A socket cannot be opened with `open(2)` at all -- `ENXIO` on
         // Linux, `EOPNOTSUPP` on macOS (open(2): "the named file is a
         // socket"): not a regular file, by the only fact obtainable.
@@ -86,8 +94,15 @@ fn open_entry(dir: &DirectoryHandle, _dir_path: &Path, name: &OsStr) -> Opened {
 /// itself; a directory or a reparse point that will not open as a file is
 /// classified from the path's own metadata (the disclosed path-based
 /// residual on this platform).
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` protects the final component alone, so
+/// `dir` fixes nothing here: a reparse point planted at an ancestor of
+/// `dir_path` is followed and this open can reach a file outside the
+/// directory the caller believes it holds. `dir` is unused on this platform
+/// for exactly that reason (spike slice 5d, R1-014, and `docs/spike-log.md`
+/// § Slice 5d).
 #[cfg(not(unix))]
-fn open_entry(_dir: &DirectoryHandle, dir_path: &Path, name: &OsStr) -> Opened {
+pub(crate) fn open_entry(_dir: &DirectoryHandle, dir_path: &Path, name: &OsStr) -> Opened {
     let path = dir_path.join(name);
     let opened = {
         #[cfg(windows)]
@@ -107,6 +122,9 @@ fn open_entry(_dir: &DirectoryHandle, dir_path: &Path, name: &OsStr) -> Opened {
     };
     match opened {
         Ok(file) => Opened::File(file),
+        // `ERROR_TOO_MANY_OPEN_FILES`: no descriptor left, which says
+        // nothing about the entry.
+        Err(ref error) if error.raw_os_error() == Some(4) => Opened::Exhausted,
         Err(_) => match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Opened::Refused(CandidateProbe::Escape(EscapeReason::Link))
@@ -125,13 +143,13 @@ fn open_entry(_dir: &DirectoryHandle, dir_path: &Path, name: &OsStr) -> Opened {
 /// wraps unconditionally on purpose.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
-fn link_count(metadata: &std::fs::Metadata) -> Option<u64> {
+pub(crate) fn link_count(metadata: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
     Some(metadata.nlink())
 }
 
 #[cfg(not(unix))]
-fn link_count(_metadata: &std::fs::Metadata) -> Option<u64> {
+pub(crate) fn link_count(_metadata: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
@@ -173,6 +191,9 @@ impl CandidateProber for FsCandidateProber {
         let file = match open_entry(dir, dir_path, name) {
             Opened::File(file) => file,
             Opened::Refused(probe) => return probe,
+            // An entry this process has no descriptor left to open is not
+            // an entry it can say anything about.
+            Opened::Exhausted => return CandidateProbe::Unreadable,
         };
         // `fstat` on the handle just opened, never a stat by path: every
         // fact below is about the file description `file` names.

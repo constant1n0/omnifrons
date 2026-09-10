@@ -24,8 +24,15 @@ sha2 = { workspace = true }
 # feature, not a separate "fcntl" feature -- 0.31.3 has none by that
 # name) rather than assumed. `user` additionally gates
 # `nix::unistd::Uid::effective`/`is_root`, used only by this crate's own
-# tests to skip a permission-bit assertion when running as root.
-nix = { version = "0.31.3", default-features = false, features = ["fs", "user"] }
+# tests to skip a permission-bit assertion when running as root. `dir`
+# gates `nix::dir::Dir` (`fdopendir`), which is what lets
+# `fs_wrong_root_scanner` *list* a directory relative to the handle it
+# already holds instead of re-resolving its path -- the listing was the
+# one fact in that walk still taken by path (spike slice 5d, R1-013).
+# Verified against the vendored 0.31.3 source: `dir = ["fs"]` in its
+# `[features]` table, so this adds no crate to the dependency graph and
+# `cargo tree -e normal` is unchanged.
+nix = { version = "0.31.3", default-features = false, features = ["dir", "fs", "user"] }
 
 [dev-dependencies]
 omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }

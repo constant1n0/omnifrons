@@ -121,6 +121,15 @@ pub(crate) fn open_directory_no_follow(path: &Path) -> std::io::Result<File> {
 /// Open the subdirectory `name` of the open directory `dir` without
 /// following a link at that name: relative to the handle on unix
 /// (`openat`), by the joined path on Windows.
+///
+/// **The two are not equivalent, and callers that descend must say so.**
+/// The unix arm resolves nothing but `name`, so `dir` fixes every component
+/// above it. The Windows arm re-resolves the whole joined path and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` refuses a reparse point at the final
+/// component only: one planted at an *ancestor* is followed, and a chain of
+/// these calls can therefore leave the tree the first handle was taken in.
+/// `FsWrongRootScanner`'s walk and its `open_misplaced` both disclose that
+/// rather than claim otherwise (spike slice 5d, R1-014).
 pub(crate) fn open_child_directory_no_follow(
     dir: &File,
     dir_path: &Path,
