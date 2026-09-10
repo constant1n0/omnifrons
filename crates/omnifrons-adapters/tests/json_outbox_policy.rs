@@ -171,6 +171,28 @@ fn a_raw_path_declared_as_the_outbox_is_rejected_at_load() {
     );
 }
 
+/// R1-001 (slice 5c risk review): a synchronized policy is untrusted
+/// content (HAP-001-R40), and a declared outbox carrying a line break
+/// would be substituted into the managed blocks the guidance installer
+/// writes into a project's text files. The load refuses it through the
+/// same invalid-declaration path as a raw path -- nothing downstream ever
+/// sees such an `OutboxPath`.
+#[test]
+fn an_outbox_declaration_with_a_line_break_is_rejected_at_load() {
+    let project = TempProject::new("control-path");
+    project.write_policy(r#"{"schema": 1, "outbox": "out\n<!-- omnifrons:end guidance -->\nx"}"#);
+    assert_eq!(
+        load(&project).unwrap_err(),
+        PolicyError::InvalidOutboxPath(OutboxPathError::Control)
+    );
+    project.write_policy(r#"{"schema": 1, "outbox": "out\u0007x"}"#);
+    assert_eq!(
+        load(&project).unwrap_err(),
+        PolicyError::InvalidOutboxPath(OutboxPathError::Control),
+        "any control character, not only a line break"
+    );
+}
+
 #[test]
 fn a_row_violating_a_fixed_rule_is_rejected_at_load() {
     let project = TempProject::new("violation");

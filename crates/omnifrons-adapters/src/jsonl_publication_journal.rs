@@ -49,7 +49,9 @@ struct ApprovedLine {
     approval_id: String,
     publication_id: String,
     project_id: String,
-    run_id: String,
+    /// `null` for an approval made from the whole-outbox inventory (spike
+    /// slice 5c); a line written before that slice always carries a run.
+    run_id: Option<String>,
     name: String,
     display_name: String,
     sha256: String,
@@ -94,7 +96,10 @@ impl LogEntry {
                 approval_id: approval.approval_id.to_hex(),
                 publication_id: approval.publication_id.to_hex(),
                 project_id: approval.project.to_hex(),
-                run_id: approval.run_id.as_str().to_string(),
+                run_id: approval
+                    .run_id
+                    .as_ref()
+                    .map(|run_id| run_id.as_str().to_string()),
                 name: approval.name.clone(),
                 display_name: approval.display_name.as_str().to_string(),
                 sha256: approval.digest.to_hex(),
@@ -134,7 +139,10 @@ impl LogEntry {
                     publication_id: PublicationIdentity::from_hex(&line.publication_id)
                         .ok_or(Corrupt)?,
                     project: ProjectIdentity::from_hex(&line.project_id).ok_or(Corrupt)?,
-                    run_id: RunId::new(line.run_id).map_err(|_| Corrupt)?,
+                    run_id: match line.run_id {
+                        Some(token) => Some(RunId::new(token).map_err(|_| Corrupt)?),
+                        None => None,
+                    },
                     name: line.name,
                     display_name: DisplayName::sanitize(&line.display_name),
                     digest: Sha256Digest::from_hex(&line.sha256).ok_or(Corrupt)?,

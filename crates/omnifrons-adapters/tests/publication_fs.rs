@@ -46,7 +46,8 @@ use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, Attribution, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactState, AssetRootId, DisplayName, PublicationIdentity,
+    ArtifactApproval, ArtifactState, AssetRootId, DisplayName, JournalEntry, Producer,
+    PublicationIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -495,7 +496,7 @@ impl RealFixture {
             approval_id: derive_artifact_approval_id(&hasher, &publication_id, approved_at),
             publication_id,
             project,
-            run_id: run_id.clone(),
+            run_id: Some(run_id.clone()),
             name: format!("run-1/{name}"),
             display_name: DisplayName::sanitize(name),
             digest,
@@ -662,6 +663,184 @@ fn a_swapped_entry_is_outbox_escape_with_the_approved_bytes_recovered() {
     assert_eq!(
         std::fs::read(fixture.run_dir.join("report.pdf")).expect("the swapped file stays"),
         b"%PDF-1.7\nswapped\n"
+    );
+}
+
+/// Spike slice 5c (HAP-001-R11, R36) over the real adapters: an approval
+/// made from the whole-outbox inventory -- no run -- registers a record
+/// whose `producer` is `unattributed`, carrying the run subdirectory the
+/// entry sat under as `foundUnderRunId` when there was one and `null` for
+/// an outbox-root entry, with no run id, adapter id, or approval reference
+/// standing in; the journal's `approved` line carries `runId: null` and
+/// replays as such.
+/// Run the transaction over the real adapters for `approval` from
+/// `source`, expecting it to register.
+fn publish_over_real_adapters(
+    fixture: &RealFixture,
+    provider: &LocalDirBlobStore,
+    catalog: &mut JsonlCatalogStore,
+    journal: &mut JsonlPublicationJournal,
+    approval: &ArtifactApproval,
+    source: CandidateSource,
+) -> omnifrons_app::publication::Published {
+    let workspace = fixture.project.workspace();
+    let hasher = Sha2Hasher::new();
+    let ops = FsOutboxEntryOps::new();
+    let clock = FixedClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_725_782_401));
+    publish(
+        PublishPorts {
+            hasher: &hasher,
+            provider,
+            catalog,
+            journal,
+            entry_ops: &ops,
+            clock: &clock,
+            work_area: &fixture.work_area,
+            workspaces: &[&workspace],
+        },
+        approval,
+        source,
+        &mut |_| {},
+    )
+    .expect("registered")
+}
+
+/// The two unattributed records the test below registers, checked both
+/// ways: the catalog file's own text -- the wire shape HAP-001-R36 names
+/// -- and, per R3-006, the same records read back through
+/// `JsonlCatalogStore::list()` as typed values, so the location fact is
+/// proven to survive the store's own parse and not only its serialization.
+fn assert_unattributed_records(
+    fixture: &RealFixture,
+    catalog: &JsonlCatalogStore,
+    under_run: &PublicationIdentity,
+    root: &PublicationIdentity,
+) {
+    let catalog_text =
+        std::fs::read_to_string(fixture.project.path().join(".omnifrons/catalog.jsonl"))
+            .expect("the catalog file");
+    let records: Vec<serde_json::Value> = catalog_text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect();
+    assert_eq!(records.len(), 2, "one record per publication");
+    assert_eq!(
+        records[0]["record"]["provenance"]["producer"],
+        serde_json::json!({"kind": "unattributed", "foundUnderRunId": "run-1"})
+    );
+    assert_eq!(
+        records[1]["record"]["provenance"]["producer"],
+        serde_json::json!({"kind": "unattributed", "foundUnderRunId": null})
+    );
+
+    let listed = catalog.list().expect("list");
+    assert_eq!(listed.len(), 2, "one record per publication");
+    let producer_of = |publication: &PublicationIdentity| {
+        listed
+            .iter()
+            .find(|record| record.publication_id == *publication)
+            .map(|record| record.provenance.producer.clone())
+            .expect("a record for that publication")
+    };
+    assert_eq!(
+        producer_of(under_run),
+        Producer::Unattributed {
+            found_under: Some(RunId::new("run-1").expect("valid")),
+        }
+    );
+    assert_eq!(
+        producer_of(root),
+        Producer::Unattributed { found_under: None }
+    );
+}
+
+#[test]
+fn an_unattributed_approval_over_the_real_adapters_registers_producer_unattributed() {
+    const DROPPED: &[u8] = b"%PDF-1.7\ndropped at the outbox root\n";
+    let fixture = RealFixture::new("real-unattributed");
+    let workspace = fixture.project.workspace();
+    let provider = open_provider(&fixture.base, &fixture.project);
+    let mut catalog = JsonlCatalogStore::open(&workspace).expect("catalog");
+    let mut journal = JsonlPublicationJournal::open(&fixture.work_area).expect("journal");
+
+    // Under a run subdirectory no remembered run's inventory covers.
+    std::fs::write(fixture.run_dir.join("stray.pdf"), PDF).expect("entry");
+    let mut under_run = fixture.approval("stray.pdf", PDF);
+    under_run.run_id = None;
+    under_run.attribution = Attribution::Unattributed;
+    journal
+        .append(&JournalEntry::Approved(Box::new(under_run.clone())))
+        .expect("the approved line");
+    let source = fixture.source("stray.pdf");
+    let published = publish_over_real_adapters(
+        &fixture,
+        &provider,
+        &mut catalog,
+        &mut journal,
+        &under_run,
+        source,
+    );
+    assert_eq!(
+        published.record.provenance.producer,
+        Producer::Unattributed {
+            found_under: Some(RunId::new("run-1").expect("valid")),
+        }
+    );
+
+    // At the outbox root: found under no run.
+    let outbox_dir = fixture.project.path().join(".omnifrons/outbox");
+    std::fs::write(outbox_dir.join("dropped.pdf"), DROPPED).expect("root entry");
+    let mut root = fixture.approval("dropped.pdf", DROPPED);
+    root.run_id = None;
+    root.name = "dropped.pdf".to_string();
+    root.attribution = Attribution::Unattributed;
+    let source = CandidateSource {
+        dir: open_dir(&outbox_dir),
+        dir_path: outbox_dir.clone(),
+        file_name: OsString::from("dropped.pdf"),
+        handle: File::open(outbox_dir.join("dropped.pdf")).expect("open the entry"),
+    };
+    let published = publish_over_real_adapters(
+        &fixture,
+        &provider,
+        &mut catalog,
+        &mut journal,
+        &root,
+        source,
+    );
+    assert_eq!(
+        published.record.provenance.producer,
+        Producer::Unattributed { found_under: None }
+    );
+
+    assert_unattributed_records(
+        &fixture,
+        &catalog,
+        &under_run.publication_id,
+        &root.publication_id,
+    );
+
+    let journal_text = std::fs::read_to_string(
+        fixture
+            .work_area
+            .journal_dir()
+            .join(JsonlPublicationJournal::FILE_NAME),
+    )
+    .expect("journal");
+    let approved: serde_json::Value =
+        serde_json::from_str(journal_text.lines().next().expect("the approved line"))
+            .expect("json");
+    assert_eq!(approved["event"], "approved");
+    assert_eq!(approved["runId"], serde_json::Value::Null);
+    assert_eq!(
+        approved["attribution"],
+        serde_json::json!({"kind": "unattributed"})
+    );
+    assert_eq!(approved["adapterId"], serde_json::Value::Null);
+    let replayed = journal.replay().expect("replay");
+    assert!(
+        matches!(&replayed[0], JournalEntry::Approved(approval) if approval.run_id.is_none()),
+        "the null run replays as no run"
     );
 }
 

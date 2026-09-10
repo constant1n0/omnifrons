@@ -46,13 +46,23 @@
 //! area's `journal/publications.jsonl`), and [`FsOutboxEntryOps`]
 //! (`omnifrons_app::outbox_entry_ops::OutboxEntryOps`; `fstat`/`fstatat`/
 //! `unlinkat`, all under the `fs` feature). Dependency tables unchanged.
+//!
+//! As of spike slice 5c (HAP-001 D18's guidance-note installer) this crate
+//! also implements the two installer ports over the same dependency set:
+//! [`FsProjectTextFile`] (`omnifrons_app::managed_file::ProjectTextFile`;
+//! one `O_NOFOLLOW` open, a sibling `.part` file renamed over the target)
+//! and [`FsSnapshotStore`] (`omnifrons_app::snapshot_store::SnapshotStore`;
+//! the work area's `snapshots/<project hex>/<id>.json` and `<id>.bytes`).
+//! Dependency tables unchanged.
 
 mod catalog_record_dto;
 pub mod fs_candidate_prober;
 pub mod fs_outbox_entry_ops;
 pub mod fs_outbox_inventory;
 pub mod fs_prober;
+pub mod fs_project_text_file;
 pub mod fs_run_outbox_preparer;
+pub mod fs_snapshot_store;
 pub mod json_outbox_policy_store;
 pub mod jsonl_approval_store;
 pub mod jsonl_catalog_store;
@@ -66,7 +76,9 @@ pub use fs_candidate_prober::FsCandidateProber;
 pub use fs_outbox_entry_ops::FsOutboxEntryOps;
 pub use fs_outbox_inventory::FsOutboxInventory;
 pub use fs_prober::FsExecutableProber;
+pub use fs_project_text_file::FsProjectTextFile;
 pub use fs_run_outbox_preparer::FsRunOutboxPreparer;
+pub use fs_snapshot_store::FsSnapshotStore;
 pub use json_outbox_policy_store::JsonOutboxPolicyStore;
 pub use jsonl_approval_store::JsonlApprovalStore;
 pub use jsonl_catalog_store::JsonlCatalogStore;
