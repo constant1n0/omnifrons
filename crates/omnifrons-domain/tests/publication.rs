@@ -4,11 +4,12 @@
 //! the portable reference (AEC-001's `ref` shape), and the closed state
 //! tokens. Framework-independent and filesystem-free.
 
-use omnifrons_domain::executable::Sha256Digest;
+use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
+use omnifrons_domain::outbox::{ArtifactClass, Attribution, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ARTIFACT_APPROVAL_ID_DOMAIN, ArtifactState, AssetRootId, AssetRootIdError, CatalogId,
-    DisplayName, PortableReference, ProjectIdentity, ProviderState, PublicationIdentity,
-    artifact_approval_id_preimage, publication_identity_preimage,
+    ARTIFACT_APPROVAL_ID_DOMAIN, ArtifactApproval, ArtifactApprovalId, ArtifactState, AssetRootId,
+    AssetRootIdError, CatalogId, DisplayName, PortableReference, ProjectIdentity, ProviderState,
+    PublicationIdentity, artifact_approval_id_preimage, publication_identity_preimage,
 };
 use std::time::{Duration, SystemTime};
 
@@ -238,5 +239,55 @@ fn display_name_trims_leading_whitespace_and_keeps_interior_whitespace() {
     assert_eq!(
         DisplayName::sanitize("  ").as_str(),
         DisplayName::EMPTY_FALLBACK
+    );
+}
+
+// -- the approval's location fact (spike slice 5c, HAP-001-R11, R36) --
+
+/// An approval fixture named `name`, listed by `run_id`'s inventory when
+/// `Some`, or by the whole-outbox inventory (no run) when `None`.
+fn approval_named(run_id: Option<RunId>, name: &str) -> ArtifactApproval {
+    ArtifactApproval {
+        approval_id: ArtifactApprovalId(1),
+        publication_id: PublicationIdentity(digest(0x33)),
+        project: ProjectIdentity(digest(0x11)),
+        run_id,
+        name: name.to_string(),
+        display_name: DisplayName::sanitize(name),
+        digest: digest(0x22),
+        size: 1,
+        detected_type: DetectedType::Pdf,
+        class: ArtifactClass::GeneratedHeavy,
+        attribution: Attribution::Unattributed,
+        asset_root_id: AssetRootId::new("main").expect("valid"),
+        adapter_id: None,
+        executable_approval: None,
+        approver: DeviceLocalUser,
+        approved_at: SystemTime::UNIX_EPOCH,
+    }
+}
+
+/// HAP-001-R11, R36: the run subdirectory an entry was found under is a
+/// location fact only -- the run whose inventory listed it, or, for an
+/// entry approved from the whole-outbox inventory (no run), the run id its
+/// outbox-relative name carries as a prefix; an outbox-root entry was found
+/// under none, and a prefix that is not a run id is not a location fact.
+#[test]
+fn approval_found_under_is_the_listing_run_or_the_names_run_prefix() {
+    let run = RunId::new("run-1").expect("valid");
+    let old = RunId::new("run-old").expect("valid");
+    assert_eq!(approval_named(None, "dropped.pdf").found_under(), None);
+    assert_eq!(
+        approval_named(None, "run-old/stray.png").found_under(),
+        Some(old)
+    );
+    assert_eq!(
+        approval_named(Some(run.clone()), "run-1/report.pdf").found_under(),
+        Some(run)
+    );
+    assert_eq!(
+        approval_named(None, "not a run id/x.pdf").found_under(),
+        None,
+        "a prefix that is not a run id is not a location fact"
     );
 }

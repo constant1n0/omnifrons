@@ -400,10 +400,7 @@ impl DisplayName {
 
         // 5. Reserved device names: the stem before the first dot.
         let stem = trimmed.split('.').next().unwrap_or(trimmed);
-        if RESERVED_DEVICE_NAMES
-            .iter()
-            .any(|reserved| reserved.eq_ignore_ascii_case(stem))
-        {
+        if is_reserved_device_name(stem) {
             return Self(format!("_{trimmed}"));
         }
         Self(trimmed.to_string())
@@ -424,9 +421,19 @@ impl fmt::Display for DisplayName {
 
 /// Whether `c` is a bidirectional override, embedding, or isolate control
 /// (U+202A..=U+202E, U+2066..=U+2069) -- the characters that let a name
-/// render in a different order than it is stored.
-const fn is_bidi_control(c: char) -> bool {
+/// render in a different order than it is stored. Shared with the managed
+/// file names of `crate::guidance`, which refuse rather than strip them.
+pub(crate) const fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether `stem` is a Windows reserved device name, case-insensitively.
+/// Shared with the managed file names of `crate::guidance`, which refuse
+/// rather than prefix them.
+pub(crate) fn is_reserved_device_name(stem: &str) -> bool {
+    RESERVED_DEVICE_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(stem))
 }
 
 /// An AEC-001 `ref` of kind `artifact` (HAP-001 § Definitions, "Portable
@@ -635,9 +642,13 @@ pub struct ArtifactApproval {
     pub publication_id: PublicationIdentity,
     /// The project the candidate belongs to.
     pub project: ProjectIdentity,
-    /// The run whose inventory the candidate was listed in.
-    pub run_id: RunId,
-    /// The candidate's name relative to the outbox (`<run id>/<file>`).
+    /// The run whose run-end inventory listed the candidate, or `None` for
+    /// an entry approved from the whole-outbox inventory (spike slice 5c:
+    /// an outbox-root entry, or one under a run subdirectory no remembered
+    /// run's inventory covers), which lists without a run.
+    pub run_id: Option<RunId>,
+    /// The candidate's name relative to the outbox: `<run id>/<file>` under
+    /// a run subdirectory, `<file>` at the outbox root.
     pub name: String,
     /// The sanitized display name.
     pub display_name: DisplayName,
@@ -661,6 +672,23 @@ pub struct ArtifactApproval {
     pub approver: DeviceLocalUser,
     /// When the approval was recorded.
     pub approved_at: SystemTime,
+}
+
+impl ArtifactApproval {
+    /// The run subdirectory the entry was found under, as a location fact
+    /// only, never provenance (HAP-001-R11, R36): the run whose inventory
+    /// listed it, or, for an entry approved from the whole-outbox
+    /// inventory, the run id its outbox-relative name carries as a prefix
+    /// (`<run id>/<file>`, the shape the inventory itself builds). An
+    /// outbox-root entry was found under none.
+    #[must_use]
+    pub fn found_under(&self) -> Option<RunId> {
+        self.run_id.clone().or_else(|| {
+            self.name
+                .split_once('/')
+                .and_then(|(prefix, _)| RunId::new(prefix).ok())
+        })
+    }
 }
 
 /// A publication step the journal records (HAP-001-R29: "publication

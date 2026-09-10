@@ -18,6 +18,8 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+use crate::publication::is_bidi_control;
+
 pub use crate::executable::Sha256Digest;
 
 /// The default outbox path when a project's policy declares none
@@ -48,6 +50,19 @@ pub enum OutboxPathError {
     /// The declared path contains a backslash: a roaming policy names the
     /// path with `/` so it means the same thing on every device.
     Backslash,
+    /// The declared path contains a control character, one of the two
+    /// Unicode line separators, or a bidirectional override, embedding or
+    /// isolate character. The declaration is untrusted content
+    /// (HAP-001-R40) that this product substitutes into the managed blocks
+    /// it writes into a project's text files, so a line break in it would
+    /// forge or break a sentinel and an override would make the block
+    /// render in an order it is not stored in; all three are refused here
+    /// rather than escaped later. One variant, not three: they are one
+    /// class of character -- the ones that make a managed block read as
+    /// something other than what it is -- and no caller can act
+    /// differently on them, which is why `ManagedFileNameError::Control`
+    /// already folds controls and overrides together for the same files.
+    Control,
 }
 
 impl fmt::Display for OutboxPathError {
@@ -57,6 +72,10 @@ impl fmt::Display for OutboxPathError {
             Self::Absolute => "the outbox path must be relative to the project root",
             Self::ParentTraversal => "the outbox path must not contain a parent (..) component",
             Self::Backslash => "the outbox path must use / as its separator",
+            Self::Control => {
+                "the outbox path must not contain control, line-separator, or bidirectional \
+                 override characters"
+            }
         };
         f.write_str(message)
     }
@@ -79,12 +98,27 @@ impl OutboxPath {
     ///
     /// # Errors
     ///
-    /// Returns [`OutboxPathError`] if `declared` is empty, absolute (or
-    /// drive-prefixed), contains a `..` component, or contains a backslash.
+    /// Returns [`OutboxPathError`] if `declared` is empty, carries a
+    /// control, line-separator or bidirectional override character, is
+    /// absolute (or drive-prefixed), contains a `..` component, or
+    /// contains a backslash.
     pub fn new(declared: impl AsRef<str>) -> Result<Self, OutboxPathError> {
         let declared = declared.as_ref();
         if declared.is_empty() {
             return Err(OutboxPathError::Empty);
+        }
+        // Before any path shape: a declaration is untrusted content
+        // (HAP-001-R40) that `guidance` substitutes into the managed blocks
+        // this product writes into a project's text files, and a line break
+        // there would forge or break a sentinel. `char::is_control` covers
+        // only the Cc category, so the bidirectional override, embedding
+        // and isolate range is refused through the same helper the managed
+        // file names and the display names of this data flow use (R1-004).
+        if declared
+            .chars()
+            .any(|c| c.is_control() || is_bidi_control(c) || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return Err(OutboxPathError::Control);
         }
         if declared.contains('\\') {
             // A `C:\x` form is a drive prefix first: report it as absolute

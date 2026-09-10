@@ -87,6 +87,89 @@ fn outbox_path_rejects_a_backslash_separator() {
     );
 }
 
+/// R1-001 (slice 5c risk review): the declared path is untrusted content
+/// from a synchronized policy file (HAP-001-R40) and is substituted into
+/// the managed blocks Omnifrons writes into a project's text files, so a
+/// line break or any other control character in it would let the policy
+/// forge or break a sentinel and leave the guidance feature permanently
+/// malformed for that project. Every control character, and the two
+/// Unicode line and paragraph separators, are refused at the door.
+#[test]
+fn outbox_path_rejects_control_characters_and_line_separators() {
+    assert_eq!(
+        OutboxPath::new("out\n<!-- omnifrons:end guidance -->").unwrap_err(),
+        OutboxPathError::Control,
+        "a newline would forge an end sentinel inside the managed block"
+    );
+    for declared in [
+        "out\r\n# omnifrons:end ignore",
+        "out\rx",
+        "out\tx",
+        "out\u{0}x",
+        "out\u{7}x",
+        "out\u{7f}x",
+        "out\u{85}x",
+        "out\u{2028}x",
+        "out\u{2029}x",
+    ] {
+        assert_eq!(
+            OutboxPath::new(declared).unwrap_err(),
+            OutboxPathError::Control,
+            "{declared:?}"
+        );
+    }
+    // One fixed message for the whole class, naming no path: the
+    // declaration is untrusted content and never rides its own refusal.
+    assert_eq!(
+        OutboxPathError::Control.to_string(),
+        "the outbox path must not contain control, line-separator, or bidirectional override characters"
+    );
+    // A path that merely looks like a sentinel stays one line and is
+    // accepted: the refusal is about line breaks, not about spelling.
+    assert!(OutboxPath::new("<!-- omnifrons:end guidance -->").is_ok());
+}
+
+/// R1-004 (slice 5c risk re-review): `char::is_control` covers only the
+/// Cc category, so the bidirectional override, embedding and isolate
+/// range (U+202A..=U+202E, U+2066..=U+2069) passed the refusal above and
+/// was written verbatim into the user's `AGENTS.md` and `.gitignore`. A
+/// right-to-left override there makes the block render in an order it is
+/// not stored in -- Trojan-Source class spoofing in the two files a human
+/// and an agent both read as instructions -- and the renderer's strip
+/// protects the preview only, never the bytes on disk. The declaration is
+/// untrusted content (HAP-001-R40), so the range is refused at the door
+/// under the same `Control` variant this repository already uses for it in
+/// `ManagedFileName::check_component` and `DisplayName::sanitize`.
+#[test]
+fn outbox_path_rejects_bidirectional_override_characters() {
+    assert_eq!(
+        OutboxPath::new("build/\u{202E}gnp.esrever/out").unwrap_err(),
+        OutboxPathError::Control,
+        "a right-to-left override reorders the path a reader sees"
+    );
+    for declared in [
+        "out\u{202A}x",
+        "out\u{202B}x",
+        "out\u{202C}x",
+        "out\u{202D}x",
+        "out\u{202E}x",
+        "out\u{2066}x",
+        "out\u{2067}x",
+        "out\u{2068}x",
+        "out\u{2069}x",
+    ] {
+        assert_eq!(
+            OutboxPath::new(declared).unwrap_err(),
+            OutboxPathError::Control,
+            "{declared:?}"
+        );
+    }
+    // U+200F is a plain right-to-left mark, not an override: it stays
+    // accepted, exactly where `is_bidi_control` draws the line for the
+    // managed file names and the display names of the same data flow.
+    assert!(OutboxPath::new("out\u{200F}x").is_ok());
+}
+
 // -- RunId --
 
 #[test]

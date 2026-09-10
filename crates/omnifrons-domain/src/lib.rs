@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod executable;
+pub mod guidance;
 pub mod outbox;
 pub mod output;
 pub mod publication;
