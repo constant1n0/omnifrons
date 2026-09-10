@@ -2,6 +2,7 @@
 //! production builds never pay for them.
 
 pub mod approval_store;
+pub mod guidance;
 pub mod harness_adapter;
 pub mod process_supervisor;
 pub mod publication;

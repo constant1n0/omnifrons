@@ -161,7 +161,7 @@ impl Fixture {
             approval_id: derive_artifact_approval_id(&self.hasher, &publication_id, approved_at),
             publication_id,
             project,
-            run_id: run_id.clone(),
+            run_id: Some(run_id.clone()),
             name: format!("run-1/{name}"),
             display_name: DisplayName::sanitize(name),
             digest,
@@ -909,5 +909,63 @@ fn a_held_handle_that_is_not_a_regular_file_is_outbox_escape_with_nothing_staged
             .next()
             .is_none(),
         "no recovery entry"
+    );
+}
+
+/// Spike slice 5c (HAP-001-R11, R36): an approval made from the
+/// whole-outbox inventory -- no listing run -- publishes with
+/// `producer: unattributed`; the run subdirectory the entry was found
+/// under, when there was one, rides the record as a location fact only,
+/// and an outbox-root entry was found under none.
+#[test]
+fn an_unattributed_approval_records_the_location_fact_and_no_provenance() {
+    const DROPPED: &[u8] = b"%PDF-1.7\ndropped at the root\n";
+    let mut fixture = Fixture::new("unattributed");
+    let entry_ops = ScriptedEntryOps::always(EntryIdentity::SameFile);
+    let workspace = fixture.workspace();
+
+    // Under a run subdirectory no remembered run's inventory covers: the
+    // location fact is the run id the outbox-relative name carries.
+    let mut under_run = fixture.approval("report.pdf", PDF);
+    under_run.run_id = None;
+    under_run.attribution = Attribution::Unattributed;
+    let source = fixture.source("report.pdf");
+    let published = publish(
+        fixture.ports(&entry_ops, &[&workspace]),
+        &under_run,
+        source,
+        &mut |_| {},
+    )
+    .expect("registered");
+    assert_eq!(
+        published.record.provenance.producer,
+        Producer::Unattributed {
+            found_under: Some(RunId::new("run-1").expect("valid")),
+        }
+    );
+
+    // At the outbox root: found under no run at all.
+    let outbox_dir = fixture.project.path().join(".omnifrons/outbox");
+    std::fs::write(outbox_dir.join("dropped.pdf"), DROPPED).expect("root entry");
+    let mut root = fixture.approval("dropped.pdf", DROPPED);
+    root.run_id = None;
+    root.name = "dropped.pdf".to_string();
+    root.attribution = Attribution::Unattributed;
+    let source = CandidateSource {
+        dir: DirectoryHandle::new(open_directory(&outbox_dir)),
+        dir_path: outbox_dir.clone(),
+        file_name: OsString::from("dropped.pdf"),
+        handle: File::open(outbox_dir.join("dropped.pdf")).expect("open the entry"),
+    };
+    let published = publish(
+        fixture.ports(&entry_ops, &[&workspace]),
+        &root,
+        source,
+        &mut |_| {},
+    )
+    .expect("registered");
+    assert_eq!(
+        published.record.provenance.producer,
+        Producer::Unattributed { found_under: None }
     );
 }

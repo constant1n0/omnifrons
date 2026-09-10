@@ -510,7 +510,7 @@ pub fn sample_approval(publication: PublicationIdentity, name: &str) -> Artifact
         approval_id: ArtifactApprovalId(0x0123_4567_89ab_cdef),
         publication_id: publication,
         project: ProjectIdentity(Sha256Digest([7; 32])),
-        run_id: run_id.clone(),
+        run_id: Some(run_id.clone()),
         name: format!("run-1/{name}"),
         display_name: DisplayName::sanitize(name),
         digest: Sha256Digest([0xab; 32]),
@@ -624,6 +624,18 @@ pub fn publication_journal_contract<J: PublicationJournal>(make: impl Fn() -> J)
     let record = sample_record(publication, "main", "report.pdf");
     let entries = vec![
         JournalEntry::Approved(Box::new(sample_approval(publication, "report.pdf"))),
+        // An approval made from the whole-outbox inventory (spike slice
+        // 5c): no run, no launch provenance, the unattributed fact.
+        JournalEntry::Approved(Box::new(ArtifactApproval {
+            approval_id: ArtifactApprovalId(0x0123_4567_89ab_cdf0),
+            run_id: None,
+            name: "dropped.pdf".to_string(),
+            display_name: DisplayName::sanitize("dropped.pdf"),
+            attribution: Attribution::Unattributed,
+            adapter_id: None,
+            executable_approval: None,
+            ..sample_approval(publication, "dropped.pdf")
+        })),
         JournalEntry::Step(Box::new(sample_step(
             publication,
             JournalStep::PublishedLocal,

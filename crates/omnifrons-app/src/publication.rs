@@ -277,8 +277,11 @@ fn build_record(
             adapter_id: approval.adapter_id.clone(),
             executable_approval: approval.executable_approval,
         },
+        // HAP-001-R36: the run subdirectory the entry was found under is a
+        // location fact only -- the listing run's, or the one its name
+        // carries when it was approved from the whole-outbox inventory.
         Attribution::Unattributed => Producer::Unattributed {
-            found_under: Some(approval.run_id.clone()),
+            found_under: approval.found_under(),
         },
     };
     let capabilities = provider.capabilities();

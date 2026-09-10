@@ -89,3 +89,37 @@ fn digest_reader_matches_sha256_over_the_same_bytes() {
     assert_eq!(digest, hasher.sha256(bytes));
     assert_eq!(size, bytes.len() as u64);
 }
+
+/// Spike slice 5c: a snapshot id is the first eight bytes of
+/// `sha256("omnifrons-guidance-snapshot-v1" ‖ project identity ‖ the file
+/// digest ‖ nanos since the epoch)`, 16 hex on the wire, and a later
+/// instant is another id.
+#[test]
+fn snapshot_id_is_the_first_eight_bytes_of_the_preimage_hash() {
+    use omnifrons_app::content_hasher::derive_snapshot_id;
+    use omnifrons_app::snapshot_store::{SNAPSHOT_ID_DOMAIN, SnapshotId, snapshot_id_preimage};
+    let hasher = FakeHasher;
+    let project = ProjectIdentity(Sha256Digest([5; 32]));
+    let digest = Sha256Digest([6; 32]);
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_725_782_401);
+    let id = derive_snapshot_id(&hasher, &project, &digest, at);
+    let full = hasher.sha256(&snapshot_id_preimage(&project, &digest, at));
+    let mut expected = [0u8; 8];
+    expected.copy_from_slice(&full.0[..8]);
+    assert_eq!(id.0, u64::from_be_bytes(expected));
+    assert_eq!(id.to_hex().len(), 16);
+    assert_eq!(SnapshotId::from_hex(&id.to_hex()), Some(id));
+    assert_eq!(SnapshotId::from_hex("012"), None);
+    assert_eq!(SNAPSHOT_ID_DOMAIN, b"omnifrons-guidance-snapshot-v1");
+    let preimage = snapshot_id_preimage(&project, &digest, at);
+    assert!(preimage.starts_with(SNAPSHOT_ID_DOMAIN));
+    assert_eq!(&preimage[SNAPSHOT_ID_DOMAIN.len()..][..32], &[5; 32]);
+    assert_eq!(&preimage[SNAPSHOT_ID_DOMAIN.len() + 32..][..32], &[6; 32]);
+    assert_eq!(preimage.len(), SNAPSHOT_ID_DOMAIN.len() + 32 + 32 + 16);
+    // One second, not one nanosecond: Windows keeps `SystemTime` in 100 ns
+    // steps, so a 1 ns later instant is the same instant there.
+    assert_ne!(
+        id,
+        derive_snapshot_id(&hasher, &project, &digest, at + Duration::from_secs(1))
+    );
+}

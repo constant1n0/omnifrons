@@ -19,6 +19,7 @@ use omnifrons_domain::publication::{
 };
 
 use crate::harness_adapter::WorkspaceRoot;
+use crate::snapshot_store::{SnapshotId, snapshot_id_preimage};
 
 /// The domain tag mixed into a project identity's preimage. The project
 /// identity itself is a spike default (`docs/spike-log.md` § Slice 5b):
@@ -75,4 +76,20 @@ pub fn derive_artifact_approval_id(
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest.0[..8]);
     ArtifactApprovalId(u64::from_be_bytes(bytes))
+}
+
+/// The snapshot id for a managed file of `project` whose bytes digest to
+/// `file_digest`, taken at `taken_at` (spike slice 5c): the first 8 bytes
+/// of the preimage's SHA-256, big-endian.
+#[must_use]
+pub fn derive_snapshot_id(
+    hasher: &dyn ContentHasher,
+    project: &ProjectIdentity,
+    file_digest: &Sha256Digest,
+    taken_at: SystemTime,
+) -> SnapshotId {
+    let digest = hasher.sha256(&snapshot_id_preimage(project, file_digest, taken_at));
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.0[..8]);
+    SnapshotId(u64::from_be_bytes(bytes))
 }

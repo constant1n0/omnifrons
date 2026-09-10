@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::blob_store::{DestinationError, DeviceAssetPath};
-use omnifrons_app::work_area::{JOURNAL_DIR, RECOVERY_DIR, WorkAreaError, WorkAreaRoot};
+use omnifrons_app::work_area::{
+    JOURNAL_DIR, RECOVERY_DIR, SNAPSHOTS_DIR, WorkAreaError, WorkAreaRoot,
+};
 
 /// A drop-guard temp directory.
 struct TempDir(PathBuf);
@@ -59,10 +61,16 @@ fn opening_a_work_area_creates_it_with_its_journal_and_recovery_directories() {
         work_area.recovery_dir(),
         work_area.path().join(RECOVERY_DIR)
     );
+    // Spike slice 5c: the guidance installer's snapshots live beside them.
+    assert!(work_area.snapshots_dir().is_dir());
+    assert_eq!(
+        work_area.snapshots_dir(),
+        work_area.path().join(SNAPSHOTS_DIR)
+    );
     assert_eq!(
         std::fs::read_dir(work_area.path()).expect("list").count(),
-        2,
-        "the work area holds journal/ and recovery/ and nothing else in this slice"
+        3,
+        "the work area holds journal/, recovery/, and snapshots/ and nothing else"
     );
 }
 
@@ -81,6 +89,7 @@ fn the_work_area_is_owner_only_on_unix() {
         work_area.path().to_path_buf(),
         work_area.journal_dir(),
         work_area.recovery_dir(),
+        work_area.snapshots_dir(),
     ] {
         let mode = std::fs::metadata(&dir)
             .expect("metadata")

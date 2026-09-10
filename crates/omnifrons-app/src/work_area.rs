@@ -1,10 +1,12 @@
 //! The product work area (spike slice 5b, HAP-001-R7, D1): Omnifrons's
-//! own device-local, owner-only directory holding the publication journal
-//! and recovery entries -- never inside a registered workspace root, never
-//! declared to a harness. Canonicalized and checked when configured, and
-//! re-canonicalized and re-checked at every use ([`WorkAreaRoot::check`]),
-//! so a workspace registered over it afterwards refuses the next journal
-//! or recovery write with `work-area-invalid`.
+//! own device-local, owner-only directory holding the publication journal,
+//! recovery entries, and -- as of spike slice 5c -- the guidance
+//! installer's snapshots (HAP-001 D18) -- never inside a registered
+//! workspace root, never declared to a harness. Canonicalized and checked
+//! when configured, and re-canonicalized and re-checked at every use
+//! ([`WorkAreaRoot::check`]), so a workspace registered over it afterwards
+//! refuses the next journal, recovery, or snapshot write with
+//! `work-area-invalid`.
 //!
 //! The vault HAP-001-R7 also names does not exist in this repository yet;
 //! the check runs against the registered workspace roots the caller
@@ -19,6 +21,10 @@ pub const JOURNAL_DIR: &str = "journal";
 
 /// The recovery entries' directory under the work area.
 pub const RECOVERY_DIR: &str = "recovery";
+
+/// The guidance installer's snapshots directory under the work area
+/// (spike slice 5c, HAP-001 D18): one subdirectory per project identity.
+pub const SNAPSHOTS_DIR: &str = "snapshots";
 
 /// Why a work area could not be opened or fails its re-check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -157,10 +163,10 @@ pub struct WorkAreaRoot {
 
 impl WorkAreaRoot {
     /// Open the work area configured at `configured`, creating it and its
-    /// `journal/` and `recovery/` subdirectories (owner-only) when missing,
-    /// after checking that it does not resolve inside any of `workspaces`
-    /// (HAP-001-R7 at configuration time). Nothing is created when the
-    /// check fails.
+    /// `journal/`, `recovery/`, and `snapshots/` subdirectories
+    /// (owner-only) when missing, after checking that it does not resolve
+    /// inside any of `workspaces` (HAP-001-R7 at configuration time).
+    /// Nothing is created when the check fails.
     ///
     /// # Errors
     ///
@@ -173,11 +179,16 @@ impl WorkAreaRoot {
         refuse_inside_workspaces(configured, workspaces).map_err(WorkAreaError::from)?;
         create_owner_only_dir(configured).map_err(|_| WorkAreaError::Unusable)?;
         let path = canonical_outside_workspaces(configured, workspaces)?;
-        for sub in [JOURNAL_DIR, RECOVERY_DIR] {
+        for sub in [JOURNAL_DIR, RECOVERY_DIR, SNAPSHOTS_DIR] {
             create_owner_only_dir(&path.join(sub)).map_err(|_| WorkAreaError::Unusable)?;
         }
         let root = Self { path };
-        for dir in [root.path.clone(), root.journal_dir(), root.recovery_dir()] {
+        for dir in [
+            root.path.clone(),
+            root.journal_dir(),
+            root.recovery_dir(),
+            root.snapshots_dir(),
+        ] {
             if !is_owner_only(&dir).map_err(|_| WorkAreaError::Unusable)? {
                 return Err(WorkAreaError::NotOwnerOnly);
             }
@@ -237,6 +248,12 @@ impl WorkAreaRoot {
     #[must_use]
     pub fn recovery_dir(&self) -> PathBuf {
         self.path.join(RECOVERY_DIR)
+    }
+
+    /// The guidance installer's snapshots directory (spike slice 5c).
+    #[must_use]
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.path.join(SNAPSHOTS_DIR)
     }
 }
 
