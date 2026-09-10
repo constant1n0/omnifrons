@@ -10,10 +10,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-use omnifrons_app::ProcessTerminalState;
 use omnifrons_app::{
-    HarnessKind, HarnessRequest, ProcessId, ProcessStatus, ProcessSupervisor, SupervisorError,
+    HarnessKind, HarnessRequest, ProcessId, ProcessStatus, ProcessSupervisor, ProcessTerminalState,
+    SupervisorError,
 };
 use omnifrons_supervisor::TokioProcessSupervisor;
 
@@ -27,14 +26,48 @@ fn demo_harness_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_demo-harness"))
 }
 
+/// The *confirmed* terminal state of an observed status, if it is one.
+///
+/// `Terminal(OrphanRiskUncertain)` from `observe` is deliberately not
+/// confirmation: `TokioProcessSupervisor::observe` returns it when
+/// `try_wait` itself failed (`crates/omnifrons-supervisor/src/lib.rs`,
+/// the `Err(_)` arm), and that arm leaves the entry `Tracked::Running`
+/// and records no terminal order -- so the very next `observe` answering
+/// `Ok(None)` reports `Running` again. A caller that treats that report
+/// as an arrival is asserting something the supervisor never proved
+/// (`docs/spike-log.md` § Slice 5d).
+///
+/// Exhaustive on purpose, with no catch-all: a new `ProcessTerminalState`
+/// would otherwise be classified "not proof" silently, and whether a new
+/// terminal state is proof of an arrival is exactly the judgment this
+/// helper exists to make (spike slice 5d, R3-018). A variant added later
+/// breaks this build instead.
+fn confirmed_terminal(status: Option<ProcessStatus>) -> Option<ProcessTerminalState> {
+    match status {
+        Some(ProcessStatus::Terminal(state)) => match state {
+            ProcessTerminalState::Exited { .. } | ProcessTerminalState::Killed => Some(state),
+            ProcessTerminalState::OrphanRiskUncertain => None,
+        },
+        Some(ProcessStatus::Running) | None => None,
+    }
+}
+
+/// Wait until `id` reaches a state the supervisor actually proved. An
+/// unproven `OrphanRiskUncertain` keeps the loop going rather than
+/// standing in for an arrival that never happened.
 fn wait_for_terminal(supervisor: &TokioProcessSupervisor, id: ProcessId) {
     let deadline = Instant::now() + REAP_DEADLINE;
     loop {
-        match supervisor.observe(id) {
-            Some(ProcessStatus::Terminal(_)) => return,
-            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            other => panic!("process {id:?} did not reach a terminal state in time: {other:?}"),
+        let observed = supervisor.observe(id);
+        if confirmed_terminal(observed).is_some() {
+            return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "process {id:?} did not reach a confirmed terminal state in time; last observed \
+             {observed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -157,12 +190,47 @@ fn the_oldest_terminal_entry_is_evicted_past_the_retention_cap() {
         .expect_err("stop on an evicted id must report UnknownProcess, never re-signal a pid");
     assert_eq!(stop_after_eviction, SupervisorError::UnknownProcess);
 
-    // The most recently terminated entry must still be retained.
+    // The most recently terminated entry must still be retained. The
+    // assertion prints what was actually observed: the one time this test
+    // failed on windows-latest it printed a fixed message and diagnosed
+    // nothing (`docs/spike-log.md` § Slice 5d).
+    // `confirmed_terminal` and not `Terminal(_)`: the loop that just ran for
+    // this id refuses an unproven `OrphanRiskUncertain`, and an assertion
+    // weaker than the wait that preceded it can only ever pass by accident
+    // (spike slice 5d, R3-017).
+    let observed = supervisor.observe(last_id);
     assert!(
-        matches!(
-            supervisor.observe(last_id),
-            Some(ProcessStatus::Terminal(_))
-        ),
-        "the most recently terminated entry must still be retained"
+        confirmed_terminal(observed).is_some(),
+        "the most recently terminated entry must still be retained in a state the supervisor \
+         proved; observed {observed:?} for {last_id:?}"
     );
+}
+
+/// A pin on what [`confirmed_terminal`] treats as proof, so the
+/// distinction this file depends on cannot drift silently: a reaped exit
+/// and a kill are confirmations; the `OrphanRiskUncertain` report
+/// `observe` returns when `try_wait` itself failed is not, because the
+/// entry it describes is still `Tracked::Running` and no terminal order
+/// was recorded for it.
+#[test]
+fn an_unproven_orphan_risk_report_is_not_a_confirmed_terminal_state() {
+    assert_eq!(
+        confirmed_terminal(Some(ProcessStatus::Terminal(
+            ProcessTerminalState::Exited { code: Some(0) }
+        ))),
+        Some(ProcessTerminalState::Exited { code: Some(0) })
+    );
+    assert_eq!(
+        confirmed_terminal(Some(ProcessStatus::Terminal(ProcessTerminalState::Killed))),
+        Some(ProcessTerminalState::Killed)
+    );
+    assert_eq!(
+        confirmed_terminal(Some(ProcessStatus::Terminal(
+            ProcessTerminalState::OrphanRiskUncertain
+        ))),
+        None,
+        "an unproven report is not an arrival"
+    );
+    assert_eq!(confirmed_terminal(Some(ProcessStatus::Running)), None);
+    assert_eq!(confirmed_terminal(None), None);
 }
