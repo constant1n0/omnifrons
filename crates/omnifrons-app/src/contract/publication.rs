@@ -17,9 +17,10 @@ use std::time::{Duration, SystemTime};
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, Attribution, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactApprovalId, ArtifactState, AssetRootId, CatalogId, CatalogRecord,
-    DisplayName, JournalEntry, JournalStep, Producer, ProjectIdentity, Provenance, ProviderLocator,
-    ProviderRecord, ProviderState, PublicationIdentity, RECORD_VERSION, StepEntry, StepOutcome,
+    ApprovalSource, ArtifactApproval, ArtifactApprovalId, ArtifactState, AssetRootId, CatalogId,
+    CatalogRecord, DisplayName, JournalEntry, JournalStep, Producer, ProjectIdentity, Provenance,
+    ProviderLocator, ProviderRecord, ProviderState, PublicationIdentity, RECORD_VERSION, StepEntry,
+    StepOutcome,
 };
 
 use crate::blob_store::{
@@ -523,6 +524,7 @@ pub fn sample_approval(publication: PublicationIdentity, name: &str) -> Artifact
         executable_approval: Some(omnifrons_domain::executable::ApprovalId(42)),
         approver: DeviceLocalUser,
         approved_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_725_782_399),
+        source: ApprovalSource::Outbox,
     }
 }
 
@@ -635,6 +637,23 @@ pub fn publication_journal_contract<J: PublicationJournal>(make: impl Fn() -> J)
             adapter_id: None,
             executable_approval: None,
             ..sample_approval(publication, "dropped.pdf")
+        })),
+        // A re-approval of a recovery entry (spike slice 5e,
+        // HAP-001-R18): no run, and the publication its bytes were
+        // recovered from carried as a location fact that has to survive
+        // the journal, or a restart would lose what is being republished.
+        JournalEntry::Approved(Box::new(ArtifactApproval {
+            approval_id: ArtifactApprovalId(0x0123_4567_89ab_cdf1),
+            run_id: None,
+            name: "cd".repeat(32),
+            display_name: DisplayName::sanitize("report.pdf"),
+            attribution: Attribution::Unattributed,
+            adapter_id: None,
+            executable_approval: None,
+            source: ApprovalSource::Recovery {
+                recovered_from: PublicationIdentity(Sha256Digest([0x99; 32])),
+            },
+            ..sample_approval(publication, "report.pdf")
         })),
         JournalEntry::Step(Box::new(sample_step(
             publication,

@@ -38,8 +38,9 @@ use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, Attribution, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactState, AssetRootId, DisplayName, JournalEntry, JournalStep,
-    PortableReference, Producer, ProjectIdentity, ProviderState, RECORD_VERSION, StepOutcome,
+    ApprovalSource, ArtifactApproval, ArtifactState, AssetRootId, DisplayName, JournalEntry,
+    JournalStep, PortableReference, Producer, ProjectIdentity, ProviderState, RECORD_VERSION,
+    StepOutcome,
 };
 
 /// Open a directory handle for a fixture. Windows refuses a plain
@@ -174,6 +175,7 @@ impl Fixture {
             executable_approval: None,
             approver: DeviceLocalUser,
             approved_at,
+            source: ApprovalSource::Outbox,
         }
     }
 
@@ -967,5 +969,62 @@ fn an_unattributed_approval_records_the_location_fact_and_no_provenance() {
     assert_eq!(
         published.record.provenance.producer,
         Producer::Unattributed { found_under: None }
+    );
+}
+
+/// HAP-001-R18, R28: a recovery entry is the preserved copy of what was
+/// digested and approved. Publishing it registers those bytes and leaves
+/// the entry exactly where it is -- this contract defines no deletion path
+/// for one, and HAP-001-R39 makes MRP-001's tombstone the only way a
+/// registered artifact goes away. Without this the transaction's step 10
+/// would unlink the recovery entry the way it unlinks an outbox entry, and
+/// the one copy of an `outbox-escape`'s bytes would be gone (spike slice
+/// 5e).
+///
+/// **The bytes here sit in the fixture's outbox, not in a work area's
+/// `recovery/`**, and the name says so: what the transaction branches on
+/// is `ApprovalSource`, not where the file is, and this is the test of
+/// that branch. The real recovery layout -- a digest-named entry under
+/// the work area, re-opened through the recovery directory's own handle
+/// -- is built and published by the shell's
+/// `publishing_a_recovery_approval_registers_it_and_keeps_the_entry`.
+#[test]
+fn an_approval_sourced_from_recovery_is_published_without_removing_its_entry() {
+    let mut fixture = Fixture::new("recovery-retained");
+    let mut approval = fixture.approval("report.pdf", PDF);
+    approval.run_id = None;
+    approval.attribution = Attribution::Unattributed;
+    approval.source = ApprovalSource::Recovery {
+        recovered_from: omnifrons_domain::publication::PublicationIdentity(Sha256Digest(
+            [0x99; 32],
+        )),
+    };
+    let source = fixture.source("report.pdf");
+    let entry_path = source.dir_path.join(&source.file_name);
+    let entry_ops = ScriptedEntryOps::always(EntryIdentity::SameFile);
+    let workspace = fixture.workspace();
+
+    let published = publish(
+        fixture.ports(&entry_ops, &[&workspace]),
+        &approval,
+        source,
+        &mut |_| {},
+    )
+    .expect("the publication succeeds");
+
+    assert_eq!(published.state, ArtifactState::Registered);
+    assert_eq!(
+        published.cleanup,
+        CleanupOutcome::Deferred("recovery-entry-retained".to_string()),
+        "the entry is kept, and the journal says why",
+    );
+    assert!(
+        entry_path.exists(),
+        "the recovery entry is still there after a successful publication",
+    );
+    assert_eq!(
+        fixture.steps().last().copied(),
+        Some((JournalStep::Cleanup, StepOutcome::Deferred)),
+        "and the deferral is journaled, never silent",
     );
 }

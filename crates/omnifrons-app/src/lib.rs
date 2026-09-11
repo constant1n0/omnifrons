@@ -6,6 +6,7 @@
 
 pub mod approval_store;
 pub mod blob_store;
+pub mod catalog_repair;
 pub mod catalog_store;
 pub mod clock;
 pub mod content_hasher;

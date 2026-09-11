@@ -26,9 +26,9 @@ use std::time::SystemTime;
 
 use omnifrons_domain::outbox::{Attribution, ContentDigest};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactState, CatalogId, CatalogRecord, JournalEntry, JournalStep,
-    PortableReference, Producer, ProjectIdentity, Provenance, ProviderRecord, ProviderState,
-    PublicationIdentity, RECORD_VERSION, StepEntry, StepOutcome,
+    ApprovalSource, ArtifactApproval, ArtifactState, CatalogId, CatalogRecord, JournalEntry,
+    JournalStep, PortableReference, Producer, ProjectIdentity, Provenance, ProviderRecord,
+    ProviderState, PublicationIdentity, RECORD_VERSION, StepEntry, StepOutcome,
 };
 
 use crate::blob_store::{BlobStoreError, BlobStorePort};
@@ -45,6 +45,11 @@ use crate::work_area::{WorkAreaError, WorkAreaRoot};
 /// transaction records the adapter's own reason when `confirm` yields
 /// nothing.
 pub const NO_CONFIRMATION_REASON: &str = "no remote";
+
+/// The fixed cleanup reason a publication of a recovery entry journals
+/// (spike slice 5e, HAP-001-R18): the preserved bytes are kept, and this
+/// says so rather than leaving a removal that never happened unexplained.
+pub const RECOVERY_ENTRY_RETAINED: &str = "recovery-entry-retained";
 
 /// The held handle and where its name lives: the one source of every
 /// published byte, and the directory the identity check and the removal
@@ -649,6 +654,20 @@ impl Transaction<'_, '_> {
         })
     }
 
+    /// Step 10 for a source this transaction must not remove: the
+    /// deferral is journaled with its fixed reason, exactly as
+    /// [`Transaction::cleanup`] journals its own.
+    fn defer_cleanup(&mut self, reason: &str) -> Result<CleanupOutcome, PublishError> {
+        self.journal(
+            JournalStep::Cleanup,
+            StepOutcome::Deferred,
+            Some(reason),
+            None,
+            None,
+        )?;
+        Ok(CleanupOutcome::Deferred(reason.to_string()))
+    }
+
     /// Step 10: remove the entry only now that both steps are verified,
     /// and only while the path still names the handle's file
     /// (HAP-001-R28); otherwise defer, journaled, never silent.
@@ -824,7 +843,17 @@ pub fn publish(
 
     let mut published = transaction.register(record, None)?;
     if published.state == ArtifactState::Registered {
-        published.cleanup = transaction.cleanup(&source)?;
+        published.cleanup = if approval.source == ApprovalSource::Outbox {
+            transaction.cleanup(&source)?
+        } else {
+            // HAP-001-R18, R28: a recovery entry is the preserved copy of
+            // what was digested and approved. Registering those bytes does
+            // not make the preserved copy disposable, and this contract
+            // defines no deletion path for one -- HAP-001-R39 makes
+            // MRP-001's tombstone the only way a registered artifact goes
+            // away. Deferred, journaled, never silent.
+            transaction.defer_cleanup(RECOVERY_ENTRY_RETAINED)?
+        };
     }
     Ok(published)
 }
