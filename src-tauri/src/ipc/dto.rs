@@ -883,6 +883,12 @@ pub struct ArtifactApprovalDto {
     pub asset_root_id: String,
     pub act_as: ActAsTag,
     pub approved_at: u64,
+    /// The publication this approval's bytes were recovered from
+    /// (HAP-001-R18), as a location fact so the surface can show what is
+    /// being re-published; `null` for an outbox entry. Never provenance:
+    /// the record this approval registers carries `producer:
+    /// unattributed` (spike slice 5e).
+    pub recovered_from: Option<String>,
     /// Whether the entry's handle is held for the publication that follows
     /// (HAP-001-R17): `false` when HAP-001 D22's cap left no room for it,
     /// in which case the publication re-opens the entry under the
@@ -920,6 +926,7 @@ impl ArtifactApprovalDto {
             asset_root_id: approval.asset_root_id.as_str().to_string(),
             act_as: ActAsTag::DeviceLocalUser,
             approved_at: system_time_to_millis(approval.approved_at),
+            recovered_from: approval.recovered_from().map(|id| id.to_hex()),
             handle_held,
         }
     }
@@ -1395,6 +1402,178 @@ pub struct MisplacedRemedyDto {
     pub detail: Option<String>,
 }
 
+/// One recovery entry (spike slice 5e, HAP-001-R18): the bytes a
+/// publication held when its outbox path stopped naming them, kept in the
+/// product work area so that what was digested and approved survives.
+/// Never a path -- the work area is device configuration (HAP-001-R5).
+///
+/// **These entries are the device's, not the active project's** (slice 5e
+/// review, R1-005). The work area and the journal that accounts for them
+/// are one per device, and the `outbox-escape` step that writes one
+/// carries no project, so `recovery_list` lists every entry this device
+/// holds whatever workspace is active -- including entries an escape wrote
+/// while another project was open, and entries whose project is gone.
+/// `recovery_approve` then registers the bytes into the project that is
+/// active **now**, under that project's identity and its asset root; the
+/// entry is not moved between projects, it is published afresh from the
+/// one the user is in. Scoping this listing would take a project identity
+/// on the escape step, which is a change to a persisted shape, and it
+/// would hide exactly the entries HAP-001-R18 exists for -- the ones whose
+/// publication "may no longer exist anywhere". So it is stated, on this
+/// DTO, on both commands and on the surface, rather than implied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryEntryDto {
+    /// The digest the entry is filed under. A locator, not a verified
+    /// fact: `usable` says whether the bytes at that name currently hash
+    /// to it, and `recovery_approve` re-verifies from its own handle
+    /// whatever this said.
+    pub sha256: String,
+    /// The size read from the entry's own handle, and `null` whenever no
+    /// size was taken from one. That is **not** only "it did not open as
+    /// a regular file": an entry that opened perfectly well but carries a
+    /// link count above one is reported `size: null` too, because the
+    /// probe refuses it before it digests anything (HAP-001-R20 applied
+    /// to a recovery entry). `null` therefore means "this entry yielded
+    /// no facts", and [`Self::usable`] is the flag that says so.
+    pub size: Option<u64>,
+    /// The publication whose `outbox-escape` wrote it, from this device's
+    /// journal -- never inferred from the file name.
+    pub recovered_from: String,
+    /// When that step was journaled, in milliseconds since the epoch.
+    pub recovered_at: u64,
+    /// **The name the re-publication would register and write this under**
+    /// (slice 5e review, R1-004): the escaped publication's own display
+    /// name when this device's journal still carries its approval, and the
+    /// entry's digest otherwise -- derived exactly as `recovery_approve`
+    /// derives it, so the surface shows the decision's own fact and not an
+    /// approximation of it. Sanitized to one component; never a path.
+    pub display_name: String,
+    /// **The class that decides whether the approval is allowed at all**
+    /// (R1-004): the project policy's verdict on [`Self::display_name`]
+    /// beside the detected type and size read from this entry's own
+    /// handle. `recovery_approve` refuses anything but `generated-heavy`,
+    /// so a user who cannot see this cannot see why an entry will be
+    /// refused -- and an executable-looking recovered name is exactly the
+    /// case that flips it (HAP-001-R4 is name-and-type, never content
+    /// shape).
+    ///
+    /// `null` when no classification was made, which is the same fact
+    /// [`Self::size`] reports as `null`: the probe yielded nothing to
+    /// classify. A token is never invented for an entry that was not
+    /// classified.
+    pub class: Option<String>,
+    /// Whether the entry opened as a regular file with a link count of
+    /// one whose bytes hash to the name it is filed under. `false` is
+    /// listed rather than hidden: an entry that stopped being what it was
+    /// filed as is exactly what a user needs told.
+    pub usable: bool,
+}
+
+/// Which repair rule would drop a Catalog line (spike slice 5e). The two
+/// rules that delete no registration; the others are refused, never
+/// applied (HAP-001-R39).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairRuleTag {
+    /// The later of two `record` lines carrying one `catalogId`.
+    DuplicateRecord,
+    /// An `alias` no earlier `record` line carries.
+    DanglingAlias,
+}
+
+impl From<omnifrons_app::catalog_repair::RepairRule> for RepairRuleTag {
+    fn from(rule: omnifrons_app::catalog_repair::RepairRule) -> Self {
+        use omnifrons_app::catalog_repair::RepairRule;
+        match rule {
+            RepairRule::DuplicateRecord => Self::DuplicateRecord,
+            RepairRule::DanglingAlias => Self::DanglingAlias,
+        }
+    }
+}
+
+/// Why a Catalog line refuses the whole repair (spike slice 5e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairRefusalTag {
+    /// A `record` whose `catalogId` is not `<assetRootId>/<publicationId>`:
+    /// the only line registering that artifact, so dropping it would
+    /// delete one (HAP-001-R39).
+    CatalogIdMismatch,
+    /// A `record` carrying a `publicationId` an earlier `record` already
+    /// carries, under a **different** `assetRootId`: two `catalogId`s,
+    /// so two registered artifacts, and dropping the later one would
+    /// delete the second asset root's registration (HAP-001-R39).
+    DuplicateAcrossAssetRoots,
+    /// A line this version cannot decode. Never dropped: the Catalog is
+    /// untrusted synchronized content (HAP-001-R40).
+    Unparsable,
+}
+
+impl From<omnifrons_app::catalog_repair::RepairRefusal> for RepairRefusalTag {
+    fn from(refusal: omnifrons_app::catalog_repair::RepairRefusal) -> Self {
+        use omnifrons_app::catalog_repair::RepairRefusal;
+        match refusal {
+            RepairRefusal::CatalogIdMismatch => Self::CatalogIdMismatch,
+            RepairRefusal::DuplicateAcrossAssetRoots => Self::DuplicateAcrossAssetRoots,
+            RepairRefusal::Unparsable => Self::Unparsable,
+        }
+    }
+}
+
+/// One line `catalog_repair` would drop, named by its one-based number --
+/// never by its content, which is untrusted synchronized text
+/// (HAP-001-R40, RCS-001-R14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogRepairDropDto {
+    pub line: u32,
+    pub rule: RepairRuleTag,
+    /// The publication identity the line names, when this version can
+    /// parse it; `null` for an alias whose identity is not 64 hex
+    /// characters -- which is exactly why no record carries it.
+    pub publication_id: Option<String>,
+}
+
+/// One line that refuses the repair, named the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogRepairRefusalDto {
+    pub line: u32,
+    pub reason: RepairRefusalTag,
+}
+
+/// `catalog_repair_preview`'s answer (spike slice 5e): what a repair
+/// would do, and the digest `catalog_repair` has to be given back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogRepairPreviewDto {
+    /// The digest of the catalog these lines were read from.
+    pub sha256: String,
+    /// Whether an apply would run: nothing refuses it, and there is
+    /// something to drop.
+    pub repairable: bool,
+    pub drops: Vec<CatalogRepairDropDto>,
+    pub refusals: Vec<CatalogRepairRefusalDto>,
+    /// How many registrations the repaired catalog would carry.
+    pub kept_records: u32,
+}
+
+/// `catalog_repair`'s answer (spike slice 5e). Never a path: the
+/// pre-repair copy lives in the product work area, which is device
+/// configuration and never crosses IPC (HAP-001-R5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogRepairedDto {
+    /// The digest of the bytes that were repaired -- the binding the
+    /// request carried, and the content of the copy kept in the work area.
+    pub original_sha256: String,
+    /// The digest of the catalog as it now stands.
+    pub sha256: String,
+    pub dropped_lines: u32,
+    pub kept_records: u32,
+}
+
 /// The closed set of error codes a failed IPC command reports. Fixed and
 /// exhaustive: every value the renderer can compare against structurally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1535,6 +1714,26 @@ pub enum ShellErrorCode {
     /// The wrong-root scan could not walk the active workspace root, so no
     /// verdict is claimed for it (spike slice 5d).
     ScanFailed,
+    /// The project's Catalog is corrupt: it has lines this version cannot
+    /// read, and `catalog_repair_preview` says which. Distinct from
+    /// [`ShellErrorCode::CatalogUnavailable`], which is a catalog that
+    /// could not be read or written at all and has no repair to offer
+    /// (spike slice 5e).
+    CatalogCorrupt,
+    /// `catalog_repair`'s `sha256` is not the catalog's own digest any
+    /// more: the preview is stale and nothing was rewritten (spike slice
+    /// 5e, the `ProjectTextFile` binding).
+    CatalogChanged,
+    /// The catalog carries a line this repair may not drop -- a `record`
+    /// whose `catalogId` disagrees with its identity, which is the only
+    /// line registering that artifact (HAP-001-R39), or a line this
+    /// version cannot decode (HAP-001-R40). Nothing was rewritten and the
+    /// case needs an owner decision (spike slice 5e).
+    RepairRefused,
+    /// `recovery_approve` named a digest no recovery entry of this
+    /// device's journal carries, or whose entry is no longer a usable
+    /// regular file (HAP-001-R18; spike slice 5e).
+    RecoveryUnknown,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -1683,7 +1882,7 @@ impl From<&omnifrons_domain::executable::PlatformEvidence> for PlatformEvidenceD
 /// [`u64::MAX`] if a duration since the epoch somehow overflowed `u64`
 /// milliseconds (equally never expected before the year 292 million or
 /// so).
-fn system_time_to_millis(time: std::time::SystemTime) -> u64 {
+pub(crate) fn system_time_to_millis(time: std::time::SystemTime) -> u64 {
     time.duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -2837,6 +3036,7 @@ mod tests {
             asset_root_id: "main".to_string(),
             act_as: super::ActAsTag::DeviceLocalUser,
             approved_at: 1_725_782_401_000,
+            recovered_from: None,
             handle_held: true,
         };
         assert_eq!(
@@ -2855,6 +3055,7 @@ mod tests {
                 "assetRootId": "main",
                 "actAs": "device-local-user",
                 "approvedAt": 1_725_782_401_000u64,
+                "recoveredFrom": null,
                 "handleHeld": true,
             })
         );
@@ -2881,6 +3082,7 @@ mod tests {
             asset_root_id: "main".to_string(),
             act_as: super::ActAsTag::DeviceLocalUser,
             approved_at: 1_725_782_401_000,
+            recovered_from: None,
             handle_held: false,
         };
         let value = json(&dto);
@@ -2897,10 +3099,12 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
+        assert_eq!(value["recoveredFrom"], serde_json::Value::Null);
         assert_eq!(
             keys.len(),
-            14,
-            "the thirteen slice-5b keys plus handleHeld, none a path: {keys:?}"
+            15,
+            "the thirteen slice-5b keys plus handleHeld (5c) and recoveredFrom (5e), none a path: \
+             {keys:?}"
         );
     }
 
@@ -3438,6 +3642,171 @@ mod tests {
         }
         assert!(serde_json::from_str::<super::RemedyTag>("\"delete\"").is_err());
         assert!(serde_json::from_str::<super::RemedyTag>("\"Quarantine\"").is_err());
+    }
+
+    /// `catalog_repair_preview`'s payload: line numbers and tokens, never
+    /// a line's content -- the Catalog is synchronized, untrusted text
+    /// (HAP-001-R40) -- and never a path.
+    #[test]
+    fn catalog_repair_preview_dto_json_shape() {
+        let dto = super::CatalogRepairPreviewDto {
+            sha256: "ab".repeat(32),
+            repairable: false,
+            drops: vec![super::CatalogRepairDropDto {
+                line: 4,
+                rule: super::RepairRuleTag::DuplicateRecord,
+                publication_id: Some("cd".repeat(32)),
+            }],
+            refusals: vec![super::CatalogRepairRefusalDto {
+                line: 7,
+                reason: super::RepairRefusalTag::CatalogIdMismatch,
+            }],
+            kept_records: 2,
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "sha256": "ab".repeat(32),
+                "repairable": false,
+                "drops": [{
+                    "line": 4,
+                    "rule": "duplicate-record",
+                    "publicationId": "cd".repeat(32),
+                }],
+                "refusals": [{"line": 7, "reason": "catalog-id-mismatch"}],
+                "keptRecords": 2,
+            })
+        );
+        assert_eq!(
+            json(&super::RepairRuleTag::DanglingAlias),
+            serde_json::json!("dangling-alias")
+        );
+        assert_eq!(
+            json(&super::RepairRefusalTag::Unparsable),
+            serde_json::json!("unparsable")
+        );
+    }
+
+    /// The two `as_str` methods on the app's own `RepairRule` and
+    /// `RepairRefusal` publish the same tokens these two tags serialize
+    /// to, and nothing else pinned them equal -- so a token renamed on one
+    /// side would leave the other rendering the old one with every test
+    /// green. Every variant, both directions, from the app's own lists.
+    #[test]
+    fn every_repair_token_is_the_same_on_both_sides_of_the_wire() {
+        use omnifrons_app::catalog_repair::{RepairRefusal, RepairRule};
+
+        for rule in RepairRule::ALL {
+            assert_eq!(
+                json(&super::RepairRuleTag::from(rule)),
+                serde_json::json!(rule.as_str()),
+                "{rule:?}",
+            );
+        }
+        for refusal in RepairRefusal::ALL {
+            assert_eq!(
+                json(&super::RepairRefusalTag::from(refusal)),
+                serde_json::json!(refusal.as_str()),
+                "{refusal:?}",
+            );
+        }
+        // And the lists are the whole enums: a variant added without being
+        // listed leaves this count wrong.
+        assert_eq!(RepairRule::ALL.len(), 2);
+        assert_eq!(RepairRefusal::ALL.len(), 3);
+    }
+
+    /// `catalog_repair`'s payload: the binding it carried, the digest the
+    /// file now has, and two counts. The pre-repair copy lives in the
+    /// product work area and is never named here (HAP-001-R5).
+    #[test]
+    fn catalog_repaired_dto_json_shape() {
+        let dto = super::CatalogRepairedDto {
+            original_sha256: "ab".repeat(32),
+            sha256: "cd".repeat(32),
+            dropped_lines: 1,
+            kept_records: 2,
+        };
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "originalSha256": "ab".repeat(32),
+                "sha256": "cd".repeat(32),
+                "droppedLines": 1,
+                "keptRecords": 2,
+            })
+        );
+    }
+
+    /// `recovery_list`'s payload (HAP-001-R18): the digest the entry is
+    /// filed under, the facts its own handle gave, the provenance this
+    /// device's journal recorded, and -- since R1-004 -- the display name
+    /// and class the approval would use. Never a path.
+    #[test]
+    fn recovery_entry_dto_json_shape() {
+        let usable = super::RecoveryEntryDto {
+            sha256: "ab".repeat(32),
+            size: Some(4096),
+            recovered_from: "cd".repeat(32),
+            recovered_at: 1_725_782_400_000,
+            display_name: "quarterly report.pdf".to_string(),
+            class: Some("generated-heavy".to_string()),
+            usable: true,
+        };
+        assert_eq!(
+            json(&usable),
+            serde_json::json!({
+                "sha256": "ab".repeat(32),
+                "size": 4096,
+                "recoveredFrom": "cd".repeat(32),
+                "recoveredAt": 1_725_782_400_000u64,
+                "displayName": "quarterly report.pdf",
+                "class": "generated-heavy",
+                "usable": true,
+            })
+        );
+        // An entry whose probe yielded nothing: no size and no class, and
+        // the two are the same fact said twice (R1-004). The name is not
+        // among them -- it comes from the journal, which answered.
+        let unusable = super::RecoveryEntryDto {
+            size: None,
+            class: None,
+            usable: false,
+            ..usable
+        };
+        assert_eq!(json(&unusable)["size"], serde_json::Value::Null);
+        assert_eq!(json(&unusable)["class"], serde_json::Value::Null);
+        assert_eq!(json(&unusable)["usable"], serde_json::json!(false));
+        assert_eq!(
+            json(&unusable)["displayName"],
+            serde_json::json!("quarterly report.pdf")
+        );
+    }
+
+    /// The four slice-5e error codes each render as their documented
+    /// kebab-case token. `catalog-corrupt` is distinct from the existing
+    /// `catalog-unavailable`: a corrupt catalog has a repair to offer and
+    /// an unreadable one has not.
+    #[test]
+    fn slice_5e_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::CatalogCorrupt, "catalog-corrupt"),
+            (ShellErrorCode::CatalogChanged, "catalog-changed"),
+            (ShellErrorCode::RepairRefused, "repair-refused"),
+            (ShellErrorCode::RecoveryUnknown, "recovery-unknown"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(json(&error)["code"], serde_json::json!(token));
+            assert!(
+                !error.message.contains('/') && !error.message.contains('\\'),
+                "a catalogue message never carries a path separator"
+            );
+        }
+        assert_ne!(
+            json(&ShellError::new(ShellErrorCode::CatalogCorrupt, "m"))["code"],
+            json(&ShellError::new(ShellErrorCode::CatalogUnavailable, "m"))["code"],
+        );
     }
 
     /// The three slice-5d error codes each render as their documented

@@ -53,8 +53,8 @@ use omnifrons_app::work_area::{WorkAreaError, WorkAreaRoot};
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, Attribution, CandidateState, OutboxPath, RunId};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactApprovalId, ArtifactState, DisplayName, JournalEntry, JournalStep,
-    ProjectIdentity, StepOutcome,
+    ApprovalSource, ArtifactApproval, ArtifactApprovalId, ArtifactState, DisplayName, JournalEntry,
+    JournalStep, ProjectIdentity, StepOutcome,
 };
 use omnifrons_supervisor::TokioProcessSupervisor;
 use tauri::ipc::Channel;
@@ -113,16 +113,31 @@ impl From<DestinationError> for ShellError {
 }
 
 impl From<CatalogStoreError> for ShellError {
+    /// A **corrupt** catalog is its own code as of spike slice 5e: it has
+    /// lines a repair can name (`catalog_repair_preview`), where a catalog
+    /// that could not be read or written at all has nothing to offer.
+    /// Collapsing the two into `catalog-unavailable`, as slice 5b did,
+    /// left the surface unable to tell "offer the repair" from "there is
+    /// no repair to offer".
     fn from(error: CatalogStoreError) -> Self {
-        let message = match error {
-            CatalogStoreError::Unreadable => "the catalog could not be read",
-            CatalogStoreError::Corrupt => "the catalog is corrupt",
-            CatalogStoreError::WriteFailed => "the catalog could not be written",
-            CatalogStoreError::Duplicate | CatalogStoreError::Unknown => {
-                "the catalog refused the record"
-            }
-        };
-        Self::new(ShellErrorCode::CatalogUnavailable, message)
+        match error {
+            CatalogStoreError::Corrupt => Self::new(
+                ShellErrorCode::CatalogCorrupt,
+                "the catalog is corrupt; preview the repair to see which lines",
+            ),
+            CatalogStoreError::Unreadable => Self::new(
+                ShellErrorCode::CatalogUnavailable,
+                "the catalog could not be read",
+            ),
+            CatalogStoreError::WriteFailed => Self::new(
+                ShellErrorCode::CatalogUnavailable,
+                "the catalog could not be written",
+            ),
+            CatalogStoreError::Duplicate | CatalogStoreError::Unknown => Self::new(
+                ShellErrorCode::CatalogUnavailable,
+                "the catalog refused the record",
+            ),
+        }
     }
 }
 
@@ -442,6 +457,7 @@ fn approve_listed_entry(
         executable_approval: record.executable_approval(),
         approver: DeviceLocalUser,
         approved_at: now,
+        source: ApprovalSource::Outbox,
     };
     Ok((approval, candidate.handle.is_some()))
 }
@@ -539,6 +555,7 @@ fn approve_whole_outbox_entry(
         executable_approval: None,
         approver: DeviceLocalUser,
         approved_at: now,
+        source: ApprovalSource::Outbox,
     };
     Ok((
         approval,
@@ -587,7 +604,7 @@ fn open_entry_directory(
 /// room the handle is released here, explicitly, and the fact rides the
 /// payload as `handleHeld: false` -- never silent: the publication
 /// re-opens the entry when its turn comes (HAP-001-R17).
-fn hold_for_publication(
+pub(crate) fn hold_for_publication(
     runs: &Arc<Mutex<RunTable>>,
     id: ArtifactApprovalId,
     source: CandidateSource,
@@ -618,11 +635,21 @@ fn hold_for_publication(
 fn acquire_source(
     outbox: &OutboxState,
     workspace: &omnifrons_app::WorkspaceRoot,
+    work_area: &WorkAreaRoot,
     approval: &ArtifactApproval,
     journal: &mut JsonlPublicationJournal,
     now: SystemTime,
     on_state: &mut dyn FnMut(ArtifactStateFrame),
 ) -> Result<CandidateSource, ShellError> {
+    // A recovery entry is not in the outbox at all (spike slice 5e,
+    // HAP-001-R18): its name is a digest under the work area's
+    // `recovery/`, so the held handle is the table's and the re-open
+    // path is the recovery directory's, never the outbox's. Parsing its
+    // name as an outbox-relative one would send the re-open looking for a
+    // 64-hex entry at the outbox root.
+    if approval.source != ApprovalSource::Outbox {
+        return acquire_recovery_source(outbox, work_area, approval, journal, now, on_state);
+    }
     let location = EntryLocation::of(approval);
     if let Some(location) = &location
         && let Some(source) = take_held_source(&outbox.runs, approval, location)?
@@ -709,6 +736,101 @@ fn acquire_source(
             now,
             on_state,
             refused("the entry could not be re-opened under the outbox"),
+        )),
+    }
+}
+
+/// The bytes of a recovery entry (spike slice 5e): the handle held since
+/// the re-approval, or, when the D22 cap released it or the process
+/// restarted, one fresh no-follow open relative to the work area's
+/// `recovery/` handle whose digest, size, and detected type must equal
+/// the approved ones -- the same re-open discipline an outbox entry gets,
+/// against the directory this entry actually lives in.
+fn acquire_recovery_source(
+    outbox: &OutboxState,
+    work_area: &WorkAreaRoot,
+    approval: &ArtifactApproval,
+    journal: &mut JsonlPublicationJournal,
+    now: SystemTime,
+    on_state: &mut dyn FnMut(ArtifactStateFrame),
+) -> Result<CandidateSource, ShellError> {
+    {
+        let mut runs = outbox
+            .runs
+            .lock()
+            .expect("run table mutex poisoned by a prior panic");
+        if let Some(source) = runs.take_approved(approval.approval_id) {
+            return Ok(source);
+        }
+    }
+    let Ok((dir, dir_path)) = omnifrons_adapters::open_recovery_dir(work_area) else {
+        return Err(fail_before_publish(
+            journal,
+            approval,
+            JournalStep::Refused,
+            ArtifactState::Refused,
+            "recovery-directory-not-openable",
+            now,
+            on_state,
+            refused("the recovery entry could not be re-opened"),
+        ));
+    };
+    let file_name = OsString::from(approval.digest.to_hex());
+    match FsCandidateProber::new().probe(&dir, &dir_path, &file_name) {
+        CandidateProbe::Regular(regular)
+            if regular.digest == approval.digest
+                && regular.size == approval.size
+                && regular.detected_type == approval.detected_type =>
+        {
+            Ok(CandidateSource {
+                dir,
+                dir_path,
+                file_name,
+                handle: regular.handle,
+            })
+        }
+        CandidateProbe::Regular(_) => Err(fail_before_publish(
+            journal,
+            approval,
+            JournalStep::Refused,
+            ArtifactState::Refused,
+            "identity-facts-changed-at-re-open",
+            now,
+            on_state,
+            refused("the recovery entry's identity facts changed since it was approved"),
+        )),
+        CandidateProbe::Escape(_) => Err(fail_before_publish(
+            journal,
+            approval,
+            JournalStep::Refused,
+            ArtifactState::Refused,
+            "recovery-entry-not-a-regular-file",
+            now,
+            on_state,
+            refused("the recovery entry is no longer a regular file"),
+        )),
+        CandidateProbe::Linked { .. } => Err(fail_before_publish(
+            journal,
+            approval,
+            JournalStep::OutboxLinked,
+            ArtifactState::OutboxLinked,
+            "link-count-above-one-at-re-open",
+            now,
+            on_state,
+            refused("the recovery entry's link count is greater than one"),
+        )),
+        CandidateProbe::Unreadable => Err(fail_before_publish(
+            journal,
+            approval,
+            JournalStep::Refused,
+            ArtifactState::Refused,
+            "recovery-entry-unreadable-at-re-open",
+            now,
+            on_state,
+            ShellError::new(
+                ShellErrorCode::RecoveryUnknown,
+                "the recovery entry could not be opened",
+            ),
         )),
     }
 }
@@ -844,7 +966,15 @@ pub fn publish_approved(
         }
     }
 
-    let source = acquire_source(outbox, workspace, &approval, &mut journal, now, on_state)?;
+    let source = acquire_source(
+        outbox,
+        workspace,
+        &work_area,
+        &approval,
+        &mut journal,
+        now,
+        on_state,
+    )?;
     let provider = open_provider(publication, workspace, &approval.asset_root_id)?;
     let entry_ops = FsOutboxEntryOps::new();
     let mut sink = |event: StateEvent| on_state(ArtifactStateFrame::from_event(&event));
@@ -1825,8 +1955,15 @@ mod tests {
                 PublishError::Journal(omnifrons_app::publication_journal::JournalError::Corrupt),
                 ShellErrorCode::WorkAreaInvalid,
             ),
+            // Spike slice 5e: a corrupt catalog has a repair to offer and
+            // is its own code, where one that could not be read at all
+            // has none.
             (
                 PublishError::Catalog(omnifrons_app::catalog_store::CatalogStoreError::Corrupt),
+                ShellErrorCode::CatalogCorrupt,
+            ),
+            (
+                PublishError::Catalog(omnifrons_app::catalog_store::CatalogStoreError::Unreadable),
                 ShellErrorCode::CatalogUnavailable,
             ),
             (
@@ -2467,5 +2604,124 @@ mod tests {
         assert_eq!(fixture.held_handles(), held_before + 1);
         fixture.outbox.forget_runs();
         assert_eq!(fixture.held_handles(), 0);
+    }
+
+    // -- spike slice 5e: the recovery entry an escape actually writes --
+
+    /// HAP-001-R18 end to end, over the real adapters: the entry's name
+    /// stops holding the file the handle holds, nothing is published, and
+    /// the held bytes become a recovery entry that `recovery_list` then
+    /// shows with the escaped publication's identity. This is the state
+    /// the recovery module's own fixture arranges directly; running it
+    /// once for real is what says that arrangement is the truth.
+    ///
+    /// Unix only: `FsOutboxEntryOps` compares device and inode by handle,
+    /// which `std` does not offer on Windows -- it reports `Unverifiable`
+    /// there, so no escape is ever detected and no recovery entry is ever
+    /// written. The `#[cfg(not(unix))]` counterpart below performs the
+    /// **same swap** and asserts that residual.
+    #[cfg(unix)]
+    #[test]
+    fn an_escape_writes_a_recovery_entry_the_listing_then_shows() {
+        let fixture = Fixture::new("escape-recovery");
+        let approval = fixture.approve("report.pdf", PDF).expect("approved");
+        assert!(approval.handle_held, "the run record holds the handle");
+
+        // The name stops naming the handle's file: a different file is put
+        // there while the approved one is still open.
+        let entry = fixture.run_dir.join("report.pdf");
+        std::fs::remove_file(&entry).expect("unlink the approved name");
+        std::fs::write(&entry, b"%PDF-1.7\nsomeone else's bytes\n").expect("a different file");
+
+        let (result, frames) = fixture.publish(&approval.approval_id);
+        let error = result.expect_err("nothing is published");
+        assert_eq!(error.code, ShellErrorCode::OutboxEscape);
+        assert!(
+            error.message.contains("recovery entry"),
+            "the message says the bytes were kept: {}",
+            error.message
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| match frame {
+                    ArtifactStateFrame::ArtifactState { state, .. } => *state,
+                })
+                .collect::<Vec<_>>(),
+            vec![ArtifactStateTag::OutboxEscape],
+        );
+
+        let listed = crate::ipc::recovery::recovery_list_for(
+            &fixture.outbox,
+            &fixture.workspace(),
+            &fixture.publication,
+        )
+        .expect("the listing reads the journal");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(
+            listed[0].sha256,
+            hex(PDF),
+            "the entry is filed under the digest of the bytes that were held",
+        );
+        assert_eq!(
+            listed[0].recovered_from, approval.publication_id,
+            "and the journal says which publication escaped",
+        );
+        assert_eq!(listed[0].size, Some(PDF.len() as u64));
+        assert!(listed[0].usable);
+    }
+
+    /// The Windows residual, asserted over the swap that provokes it
+    /// rather than over an untouched entry: the approved name is made to
+    /// stop naming the file the held handle holds, exactly as in the unix
+    /// test above, and **nothing detects it**. `FsOutboxEntryOps` has no
+    /// by-handle identity comparison in `std` on this platform, so it
+    /// reports `Unverifiable`, the transaction publishes from the held
+    /// handle, and no recovery entry is written at all -- `recovery_list`
+    /// is empty. HAP-001-R19 requires this disclosed, not closed.
+    ///
+    /// The swap is a **rename**, not an unlink and a re-create: Windows
+    /// leaves an unlinked name in a delete-pending state while a handle
+    /// is open on it, so the re-create at that name would fail and the
+    /// fixture, not the residual, would be what the test observed. A
+    /// rename of an open file succeeds there -- `std` opens with
+    /// `FILE_SHARE_DELETE` -- and leaves the name free for the different
+    /// file that follows, which is the same end state the unix swap
+    /// reaches.
+    ///
+    /// Its counterpart above is what says this body is really checked:
+    /// with this gate flipped to `#[cfg(unix)]` the test **fails** on
+    /// Linux, where the identity comparison exists, because the escape is
+    /// detected and the listing is not empty. A green here is therefore a
+    /// statement about the platform and not about the fixture.
+    #[cfg(not(unix))]
+    #[test]
+    fn an_escape_is_not_detected_where_there_is_no_by_handle_identity() {
+        let fixture = Fixture::new("escape-residual");
+        let approval = fixture.approve("report.pdf", PDF).expect("approved");
+        assert!(approval.handle_held, "the run record holds the handle");
+
+        // The name stops naming the handle's file.
+        let entry = fixture.run_dir.join("report.pdf");
+        std::fs::rename(&entry, fixture.run_dir.join("moved-aside.pdf"))
+            .expect("rename the approved name out of the way");
+        std::fs::write(&entry, b"%PDF-1.7\nsomeone else's bytes\n").expect("a different file");
+
+        let (result, _frames) = fixture.publish(&approval.approval_id);
+        assert!(
+            result.is_ok(),
+            "no escape was detected: the copy still comes from the held handle and verifies: \
+             {result:?}",
+        );
+        let listed = crate::ipc::recovery::recovery_list_for(
+            &fixture.outbox,
+            &fixture.workspace(),
+            &fixture.publication,
+        )
+        .expect("the listing reads the journal");
+        assert!(
+            listed.is_empty(),
+            "and nothing was recovered, because nothing was detected: {listed:?}",
+        );
     }
 }

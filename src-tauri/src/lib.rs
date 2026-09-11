@@ -16,6 +16,7 @@ mod wrong_root_state;
 use adapter_state::AdapterState;
 use executable_state::ExecutableState;
 use health::ShellHealth;
+use ipc::catalog_repair::{catalog_repair, catalog_repair_preview};
 use ipc::commands::{
     adapters_list, approvals_list, candidates_list, executable_approve, executable_pick_and_probe,
     executable_revoke, harness_observe, harness_spawn, harness_stop, outbox_status,
@@ -26,6 +27,7 @@ use ipc::guidance::{
     guidance_snapshots, guidance_status,
 };
 use ipc::publication::{artifact_approve, artifact_publish, publications_list};
+use ipc::recovery::{recovery_approve, recovery_list};
 use ipc::wrong_root::{misplaced_list, misplaced_remedy, wrongroot_scan, wrongroot_status};
 use omnifrons_supervisor::TokioProcessSupervisor;
 use outbox_state::OutboxState;
@@ -135,6 +137,10 @@ pub fn run() {
             wrongroot_scan,
             misplaced_list,
             misplaced_remedy,
+            catalog_repair_preview,
+            catalog_repair,
+            recovery_list,
+            recovery_approve,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");
