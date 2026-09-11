@@ -672,9 +672,81 @@ pub struct ArtifactApproval {
     pub approver: DeviceLocalUser,
     /// When the approval was recorded.
     pub approved_at: SystemTime,
+    /// Where the approved bytes come from (spike slice 5e). Every
+    /// approval before that slice is [`ApprovalSource::Outbox`].
+    pub source: ApprovalSource,
+}
+
+/// Where an approved artifact's bytes come from (spike slice 5e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalSource {
+    /// The project's outbox: the entry named by [`ArtifactApproval::name`],
+    /// under the run subdirectory or at the outbox root.
+    #[default]
+    Outbox,
+    /// A recovery entry in the product work area (HAP-001-R18): the bytes
+    /// a publication held when its outbox path stopped naming them, kept
+    /// so that what was digested and approved survives. It is named by
+    /// **its own** digest, which is [`ArtifactApproval::digest`], and the
+    /// publication it was recovered from is a location fact only -- never
+    /// provenance, and never the identity the re-publication registers
+    /// under, which HAP-001-R23 derives from the recovered bytes.
+    Recovery {
+        /// The publication whose `outbox-escape` wrote the entry.
+        recovered_from: PublicationIdentity,
+    },
+}
+
+/// A standing approval policy (HAP-001 D3): the later relaxation that
+/// auto-approves a class under a size cap. **Nothing in this repository
+/// configures one** -- v1 is per-artifact approval -- and this type exists
+/// so the exclusions HAP-001-R22 and D3 fix are a rule with a test rather
+/// than a property of that absence. HAP-001-R18's "a fresh explicit
+/// approval that no standing policy covers" has to hold against a policy
+/// that would otherwise cover the class and the size, and
+/// [`StandingApprovalPolicy::covers`] is where that is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandingApprovalPolicy {
+    /// The one class this policy would auto-approve.
+    pub class: ArtifactClass,
+    /// The size at or below which it would.
+    pub max_size: u64,
+}
+
+impl StandingApprovalPolicy {
+    /// Whether this policy may cover `approval` -- which HAP-001-R22 and
+    /// D3 narrow to "an entry the run's own proposal named by digest",
+    /// never an unattributed entry and never a recovery entry.
+    #[must_use]
+    pub fn covers(&self, approval: &ArtifactApproval) -> bool {
+        // HAP-001-R18: a recovery entry is a security-relevant anomaly's
+        // preserved bytes; re-publishing it always needs a fresh explicit
+        // approval, whatever else the approval carries.
+        if approval.source != ApprovalSource::Outbox {
+            return false;
+        }
+        // HAP-001-R11, R22: attribution by location alone never satisfies
+        // a standing approval, and an unattributed entry has no producer
+        // verdict at all -- its gate is the explicit human approval.
+        if !matches!(approval.attribution, Attribution::Run(_)) || approval.run_id.is_none() {
+            return false;
+        }
+        approval.class == self.class && approval.size <= self.max_size
+    }
 }
 
 impl ArtifactApproval {
+    /// The publication this approval's bytes were recovered from
+    /// (HAP-001-R18), as a location fact for the surface; `None` for an
+    /// outbox entry.
+    #[must_use]
+    pub const fn recovered_from(&self) -> Option<PublicationIdentity> {
+        match self.source {
+            ApprovalSource::Outbox => None,
+            ApprovalSource::Recovery { recovered_from } => Some(recovered_from),
+        }
+    }
+
     /// The run subdirectory the entry was found under, as a location fact
     /// only, never provenance (HAP-001-R11, R36): the run whose inventory
     /// listed it, or, for an entry approved from the whole-outbox

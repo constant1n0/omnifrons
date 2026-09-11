@@ -7,9 +7,10 @@
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, Attribution, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ARTIFACT_APPROVAL_ID_DOMAIN, ArtifactApproval, ArtifactApprovalId, ArtifactState, AssetRootId,
-    AssetRootIdError, CatalogId, DisplayName, PortableReference, ProjectIdentity, ProviderState,
-    PublicationIdentity, artifact_approval_id_preimage, publication_identity_preimage,
+    ARTIFACT_APPROVAL_ID_DOMAIN, ApprovalSource, ArtifactApproval, ArtifactApprovalId,
+    ArtifactState, AssetRootId, AssetRootIdError, CatalogId, DisplayName, PortableReference,
+    ProjectIdentity, ProviderState, PublicationIdentity, StandingApprovalPolicy,
+    artifact_approval_id_preimage, publication_identity_preimage,
 };
 use std::time::{Duration, SystemTime};
 
@@ -264,6 +265,7 @@ fn approval_named(run_id: Option<RunId>, name: &str) -> ArtifactApproval {
         executable_approval: None,
         approver: DeviceLocalUser,
         approved_at: SystemTime::UNIX_EPOCH,
+        source: ApprovalSource::Outbox,
     }
 }
 
@@ -290,4 +292,98 @@ fn approval_found_under_is_the_listing_run_or_the_names_run_prefix() {
         None,
         "a prefix that is not a run id is not a location fact"
     );
+}
+
+/// HAP-001-R18, R22 and D3: a **standing** approval policy may cover only
+/// an entry the run's own proposal named by digest, and never an
+/// unattributed entry or a recovery entry. Asserted here against a policy
+/// that *would* cover this class and size, so the exclusion is the rule's
+/// own and not the absence of any policy at all -- no standing policy is
+/// configured anywhere in this repository, and that must not be what makes
+/// HAP-001-R18's fresh explicit approval hold.
+#[test]
+fn a_standing_policy_never_covers_a_recovery_entry_or_an_unattributed_one() {
+    let policy = StandingApprovalPolicy {
+        class: ArtifactClass::GeneratedHeavy,
+        max_size: 1024,
+    };
+
+    let mut run_named = approval_named(Some(RunId::new("run-1").expect("valid")), "report.pdf");
+    run_named.attribution = Attribution::Run(RunId::new("run-1").expect("valid"));
+    assert!(
+        policy.covers(&run_named),
+        "the one case D3 allows: an entry the run's own proposal named by digest",
+    );
+
+    let unattributed = approval_named(None, "stray.pdf");
+    assert!(
+        !policy.covers(&unattributed),
+        "HAP-001-R22: never an unattributed entry",
+    );
+
+    // The two halves of that exclusion, one input each, so neither can be
+    // deleted with this suite still green. The case above carries both at
+    // once -- no attribution *and* no run -- and therefore pins neither.
+    let mut located_only = approval_named(None, "run-1/report.pdf");
+    located_only.attribution = Attribution::Run(RunId::new("run-1").expect("valid"));
+    assert_eq!(located_only.run_id, None);
+    assert!(
+        !policy.covers(&located_only),
+        "HAP-001-R11: attribution by location alone -- a run id the name carries and no \
+         inventory that listed it -- never satisfies a standing approval",
+    );
+
+    let mut listed_but_unattributed = approval_named(
+        Some(RunId::new("run-1").expect("valid")),
+        "run-1/report.pdf",
+    );
+    listed_but_unattributed.attribution = Attribution::Unattributed;
+    assert!(
+        !policy.covers(&listed_but_unattributed),
+        "HAP-001-R22: a run's inventory listing an entry is not the run's proposal naming it \
+         by digest, so there is no producer verdict to stand on",
+    );
+
+    let mut recovered = approval_named(None, "aa".repeat(32).as_str());
+    recovered.source = ApprovalSource::Recovery {
+        recovered_from: PublicationIdentity(digest(0x44)),
+    };
+    recovered.attribution = Attribution::Run(RunId::new("run-1").expect("valid"));
+    recovered.run_id = Some(RunId::new("run-1").expect("valid"));
+    assert!(
+        !policy.covers(&recovered),
+        "HAP-001-R18: a recovery entry's re-publication always needs a fresh explicit approval, \
+         whatever else the approval carries",
+    );
+
+    let mut oversized = approval_named(Some(RunId::new("run-1").expect("valid")), "big.pdf");
+    oversized.attribution = Attribution::Run(RunId::new("run-1").expect("valid"));
+    oversized.size = 1025;
+    assert!(!policy.covers(&oversized), "and the cap still applies");
+
+    // Both sides of the cap, so `<=` cannot become `<` unnoticed: the
+    // policy reads "at or below".
+    let mut at_the_cap = approval_named(Some(RunId::new("run-1").expect("valid")), "exact.pdf");
+    at_the_cap.attribution = Attribution::Run(RunId::new("run-1").expect("valid"));
+    at_the_cap.size = 1024;
+    assert!(
+        policy.covers(&at_the_cap),
+        "the size at the cap is covered: the cap is inclusive",
+    );
+}
+
+/// An approval's source says where its bytes come from, and the default
+/// every approval before spike slice 5e carried is the outbox.
+#[test]
+fn an_approvals_source_names_the_publication_a_recovery_entry_came_from() {
+    let outbox = approval_named(None, "stray.pdf");
+    assert_eq!(outbox.source, ApprovalSource::Outbox);
+    assert_eq!(outbox.recovered_from(), None);
+
+    let original = PublicationIdentity(digest(0x44));
+    let mut recovered = approval_named(None, "aa".repeat(32).as_str());
+    recovered.source = ApprovalSource::Recovery {
+        recovered_from: original,
+    };
+    assert_eq!(recovered.recovered_from(), Some(original));
 }
