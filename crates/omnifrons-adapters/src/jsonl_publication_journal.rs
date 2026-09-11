@@ -20,8 +20,8 @@ use omnifrons_domain::adapter::AdapterId;
 use omnifrons_domain::executable::{ApprovalId, DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactApprovalId, AssetRootId, CatalogRecord, DisplayName, JournalEntry,
-    JournalStep, ProjectIdentity, PublicationIdentity, StepEntry, StepOutcome,
+    ApprovalSource, ArtifactApproval, ArtifactApprovalId, AssetRootId, CatalogRecord, DisplayName,
+    JournalEntry, JournalStep, ProjectIdentity, PublicationIdentity, StepEntry, StepOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,15 @@ struct ApprovedLine {
     adapter_id: Option<String>,
     executable_approval_id: Option<u64>,
     approved_at: TimestampDto,
+    /// The publication a recovery entry's bytes were recovered from
+    /// (spike slice 5e, HAP-001-R18), as a location fact; absent for an
+    /// outbox entry. `default` on purpose, and the one place this file
+    /// relaxes its own fail-closed discipline: every `approved` line
+    /// written before slice 5e is an outbox approval, so a line without
+    /// the field is read as exactly what it is, rather than failing a
+    /// replay of a journal this device itself wrote.
+    #[serde(default)]
+    recovered_from: Option<String>,
 }
 
 /// A `step` line.
@@ -114,6 +123,7 @@ impl LogEntry {
                     .map(|id| id.as_str().to_string()),
                 executable_approval_id: approval.executable_approval.map(|id| id.0),
                 approved_at: approval.approved_at.into(),
+                recovered_from: approval.recovered_from().map(|id| id.to_hex()),
             })),
             JournalEntry::Step(step) => Self::Step(Box::new(StepLine {
                 schema: SCHEMA_VERSION,
@@ -158,6 +168,12 @@ impl LogEntry {
                     executable_approval: line.executable_approval_id.map(ApprovalId),
                     approver: DeviceLocalUser,
                     approved_at: line.approved_at.into(),
+                    source: match line.recovered_from {
+                        Some(token) => ApprovalSource::Recovery {
+                            recovered_from: PublicationIdentity::from_hex(&token).ok_or(Corrupt)?,
+                        },
+                        None => ApprovalSource::Outbox,
+                    },
                 })))
             }
             Self::Step(line) => {

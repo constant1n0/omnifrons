@@ -64,7 +64,10 @@ impl FsProjectTextFile {
 static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// What opening the managed file without following a link yielded.
-enum Opened {
+/// Shared with `jsonl_catalog_store`'s repair (spike slice 5e), which
+/// rewrites a file under the project's own `.omnifrons/` and needs the
+/// same discipline this module already proved.
+pub(crate) enum Opened {
     File(File),
     Absent,
     NotAFile,
@@ -74,7 +77,7 @@ enum Opened {
 /// Unix: `O_NOFOLLOW` refuses a link at the name with `ELOOP`; a FIFO
 /// opens without blocking under `O_NONBLOCK` and is refused from `fstat`.
 #[cfg(unix)]
-fn open_no_follow(path: &Path) -> Opened {
+pub(crate) fn open_no_follow(path: &Path) -> Opened {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
@@ -94,7 +97,7 @@ fn open_no_follow(path: &Path) -> Opened {
 /// handle's metadata; a directory, which will not open as a file, is
 /// classified from the path's own metadata.
 #[cfg(not(unix))]
-fn open_no_follow(path: &Path) -> Opened {
+pub(crate) fn open_no_follow(path: &Path) -> Opened {
     let opened = {
         #[cfg(windows)]
         {

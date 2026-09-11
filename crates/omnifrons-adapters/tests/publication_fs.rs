@@ -46,8 +46,8 @@ use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::executable::{DeviceLocalUser, Sha256Digest};
 use omnifrons_domain::outbox::{ArtifactClass, Attribution, DetectedType, RunId};
 use omnifrons_domain::publication::{
-    ArtifactApproval, ArtifactState, AssetRootId, DisplayName, JournalEntry, Producer,
-    PublicationIdentity,
+    ApprovalSource, ArtifactApproval, ArtifactState, AssetRootId, DisplayName, JournalEntry,
+    Producer, PublicationIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -509,6 +509,7 @@ impl RealFixture {
             executable_approval: None,
             approver: DeviceLocalUser,
             approved_at,
+            source: ApprovalSource::Outbox,
         }
     }
 

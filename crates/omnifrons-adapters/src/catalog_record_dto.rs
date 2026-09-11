@@ -157,6 +157,16 @@ pub(crate) struct RecordDto {
     record_version: u32,
 }
 
+impl RecordDto {
+    /// Whether this line's `catalogId` is not `<assetRootId>/<publicationId>`
+    /// as the three fields are *written*, compared as text so the one rule
+    /// that must never be repaired (HAP-001-R39, spike slice 5e) is
+    /// recognized even on a line this version cannot otherwise decode.
+    pub(crate) fn ids_disagree(&self) -> bool {
+        self.catalog_id != format!("{}/{}", self.asset_root_id, self.publication_id)
+    }
+}
+
 impl From<&CatalogRecord> for RecordDto {
     fn from(record: &CatalogRecord) -> Self {
         let producer = match &record.provenance.producer {
