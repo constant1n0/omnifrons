@@ -1,12 +1,19 @@
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { afterEach, describe, expect, it } from 'vitest'
 
+// The shell's IPC DTOs, as text: the closed sets this file mirrors are
+// closed there, so the guard at the end of this file reads them from there
+// (R1-002 / R1-011).
+import DTO_SOURCE from '../../../src-tauri/src/ipc/dto.rs?raw'
+
 import {
   adaptersList,
   approvalsList,
   artifactApprove,
   artifactPublish,
   candidatesList,
+  catalogRepair,
+  catalogRepairPreview,
   executableApprove,
   executablePickAndProbe,
   executableRevoke,
@@ -25,18 +32,25 @@ import {
   misplacedRemedy,
   outboxStatus,
   publicationsList,
+  recoveryApprove,
+  recoveryList,
   workspaceCurrent,
   workspacePick,
   wrongRootScan,
   wrongRootStatus,
+  type ActAs,
   type AdapterDescriptor,
   type AgentEvent,
+  type AgentPhaseTag,
   type Approval,
+  type ApprovalStatus,
   type ArtifactApproval,
   type ArtifactState,
   type ArtifactStateFrame,
   type Availability,
   type Candidate,
+  type CandidateState,
+  type CatalogRepairPreview,
   type Evidence,
   type GuidanceAction,
   type GuidanceApplied,
@@ -45,9 +59,18 @@ import {
   type GuidanceStatus,
   type HarnessFrame,
   type ManagedStatus,
+  type OutboxReason,
+  type OutboxState,
   type OutboxStatus,
+  type PortableReference,
+  type ProcessTerminalStateTag,
+  type PromptChannel,
   type ProviderState,
   type Publication,
+  type RecoveryEntry,
+  type RefusalReason,
+  type RepairRule,
+  type ScopeMode,
   type ShellError,
   type ShellErrorCode,
   type MisplacedRemedy,
@@ -58,6 +81,9 @@ import {
   type RemedyOutcome,
   type ScanSummary,
   type Snapshot,
+  type TerminalActionKind,
+  type TransportClass,
+  type WorkAreaState,
   type WrongRootReason,
   type WrongRootStatus,
 } from './harness'
@@ -1089,6 +1115,7 @@ const SAMPLE_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782401000,
+  recoveredFrom: null,
   handleHeld: true,
 }
 
@@ -1140,8 +1167,9 @@ describe('artifactApprove (slice 5b)', () => {
     for (const key of Object.keys(capturedArgs!)) {
       expect(key.toLowerCase()).not.toContain('path')
     }
-    // Fourteen keys since slice 5c: `handleHeld` joined the thirteen of
-    // slice 5b (`docs/spike-log.md` § Slice 5c, IPC shapes).
+    // Fifteen keys since slice 5e: `recoveredFrom` joined the fourteen of
+    // slice 5c, which `handleHeld` had joined from slice 5b's thirteen
+    // (`docs/spike-log.md` § Slice 5e, IPC shapes).
     expect(Object.keys(approval).sort()).toEqual([
       'actAs',
       'approvalId',
@@ -1154,6 +1182,7 @@ describe('artifactApprove (slice 5b)', () => {
       'handleHeld',
       'name',
       'publicationId',
+      'recoveredFrom',
       'runId',
       'sha256Short',
       'size',
@@ -1348,13 +1377,20 @@ describe('publicationsList (slice 5b)', () => {
     expect(result[1]?.reference).toBeNull()
   })
 
-  it('rejects with the typed catalog-unavailable and work-area-invalid ShellErrors', async () => {
-    const catalog: ShellError = { code: 'catalog-unavailable', message: 'the catalog is corrupt' }
+  it('rejects with the typed catalog-corrupt, catalog-unavailable and work-area-invalid ShellErrors -- a corrupt catalog is its own code since slice 5e, and no longer the unavailable one', async () => {
+    const corrupt: ShellError = {
+      code: 'catalog-corrupt',
+      message: 'the catalog is corrupt; preview the repair to see which lines',
+    }
+    const catalog: ShellError = {
+      code: 'catalog-unavailable',
+      message: 'the catalog could not be read',
+    }
     const workArea: ShellError = {
       code: 'work-area-invalid',
       message: 'the product work area resolves inside a registered workspace root',
     }
-    for (const error of [catalog, workArea]) {
+    for (const error of [corrupt, catalog, workArea]) {
       mockIPC((cmd) => {
         if (cmd === 'publications_list') return Promise.reject(error)
         throw new Error(`unexpected command: ${cmd}`)
@@ -1436,7 +1472,7 @@ describe('slice 5b closed sets', () => {
     expect(availabilities.map(availabilityLabel)).toEqual(availabilities)
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes and the three slice 5d codes among the forty-one -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes, the three slice 5d codes and the four slice 5e codes among the forty-five -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
     function codeLabel(code: ShellErrorCode): string {
       switch (code) {
         case 'unknown-process':
@@ -1480,6 +1516,10 @@ describe('slice 5b closed sets', () => {
         case 'misplaced-unknown':
         case 'quarantine-unavailable':
         case 'scan-failed':
+        case 'catalog-corrupt':
+        case 'catalog-changed':
+        case 'repair-refused':
+        case 'recovery-unknown':
           return code
         default: {
           const unreachable: never = code
@@ -1530,8 +1570,12 @@ describe('slice 5b closed sets', () => {
       'misplaced-unknown',
       'quarantine-unavailable',
       'scan-failed',
+      'catalog-corrupt',
+      'catalog-changed',
+      'repair-refused',
+      'recovery-unknown',
     ]
-    expect(new Set(codes).size).toBe(41)
+    expect(new Set(codes).size).toBe(45)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
@@ -1596,6 +1640,7 @@ const UNATTRIBUTED_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782401000,
+  recoveredFrom: null,
   handleHeld: true,
 }
 
@@ -1696,7 +1741,7 @@ const SNAPSHOTS: Snapshot[] = [
 ]
 
 describe('artifactApprove with runId null (slice 5c)', () => {
-  it('invokes artifact_approve with exactly { runId: null, name, sha256 } -- the key present and null, the full 64-hex digest -- and returns the unattributed approval verbatim: runId null, the bare unattributed kind, handleHeld, fourteen keys, no path-shaped key', async () => {
+  it('invokes artifact_approve with exactly { runId: null, name, sha256 } -- the key present and null, the full 64-hex digest -- and returns the unattributed approval verbatim: runId null, the bare unattributed kind, handleHeld, fifteen keys, no path-shaped key', async () => {
     const mock = mockCommand('artifact_approve', () => UNATTRIBUTED_ARTIFACT_APPROVAL)
 
     const approval = await artifactApprove(null, 'dropped.pdf', DROPPED_DIGEST)
@@ -1710,7 +1755,8 @@ describe('artifactApprove with runId null (slice 5c)', () => {
     expect(approval.runId).toBeNull()
     expect(approval.attribution).toEqual({ kind: 'unattributed' })
     expect(approval.handleHeld).toBe(true)
-    expect(Object.keys(approval)).toHaveLength(14)
+    expect(approval.recoveredFrom).toBeNull()
+    expect(Object.keys(approval)).toHaveLength(15)
   })
 
   it('returns handleHeld false verbatim when the D22 cap left no room for the re-opened handle -- for a run entry too', async () => {
@@ -2577,5 +2623,724 @@ describe('slice 5d closed sets', () => {
     expect(reasons.map(reasonLabel)).toEqual(reasons)
     const kind: Extract<AgentEvent, { kind: 'misplaced' }>['kind'] = 'misplaced'
     expect(kind).toBe('misplaced')
+  })
+})
+
+// -- Slice 5e: catalog repair and recovery re-approval --
+
+/** The digest of the catalog `catalog_repair_preview` read, and the binding the apply has to send back. */
+const CATALOG_DIGEST = 'ab'.repeat(32)
+
+/** The digest the repaired catalog carries afterwards -- a different file, so a different digest. */
+const REPAIRED_DIGEST = 'cd'.repeat(32)
+
+/**
+ * `catalog_repair_preview`'s answer (`docs/spike-log.md` § Slice 5e, IPC
+ * shapes): what a repair would drop and what refuses it, each line named by
+ * its one-based number and never by its content -- the Catalog is
+ * synchronized, untrusted text (HAP-001-R40).
+ */
+const CATALOG_PREVIEW: CatalogRepairPreview = {
+  sha256: CATALOG_DIGEST,
+  repairable: false,
+  drops: [{ line: 4, rule: 'duplicate-record', publicationId: 'cd'.repeat(32) }],
+  refusals: [{ line: 7, reason: 'catalog-id-mismatch' }],
+  keptRecords: 2,
+}
+
+/**
+ * One recovery entry this device's journal knows about (HAP-001-R18),
+ * carrying the name and class the approval would use (R1-004).
+ */
+const RECOVERY_ENTRY: RecoveryEntry = {
+  sha256: CATALOG_DIGEST,
+  size: 4096,
+  recoveredFrom: 'cd'.repeat(32),
+  recoveredAt: 1_725_782_400_000,
+  displayName: 'report.pdf',
+  class: 'generated-heavy',
+  usable: true,
+}
+
+/**
+ * `recovery_approve`'s payload: the existing `ArtifactApprovalDto` with the
+ * one additive key `recoveredFrom` -- a location fact, never provenance:
+ * the record this registers carries `producer: unattributed` (HAP-001-R11,
+ * R36), which is what `attribution` says here.
+ */
+const RECOVERY_APPROVAL: ArtifactApproval = {
+  approvalId: '7c44aa0195e1b3d2',
+  publicationId: PUBLICATION_ID,
+  runId: null,
+  name: CATALOG_DIGEST,
+  displayName: 'report.pdf',
+  sha256Short: 'abababab',
+  size: 4096,
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  attribution: { kind: 'unattributed' },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1_725_782_401_000,
+  recoveredFrom: '99'.repeat(32),
+  handleHeld: true,
+}
+
+describe('catalogRepairPreview (slice 5e)', () => {
+  it('invokes catalog_repair_preview with no arguments and returns the plan verbatim: five keys, each line named by number, no line content and no path-shaped key', async () => {
+    const mocked = mockCommand('catalog_repair_preview', () => CATALOG_PREVIEW)
+
+    const preview = await catalogRepairPreview()
+
+    expect(mocked.args()).toEqual({})
+    expect(preview).toEqual(CATALOG_PREVIEW)
+    expect(Object.keys(preview).sort()).toEqual([
+      'drops',
+      'keptRecords',
+      'refusals',
+      'repairable',
+      'sha256',
+    ])
+    expect(Object.keys(preview.drops[0]!).sort()).toEqual(['line', 'publicationId', 'rule'])
+    expect(Object.keys(preview.refusals[0]!).sort()).toEqual(['line', 'reason'])
+    expectNoPathShapedKey(preview)
+    expectNoPathShapedKey(preview.drops[0]!)
+    expectNoPathShapedKey(preview.refusals[0]!)
+  })
+
+  it("returns repairable true with a dangling-alias drop whose publicationId is null -- which is exactly why no record carries it -- and no refusal", async () => {
+    mockCommand('catalog_repair_preview', () => ({
+      sha256: CATALOG_DIGEST,
+      repairable: true,
+      drops: [{ line: 3, rule: 'dangling-alias', publicationId: null }],
+      refusals: [],
+      keptRecords: 1,
+    }))
+
+    const preview = await catalogRepairPreview()
+
+    expect(preview.repairable).toBe(true)
+    expect(preview.drops).toEqual([{ line: 3, rule: 'dangling-alias', publicationId: null }])
+    expect(preview.refusals).toEqual([])
+  })
+
+  it('rejects with the typed catalog-unavailable and workspace-unavailable ShellErrors, neither carrying detail', async () => {
+    const errors: ShellError[] = [
+      { code: 'catalog-unavailable', message: 'the project has no catalog to repair' },
+      { code: 'workspace-unavailable', message: 'no workspace has been picked yet' },
+    ]
+    for (const error of errors) {
+      mockCommand('catalog_repair_preview', () => Promise.reject(error))
+
+      const rejected: unknown = await catalogRepairPreview().then(
+        () => {
+          throw new Error('catalog_repair_preview resolved instead of rejecting')
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+      clearMocks()
+    }
+  })
+})
+
+describe('catalogRepair (slice 5e)', () => {
+  it('invokes catalog_repair with exactly { sha256 } -- the preview\'s own 64-hex digest -- and returns the outcome verbatim: four keys, the binding it carried, the digest the file now has, two counts, no path', async () => {
+    const mocked = mockCommand('catalog_repair', () => ({
+      originalSha256: CATALOG_DIGEST,
+      sha256: REPAIRED_DIGEST,
+      droppedLines: 1,
+      keptRecords: 2,
+    }))
+
+    const repaired = await catalogRepair(CATALOG_DIGEST)
+
+    expect(mocked.args()).toEqual({ sha256: CATALOG_DIGEST })
+    expect(Object.keys(mocked.args()).sort()).toEqual(['sha256'])
+    expect(mocked.args().sha256).toHaveLength(64)
+    expect(repaired).toEqual({
+      originalSha256: CATALOG_DIGEST,
+      sha256: REPAIRED_DIGEST,
+      droppedLines: 1,
+      keptRecords: 2,
+    })
+    expect(Object.keys(repaired).sort()).toEqual([
+      'droppedLines',
+      'keptRecords',
+      'originalSha256',
+      'sha256',
+    ])
+    expectNoPathShapedKey(mocked.args())
+    expectNoPathShapedKey(repaired)
+  })
+
+  it('rejects with each of the seven typed ShellErrors its Rust body reaches -- catalog-changed and repair-refused among them -- none carrying detail', async () => {
+    const errors: ShellError[] = [
+      {
+        code: 'catalog-changed',
+        message: 'the catalog changed since it was previewed; preview it again',
+      },
+      {
+        code: 'repair-refused',
+        message:
+          'a line of the catalog registers an artifact and needs an owner decision, not a repair',
+      },
+      { code: 'catalog-unavailable', message: 'the catalog could not be written' },
+      { code: 'invalid-request', message: 'the digest is not 64 hex characters' },
+      { code: 'run-active', message: 'a run is active; approve or publish once it has ended' },
+      {
+        code: 'work-area-invalid',
+        message: 'the pre-repair copy could not be written to the product work area',
+      },
+      { code: 'workspace-unavailable', message: 'no workspace has been picked yet' },
+    ]
+    for (const error of errors) {
+      mockCommand('catalog_repair', () => Promise.reject(error))
+
+      const rejected: unknown = await catalogRepair(CATALOG_DIGEST).then(
+        () => {
+          throw new Error('catalog_repair resolved instead of rejecting')
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+      clearMocks()
+    }
+  })
+})
+
+describe('recoveryList (slice 5e)', () => {
+  it('invokes recovery_list with no arguments and returns every entry verbatim: seven keys, the digest it is filed under, the name and class the approval would use, the publication it was recovered from, no path-shaped key', async () => {
+    const mocked = mockCommand('recovery_list', () => [RECOVERY_ENTRY])
+
+    const entries = await recoveryList()
+
+    expect(mocked.args()).toEqual({})
+    expect(entries).toEqual([RECOVERY_ENTRY])
+    // Seven since R1-004: `displayName` and `class` joined the five, so
+    // the surface can show what the approval would register and write
+    // before the decision is made.
+    expect(Object.keys(entries[0]!).sort()).toEqual([
+      'class',
+      'displayName',
+      'recoveredAt',
+      'recoveredFrom',
+      'sha256',
+      'size',
+      'usable',
+    ])
+    expect(entries[0]!.sha256).toHaveLength(64)
+    expect(entries[0]!.recoveredFrom).toHaveLength(64)
+    expectNoPathShapedKey(entries[0]!)
+  })
+
+  it('returns size null and usable false verbatim for an entry that did not open as a regular file, and usable false for one whose bytes no longer hash to its name', async () => {
+    mockCommand('recovery_list', () => [
+      { ...RECOVERY_ENTRY, size: null, usable: false },
+      { ...RECOVERY_ENTRY, sha256: 'ef'.repeat(32), size: 11, usable: false },
+    ])
+
+    const entries = await recoveryList()
+
+    expect(entries[0]!.size).toBeNull()
+    expect(entries[0]!.usable).toBe(false)
+    expect(entries[1]!.size).toBe(11)
+    expect(entries[1]!.usable).toBe(false)
+  })
+
+  it('rejects with the typed work-area-invalid and workspace-unavailable ShellErrors', async () => {
+    const errors: ShellError[] = [
+      { code: 'work-area-invalid', message: 'the publication journal could not be read' },
+      { code: 'workspace-unavailable', message: 'no workspace has been picked yet' },
+    ]
+    for (const error of errors) {
+      mockCommand('recovery_list', () => Promise.reject(error))
+
+      const rejected: unknown = await recoveryList().then(
+        () => {
+          throw new Error('recovery_list resolved instead of rejecting')
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(isShellError(rejected)).toBe(true)
+      clearMocks()
+    }
+  })
+})
+
+describe('recoveryApprove (slice 5e)', () => {
+  // One key (R1-006 / R3-069): the second, `sha256`, was the same digest
+  // under another name -- a `RecoveryEntry` carries one digest and it is
+  // the name the entry is filed under, so no caller could ever make the
+  // two differ, and swapping them passed the whole suite.
+  it("invokes recovery_approve with exactly { digest } -- the entry's own digest -- and returns the approval verbatim: fifteen keys, recoveredFrom the escaped publication, runId null, attribution unattributed", async () => {
+    const mocked = mockCommand('recovery_approve', () => RECOVERY_APPROVAL)
+
+    const approval = await recoveryApprove(CATALOG_DIGEST)
+
+    expect(mocked.args()).toEqual({ digest: CATALOG_DIGEST })
+    expect(Object.keys(mocked.args())).toEqual(['digest'])
+    expect(approval).toEqual(RECOVERY_APPROVAL)
+    // Fifteen keys since slice 5e: `recoveredFrom` joined the fourteen of
+    // slice 5c (`docs/spike-log.md` § Slice 5e, IPC shapes).
+    expect(Object.keys(approval)).toHaveLength(15)
+    expect(Object.keys(approval).sort()).toEqual([
+      'actAs',
+      'approvalId',
+      'approvedAt',
+      'assetRootId',
+      'attribution',
+      'class',
+      'detectedType',
+      'displayName',
+      'handleHeld',
+      'name',
+      'publicationId',
+      'recoveredFrom',
+      'runId',
+      'sha256Short',
+      'size',
+    ])
+    expect(approval.recoveredFrom).toBe('99'.repeat(32))
+    expect(approval.runId).toBeNull()
+    expect(approval.attribution).toEqual({ kind: 'unattributed' })
+    expectNoPathShapedKey(mocked.args())
+    expectNoPathShapedKey(approval)
+  })
+
+  it('types recoveredFrom as null for an outbox approval, the additive key every slice-5b and 5c approval now carries', async () => {
+    mockCommand('artifact_approve', () => ({ ...SAMPLE_ARTIFACT_APPROVAL, recoveredFrom: null }))
+
+    const approval = await artifactApprove(RUN_ID, `${RUN_ID}/report.pdf`, REPORT_DIGEST)
+
+    expect(approval.recoveredFrom).toBeNull()
+    expect(Object.keys(approval)).toHaveLength(15)
+  })
+
+  it('rejects with each of the nine typed ShellErrors its Rust body reaches -- recovery-unknown and integrity-mismatch among them, and outbox-invalid, which its own doc comment omits', async () => {
+    const errors: ShellError[] = [
+      {
+        code: 'recovery-unknown',
+        message: 'no recovery entry with that digest is recorded for this device',
+      },
+      {
+        code: 'integrity-mismatch',
+        message: 'the recovery entry\'s bytes are not the digest it is filed under',
+      },
+      { code: 'refused', message: 'the recovery entry is not a regular file' },
+      { code: 'destination-invalid', message: 'the project declares no asset root' },
+      { code: 'outbox-invalid', message: 'the classification policy could not be loaded' },
+      { code: 'work-area-invalid', message: 'the publication journal could not be written' },
+      { code: 'invalid-request', message: 'the digest is not 64 hex characters' },
+      { code: 'run-active', message: 'a run is active; approve or publish once it has ended' },
+      { code: 'workspace-unavailable', message: 'no workspace has been picked yet' },
+    ]
+    for (const error of errors) {
+      mockCommand('recovery_approve', () => Promise.reject(error))
+
+      const rejected: unknown = await recoveryApprove(CATALOG_DIGEST).then(
+        () => {
+          throw new Error('recovery_approve resolved instead of rejecting')
+        },
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+      clearMocks()
+    }
+  })
+})
+
+/**
+ * The closed sets this file mirrors are closed by the **shell**, not by
+ * this file, so the guard has to read the shell.
+ *
+ * The guard this replaces switched each union over its own members and
+ * asserted that every token mapped to itself. That can only ever fail if
+ * someone edits both halves of the same file inconsistently: it is a
+ * tautology about the renderer, and it was green throughout the whole time
+ * `RefusalReason` was missing `duplicate-across-asset-roots` -- a token
+ * `dto.rs` emits today, which the surface's exhaustive switch therefore
+ * fell through and rendered raw (R1-001 / R1-002 / R1-011). A guard over a
+ * cross-language contract has to have the other language in it.
+ *
+ * So: the variants are read out of `dto.rs` itself and compared with the
+ * tokens this file declares. A Rust-side addition fails here, on the
+ * renderer side, which is the direction that drifted; a renderer-side
+ * addition the Rust does not have fails here too. The arrays are pinned to
+ * their unions by the {@link CoversExactly} assertions below, so a token
+ * added to an array but not to its union -- or the reverse -- fails
+ * `tsc -b` in `pnpm -r build` instead.
+ *
+ * **It began as a guard over the two unions that had drifted, which is the
+ * wrong unit** (slice 5e re-review, R3-102): the lesson of the drift is
+ * that a cross-language contract needs the other language in its guard,
+ * and that is true of every such set, not of the two that were caught.
+ * {@link MIRRORED_UNIONS} is therefore every closed token set this file
+ * declares that a `pub enum` in `dto.rs` closes -- twenty-five of them,
+ * swept by hand against `dto.rs` -- and the three the reader structurally
+ * **cannot** reach are named here rather than left to look guarded:
+ *
+ * - `ArtifactClass` (R3-109) is not a `pub enum` in `dto.rs` at all. Its
+ *   tokens come from a hand-written `match` in
+ *   `crates/omnifrons-domain/src/outbox.rs`'s `ArtifactClass::as_str`, and
+ *   they cross the wire as `Option<String>`.
+ * - `WrongRootReason` likewise, from `omnifrons-domain`'s
+ *   `wrong_root.rs`, carried as a plain `String`.
+ * - `RemedyDetail` likewise, from `src-tauri/src/ipc/wrong_root.rs` and
+ *   `omnifrons-app`'s `quarantine.rs`, carried as `Option<String>`.
+ *
+ * All three are fail-closed on this side -- the surface renders an
+ * unrecognized token as itself rather than throwing, which its own tests
+ * pin -- and all three would need the Rust side to name a closed enum on
+ * the wire before a guard like this one could read it.
+ */
+
+/**
+ * The attribute block and the body of one `pub enum` in the shell's own
+ * `dto.rs`, read as text through Vite's `?raw`.
+ *
+ * Not `node:fs`: `tsconfig.app.json` gives `src` the `vite/client` types
+ * and **not** node's, deliberately -- this is browser code -- and a
+ * cross-language guard is not a reason to hand every module in `src` the
+ * node globals. `?raw` is resolved by the same transform that builds the
+ * rest of this file, needs no node types (`vite/client` declares it), and
+ * makes the dependency on the shell's source a real import rather than a
+ * path assembled at run time. `dto.rs` sits outside this package, so
+ * `vite.config.ts` lists the repository root in `server.fs.allow`
+ * explicitly (R3-105) rather than relying on Vite inferring it.
+ *
+ * The attributes are the lines above the header, back to the blank line
+ * that separates this item from the one before it -- which is where
+ * `#[serde(rename_all = ...)]` lives, and reading it is the difference
+ * between mirroring the wire spelling and guessing at it.
+ */
+function rustEnumSource(enumName: string): { attributes: string; body: string } {
+  const header = `pub enum ${enumName} {`
+  const start = DTO_SOURCE.indexOf(header)
+  if (start === -1) throw new Error(`${enumName} was not found in dto.rs`)
+  const end = DTO_SOURCE.indexOf('\n}', start)
+  if (end === -1) throw new Error(`${enumName}'s body was not terminated in dto.rs`)
+  const before = DTO_SOURCE.slice(0, start).split('\n')
+  const attributes: string[] = []
+  for (let line = before.length - 2; line >= 0 && before[line]?.trim() !== ''; line -= 1) {
+    attributes.unshift(before[line] ?? '')
+  }
+  return { attributes: attributes.join('\n'), body: DTO_SOURCE.slice(start + header.length, end) }
+}
+
+/**
+ * The wire spelling `serde`'s `rename_all` gives a variant name.
+ *
+ * Only the conversion `dto.rs` actually uses is implemented, and any other
+ * value throws rather than being guessed at (R3-103): the previous reader
+ * hard-coded kebab-case under a comment claiming it *mirrored* the serde
+ * attribute, which it did not read at all. It happened to be right about
+ * every enum here, and it would have been silently wrong the first time
+ * one of them carried something else.
+ */
+const RENAME_ALL: Readonly<Record<string, (variant: string) => string>> = {
+  'kebab-case': (variant) => variant.replace(/(?<!^)([A-Z])/g, '-$1').toLowerCase(),
+}
+
+/**
+ * Every wire token one `pub enum` in `dto.rs` emits, in declaration order.
+ *
+ * A variant's own `#[serde(rename = "…")]` wins over the enum's
+ * `rename_all`, which is how `ProcessTerminalStateTag::OrphanRiskUncertain`
+ * reaches the wire as `orphan-risk/uncertain` **with the slash** -- a
+ * spelling no kebab-case conversion produces, and the measured false
+ * negative that says this reader reads the attributes rather than
+ * assuming them.
+ *
+ * A variant is matched on `,`, `(` **or** `{` after its name, not on `,`
+ * alone (R3-103): a payload-carrying variant added to a guarded tag is the
+ * same drift as a unit one, and the comma-only pattern let it through with
+ * the suite green.
+ */
+function rustEnumTokens(enumName: string): string[] {
+  const { attributes, body } = rustEnumSource(enumName)
+  const renameAll = /rename_all\s*=\s*"([a-zA-Z-]+)"/.exec(attributes)?.[1] ?? null
+  const rename = renameAll === null ? (variant: string) => variant : RENAME_ALL[renameAll]
+  if (rename === undefined) {
+    throw new Error(`${enumName} carries rename_all = "${renameAll}", which this reader has not implemented`)
+  }
+  const tokens: string[] = []
+  let renamed: string | null = null
+  for (const line of body.split('\n')) {
+    const explicit = /#\[serde\(rename = "([^"]*)"\)\]/.exec(line)
+    if (explicit?.[1] !== undefined) {
+      renamed = explicit[1]
+      continue
+    }
+    // Doc comments and attributes carry capitalized words of their own.
+    if (/^\s*(\/\/|#\[)/.test(line)) continue
+    const variant = /^\s*([A-Z]\w*)\s*[,({]/.exec(line)
+    if (variant?.[1] === undefined) continue
+    tokens.push(renamed ?? rename(variant[1]))
+    renamed = null
+  }
+  if (tokens.length === 0) throw new Error(`${enumName} parsed to no variants`)
+  return tokens
+}
+
+/**
+ * Compile-time, enforced by `tsc -b` in `pnpm -r build` and not by vitest:
+ * `Tokens` covers `Union` exactly -- no member missing, no extra. The
+ * tuple keeps the conditional from distributing over the union.
+ */
+type CoversExactly<Union extends string, Tokens extends readonly string[]> = [
+  Exclude<Union, Tokens[number]>,
+  Exclude<Tokens[number], Union>,
+] extends [never, never]
+  ? true
+  : never
+
+/** Every token {@link ProcessTerminalStateTag} declares. Pinned to the union below. */
+const PROCESS_TERMINAL_STATE_TAGS = ['exited', 'killed', 'orphan-risk/uncertain'] as const
+/** Every token {@link AgentPhaseTag} declares. */
+const AGENT_PHASE_TAGS = ['init', 'finished', 'exited'] as const
+/** Every token {@link TerminalActionKind} declares. */
+const TERMINAL_ACTION_KINDS = ['title', 'notification'] as const
+/** Every token {@link ShellErrorCode} declares. */
+const SHELL_ERROR_CODES = [
+  'unknown-process',
+  'spawn-failed',
+  'already-subscribed',
+  'invalid-request',
+  'too-many-processes',
+  'no-candidate',
+  'not-executable',
+  'probe-failed',
+  'too-large',
+  'unapproved',
+  'changed-since-approval',
+  'shadowed-path',
+  'revoked',
+  'approval-store-unavailable',
+  'unknown-adapter',
+  'prompt-too-large',
+  'workspace-unavailable',
+  'secret-shaped-env',
+  'no-workspace',
+  'pty-unsupported',
+  'prompt-not-typeable',
+  'outbox-invalid',
+  'outbox-unavailable',
+  'integrity-mismatch',
+  'duplicate-publication',
+  'work-area-invalid',
+  'destination-invalid',
+  'outbox-escape',
+  'outbox-linked',
+  'refused',
+  'catalog-unavailable',
+  'run-active',
+  'guidance-file-invalid',
+  'guidance-file-changed',
+  'guidance-block-modified',
+  'guidance-block-malformed',
+  'guidance-unmanaged',
+  'snapshot-unavailable',
+  'misplaced-unknown',
+  'quarantine-unavailable',
+  'scan-failed',
+  'catalog-corrupt',
+  'catalog-changed',
+  'repair-refused',
+  'recovery-unknown',
+] as const
+/** Every token {@link ApprovalStatus} declares. */
+const APPROVAL_STATUSES = ['active', 'revoked'] as const
+/** Every token {@link WorkAreaState} declares. */
+const WORK_AREA_STATES = ['valid', 'work-area-invalid'] as const
+/** Every token {@link TransportClass} declares. */
+const TRANSPORT_CLASSES = ['structured-streaming-cli', 'pty'] as const
+/** Every token {@link PromptChannel} declares. */
+const PROMPT_CHANNELS = ['stdin-then-close', 'argv', 'pty-typed'] as const
+/** Every token {@link ScopeMode} declares. */
+const SCOPE_MODES = ['sandbox-enforced', 'harness-enforced', 'advisory'] as const
+/** Every token {@link OutboxState} declares. */
+const OUTBOX_STATES = ['valid', 'outbox-invalid', 'outbox-unavailable'] as const
+/** Every token {@link OutboxReason} declares. */
+const OUTBOX_REASONS = [
+  'outside-project',
+  'link',
+  'not-a-directory',
+  'unreadable',
+  'policy-unreadable',
+  'policy-corrupt',
+  'policy-invalid',
+] as const
+/** Every token {@link CandidateState} declares. */
+const CANDIDATE_STATES = ['candidate', 'outbox-escape', 'outbox-linked'] as const
+/** Every token {@link ArtifactState} declares. */
+const ARTIFACT_STATES = [
+  'candidate',
+  'published-local',
+  'registered',
+  'provider-synced',
+  'registration-pending',
+  'refused',
+  'integrity-mismatch',
+  'duplicate-publication',
+  'outbox-escape',
+  'outbox-linked',
+] as const
+/** Every token {@link ProviderState} declares. */
+const PROVIDER_STATES = ['pending', 'synced', 'failed', 'unavailable'] as const
+/** Every token {@link Availability} declares. */
+const AVAILABILITIES = ['local', 'unknown'] as const
+/** Every token {@link ActAs} declares. */
+const ACT_AS_TOKENS = ['device-local-user'] as const
+/** Every token {@link PortableReference}'s `kind` declares. */
+const REFERENCE_KINDS = ['artifact'] as const
+/** Every token {@link GuidanceKind} declares. */
+const GUIDANCE_KINDS = ['guidance', 'ignore'] as const
+/** Every token {@link ManagedStatus} declares. */
+const MANAGED_STATUSES = ['absent', 'current', 'outdated', 'modified', 'malformed'] as const
+/** Every token {@link GuidanceAction} declares. */
+const GUIDANCE_ACTIONS = ['insert', 'replace', 'no-op', 'remove', 'restore'] as const
+/** Every token {@link OutputDiscipline} declares. */
+const OUTPUT_DISCIPLINES = ['enforced', 'advisory'] as const
+/** Every token {@link Remedy} declares. */
+const REMEDIES = ['quarantine', 'publish', 'ignore'] as const
+/** Every token {@link RemedyOutcome} declares. */
+const REMEDY_OUTCOMES = ['quarantined', 'copied-to-outbox', 'ignored'] as const
+/** Every token {@link RepairRule} declares. */
+const REPAIR_RULES = ['duplicate-record', 'dangling-alias'] as const
+/** Every token {@link RefusalReason} declares. */
+const REFUSAL_REASONS = ['catalog-id-mismatch', 'duplicate-across-asset-roots', 'unparsable'] as const
+
+// Compile-time, enforced by `tsc -b` in `pnpm -r build` and not by vitest:
+// each array covers its union exactly -- no member missing, no extra.
+const _assertions: [
+  CoversExactly<ProcessTerminalStateTag, typeof PROCESS_TERMINAL_STATE_TAGS>,
+  CoversExactly<AgentPhaseTag, typeof AGENT_PHASE_TAGS>,
+  CoversExactly<TerminalActionKind, typeof TERMINAL_ACTION_KINDS>,
+  CoversExactly<ShellErrorCode, typeof SHELL_ERROR_CODES>,
+  CoversExactly<ApprovalStatus, typeof APPROVAL_STATUSES>,
+  CoversExactly<WorkAreaState, typeof WORK_AREA_STATES>,
+  CoversExactly<TransportClass, typeof TRANSPORT_CLASSES>,
+  CoversExactly<PromptChannel, typeof PROMPT_CHANNELS>,
+  CoversExactly<ScopeMode, typeof SCOPE_MODES>,
+  CoversExactly<OutboxState, typeof OUTBOX_STATES>,
+  CoversExactly<OutboxReason, typeof OUTBOX_REASONS>,
+  CoversExactly<CandidateState, typeof CANDIDATE_STATES>,
+  CoversExactly<ArtifactState, typeof ARTIFACT_STATES>,
+  CoversExactly<ProviderState, typeof PROVIDER_STATES>,
+  CoversExactly<Availability, typeof AVAILABILITIES>,
+  CoversExactly<ActAs, typeof ACT_AS_TOKENS>,
+  CoversExactly<PortableReference['kind'], typeof REFERENCE_KINDS>,
+  CoversExactly<GuidanceKind, typeof GUIDANCE_KINDS>,
+  CoversExactly<ManagedStatus, typeof MANAGED_STATUSES>,
+  CoversExactly<GuidanceAction, typeof GUIDANCE_ACTIONS>,
+  CoversExactly<OutputDiscipline, typeof OUTPUT_DISCIPLINES>,
+  CoversExactly<Remedy, typeof REMEDIES>,
+  CoversExactly<RemedyOutcome, typeof REMEDY_OUTCOMES>,
+  CoversExactly<RepairRule, typeof REPAIR_RULES>,
+  CoversExactly<RefusalReason, typeof REFUSAL_REASONS>,
+] = [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+]
+
+/**
+ * Every closed token set this file declares that `dto.rs` closes, paired
+ * with the `pub enum` that closes it. The three sets `dto.rs` does not
+ * close -- `ArtifactClass`, `WrongRootReason`, `RemedyDetail` -- are named
+ * in the paragraph above and are deliberately absent.
+ */
+const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
+  ['ProcessTerminalStateTag', PROCESS_TERMINAL_STATE_TAGS],
+  ['AgentPhaseTag', AGENT_PHASE_TAGS],
+  ['TerminalActionKindDto', TERMINAL_ACTION_KINDS],
+  ['ShellErrorCode', SHELL_ERROR_CODES],
+  ['ApprovalStatusTag', APPROVAL_STATUSES],
+  ['WorkAreaStateTag', WORK_AREA_STATES],
+  ['TransportClassDto', TRANSPORT_CLASSES],
+  ['PromptChannelDto', PROMPT_CHANNELS],
+  ['ScopeModeDto', SCOPE_MODES],
+  ['OutboxStateTag', OUTBOX_STATES],
+  ['OutboxReasonTag', OUTBOX_REASONS],
+  ['CandidateStateTag', CANDIDATE_STATES],
+  ['ArtifactStateTag', ARTIFACT_STATES],
+  ['ProviderStateTag', PROVIDER_STATES],
+  ['AvailabilityTag', AVAILABILITIES],
+  ['ActAsTag', ACT_AS_TOKENS],
+  ['ReferenceKindTag', REFERENCE_KINDS],
+  ['ManagedFileKindDto', GUIDANCE_KINDS],
+  ['ManagedStatusTag', MANAGED_STATUSES],
+  ['GuidanceActionTag', GUIDANCE_ACTIONS],
+  ['OutputDisciplineTag', OUTPUT_DISCIPLINES],
+  ['RemedyTag', REMEDIES],
+  ['RemedyOutcomeTag', REMEDY_OUTCOMES],
+  ['RepairRuleTag', REPAIR_RULES],
+  ['RepairRefusalTag', REFUSAL_REASONS],
+]
+
+describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103)', () => {
+  it.each(MIRRORED_UNIONS)(
+    '%s: this file declares exactly the tokens dto.rs emits -- a variant added to the shell and not to this union fails here',
+    (enumName, tokens) => {
+      expect([...tokens].sort()).toEqual(rustEnumTokens(enumName).sort())
+    },
+  )
+
+  it('RefusalReason carries duplicate-across-asset-roots, the token that drifted', () => {
+    expect(rustEnumTokens('RepairRefusalTag')).toContain('duplicate-across-asset-roots')
+  })
+
+  // The wire spelling is serde's, not this reader's guess at it: the one
+  // variant in `dto.rs` carrying its own `#[serde(rename = …)]` reaches the
+  // wire with a slash no kebab-case conversion produces, and reading the
+  // attribute is the only way to get it right (R3-103).
+  it('reads a per-variant serde rename rather than converting the Rust name: orphan-risk/uncertain keeps its slash', () => {
+    expect(rustEnumTokens('ProcessTerminalStateTag')).toContain('orphan-risk/uncertain')
+    expect(rustEnumTokens('ProcessTerminalStateTag')).not.toContain('orphan-risk-uncertain')
+  })
+
+  it('the reader is reading the shell, not an empty match: a name dto.rs does not define throws rather than passing vacuously', () => {
+    expect(() => rustEnumTokens('NoSuchTagInDtoRs')).toThrow(/was not found in dto\.rs/)
+    expect(_assertions.every((assertion) => assertion)).toBe(true)
+  })
+
+  it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
+    const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
+    expect(new Set(enums).size).toBe(enums.length)
+    expect(enums).toHaveLength(25)
   })
 })

@@ -44,7 +44,8 @@ const BUILT_IN_ADAPTERS: AdapterDescriptor[] = [
 // `approvals_list` on mount, and `AgentPanel` also calls `workspace_current`,
 // `adapters_list`, `outbox_status`, `publications_list`, -- since slice
 // 5c -- `guidance_status` and `guidance_snapshots` for both managed kinds,
-// and -- since slice 5d -- `wrongroot_status` and `misplaced_list`
+// -- since slice 5d -- `wrongroot_status` and `misplaced_list`, and -- since
+// slice 5e -- `recovery_list`
 // -- mock all of them here, for every test, so this module's IPC surface is
 // deterministic rather than leaving `invoke` unmocked, which throws a bare
 // `TypeError` (no `__TAURI_INTERNALS__` in this jsdom environment) instead
@@ -66,7 +67,11 @@ beforeEach(() => {
       cmd === 'outbox_status' ||
       cmd === 'publications_list' ||
       cmd === 'guidance_status' ||
-      cmd === 'guidance_snapshots'
+      cmd === 'guidance_snapshots' ||
+      // `recovery_list` is the fifth project-scoped mount-time fetch
+      // (slice 5e): the work area's publication journal is read against the
+      // active workspace, so with none the shell answers the same way.
+      cmd === 'recovery_list'
     ) {
       return Promise.reject({
         code: 'workspace-unavailable',
@@ -121,6 +126,27 @@ describe('App', () => {
     expect(
       screen.getByRole('list', { name: 'Output discipline disclosures' }).querySelectorAll('li'),
     ).toHaveLength(2)
+    // Slice 5e's two regions stand at mount too. The Catalog says it has
+    // not been previewed rather than nothing at all -- previewing is a user
+    // act, so no `catalog_repair_preview` is sent here -- and `recovery_list`
+    // rejects `workspace-unavailable` with no project, which the panel meets
+    // with the fault line and never an alert.
+    expect(screen.getByRole('status', { name: 'Catalog plan' }).textContent).toBe(
+      'catalog: not previewed — nothing here has read it yet; previewing reads the whole catalog and writes nothing',
+    )
+    // The recovery listing did answer -- with the rejection -- so the count
+    // line is not rendered at all: `recovery entries: 0` is a claim about
+    // this device that a read which was never made must not make.
+    expect(screen.queryByRole('status', { name: 'Recovery count' })).toBeNull()
+    // And it says *why* it was not made. `workspace-unavailable` at mount
+    // is idle, not a failure: this test used to assert the panel claimed
+    // the entries "could not be read" before a workspace had ever been
+    // picked, which left a genuine read failure saying exactly what idle
+    // says (R1-007).
+    expect(screen.queryByRole('status', { name: 'Recovery entries unavailable' })).toBeNull()
+    expect(screen.getByRole('status', { name: 'Recovery entries not read' }).textContent).toBe(
+      'no workspace is active, so the recovery entries were not read; this is not a report that there are none',
+    )
   })
 
   it('renders untrusted content as plain text by default', () => {

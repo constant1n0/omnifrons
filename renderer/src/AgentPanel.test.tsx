@@ -3,6 +3,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { AgentPanel } from './AgentPanel'
+// This panel's own source, as text: the run-active mirror is an invariant
+// over *where the code is written*, not over any one run's timing, so the
+// guard that holds it reads the file (slice 5e review, R3-071b). Vite's
+// `?raw`, the technique the cross-language DTO guard introduced in
+// `ipc/harness.test.ts`.
+import PANEL_SOURCE from './AgentPanel.tsx?raw'
 import { ApprovalSurface } from './ApprovalSurface'
 import { HarnessPanel } from './HarnessPanel'
 import type {
@@ -11,6 +17,7 @@ import type {
   ArtifactApproval,
   ArtifactStateFrame,
   Candidate,
+  CatalogRepairPreview,
   Evidence,
   GuidanceApplied,
   GuidancePreview,
@@ -21,6 +28,7 @@ import type {
   OutboxStatus,
   OutputDiscipline,
   Publication,
+  RecoveryEntry,
   Remedy,
   RemedyDetail,
   RemedyOutcome,
@@ -132,6 +140,11 @@ function defaultHandlers(
     if (cmd === 'workspace_current') return null
     if (cmd === 'outbox_status') return options.outbox ?? Promise.reject(OUTBOX_NO_WORKSPACE)
     if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+    // `recovery_list` is project-scoped like the two above (slice 5e): the
+    // work area's journal is read against the active workspace, so with none
+    // the shell answers `workspace-unavailable` and the panel meets it with
+    // an empty table and the fault line, never an alert.
+    if (cmd === 'recovery_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
     if (cmd === 'adapters_list') return options.adapters ?? [SAMPLE_ADAPTER, PTY_ADAPTER]
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
@@ -3730,6 +3743,7 @@ function mockMountWithPublications(
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
     if (cmd === 'outbox_status') return OUTBOX_STATUS_VALID
     if (cmd === 'publications_list') return answer()
+    if (cmd === 'recovery_list') return []
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
     throw new Error(`unexpected command: ${cmd}`)
   })
@@ -3890,11 +3904,17 @@ describe('AgentPanel publications table (slice 5b)', () => {
     ])
   })
 
-  it('shows the banner for catalog-unavailable from publications_list as a plain catalogue code with its fixed message, no "untrusted", no stray detail and no section, and leaves the panel usable', async () => {
+  // The code a **corrupt** catalog reaches this banner with changed in
+  // slice 5e: `CatalogStoreError::Corrupt` rendered `catalog-unavailable`
+  // through slice 5d and renders `catalog-corrupt` now, with its own fixed
+  // message, because a corrupt catalog has a repair to offer and an
+  // unreadable one has not. The test is corrected rather than dropped --
+  // the banner's behaviour is unchanged and is still what it pins.
+  it('shows the banner for catalog-corrupt from publications_list as a plain catalogue code with its fixed message, no "untrusted", no stray detail and no section, and leaves the panel usable', async () => {
     mockMountWithPublications(() =>
       Promise.reject({
-        code: 'catalog-unavailable',
-        message: 'the catalog is corrupt',
+        code: 'catalog-corrupt',
+        message: 'the catalog is corrupt; preview the repair to see which lines',
         detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
       }),
     )
@@ -3902,7 +3922,9 @@ describe('AgentPanel publications table (slice 5b)', () => {
     render(<AgentPanel />)
 
     const banner = await screen.findByRole('alert')
-    expect(banner.textContent).toBe('catalog-unavailable: the catalog is corrupt')
+    expect(banner.textContent).toBe(
+      'catalog-corrupt: the catalog is corrupt; preview the repair to see which lines',
+    )
     expect(banner.textContent).not.toContain('untrusted')
     expect(banner.textContent).not.toContain('aaaaaaaa')
     expect(screen.queryByRole('region', { name: 'Publications' })).toBeNull()
@@ -3968,7 +3990,10 @@ describe('AgentPanel publications table (slice 5b)', () => {
     unmount()
 
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    rejectList({ code: 'catalog-unavailable', message: 'the catalog is corrupt' })
+    rejectList({
+      code: 'catalog-corrupt',
+      message: 'the catalog is corrupt; preview the repair to see which lines',
+    })
     await new Promise((resolve) => {
       setTimeout(resolve, 0)
     })
@@ -4030,6 +4055,7 @@ const SAMPLE_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782401000,
+  recoveredFrom: null,
   handleHeld: true,
 }
 
@@ -4751,6 +4777,7 @@ const STRAY_ARTIFACT_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782402000,
+  recoveredFrom: null,
   handleHeld: true,
 }
 
@@ -4975,7 +5002,15 @@ describe('AgentPanel publish (slice 5b, HAP-001-R35)', () => {
     ],
     ['outbox-linked', "the entry's link count is greater than one", 'outbox-linked'],
     ['refused', "the entry's identity facts changed since it was approved", 'refused'],
-    ['catalog-unavailable', 'the catalog is corrupt', null],
+    // Slice 5e split this case in two: a corrupt catalog is
+    // `catalog-corrupt`, and `catalog-unavailable` keeps every catalog that
+    // could not be read or written at all. `artifact_publish` reaches both.
+    [
+      'catalog-corrupt',
+      'the catalog is corrupt; preview the repair to see which lines',
+      null,
+    ],
+    ['catalog-unavailable', 'the catalog could not be written', null],
     [
       'destination-invalid',
       'the device asset path resolves inside a registered workspace root',
@@ -5301,6 +5336,16 @@ function answerGuidanceFresh(cmd: string, args: Record<string, unknown>): unknow
 }
 
 /**
+ * A fresh project's recovery answers (`docs/spike-log.md` § Slice 5e, IPC
+ * shapes): a device with nothing preserved. `undefined` for any other
+ * command, so a caller can fall through.
+ */
+function answerRecoveryFresh(cmd: string): unknown {
+  if (cmd === 'recovery_list') return []
+  return undefined
+}
+
+/**
  * A fresh project's wrong-root answers (`docs/spike-log.md` § Slice 5d, IPC
  * shapes): the advisory report every built-in adapter's scope mode
  * produces, both of its disclosures, no scan run and nothing standing.
@@ -5355,6 +5400,8 @@ function mountWithWorkspace(
     if (guidance !== undefined) return guidance
     const wrongRoot = answerWrongRootFresh(cmd)
     if (wrongRoot !== undefined) return wrongRoot
+    const recovery = answerRecoveryFresh(cmd)
+    if (recovery !== undefined) return recovery
     throw new Error(`unexpected command: ${cmd}`)
   })
   render(<AgentPanel />)
@@ -5434,6 +5481,7 @@ const DROPPED_APPROVAL: ArtifactApproval = {
   assetRootId: 'main',
   actAs: 'device-local-user',
   approvedAt: 1725782401000,
+  recoveredFrom: null,
   handleHeld: true,
 }
 
@@ -10399,6 +10447,209 @@ describe('AgentPanel one run per tick (slice 5d second review, R3-033 / R3-034)'
   })
 })
 
+describe('AgentPanel a stop that answers after its own run ended (slice 5e review, R3-071b / R3-106)', () => {
+  /**
+   * `handleStop` was the one async handler on this panel with no generation
+   * check on its resolve path -- `handleFrame`, `handleStart`,
+   * `handleListOutbox`, `refreshRecovery`, `handleConfirmRecoveryApproval`,
+   * `handleRecoveryPublish`, `handleCatalogPreview` and
+   * `handleCatalogRepair` all carry one -- and the sequence below reaches
+   * it with no timing trick at all: the renderer gives the supervisor
+   * 2000 ms to confirm a stop, the run's own terminal `state` frame can
+   * land first on its own channel, and the user is free to start the next
+   * run in the window that opens.
+   *
+   * Two defects meet on that path. The older one (R3-106) is the stale
+   * stop's badge and its `setActiveId(null)`: run 1's token overwrites run
+   * 2's, and nulling run 2's id takes its Stop button away, leaving a live
+   * child this surface can never reach again. The newer one (R3-071b) is
+   * the synchronous `runActiveRef.current = false` the previous review pass
+   * added beside it: it releases the freeze **while run 2's child is live**
+   * -- exactly what that ref's own doc comment says must never happen --
+   * so Start spawns a third child from a panel whose single-run discipline
+   * permits one, and every write this panel freezes comes back under a
+   * running process. One generation check closes both.
+   */
+  it('drops it whole: run 2 keeps its badge and its Stop, no third child is spawned, and the remedies stay frozen under the live run', async () => {
+    const channels: LiveChannel[] = []
+    const spawned: number[] = []
+    let releaseStop: ((state: { state: string; code: number | null }) => void) | undefined
+    const calls = mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channels.push((args as { onFrame: LiveChannel }).onFrame)
+        const id = 7 + spawned.length
+        spawned.push(id)
+        return id
+      }
+      if (cmd === 'harness_stop') {
+        return new Promise((resolve) => {
+          releaseStop = resolve as (state: { state: string; code: number | null }) => void
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Misplaced files' })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+
+    // Run 1 is live, and the user clicks Stop.
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await flush()
+    expect(releaseStop).toBeDefined()
+
+    // The supervisor has not confirmed yet, and run 1's own terminal frame
+    // arrives first on run 1's channel: the run ends, Start is re-enabled.
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 3, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+
+    // So the user starts run 2 ...
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(spawned).toEqual([7, 8])
+
+    // ... and only now does the stop for run 1 answer.
+    act(() => {
+      releaseStop?.({ state: 'killed', code: null })
+    })
+    await flush()
+
+    // Run 2's badge is run 2's.
+    expect(screen.getByText('running')).toBeTruthy()
+    expect(screen.queryByText('killed')).toBeNull()
+    // Run 2 is still reachable: Stop still names a live child (R3-106).
+    expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+    // The freeze did not fall under it (R3-071b): Start refuses, and a
+    // click on it spawns no third child.
+    expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await flush()
+    expect(spawned).toEqual([7, 8])
+    // Nor did the write surface come back: the remedies still refuse.
+    const row = misplacedTableRow('docs/report.pdf')
+    fireEvent.click(within(row).getByRole('button', { name: 'Ignore' }))
+    fireEvent.click(within(row).getByRole('button', { name: 'Quarantine' }))
+    await flush()
+    expect(countCalls(calls, 'misplaced_remedy')).toBe(0)
+    expect(screen.queryByLabelText('Quarantine confirmation')).toBeNull()
+    // And Stop reaches run 2, not run 1.
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await flush()
+    expect(calls.filter((call) => call.cmd === 'harness_stop').at(-1)?.args).toEqual({
+      id: 8,
+      deadlineMs: 2000,
+    })
+  })
+
+  it("drops a stale stop that *rejects* too: run 1's refusal never reaches run 2's banner", async () => {
+    const channels: LiveChannel[] = []
+    const spawned: number[] = []
+    let rejectStop: ((reason: unknown) => void) | undefined
+    mountWithWorkspace((cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channels.push((args as { onFrame: LiveChannel }).onFrame)
+        const id = 7 + spawned.length
+        spawned.push(id)
+        return id
+      }
+      if (cmd === 'harness_stop') {
+        return new Promise((_resolve, reject) => {
+          rejectStop = reject
+        })
+      }
+      return undefined
+    })
+    await screen.findByLabelText('Adapter')
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await flush()
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 3, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+
+    act(() => {
+      rejectStop?.({ code: 'unknown-process', message: 'no such process' })
+    })
+    await flush()
+
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByText('running')).toBeTruthy()
+  })
+
+  /**
+   * The two tests above catch the three clearing sites this file has
+   * **today**; the failure mode they cannot reach is a fourth one added
+   * later, because no timing test can be written for code nobody has
+   * written yet -- and that is exactly how `handleStop` came to be the one
+   * site without a generation check in the first place.
+   *
+   * So the invariant is held structurally, over the source rather than
+   * over a run: **`activeId` is only ever cleared beside the synchronous
+   * mirror `runActiveRef`**. A fourth site that forgets the mirror fails
+   * here whatever its timing, and so does one that clears the id through a
+   * value instead of the literal.
+   *
+   * The source guard was chosen over funnelling the three sites through a
+   * single `endRun()` for that reason alone: the funnel is a convention a
+   * fourth site can simply not use, and nothing fails when it does not,
+   * while this fails the suite. It is textual, which is its honest limit
+   * -- it reads the file as lines, not as a program -- and it is checked
+   * against the file it reads by the non-vacuity assertion below.
+   */
+  it('holds the mirror structurally: every setActiveId(null) in AgentPanel.tsx sits beside a runActiveRef.current = false, and nothing else clears the id', () => {
+    // Comment and blank lines dropped, so "beside" means the previous line
+    // of *code* -- every one of these sites carries a paragraph of comment
+    // between the mirror and the state update.
+    const code = PANEL_SOURCE.split('\n')
+      .map((line) => line.trim())
+      .filter(
+        (line) =>
+          line !== '' &&
+          !line.startsWith('//') &&
+          !line.startsWith('*') &&
+          !line.startsWith('/*'),
+      )
+
+    const clearingSites = code.flatMap((line, index) =>
+      line.includes('setActiveId(null)') ? [index] : [],
+    )
+    // Non-vacuity, the `rustEnumTokens` rule: a guard that found no site
+    // would pass forever. There are three run-ending sites and two of them
+    // clear the id.
+    expect(clearingSites.length).toBeGreaterThanOrEqual(2)
+    expect(clearingSites.map((index) => code[index - 1])).toEqual(
+      clearingSites.map(() => 'runActiveRef.current = false'),
+    )
+    // And the id is raised in exactly one place, so no other call can
+    // clear it through a nullable value and slip past the check above.
+    expect(code.filter((line) => line.includes('setActiveId(') && !line.includes('(null)'))).toEqual(
+      ['setActiveId(id)'],
+    )
+  })
+})
+
 describe('AgentPanel a listing row is checked field by field (slice 5d second review, R3-035)', () => {
   /**
    * One entry per field `isMisplacedRow` checks, each carrying a value of
@@ -10466,53 +10717,176 @@ describe('AgentPanel a listing row is checked field by field (slice 5d second re
   })
 })
 
-describe('AgentPanel a remedy clears the banner (slice 5d second review, R3-036)', () => {
-  it('clears a refusal when a later remedy succeeds, so a quarantine-unavailable banner never stands above the receipt of the Publish that worked', async () => {
-    // R3-030 was recorded as covered, and it is -- for `handleScan`. The
-    // scan and the remedies each call `setError(null)` on their own way in,
-    // and only the scan's had a test: deleting `runRemedy`'s left the whole
-    // suite green, with a refusal about the quarantine directory standing
-    // above a receipt saying a copy reached the outbox.
-    let fail = true
-    mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
-      if (cmd !== 'misplaced_remedy') return undefined
-      return fail
-        ? Promise.reject({
-            code: 'quarantine-unavailable',
-            message: 'the quarantine directory could not be used',
-          })
-        : {
-            remedy: 'publish',
-            outcome: 'copied-to-outbox',
-            name: 'abababab-report.pdf',
-            sha256: 'ab'.repeat(32),
-            originalKept: true,
-            detail: null,
-          }
-    })
-    await screen.findByRole('table', { name: 'Misplaced files' })
+/**
+ * Every act on this panel that clears the banner on its way in, in one
+ * table.
+ *
+ * R3-030 was recorded as covered, and it was -- for `handleScan` alone.
+ * The scan and the remedies each call `setError(null)` on their own way in
+ * and only the scan's had a test, so deleting `runRemedy`'s left the whole
+ * suite green with a refusal about the quarantine directory standing above
+ * a receipt saying a copy had reached the outbox (R3-036).
+ *
+ * Slice 5e then added three more handlers with the same line in them and
+ * no test for any of the three (R3-067) -- the same finding, verbatim, in
+ * three new places. A one-off per handler is what let that happen twice,
+ * so this is a table: a new act that clears the banner is a row, and an
+ * act that stops clearing it fails on its own row.
+ *
+ * Each scenario raises a real refusal, asserts it is on the screen, then
+ * performs the act and waits for the act's *own* evidence of success --
+ * never merely for the banner to go, which would pass if the act never
+ * ran at all.
+ */
+describe('AgentPanel an act clears the banner on its way in (slice 5d second review, R3-036; slice 5e review, R3-067)', () => {
+  it.each([
+    [
+      'a remedy',
+      async () => {
+        let fail = true
+        mountWrongRoots({ rows: [MISPLACED_REPORT] }, (cmd) => {
+          if (cmd !== 'misplaced_remedy') return undefined
+          return fail
+            ? Promise.reject({
+                code: 'quarantine-unavailable',
+                message: 'the quarantine directory could not be used',
+              })
+            : {
+                remedy: 'publish',
+                outcome: 'copied-to-outbox',
+                name: 'abababab-report.pdf',
+                sha256: 'ab'.repeat(32),
+                originalKept: true,
+                detail: null,
+              }
+        })
+        await screen.findByRole('table', { name: 'Misplaced files' })
 
-    fireEvent.click(
-      within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
-    )
-    const banner = await screen.findByRole('alert')
-    expect(banner.textContent).toBe(
-      'quarantine-unavailable: the quarantine directory could not be used',
-    )
+        fireEvent.click(
+          within(misplacedTableRow('docs/report.pdf')).getByRole('button', { name: 'Ignore' }),
+        )
+        const banner = await screen.findByRole('alert')
+        expect(banner.textContent).toBe(
+          'quarantine-unavailable: the quarantine directory could not be used',
+        )
 
-    fail = false
-    fireEvent.click(
-      within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
-        name: 'Publish to outbox',
-      }),
-    )
+        fail = false
+        fireEvent.click(
+          within(misplacedTableRow('docs/report.pdf')).getByRole('button', {
+            name: 'Publish to outbox',
+          }),
+        )
+        await waitFor(() => {
+          expect(remedyResultLine()).not.toBeNull()
+        })
+        expect(remedyResultLine()).toContain('copied into the outbox as a new unattributed entry')
+      },
+    ],
+    [
+      'a catalog preview',
+      async () => {
+        let fail = true
+        mountCatalog(() =>
+          fail
+            ? Promise.reject({
+                code: 'catalog-unavailable',
+                message: 'the project has no catalog to repair',
+              })
+            : catalogPreview(),
+        )
+        await waitFor(() => {
+          expect(catalogLine()).not.toBeNull()
+        })
 
-    await waitFor(() => {
-      expect(remedyResultLine()).not.toBeNull()
-    })
-    expect(remedyResultLine()).toContain('copied into the outbox as a new unattributed entry')
-    expect(screen.queryByRole('alert')).toBeNull()
-  })
+        fireEvent.click(previewButton())
+        const banner = await screen.findByRole('alert')
+        expect(banner.textContent).toBe(
+          'catalog-unavailable: the project has no catalog to repair',
+        )
+
+        fail = false
+        fireEvent.click(previewButton())
+        await waitFor(() => {
+          expect(catalogRepairBlockLines()).not.toHaveLength(0)
+        })
+      },
+    ],
+    [
+      'a catalog repair',
+      async () => {
+        let fail = true
+        await previewCatalog(catalogPreview(), (cmd) =>
+          cmd === 'catalog_repair'
+            ? fail
+              ? Promise.reject({
+                  code: 'repair-refused',
+                  message: 'a line refuses the repair',
+                })
+              : {
+                  originalSha256: CATALOG_SHA256,
+                  sha256: REPAIRED_SHA256,
+                  droppedLines: 1,
+                  keptRecords: 2,
+                }
+            : undefined,
+        )
+        typeCatalogGate(CATALOG_SHORT)
+
+        fireEvent.click(catalogRepairButton())
+        const banner = await screen.findByRole('alert')
+        expect(banner.textContent).toBe('repair-refused: a line refuses the repair')
+
+        // `repair-refused` keeps the block and its typed gate, so the
+        // retry is one click.
+        fail = false
+        fireEvent.click(catalogRepairButton())
+        await waitFor(() => {
+          expect(catalogResultLine()).not.toBeNull()
+        })
+      },
+    ],
+    [
+      'a recovery approval',
+      async () => {
+        let fail = true
+        mountRecovery([RECOVERY_USABLE], (cmd) =>
+          cmd === 'recovery_approve'
+            ? fail
+              ? Promise.reject({
+                  code: 'refused',
+                  message: 'the recovery entry is not a regular file',
+                })
+              : RECOVERY_APPROVAL
+            : undefined,
+        )
+        await screen.findByRole('table', { name: 'Recovery entries' })
+        fireEvent.click(
+          within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+        )
+        await screen.findByLabelText('Recovery approval')
+        typeRecoveryGate(RECOVERY_SHORT)
+
+        fireEvent.click(recoveryApproveButton())
+        const banner = await screen.findByRole('alert')
+        expect(banner.textContent).toBe('refused: the recovery entry is not a regular file')
+
+        // Every refusal but `recovery-unknown` keeps the block open with
+        // the gate intact, so the retry is one click here too.
+        fail = false
+        fireEvent.click(recoveryApproveButton())
+        await waitFor(() => {
+          expect(recoveryRows()[0]?.[7]).toBe(APPROVED_RECOVERY_CELL)
+        })
+      },
+    ],
+  ])(
+    '%s clears a standing refusal on its way in, so the previous banner never stands above the receipt of the act that worked',
+    async (_label, scenario) => {
+      await scenario()
+
+      expect(screen.queryByRole('alert')).toBeNull()
+    },
+  )
 })
 
 describe('AgentPanel a state frame is checked before it is read (slice 5d second review, R3-049)', () => {
@@ -10786,5 +11160,3042 @@ describe('AgentPanel the other same-tick entry points (slice 5d second review, R
 
     expect(countCalls(calls, 'workspace_pick')).toBe(0)
     expect(countCalls(calls, 'harness_spawn')).toBe(1)
+  })
+})
+
+// -- Slice 5e: catalog repair and recovery re-approval --
+
+/** The digest of the catalog a preview read, and the binding a repair sends back. */
+const CATALOG_SHA256 = 'ab'.repeat(32)
+const CATALOG_SHORT = 'abababab'
+/** The digest the repaired catalog carries afterwards. */
+const REPAIRED_SHA256 = 'cd'.repeat(32)
+
+const CATALOG_NOT_PREVIEWED_LINE =
+  'catalog: not previewed — nothing here has read it yet; previewing reads the whole catalog and writes nothing'
+
+const CATALOG_PREVIEW_UNAVAILABLE_SENTENCE =
+  'the repair preview could not be read; this is not a report that the catalog is healthy'
+
+const CATALOG_REPAIR_SCOPE_LINE =
+  'the lines above will be REMOVED from the project catalog; the catalog as it stands is copied into the product work area first, and this product offers no way to list, open or restore that copy'
+
+/** A plan a repair would run: one duplicate record to drop, nothing refusing it. */
+function catalogPreview(overrides: Partial<CatalogRepairPreview> = {}): CatalogRepairPreview {
+  return {
+    sha256: CATALOG_SHA256,
+    repairable: true,
+    drops: [{ line: 4, rule: 'duplicate-record', publicationId: 'cd'.repeat(32) }],
+    refusals: [],
+    keptRecords: 2,
+    ...overrides,
+  }
+}
+
+/** The plan of a catalog a line refuses: nothing may be dropped (HAP-001-R39). */
+const CATALOG_REFUSED_PREVIEW = catalogPreview({
+  repairable: false,
+  drops: [],
+  refusals: [{ line: 7, reason: 'catalog-id-mismatch' }],
+  keptRecords: 2,
+})
+
+function catalogLine(): string | null {
+  return screen.queryByRole('status', { name: 'Catalog plan' })?.textContent ?? null
+}
+
+function catalogFaultLine(): string | null {
+  return screen.queryByRole('status', { name: 'Catalog preview unavailable' })?.textContent ?? null
+}
+
+function catalogResultLine(): string | null {
+  return screen.queryByRole('status', { name: 'Catalog repair result' })?.textContent ?? null
+}
+
+function previewButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Preview repair' }) as HTMLButtonElement
+}
+
+function catalogDropLines(): (string | null)[] {
+  const list = screen.queryByRole('list', { name: 'Catalog repair drops' })
+  if (!list) return []
+  return Array.from(list.querySelectorAll('li')).map((line) => line.textContent)
+}
+
+function catalogRefusalLines(): (string | null)[] {
+  const list = screen.queryByRole('list', { name: 'Catalog repair refusals' })
+  if (!list) return []
+  return Array.from(list.querySelectorAll('li')).map((line) => line.textContent)
+}
+
+function catalogRepairBlock(): HTMLElement {
+  return screen.getByLabelText('Catalog repair confirmation')
+}
+
+function catalogRepairBlockLines(): (string | null)[] {
+  return Array.from(catalogRepairBlock().querySelectorAll('p')).map((line) => line.textContent)
+}
+
+function catalogGate(): HTMLInputElement {
+  return screen.getByLabelText(/^Type the short digest \(.*\) to repair$/) as HTMLInputElement
+}
+
+function catalogRepairButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Repair catalog' }) as HTMLButtonElement
+}
+
+function typeCatalogGate(value: string): void {
+  fireEvent.change(catalogGate(), { target: { value } })
+}
+
+/** Mounts over a workspace whose `catalog_repair_preview` answers `answer`, with `onCommand` first. */
+function mountCatalog(
+  answer?: unknown,
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Call[] {
+  return mountWithWorkspace((cmd, args) => {
+    const own = onCommand?.(cmd, args)
+    if (own !== undefined) return own
+    if (cmd === 'catalog_repair_preview') return answer === undefined ? undefined : answerMock(answer)
+    return undefined
+  })
+}
+
+/** Mounts, clicks Preview repair, and waits for the plan to land. */
+async function previewCatalog(
+  answer: unknown = catalogPreview(),
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Promise<Call[]> {
+  const calls = mountCatalog(answer, onCommand)
+  await waitFor(() => {
+    expect(catalogLine()).not.toBeNull()
+  })
+  fireEvent.click(previewButton())
+  await flush()
+  return calls
+}
+
+describe('AgentPanel catalog repair section (slice 5e, HAP-001-R23, R39, R40)', () => {
+  it('renders a Catalog region beside the transcript, the Candidates, Guidance, Wrong roots and Publications regions -- never inside any of them (RCS-001-R6) -- saying it has not been previewed, with a Preview repair button and no plan, and invoking nothing', async () => {
+    const calls = mountCatalog()
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+
+    const region = screen.getByRole('region', { name: 'Catalog' })
+    expect(region).not.toBeNull()
+    for (const name of ['Agent transcript']) {
+      expect(within(region).queryByLabelText(name)).toBeNull()
+    }
+    expect(
+      within(screen.getByRole('region', { name: 'Wrong roots' })).queryByRole('region', {
+        name: 'Catalog',
+      }),
+    ).toBeNull()
+    expect(catalogLine()).toBe(CATALOG_NOT_PREVIEWED_LINE)
+    expect(catalogFaultLine()).toBeNull()
+    expect(catalogDropLines()).toEqual([])
+    expect(catalogRefusalLines()).toEqual([])
+    expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+    expect(previewButton().disabled).toBe(false)
+    // Previewing is a user act: nothing reads the catalog at mount.
+    expect(countCalls(calls, 'catalog_repair_preview')).toBe(0)
+  })
+
+  it('clicking Preview repair calls catalog_repair_preview with exactly {} and renders the counts, the digest and the repairable verdict, with each drop on its own line named by NUMBER and never by content', async () => {
+    const calls = await previewCatalog()
+
+    expect(countCalls(calls, 'catalog_repair_preview')).toBe(1)
+    expect(calls.find((call) => call.cmd === 'catalog_repair_preview')?.args).toEqual({})
+    expect(catalogLine()).toBe(
+      `catalog: 1 drops, 0 refusals, 2 records kept; sha256 short ${CATALOG_SHORT} — a repair would drop the lines below and remove no registration`,
+    )
+    expect(catalogDropLines()).toEqual([
+      'line 4: a later record line for a publication an earlier line already registers; publication cdcdcdcd',
+    ])
+    expect(catalogRefusalLines()).toEqual([])
+  })
+
+  it('renders a dangling alias whose publicationId is null as a stated absence, never as a blank fact', async () => {
+    await previewCatalog(
+      catalogPreview({ drops: [{ line: 3, rule: 'dangling-alias', publicationId: null }] }),
+    )
+
+    expect(catalogDropLines()).toEqual([
+      'line 3: an alias line no earlier record line carries; publication not reported',
+    ])
+  })
+
+  it('renders each refusal by number with what it means -- an owner decision, not a repair -- and offers NO repair block at all for a plan that is not repairable', async () => {
+    await previewCatalog(CATALOG_REFUSED_PREVIEW)
+
+    expect(catalogLine()).toBe(
+      `catalog: 0 drops, 1 refusals, 2 records kept; sha256 short ${CATALOG_SHORT} — no repair is offered: either a line below may not be dropped, or there is nothing to drop`,
+    )
+    expect(catalogRefusalLines()).toEqual([
+      'line 7: a record line whose catalog identity disagrees with the identity it registers; it is not dropped: this needs an owner decision, not a repair',
+    ])
+    expect(catalogDropLines()).toEqual([])
+    expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Repair catalog' })).toBeNull()
+  })
+
+  it('renders an unparsable line the same way: named, refused, and left where it is', async () => {
+    await previewCatalog(
+      catalogPreview({ repairable: false, drops: [], refusals: [{ line: 2, reason: 'unparsable' }] }),
+    )
+
+    expect(catalogRefusalLines()).toEqual([
+      'line 2: a line this version cannot read; it is not dropped: this needs an owner decision, not a repair',
+    ])
+  })
+
+  // The third refusal token, which `dto.rs` has emitted since the Rust fix
+  // round added it and this surface had no arm for: it fell through to the
+  // unrecognized-token fallback and rendered the wire token itself, raw, on
+  // a surface whose stated discipline is fixed copy per closed token
+  // (R1-001 / R1-002 / R1-011). The copy has to say what the *other* thing
+  // is, because "duplicate" alone is what makes dropping it look safe.
+  it('renders a duplicate across asset roots as fixed copy naming the second registration, never the raw wire token', async () => {
+    await previewCatalog(
+      catalogPreview({
+        repairable: false,
+        drops: [],
+        refusals: [{ line: 5, reason: 'duplicate-across-asset-roots' }],
+      }),
+    )
+
+    const [line] = catalogRefusalLines()
+    expect(line).not.toContain('duplicate-across-asset-roots')
+    expect(line).toBe(
+      'line 5: a record line for a publication an earlier line already registers, under a different asset root, so each registers an artifact of its own; it is not dropped: this needs an owner decision, not a repair',
+    )
+  })
+
+  it('a repairable plan opens the confirmation block bound to it -- the digest, its short form, the counts, the sentence saying the lines will be REMOVED and that nothing here restores the copy, the act-as line, a gate naming the short digest, an empty input and a disabled button -- invoking nothing', async () => {
+    const calls = await previewCatalog()
+
+    expect(countCalls(calls, 'catalog_repair')).toBe(0)
+    expect(catalogRepairBlockLines()).toEqual([
+      `sha256: ${CATALOG_SHA256}`,
+      `sha256 short: ${CATALOG_SHORT}`,
+      'lines to drop: 1',
+      'records kept: 2',
+      CATALOG_REPAIR_SCOPE_LINE,
+      ACT_AS_LINE,
+    ])
+    expect(catalogGate().value).toBe('')
+    expect(catalogRepairButton().disabled).toBe(true)
+  })
+})
+
+describe('AgentPanel catalog repair gate (slice 5e, TM-001-R1/R7)', () => {
+  it.each([
+    ['the fixed word', 'repair'],
+    ['the uppercase digest', CATALOG_SHORT.toUpperCase()],
+    ['a seven-character prefix', CATALOG_SHORT.slice(0, 7)],
+    ['a nine-character prefix', CATALOG_SHA256.slice(0, 9)],
+    ['the same digest with a trailing space', `${CATALOG_SHORT} `],
+    ['the same digest with a leading space', ` ${CATALOG_SHORT}`],
+    ['the empty string', ''],
+    ['the full 64-hex digest', CATALOG_SHA256],
+  ])('leaves the button disabled for %s, and sends no catalog_repair', async (_label, typed) => {
+    const calls = await previewCatalog()
+
+    typeCatalogGate(typed)
+
+    expect(catalogRepairButton().disabled).toBe(true)
+    fireEvent.click(catalogRepairButton())
+    await flush()
+    expect(countCalls(calls, 'catalog_repair')).toBe(0)
+  })
+
+  it('refuses a plan whose sha256 is empty: the gate the label names is then empty too, and an empty input would otherwise satisfy it in front of a rewrite of the project catalog', async () => {
+    const calls = await previewCatalog(catalogPreview({ sha256: '' }))
+
+    expect(catalogGate().value).toBe('')
+    expect(catalogRepairButton().disabled).toBe(true)
+    typeCatalogGate('')
+    expect(catalogRepairButton().disabled).toBe(true)
+    fireEvent.click(catalogRepairButton())
+    await flush()
+    expect(countCalls(calls, 'catalog_repair')).toBe(0)
+  })
+
+  it("nothing pre-fills the gate: neither the plan's own digest arriving nor a programmatic value with no input event enables it; only the user's own typing does", async () => {
+    const calls = await previewCatalog()
+
+    expect(catalogGate().parentElement?.querySelector('label')?.textContent).toBe(
+      `Type the short digest (${CATALOG_SHORT}) to repair`,
+    )
+    expect(catalogGate().value).toBe('')
+    expect(catalogRepairButton().disabled).toBe(true)
+
+    catalogGate().value = CATALOG_SHORT
+    await flush()
+    expect(catalogGate().value).toBe(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(true)
+    expect(countCalls(calls, 'catalog_repair')).toBe(0)
+
+    // (React's value tracker reports a change event carrying the string
+    // already set on the node as no change, so the typed sequence passes
+    // through another value first -- a test-harness detail, the shape the
+    // slice-5d quarantine gate's own test records.)
+    typeCatalogGate('')
+    expect(catalogRepairButton().disabled).toBe(true)
+    typeCatalogGate(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(false)
+  })
+})
+
+describe('AgentPanel catalog repair (slice 5e, D2)', () => {
+  it("confirming calls catalog_repair with exactly { sha256 } -- the plan's own full digest, never the typed value -- then posts the receipt, drops the plan and its block, and reads the publications afresh because the catalog they come from has just been rewritten", async () => {
+    const calls = await previewCatalog(catalogPreview(), (cmd) =>
+      cmd === 'catalog_repair'
+        ? {
+            originalSha256: CATALOG_SHA256,
+            sha256: REPAIRED_SHA256,
+            droppedLines: 1,
+            keptRecords: 2,
+          }
+        : undefined,
+    )
+    typeCatalogGate(CATALOG_SHORT)
+    const before = calls.length
+
+    fireEvent.click(catalogRepairButton())
+    await flush()
+
+    expect(countCalls(calls, 'catalog_repair')).toBe(1)
+    expect(calls.find((call) => call.cmd === 'catalog_repair')?.args).toEqual({
+      sha256: CATALOG_SHA256,
+    })
+    expect(catalogResultLine()).toBe(
+      'catalog repaired: 1 lines dropped, 2 records kept; was abababab, now cdcdcdcd',
+    )
+    expect(catalogLine()).toBe(CATALOG_NOT_PREVIEWED_LINE)
+    expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+    expect(calls.slice(before).map((call) => call.cmd)).toContain('publications_list')
+  })
+
+  it('closes the block and drops the plan for catalog-changed -- the plan it was bound to is stale by definition -- so the next act has to be a fresh preview', async () => {
+    const calls = await previewCatalog(catalogPreview(), (cmd) =>
+      cmd === 'catalog_repair'
+        ? Promise.reject({
+            code: 'catalog-changed',
+            message: 'the catalog changed since it was previewed; preview it again',
+          })
+        : undefined,
+    )
+    typeCatalogGate(CATALOG_SHORT)
+
+    fireEvent.click(catalogRepairButton())
+    await flush()
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'catalog-changed: the catalog changed since it was previewed; preview it again',
+    )
+    expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+    expect(catalogLine()).toBe(CATALOG_NOT_PREVIEWED_LINE)
+    expect(catalogResultLine()).toBeNull()
+    expect(countCalls(calls, 'catalog_repair')).toBe(1)
+  })
+
+  it('keeps the block and the typed gate for every other refusal, so the user can read the banner and try again', async () => {
+    await previewCatalog(catalogPreview(), (cmd) =>
+      cmd === 'catalog_repair'
+        ? Promise.reject({
+            code: 'repair-refused',
+            message: 'the catalog needs no repair',
+          })
+        : undefined,
+    )
+    typeCatalogGate(CATALOG_SHORT)
+
+    fireEvent.click(catalogRepairButton())
+    await flush()
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'repair-refused: the catalog needs no repair',
+    )
+    expect(screen.queryByLabelText('Catalog repair confirmation')).not.toBeNull()
+    expect(catalogGate().value).toBe(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(false)
+  })
+
+  it.each([
+    ['catalog-changed', 'the catalog changed since it was previewed; preview it again'],
+    [
+      'repair-refused',
+      'a line of the catalog registers an artifact and needs an owner decision, not a repair',
+    ],
+    ['catalog-unavailable', 'the catalog could not be written'],
+    ['invalid-request', 'the digest is not 64 hex characters'],
+    ['run-active', 'a run is active; approve or publish once it has ended'],
+    ['work-area-invalid', 'the pre-repair copy could not be written to the product work area'],
+    ['workspace-unavailable', 'no workspace has been picked yet'],
+  ])(
+    'renders %s from catalog_repair as a plain catalogue code with its fixed message, no "untrusted" and no detail',
+    async (code, message) => {
+      await previewCatalog(catalogPreview(), (cmd) =>
+        cmd === 'catalog_repair'
+          ? Promise.reject({
+              code,
+              message,
+              detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+            })
+          : undefined,
+      )
+      typeCatalogGate(CATALOG_SHORT)
+
+      fireEvent.click(catalogRepairButton())
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(banner.textContent).not.toContain('untrusted')
+      expect(banner.textContent).not.toContain('aaaaaaaa')
+    },
+  )
+
+  it.each([
+    ['catalog-unavailable', 'the project has no catalog to repair'],
+    ['workspace-unavailable', 'no workspace has been picked yet'],
+  ])(
+    'renders %s from catalog_repair_preview as a plain catalogue code, and says the plan could not be read rather than leaving the catalog looking healthy',
+    async (code, message) => {
+      await previewCatalog(() => Promise.reject({ code, message }))
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      // The fault line stands *instead of* the not-previewed one: a preview
+      // that was asked for and did not answer is not a catalog nothing has
+      // read yet, and rendering both would make one of the two false.
+      expect(catalogFaultLine()).toBe(CATALOG_PREVIEW_UNAVAILABLE_SENTENCE)
+      expect(catalogLine()).toBeNull()
+    },
+  )
+})
+
+describe('AgentPanel catalog fail-safe and guards (slice 5e)', () => {
+  it.each([
+    ['not an object', 'corrupt'],
+    ['a plan with no arrays', { sha256: CATALOG_SHA256, repairable: true, keptRecords: 2 }],
+    [
+      'a drop that is not a drop',
+      { ...catalogPreview(), drops: [{ line: 4 }] },
+    ],
+    [
+      'a refusal that is not a refusal',
+      { ...catalogPreview(), refusals: [{ reason: 'unparsable' }] },
+    ],
+    // `drops` alone, with `refusals` the list its DTO promises: the two
+    // checks are separate and each has to be the one that fails somewhere,
+    // or one of them is never what refuses a payload (measured -- with only
+    // the "no arrays" case above, dropping the `drops` check left the suite
+    // green).
+    ['a plan whose drops is not a list', { ...catalogPreview(), drops: 'one' }],
+    ['a plan whose refusals is not a list', { ...catalogPreview(), refusals: 'none' }],
+    // One case per remaining field check (R3-062, R3-063). Each of these
+    // was removable on its own with the suite green, because every payload
+    // above fails more than one check at a time -- and each protects a
+    // different stated failure: the digest reaches `shortDigest(undefined)`
+    // and throws mid-render, which closes the whole Agent panel; the count
+    // renders `undefined records kept` as a fact; and `repairable: 'yes'`
+    // is truthy, so it opens the repair confirmation block and its Repair
+    // button over a plan the shell never called repairable.
+    ['a plan with no sha256', { ...catalogPreview(), sha256: undefined }],
+    ['a plan whose repairable is a string', { ...catalogPreview(), repairable: 'yes' }],
+    ['a plan with no keptRecords', { ...catalogPreview(), keptRecords: undefined }],
+    // And one per field of a drop, for the same reason: `{ line: 4 }`
+    // above fails the rule check and the identity check together, so
+    // neither is ever the one that refuses a payload.
+    [
+      'a drop with no rule',
+      { ...catalogPreview(), drops: [{ line: 4, publicationId: PUBLICATION_ID }] },
+    ],
+    [
+      'a drop with no line',
+      { ...catalogPreview(), drops: [{ rule: 'dangling-alias', publicationId: null }] },
+    ],
+    [
+      'a drop whose publicationId is neither string nor null',
+      { ...catalogPreview(), drops: [{ line: 4, rule: 'duplicate-record', publicationId: 7 }] },
+    ],
+    // The refusal guard's second field, for the same reason: the case
+    // above carries a `reason` and no `line`.
+    ['a refusal with no reason', { ...catalogPreview(), refusals: [{ line: 9 }] }],
+  ])(
+    'renders no plan and no thrown render for %s, and says the preview could not be read',
+    async (_label, payload) => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      await previewCatalog(payload)
+
+      expect(catalogLine()).toBeNull()
+      expect(catalogFaultLine()).toBe(CATALOG_PREVIEW_UNAVAILABLE_SENTENCE)
+      expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+      // And **no banner**: a payload that is not the plan its DTO promises
+      // is refused by the shape check and stated on the line, not raised as
+      // an error the user could act on. This is also what separates the
+      // `drops`-is-a-list check from the `TypeError` that `.every` would
+      // otherwise throw into the same `catch` -- measured: without the
+      // assertion, dropping that check left the suite green.
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(screen.queryByRole('region', { name: 'Agent' })).not.toBeNull()
+      expect(consoleErrorSpy).not.toHaveBeenCalled()
+      consoleErrorSpy.mockRestore()
+    },
+  )
+
+  // A new preview replaces the old plan, and the gate and the receipt
+  // belong to the old plan: the gate confirms a digest the new plan may
+  // not carry, and the receipt describes a repair that already happened.
+  // Both lines were in `handleCatalogPreview` and neither was tested, so
+  // each was removable with the suite green (R3-073). A gate left standing
+  // is the one with teeth: it is the typed confirmation in front of a
+  // rewrite of the project's Catalog.
+  it('clears the typed gate when a new preview replaces the plan it was typed for', async () => {
+    await previewCatalog()
+    typeCatalogGate(CATALOG_SHORT)
+    expect(catalogGate().value).toBe(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(false)
+
+    fireEvent.click(previewButton())
+    await flush()
+
+    expect(catalogGate().value).toBe('')
+    expect(catalogRepairButton().disabled).toBe(true)
+  })
+
+  it('clears the last repair receipt when a new preview is taken, so a line about a finished repair never stands over a fresh plan', async () => {
+    await previewCatalog(catalogPreview(), (cmd) =>
+      cmd === 'catalog_repair'
+        ? {
+            originalSha256: CATALOG_SHA256,
+            sha256: REPAIRED_SHA256,
+            droppedLines: 1,
+            keptRecords: 2,
+          }
+        : undefined,
+    )
+    typeCatalogGate(CATALOG_SHORT)
+    fireEvent.click(catalogRepairButton())
+    await waitFor(() => {
+      expect(catalogResultLine()).not.toBeNull()
+    })
+
+    fireEvent.click(previewButton())
+    await flush()
+
+    expect(catalogResultLine()).toBeNull()
+  })
+
+  it('previewing stays live while a run is active -- the shell takes no lock for it and seeing what is wrong is not a write -- and the answer still renders', async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountCatalog(catalogPreview(), (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+    await startRunOverWorkspace()
+
+    expect(previewButton().disabled).toBe(false)
+    fireEvent.click(previewButton())
+    await flush()
+
+    expect(countCalls(calls, 'catalog_repair_preview')).toBe(1)
+    expect(catalogDropLines()).toHaveLength(1)
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+  })
+
+  it('freezes the repair while a run is active: the gate and the button are disabled, a click on the button invokes nothing, and the typed gate survives the run', async () => {
+    let channel: LiveChannel | undefined
+    const calls = await previewCatalog(catalogPreview(), (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    typeCatalogGate(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(false)
+
+    await startRunOverWorkspace()
+
+    expect(catalogGate().disabled).toBe(true)
+    expect(catalogRepairButton().disabled).toBe(true)
+    fireEvent.click(catalogRepairButton())
+    await flush()
+    expect(countCalls(calls, 'catalog_repair')).toBe(0)
+    expect(catalogGate().value).toBe(CATALOG_SHORT)
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+    expect(catalogRepairButton().disabled).toBe(false)
+  })
+
+  it('refuses a repair click batched into the same tick as Start, when both the button and the closure are still one render behind the run', async () => {
+    const calls = await previewCatalog(catalogPreview(), (cmd) =>
+      cmd === 'harness_spawn' ? 7 : undefined,
+    )
+    typeCatalogGate(CATALOG_SHORT)
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      catalogRepairButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'catalog_repair')).toBe(0)
+  })
+
+  it('refuses a second preview and a second repair that land before React has re-rendered the disabled buttons: one read per click, one rewrite per confirmed gate', async () => {
+    const calls = mountCatalog(
+      () =>
+        new Promise(() => {
+          // Never settles: the preview stays in flight for both clicks.
+        }),
+    )
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+
+    act(() => {
+      previewButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      previewButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+    expect(countCalls(calls, 'catalog_repair_preview')).toBe(1)
+
+    clearMocks()
+    cleanup()
+
+    const repairCalls = await previewCatalog(catalogPreview(), (cmd) =>
+      cmd === 'catalog_repair'
+        ? new Promise(() => {
+            // Never settles: the repair stays in flight for both clicks.
+          })
+        : undefined,
+    )
+    typeCatalogGate(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(false)
+
+    act(() => {
+      catalogRepairButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      catalogRepairButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+    expect(countCalls(repairCalls, 'catalog_repair')).toBe(1)
+  })
+
+  it('renders an unrecognized rule and an unrecognized refusal reason as the raw token, visible and inert, with the section still standing', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await previewCatalog({
+      sha256: CATALOG_SHA256,
+      repairable: false,
+      drops: [{ line: 1, rule: 'schema-2-record', publicationId: null }],
+      refusals: [{ line: 2, reason: 'signature-unknown' }],
+      keptRecords: 0,
+    })
+
+    expect(catalogDropLines()).toEqual(['line 1: schema-2-record; publication not reported'])
+    expect(catalogRefusalLines()).toEqual([
+      'line 2: signature-unknown; it is not dropped: this needs an owner decision, not a repair',
+    ])
+    expect(screen.queryByRole('region', { name: 'Catalog' })).not.toBeNull()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it("renders a drop's publication identity and the plan's digests as plain text with no markup, no anchor and no control or override character reaching the DOM", async () => {
+    const esc = String.fromCharCode(0x1b)
+    const rlo = String.fromCodePoint(0x202e)
+    await previewCatalog({
+      // The block renders the plan's own digest in full, which is where a
+      // markup-shaped payload has room to show it stays literal; the
+      // drop's publication identity is shown in its short form, so its
+      // control and override characters are checked for absence instead.
+      sha256: `<b>bold</b>${esc}${rlo}${'a'.repeat(50)}`,
+      repairable: true,
+      drops: [{ line: 1, rule: 'duplicate-record', publicationId: `${esc}${rlo}abcdef` }],
+      refusals: [],
+      keptRecords: 1,
+    })
+
+    const region = screen.getByRole('region', { name: 'Catalog' })
+    expect(region.querySelector('b')).toBeNull()
+    expect(region.querySelector('a')).toBeNull()
+    expect(region.querySelector('[href]')).toBeNull()
+    expect(region.textContent).toContain('<b>bold</b>')
+    expect(region.textContent).not.toContain(esc)
+    expect(region.textContent).not.toContain(rlo)
+  })
+})
+
+// -- Slice 5e: the recovery listing and its re-approval --
+
+/** The digest one recovery entry is filed under, and its short form. */
+const RECOVERY_SHA256 = `9d3f2a10${'e'.repeat(56)}`
+const RECOVERY_SHORT = '9d3f2a10'
+/** The publication whose `outbox-escape` preserved those bytes -- a location fact, never provenance. */
+const ESCAPED_PUBLICATION_ID = '99'.repeat(32)
+
+const RECOVERY_ADVISORY_LINE =
+  'advisory: these are bytes a publication held when its outbox path stopped naming them; re-publishing one is a fresh approval no standing policy covers, and nothing here ever removes an entry'
+
+const RECOVERY_UNAVAILABLE_SENTENCE =
+  'the recovery entries could not be read; this is not a report that there are none'
+
+const RECOVERY_NO_WORKSPACE_SENTENCE =
+  'no workspace is active, so the recovery entries were not read; this is not a report that there are none'
+
+const RECOVERY_ROWS_DROPPED_SENTENCE =
+  'some recovery entries could not be read and are not listed; the table below is incomplete'
+
+const RECOVERY_UNUSABLE_MARK =
+  'unusable: it did not open as a regular file with a link count of one, or its bytes no longer hash to the digest it is filed under; it cannot be approved'
+
+const RECOVERY_APPROVAL_SCOPE_LINE =
+  're-publishing registers these bytes under the identity they hash to, which is not always the identity of the publication they were recovered from; the recovery entry itself is kept'
+
+const RECOVERY_UNAPPROVABLE_CLASS_MARK =
+  'this class cannot be approved for publication: only a generated-heavy entry can be, and the class is read from the name above'
+
+const RECOVERY_DEVICE_SCOPE_LINE =
+  'these entries belong to this device, not to this project; approving one registers those bytes in the project that is active now, under its identity and its asset root'
+
+const RECOVERY_DEVICE_WIDE_LINE =
+  'this list is every recovery entry this device holds, including entries preserved while another project was open; it is not filtered by the active project'
+
+/** One recovery entry (`docs/spike-log.md` § Slice 5e, IPC shapes). */
+function recoveryEntry(overrides: Partial<RecoveryEntry> = {}): RecoveryEntry {
+  return {
+    sha256: RECOVERY_SHA256,
+    size: 4096,
+    recoveredFrom: ESCAPED_PUBLICATION_ID,
+    recoveredAt: 1_725_782_400_000,
+    displayName: 'report.pdf',
+    class: 'generated-heavy',
+    usable: true,
+  ...overrides,
+  }
+}
+
+const RECOVERY_USABLE = recoveryEntry()
+const RECOVERY_UNUSABLE = recoveryEntry({
+  sha256: `11111111${'f'.repeat(56)}`,
+  size: null,
+  class: null,
+  usable: false,
+})
+
+/** `recovery_approve`'s payload: the fifteen-key approval, `recoveredFrom` the escaped publication. */
+const RECOVERY_APPROVAL: ArtifactApproval = {
+  approvalId: '7c44aa0195e1b3d2',
+  publicationId: PUBLICATION_ID,
+  runId: null,
+  name: RECOVERY_SHA256,
+  displayName: 'report.pdf',
+  sha256Short: RECOVERY_SHORT,
+  size: 4096,
+  detectedType: 'pdf',
+  class: 'generated-heavy',
+  attribution: { kind: 'unattributed' },
+  assetRootId: 'main',
+  actAs: 'device-local-user',
+  approvedAt: 1725782401000,
+  recoveredFrom: ESCAPED_PUBLICATION_ID,
+  handleHeld: true,
+}
+
+const APPROVED_RECOVERY_CELL = 'approved 7c44aa0195e1b3d2 — report.pdf, asset root main Publish'
+
+function recoveryCountLine(): string | null {
+  return screen.queryByRole('status', { name: 'Recovery count' })?.textContent ?? null
+}
+
+function recoveryUnavailableLine(): string | null {
+  return screen.queryByRole('status', { name: 'Recovery entries unavailable' })?.textContent ?? null
+}
+
+function recoveryNoWorkspaceLine(): string | null {
+  return screen.queryByRole('status', { name: 'Recovery entries not read' })?.textContent ?? null
+}
+
+function recoveryIncompleteLine(): string | null {
+  return screen.queryByRole('status', { name: 'Recovery entries incomplete' })?.textContent ?? null
+}
+
+function recoveryTable(): HTMLElement {
+  return screen.getByRole('table', { name: 'Recovery entries' })
+}
+
+function recoveryRows(): string[][] {
+  return Array.from(recoveryTable().querySelectorAll('tbody tr')).map((row) =>
+    Array.from(row.querySelectorAll('td')).map((cell) => cell.textContent ?? ''),
+  )
+}
+
+function recoveryTableRow(short: string): HTMLElement {
+  const row = Array.from(recoveryTable().querySelectorAll('tbody tr')).find(
+    (candidate) => candidate.querySelector('td')?.textContent === short,
+  )
+  if (!row) throw new Error(`no recovery row for ${short}`)
+  return row as HTMLElement
+}
+
+function recoveryApprovalBlock(): HTMLElement {
+  return screen.getByLabelText('Recovery approval')
+}
+
+function recoveryApprovalLines(): (string | null)[] {
+  return Array.from(recoveryApprovalBlock().querySelectorAll('p')).map((line) => line.textContent)
+}
+
+function recoveryGate(): HTMLInputElement {
+  return screen.getByLabelText(/^Type the short digest \(.*\) to approve$/) as HTMLInputElement
+}
+
+function recoveryApproveButton(): HTMLButtonElement {
+  return screen.getByRole('button', { name: 'Approve recovery entry' }) as HTMLButtonElement
+}
+
+function typeRecoveryGate(value: string): void {
+  fireEvent.change(recoveryGate(), { target: { value } })
+}
+
+/** Mounts over a workspace whose `recovery_list` answers `entries`, with `onCommand` first. */
+function mountRecovery(
+  entries: unknown = [RECOVERY_USABLE],
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+): Call[] {
+  return mountWithWorkspace((cmd, args) => {
+    const own = onCommand?.(cmd, args)
+    if (own !== undefined) return own
+    if (cmd === 'recovery_list') return answerMock(entries)
+    return undefined
+  })
+}
+
+/** Mounts over one usable entry and opens its approval block. */
+async function openRecoveryApprovalBlock(
+  onCommand?: (cmd: string, args: Record<string, unknown>) => unknown,
+  entries: unknown = [RECOVERY_USABLE],
+): Promise<Call[]> {
+  const calls = mountRecovery(entries, onCommand)
+  await screen.findByRole('table', { name: 'Recovery entries' })
+  fireEvent.click(within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }))
+  await screen.findByLabelText('Recovery approval')
+  return calls
+}
+
+describe('AgentPanel recovery listing (slice 5e, HAP-001-R18)', () => {
+  it('reads recovery_list with exactly {} on mount and renders a Recovery region beside the other regions -- never inside any of them -- with its advisory line, the count, and one row per entry: the digest short, the size, when, what it was recovered from, and whether it is usable', async () => {
+    const calls = mountRecovery([RECOVERY_USABLE])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(countCalls(calls, 'recovery_list')).toBe(1)
+    expect(calls.find((call) => call.cmd === 'recovery_list')?.args).toEqual({})
+    const region = screen.getByRole('region', { name: 'Recovery' })
+    expect(within(region).queryByLabelText('Agent transcript')).toBeNull()
+    expect(
+      within(screen.getByRole('region', { name: 'Catalog' })).queryByRole('region', {
+        name: 'Recovery',
+      }),
+    ).toBeNull()
+    expect(within(region).getByText(RECOVERY_ADVISORY_LINE)).not.toBeNull()
+    expect(recoveryCountLine()).toBe('recovery entries: 1')
+    expect(Array.from(recoveryTable().querySelectorAll('th')).map((th) => th.textContent)).toEqual([
+      'sha256 short',
+      'name',
+      'size',
+      'recovered at',
+      'recovered from',
+      'class',
+      'usable',
+      'action',
+    ])
+    expect(recoveryRows()).toEqual([
+      [
+        RECOVERY_SHORT,
+        'report.pdf',
+        '4096',
+        '2024-09-08T08:00:00.000Z',
+        '99999999',
+        'generated-heavy',
+        'yes',
+        'Approve',
+      ],
+    ])
+    expect(recoveryUnavailableLine()).toBeNull()
+  })
+
+  // R1-004: the approval decides what gets registered and written, and
+  // until now the surface showed neither of the two facts that decide it.
+  // The name is the one the re-publication files the artifact under, and
+  // the class is read off that name -- so they are shown together, before
+  // the decision, exactly as the shell derives them.
+  it('shows the name the re-publication would register the entry under and the class read off it, both of them the shell\'s own derivation', async () => {
+    mountRecovery([recoveryEntry({ displayName: 'quarterly report.pdf' })])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryRows()[0]?.[1]).toBe('quarterly report.pdf')
+    expect(recoveryRows()[0]?.[5]).toBe('generated-heavy')
+  })
+
+  // The digest fallback (D9): with no approval for the escaped publication
+  // in this device's journal the shell names the entry by its own digest,
+  // and the surface shows that rather than a blank cell -- which would read
+  // as "it has no name".
+  it('shows a digest-named entry under its digest, never as a blank name', async () => {
+    mountRecovery([recoveryEntry({ displayName: RECOVERY_SHA256 })])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryRows()[0]?.[1]).toBe(RECOVERY_SHA256)
+  })
+
+  // The class is the fact that refuses the approval, and an executable
+  // recovered name is exactly the case that flips it (HAP-001-R4 is
+  // name-and-type, never content shape). The entry's bytes are still what
+  // it is filed under, so `usable` says yes -- and offering Approve anyway
+  // would send the user into a `refused` the surface could have shown
+  // first. The `usable` discipline, applied to the other refusing fact:
+  // listed, with the reason said, and no button.
+  it('marks a usable entry whose class is not generated-heavy as one the approval will refuse, and offers no Approve button for it', async () => {
+    mountRecovery([recoveryEntry({ displayName: 'installer.exe', class: 'executable' })])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    const row = recoveryRows()[0]
+    expect(row?.[5]).toBe(`executable ${RECOVERY_UNAPPROVABLE_CLASS_MARK}`)
+    expect(row?.[6]).toBe('yes')
+    expect(row?.[7]).toBe('')
+    expect(
+      within(recoveryTableRow(RECOVERY_SHORT)).queryByRole('button', { name: 'Approve' }),
+    ).toBeNull()
+    // A `<mark>`, like the unusable one beside it (R3-074).
+    const mark = recoveryTableRow(RECOVERY_SHORT).querySelector('mark')
+    expect(mark?.textContent).toBe(RECOVERY_UNAPPROVABLE_CLASS_MARK)
+  })
+
+  // An entry whose probe yielded nothing was classified by nothing, and
+  // `null` is said as the stated absence every other null fact on this
+  // surface is -- never as a class token standing in for one that was
+  // never derived.
+  it('states an unclassified entry as a null fact rather than inventing a class for it', async () => {
+    mountRecovery([RECOVERY_UNUSABLE])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryRows()[0]?.[5]).toBe('—')
+  })
+
+  it('lists an unusable entry rather than hiding it, states the size it could not read as a null fact, explains why it is unusable and offers no Approve button for it', async () => {
+    mountRecovery([RECOVERY_USABLE, RECOVERY_UNUSABLE])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryCountLine()).toBe('recovery entries: 2')
+    expect(recoveryRows()[1]).toEqual([
+      '11111111',
+      'report.pdf',
+      '—',
+      '2024-09-08T08:00:00.000Z',
+      '99999999',
+      // No class: the probe yielded nothing to classify, so nothing was.
+      // The unusable mark says why there is no button; a second mark for
+      // the class would not add a reason (R1-004).
+      '—',
+      `no ${RECOVERY_UNUSABLE_MARK}`,
+      '',
+    ])
+    expect(
+      within(recoveryTableRow('11111111')).queryByRole('button', { name: 'Approve' }),
+    ).toBeNull()
+    expect(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    ).not.toBeNull()
+    // The mark is a `<mark>`, not just the words (R3-074). Asserting the
+    // cell's text alone leaves the element unpinned, and the element is the
+    // difference between a degraded fact the surface calls out and one that
+    // reads as ordinary prose beside the value it contradicts -- the same
+    // element every other degraded marker on this panel uses.
+    const mark = recoveryTableRow('11111111').querySelector('mark')
+    expect(mark).not.toBeNull()
+    expect(mark?.textContent).toBe(RECOVERY_UNUSABLE_MARK)
+  })
+
+  // R1-007: `workspace-unavailable` is the shell's answer at idle, not a
+  // read that failed -- `refreshOutboxStatus` and `refreshPublications`
+  // have always told the two apart and this fetch did not, so the panel
+  // said "could not be read; this is not a report that there are none"
+  // before a workspace was ever picked. That made a genuine read failure
+  // indistinguishable from idle, which is the one thing the sentence
+  // exists to prevent. Its own accessible name, the R3-047 shape.
+  it('says the entries were not read because no workspace is active -- never that they could not be read -- when recovery_list answers workspace-unavailable', async () => {
+    mountRecovery(() => Promise.reject({ code: 'workspace-unavailable', message: 'none' }))
+    await waitFor(() => {
+      expect(recoveryNoWorkspaceLine()).toBe(RECOVERY_NO_WORKSPACE_SENTENCE)
+    })
+
+    expect(recoveryUnavailableLine()).toBeNull()
+    // Still not the count: `recovery entries: 0` is a claim about this
+    // device that a listing nobody made must not make either.
+    expect(recoveryCountLine()).toBeNull()
+    expect(screen.queryByRole('table', { name: 'Recovery entries' })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('keeps the two apart: a read that really failed still says it could not be read, and says nothing about a workspace', async () => {
+    mountRecovery(() =>
+      Promise.reject({ code: 'work-area-invalid', message: 'the journal could not be read' }),
+    )
+    await waitFor(() => {
+      expect(recoveryUnavailableLine()).toBe(RECOVERY_UNAVAILABLE_SENTENCE)
+    })
+
+    expect(recoveryNoWorkspaceLine()).toBeNull()
+  })
+
+  it('renders no table and says the entries could not be read when recovery_list rejects, rather than the empty table a device with nothing preserved renders', async () => {
+    mountRecovery(() =>
+      Promise.reject({ code: 'work-area-invalid', message: 'the publication journal could not be read' }),
+    )
+    await waitFor(() => {
+      expect(recoveryUnavailableLine()).toBe(RECOVERY_UNAVAILABLE_SENTENCE)
+    })
+
+    expect(screen.queryByRole('table', { name: 'Recovery entries' })).toBeNull()
+    // The count is not rendered at all: `recovery entries: 0` is a claim
+    // about this device, and a read that failed must not make it.
+    expect(recoveryCountLine()).toBeNull()
+    // An automatic refresh is not a user act: no banner the user cannot
+    // act on, the discipline the guidance and wrong-root fetches set.
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  // Each case names **which** of the two fault lines it must produce
+  // (R3-072). The assertions here used to be disjunctions -- "the count or
+  // the unavailable line is present", "the unavailable line or the
+  // incomplete line says its sentence" -- and those two lines exist
+  // precisely to tell a listing that did not answer from one that answered
+  // short. A disjunction over them passes whichever arrives, so it cannot
+  // fail when the wrong one does, which is the only failure worth catching
+  // here: the whole payload refused (`unavailable`, no count at all) and
+  // some rows dropped (`dropped`, a real count beside a short table) are
+  // opposite facts about this device.
+  it.each([
+    ['not a list', 'entries', 'unavailable'],
+    // An object that answers `.filter` and `.length` the way an array
+    // would: without the top-level `Array.isArray` check it sails through
+    // the row filter and renders a table, where a string merely throws into
+    // the `catch` and reaches the same fault line from the other side
+    // (measured -- with only the string case, dropping the check left the
+    // suite green).
+    [
+      'array-like but not an array',
+      { filter: () => [recoveryEntry()], length: 1 },
+      'unavailable',
+    ],
+    ['a row that is not an object', [null], 'dropped'],
+    ['a row missing sha256', [{ ...RECOVERY_USABLE, sha256: undefined }], 'dropped'],
+    ['a row missing recoveredFrom', [{ ...RECOVERY_USABLE, recoveredFrom: undefined }], 'dropped'],
+    ['a row whose recoveredAt is not a number', [{ ...RECOVERY_USABLE, recoveredAt: 'now' }], 'dropped'],
+    ['a row whose usable is not a boolean', [{ ...RECOVERY_USABLE, usable: 'yes' }], 'dropped'],
+    ['a row whose size is neither number nor null', [{ ...RECOVERY_USABLE, size: '4096' }], 'dropped'],
+    // The two fields R1-004 added carry the same hazard as the rest: an
+    // absent `displayName` reaches `PlainTextLine` as `undefined` and
+    // throws `Array.from(undefined)` mid-render, and a `class` that is
+    // neither a token nor `null` would render as one.
+    ['a row missing displayName', [{ ...RECOVERY_USABLE, displayName: undefined }], 'dropped'],
+    ['a row whose class is neither string nor null', [{ ...RECOVERY_USABLE, class: 7 }], 'dropped'],
+  ])('drops %s without throwing mid-render, leaving the panel standing and saying exactly which shortfall it was', async (_label, payload, fault) => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountRecovery(payload)
+    await waitFor(() => {
+      expect(recoveryCountLine() !== null || recoveryUnavailableLine() !== null).toBe(true)
+    })
+
+    expect(screen.queryByRole('table', { name: 'Recovery entries' })).toBeNull()
+    if (fault === 'unavailable') {
+      // Nothing answered: the fault line replaces the count outright.
+      expect(recoveryUnavailableLine()).toBe(RECOVERY_UNAVAILABLE_SENTENCE)
+      expect(recoveryIncompleteLine()).toBeNull()
+      expect(recoveryCountLine()).toBeNull()
+    } else {
+      // A listing answered and was read short: a real count of what stands,
+      // beside the sentence saying the table is not all of it.
+      expect(recoveryIncompleteLine()).toBe(RECOVERY_ROWS_DROPPED_SENTENCE)
+      expect(recoveryUnavailableLine()).toBeNull()
+      expect(recoveryCountLine()).toBe('recovery entries: 0')
+    }
+    expect(recoveryNoWorkspaceLine()).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Agent' })).not.toBeNull()
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('says the table below is incomplete -- a separate accessible name from "unavailable" -- when some rows were dropped and others stand', async () => {
+    mountRecovery([RECOVERY_USABLE, { sha256: 'half' }])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryIncompleteLine()).toBe(RECOVERY_ROWS_DROPPED_SENTENCE)
+    expect(recoveryUnavailableLine()).toBeNull()
+    expect(recoveryRows()).toHaveLength(1)
+  })
+
+  // R1-005: the work area holding these entries is device configuration
+  // and its journal is one per device, so the shell lists them device-wide
+  // -- and the surface used to sit them among project-scoped blocks
+  // saying nothing about it. The listing says what it is, on the block
+  // itself, rather than leaving its position to imply a project scope it
+  // does not have.
+  it('states on the block that the list belongs to the device and not to the active project', async () => {
+    mountRecovery([RECOVERY_USABLE])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    const region = screen.getByRole('region', { name: 'Recovery' })
+    expect(within(region).getByText(RECOVERY_DEVICE_WIDE_LINE)).not.toBeNull()
+  })
+
+  // And the other half of the same fact: the entries come from the device,
+  // the publication goes to the project that is active now. Stated where
+  // the decision is made, because that is where it changes what happens.
+  it('states on the approval block that approving registers the bytes in the project that is active now', async () => {
+    await openRecoveryApprovalBlock()
+
+    expect(recoveryApprovalLines()).toContain(RECOVERY_DEVICE_SCOPE_LINE)
+  })
+})
+
+describe('AgentPanel recovery approval (slice 5e, HAP-001-R18, R22, D3; TM-001-R1/R7)', () => {
+  it('opens a confirmation block bound to the entry: its digest in full, the short form, the size, when, THE PUBLICATION IT WAS RECOVERED FROM IN FULL, whether it is usable, the bare unattributed fact, the destination, what re-publishing actually registers, the act-as line, a gate naming the short digest, an empty input and a disabled button -- invoking nothing', async () => {
+    const calls = await openRecoveryApprovalBlock()
+
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+    expect(recoveryApprovalLines()).toEqual([
+      `sha256: ${RECOVERY_SHA256}`,
+      `sha256 short: ${RECOVERY_SHORT}`,
+      'name: report.pdf',
+      'size: 4096',
+      'recovered at: 2024-09-08T08:00:00.000Z',
+      `recovered from: ${ESCAPED_PUBLICATION_ID}`,
+      'class: generated-heavy',
+      'usable: yes',
+      'attribution: unattributed',
+      'destination: asset root main',
+      RECOVERY_APPROVAL_SCOPE_LINE,
+      RECOVERY_DEVICE_SCOPE_LINE,
+      ACT_AS_LINE,
+    ])
+    expect(recoveryGate().value).toBe('')
+    expect(recoveryApproveButton().disabled).toBe(true)
+  })
+
+  // R1-004: the two facts that decide what lands on disk are on the block
+  // itself, not only in the row behind it -- the decision is made here.
+  it('carries the name the artifact will be registered and written under, and the class that decides whether the approval is allowed at all', async () => {
+    await openRecoveryApprovalBlock(undefined, [
+      recoveryEntry({ displayName: 'quarterly report.pdf', class: 'generated-heavy' }),
+    ])
+
+    expect(recoveryApprovalLines()).toContain('name: quarterly report.pdf')
+    expect(recoveryApprovalLines()).toContain('class: generated-heavy')
+  })
+
+  it.each([
+    ['the fixed word', 'approve'],
+    ['the uppercase digest', RECOVERY_SHORT.toUpperCase()],
+    ['a seven-character prefix', RECOVERY_SHORT.slice(0, 7)],
+    ['the same digest with a trailing space', `${RECOVERY_SHORT} `],
+    ['the empty string', ''],
+    ['the full 64-hex digest', RECOVERY_SHA256],
+  ])('leaves the button disabled for %s and sends no recovery_approve', async (_label, typed) => {
+    const calls = await openRecoveryApprovalBlock()
+
+    typeRecoveryGate(typed)
+
+    expect(recoveryApproveButton().disabled).toBe(true)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+  })
+
+  it('nothing pre-fills the gate: the digest the label itself names and a programmatic input.value with no input event both leave the button disabled; only typing enables it', async () => {
+    const calls = await openRecoveryApprovalBlock()
+
+    expect(recoveryApprovalBlock().querySelector('label')?.textContent).toBe(
+      `Type the short digest (${RECOVERY_SHORT}) to approve`,
+    )
+    expect(recoveryGate().value).toBe('')
+
+    recoveryGate().value = RECOVERY_SHORT
+    await flush()
+    expect(recoveryApproveButton().disabled).toBe(true)
+
+    typeRecoveryGate('')
+    expect(recoveryApproveButton().disabled).toBe(true)
+    typeRecoveryGate(RECOVERY_SHORT)
+    expect(recoveryApproveButton().disabled).toBe(false)
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+  })
+
+  // One key, not two (R1-006 / R3-069). The command took `{ digest,
+  // sha256 }` and this -- its only caller -- passed the entry's own digest
+  // as both, because a recovery entry has exactly one digest to pass: the
+  // name it is filed under, which is the only digest `RecoveryEntryDto`
+  // carries. The shell's "either one alone would let the other case
+  // through" was therefore unreachable from here, and swapping the two
+  // keys passed the whole suite. The shape was `artifact_approve`'s, where
+  // `name` and `sha256` really are independent facts about an outbox
+  // entry; here it was the same value twice wearing two names.
+  it("confirming calls recovery_approve with exactly { digest } -- the entry's own full digest, never the typed value -- then closes the block and gives the row the approval's facts and Publish", async () => {
+    const calls = await openRecoveryApprovalBlock((cmd) =>
+      cmd === 'recovery_approve' ? RECOVERY_APPROVAL : undefined,
+    )
+    typeRecoveryGate(RECOVERY_SHORT)
+
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    expect(countCalls(calls, 'recovery_approve')).toBe(1)
+    expect(calls.find((call) => call.cmd === 'recovery_approve')?.args).toEqual({
+      digest: RECOVERY_SHA256,
+    })
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(recoveryRows()[0]?.[7]).toBe(APPROVED_RECOVERY_CELL)
+  })
+
+  it('marks an approval whose handle the cap left unheld, so the surface says it rather than leaving it silent', async () => {
+    await openRecoveryApprovalBlock((cmd) =>
+      cmd === 'recovery_approve' ? { ...RECOVERY_APPROVAL, handleHeld: false } : undefined,
+    )
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    expect(recoveryRows()[0]?.[7]).toContain(NOT_HELD_MARK)
+  })
+
+  it('closes the block and reads the listing afresh for recovery-unknown -- the entry the facts name is one this device no longer accounts for -- and keeps it open for every other refusal', async () => {
+    const calls = await openRecoveryApprovalBlock((cmd) =>
+      cmd === 'recovery_approve'
+        ? Promise.reject({
+            code: 'recovery-unknown',
+            message: 'no recovery entry with that digest is recorded for this device',
+          })
+        : undefined,
+    )
+    typeRecoveryGate(RECOVERY_SHORT)
+    const before = calls.length
+
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'recovery-unknown: no recovery entry with that digest is recorded for this device',
+    )
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(calls.slice(before).map((call) => call.cmd)).toContain('recovery_list')
+  })
+
+  it('keeps the block and the typed gate for a refusal that is not recovery-unknown, so the user can read the banner and retry', async () => {
+    await openRecoveryApprovalBlock((cmd) =>
+      cmd === 'recovery_approve'
+        ? Promise.reject({
+            code: 'integrity-mismatch',
+            message: "the recovery entry's bytes are not the digest it is filed under",
+          })
+        : undefined,
+    )
+    typeRecoveryGate(RECOVERY_SHORT)
+
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    expect(screen.queryByLabelText('Recovery approval')).not.toBeNull()
+    expect(recoveryGate().value).toBe(RECOVERY_SHORT)
+  })
+
+  it.each([
+    ['recovery-unknown', 'no recovery entry with that digest is recorded for this device'],
+    ['integrity-mismatch', "the recovery entry's bytes are not the digest it is filed under"],
+    ['refused', 'the recovery entry is not a regular file'],
+    ['destination-invalid', 'the project declares no asset root'],
+    ['outbox-invalid', 'the classification policy could not be loaded'],
+    ['work-area-invalid', 'the publication journal could not be written'],
+    ['invalid-request', 'the digest is not 64 hex characters'],
+    ['run-active', 'a run is active; approve or publish once it has ended'],
+    ['workspace-unavailable', 'no workspace has been picked yet'],
+  ])(
+    'renders %s from recovery_approve as a plain catalogue code with its fixed message, no "untrusted" and no detail',
+    async (code, message) => {
+      await openRecoveryApprovalBlock((cmd) =>
+        cmd === 'recovery_approve'
+          ? Promise.reject({
+              code,
+              message,
+              detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
+            })
+          : undefined,
+      )
+      typeRecoveryGate(RECOVERY_SHORT)
+
+      fireEvent.click(recoveryApproveButton())
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(banner.textContent).not.toContain('untrusted')
+      expect(banner.textContent).not.toContain('aaaaaaaa')
+    },
+  )
+
+  it("refuses an approval toward a destination the surface could not show: the button stays disabled and no recovery_approve is sent", async () => {
+    const calls = await openRecoveryApprovalBlock(
+      (cmd) => (cmd === 'outbox_status' ? { ...OUTBOX_STATUS_VALID, assetRootId: null } : undefined),
+      [RECOVERY_USABLE],
+    )
+    typeRecoveryGate(RECOVERY_SHORT)
+
+    expect(recoveryApprovalLines()).toContain('destination: unconfigured')
+    expect(recoveryApproveButton().disabled).toBe(true)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+  })
+})
+
+describe('AgentPanel recovery publish (slice 5e, HAP-001-R18, R35)', () => {
+  /** Approves the entry and returns the recorded calls plus the live publish channel. */
+  async function approveRecovery(
+    publishAnswer: (channel: LiveStateChannel) => unknown = () => PUBLISHED_REPORT,
+  ): Promise<{ calls: Call[]; publishChannel: () => LiveStateChannel }> {
+    let channel: LiveStateChannel | undefined
+    const calls = await openRecoveryApprovalBlock((cmd, args) => {
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      if (cmd === 'artifact_publish') {
+        channel = (args as { onState: LiveStateChannel }).onState
+        return publishAnswer(channel)
+      }
+      return undefined
+    })
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    return {
+      calls,
+      publishChannel: () => {
+        if (!channel) throw new Error('artifact_publish was not called')
+        return channel
+      },
+    }
+  }
+
+  it('Publish carries the approval to the EXISTING artifact_publish with exactly { approvalId, onState } -- no second publish command -- renders every state frame as a transcript line and merges the publication into the Publications table', async () => {
+    const { calls, publishChannel } = await approveRecovery()
+
+    fireEvent.click(within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Publish' }))
+    await waitFor(() => {
+      expect(countCalls(calls, 'artifact_publish')).toBe(1)
+    })
+    deliverArtifactState(publishChannel(), 'published-local')
+    deliverArtifactState(publishChannel(), 'registered', 'pending')
+    await flush()
+
+    const args = calls.find((call) => call.cmd === 'artifact_publish')?.args ?? {}
+    expect(Object.keys(args).sort()).toEqual(['approvalId', 'onState'])
+    expect(args.approvalId).toBe('7c44aa0195e1b3d2')
+    expect(transcriptTexts()).toContain('publication 2a91ea59: published-local')
+    expect(transcriptTexts()).toContain('publication 2a91ea59: registered')
+    await waitFor(() => {
+      expect(recoveryRows()[0]?.[7]).toBe('registered 2a91ea59')
+    })
+    expect(publicationRows()[0]?.[1]).toBe('registered')
+  })
+
+  it('returns the row to approved with Publish enabled again when the transaction fails, and puts the code in the banner', async () => {
+    const { calls, publishChannel } = await approveRecovery(
+      () =>
+        Promise.reject({
+          code: 'integrity-mismatch',
+          message: 'the published copy did not verify against the approved digest',
+        }),
+    )
+
+    fireEvent.click(within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Publish' }))
+    await flush()
+    expect(() => publishChannel()).not.toThrow()
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'integrity-mismatch: the published copy did not verify against the approved digest',
+    )
+    expect(recoveryRows()[0]?.[7]).toBe(APPROVED_RECOVERY_CELL)
+    expect(
+      (
+        within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', {
+          name: 'Publish',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false)
+    expect(countCalls(calls, 'artifact_publish')).toBe(1)
+  })
+})
+
+describe('AgentPanel recovery guards (slice 5e)', () => {
+  it('freezes Approve and Publish while a run is active -- a click on either invokes nothing and opens nothing -- while the listing itself is untouched', async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountRecovery([RECOVERY_USABLE], (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    await startRunOverWorkspace()
+
+    const approve = within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', {
+      name: 'Approve',
+    }) as HTMLButtonElement
+    expect(approve.disabled).toBe(true)
+    fireEvent.click(approve)
+    await flush()
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+    // The rows themselves stay on the screen: reading what survived is not
+    // a write, and the run does not make the entries untrue.
+    expect(recoveryRows()).toHaveLength(1)
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+    expect(
+      (
+        within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', {
+          name: 'Approve',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false)
+  })
+
+  // The test above is named for Approve **and** Publish and only ever
+  // touched Approve, so Publish's own freeze was never exercised and was
+  // removable with the suite green (R3-068). Publish is the heavier of the
+  // two: it starts the transaction that writes into the asset root.
+  it('freezes Publish on an approved row while a run is active -- a click invokes no artifact_publish -- and releases it when the run ends', async () => {
+    let channel: LiveChannel | undefined
+    const calls = mountRecovery([RECOVERY_USABLE], (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      if (cmd === 'artifact_publish') return PUBLISHED_REPORT
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    const publish = () =>
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', {
+        name: 'Publish',
+      }) as HTMLButtonElement
+    expect(publish().disabled).toBe(false)
+
+    await startRunOverWorkspace()
+
+    expect(publish().disabled).toBe(true)
+    fireEvent.click(publish())
+    await flush()
+    expect(countCalls(calls, 'artifact_publish')).toBe(0)
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+    expect(publish().disabled).toBe(false)
+  })
+
+  // The gate input carries its own `disabled={runActive || recoveryBusy}`
+  // and nothing exercised it either (R3-068): with the freeze gone, a run
+  // starting under an open block leaves the field typeable, so the user can
+  // still satisfy the gate that stands in front of the approval.
+  it('freezes the approval gate input while a run is active, so the confirmation cannot be completed under a running process', async () => {
+    let channel: LiveChannel | undefined
+    mountRecovery([RECOVERY_USABLE], (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    expect(recoveryGate().disabled).toBe(false)
+
+    await startRunOverWorkspace()
+
+    expect(recoveryGate().disabled).toBe(true)
+    expect(recoveryApproveButton().disabled).toBe(true)
+
+    if (!channel) throw new Error('harness_spawn was not called')
+    await endRun(channel)
+    expect(recoveryGate().disabled).toBe(false)
+  })
+
+  it('refuses an Approve click batched into the same tick as Start, when both the button and the closure are still one render behind the run', async () => {
+    const calls = mountRecovery([RECOVERY_USABLE], (cmd) =>
+      cmd === 'harness_spawn' ? 7 : undefined,
+    )
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' })
+    const approve = within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      approve.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+  })
+
+  it('refuses a second recovery approval that lands before React has re-rendered the disabled button: the approval must happen once per confirmed gate', async () => {
+    const calls = await openRecoveryApprovalBlock((cmd) =>
+      cmd === 'recovery_approve'
+        ? new Promise(() => {
+            // Never settles: the approval stays in flight for both clicks.
+          })
+        : undefined,
+    )
+    typeRecoveryGate(RECOVERY_SHORT)
+    expect(recoveryApproveButton().disabled).toBe(false)
+
+    act(() => {
+      recoveryApproveButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      recoveryApproveButton().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'recovery_approve')).toBe(1)
+  })
+
+  it('closes the block when a refetched listing no longer carries the entry the decision was opened for, rather than leaving a gate standing over facts nothing reports', async () => {
+    let entries: unknown = [RECOVERY_USABLE]
+    const calls = mountRecovery(
+      () => entries,
+      (cmd) =>
+        cmd === 'recovery_approve'
+          ? Promise.reject({
+              code: 'recovery-unknown',
+              message: 'no recovery entry with that digest is recorded for this device',
+            })
+          : undefined,
+    )
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+
+    entries = []
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(screen.queryByRole('table', { name: 'Recovery entries' })).toBeNull()
+    expect(countCalls(calls, 'recovery_approve')).toBe(1)
+  })
+
+  // The test above refetches an **empty** list, which closes the block
+  // whatever the block is bound to -- and so does a `recovery-unknown`,
+  // which calls `closeRecoveryApproval()` itself. Neither says anything
+  // about the binding (R3-065).
+  //
+  // The route that does is the one where a listing lands under a block the
+  // user opened **after** it was started: a `recovery-unknown` refusal
+  // closes the block and starts a refetch, the user opens a different
+  // entry's block while that refetch is still out, and the refetch then
+  // answers without the entry now on the screen. Nothing closes the block
+  // on that path -- so if it is bound by anything but the digest it was
+  // opened for, it stays open and re-renders **another entry's** digest,
+  // name, size and provenance under a decision the user started for a
+  // different artifact, with a gate naming that other entry's short
+  // digest. Measured: with the binding replaced by `recovery[0]`, this is
+  // the only test in the suite that goes red.
+  it('closes a block whose entry a late listing no longer carries, rather than re-binding the open decision to whichever entry the listing does carry', async () => {
+    const other = recoveryEntry({
+      sha256: `22222222${'e'.repeat(56)}`,
+      displayName: 'other.pdf',
+      recoveredFrom: `88888888${'7'.repeat(56)}`,
+      size: 17,
+    })
+    const otherShort = other.sha256.slice(0, 8)
+    const pending: ((entries: RecoveryEntry[]) => void)[] = []
+    let listCount = 0
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'recovery_list') {
+        listCount += 1
+        if (listCount === 1) return [RECOVERY_USABLE, other]
+        return new Promise<RecoveryEntry[]>((resolve) => {
+          pending.push(resolve)
+        })
+      }
+      if (cmd === 'recovery_approve') {
+        return Promise.reject({
+          code: 'recovery-unknown',
+          message: 'no recovery entry with that digest is recorded for this device',
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    // The refusal closes this block and starts a listing that stays out.
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(pending).toHaveLength(1)
+
+    // The user now opens the OTHER entry's block, while that listing is
+    // still in flight.
+    fireEvent.click(within(recoveryTableRow(otherShort)).getByRole('button', { name: 'Approve' }))
+    await screen.findByLabelText('Recovery approval')
+    expect(recoveryApprovalLines()).toContain(`sha256: ${other.sha256}`)
+
+    // The listing lands, carrying the first entry and not the open one.
+    await act(async () => {
+      pending[0]!([RECOVERY_USABLE])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    // And the block did not close for want of anything to show: the other
+    // entry is on the screen, and it is precisely the one the block would
+    // have re-bound to.
+    expect(recoveryRows()).toHaveLength(1)
+    expect(recoveryRows()[0]?.[0]).toBe(RECOVERY_SHORT)
+  })
+
+  it("renders an entry's digests as plain text with no markup, no anchor and no control or override character reaching the DOM", async () => {
+    const esc = String.fromCharCode(0x1b)
+    const rlo = String.fromCodePoint(0x202e)
+    await openRecoveryApprovalBlock(undefined, [
+      recoveryEntry({ recoveredFrom: `<b>bold</b>${esc}${rlo}${'9'.repeat(50)}` }),
+    ])
+
+    const region = screen.getByRole('region', { name: 'Recovery' })
+    expect(region.querySelector('b')).toBeNull()
+    expect(region.querySelector('a')).toBeNull()
+    expect(region.querySelector('[href]')).toBeNull()
+    expect(region.textContent).toContain('<b>bold</b>')
+    expect(region.textContent).not.toContain(esc)
+    expect(region.textContent).not.toContain(rlo)
+  })
+})
+
+describe('AgentPanel catalog and recovery across a workspace pick (slice 5e; slice 5c review, R1-001)', () => {
+  it("resets both blocks on a workspace pick -- a real repair receipt and a real approved recovery row go, since they are the previous project's -- and reads the new project's entries afresh", async () => {
+    // Each thing the reset takes is produced before the pick rather than
+    // asserted absent after it: a receipt that was never posted is null the
+    // whole time, and deleting the reset would leave such a test green --
+    // the slice-5d lesson, applied to a surface whose receipt names a
+    // rewritten project file and whose approved row names bytes about to be
+    // published. **And nothing else may clear them in between**: an earlier
+    // draft previewed a second time before picking, which clears the
+    // receipt itself, and with that in the test `setCatalogResult(null)`
+    // could be deleted from the pick with the suite still green (measured).
+    let previews = 0
+    const calls = mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'catalog_repair_preview') {
+        previews += 1
+        return catalogPreview()
+      }
+      if (cmd === 'catalog_repair') {
+        return {
+          originalSha256: CATALOG_SHA256,
+          sha256: REPAIRED_SHA256,
+          droppedLines: 1,
+          keptRecords: 2,
+        }
+      }
+      if (cmd === 'recovery_list') return [RECOVERY_USABLE]
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    // A completed repair, so the receipt on the screen is a real one.
+    fireEvent.click(previewButton())
+    await flush()
+    typeCatalogGate(CATALOG_SHORT)
+    fireEvent.click(catalogRepairButton())
+    await waitFor(() => {
+      expect(catalogResultLine()).not.toBeNull()
+    })
+    expect(catalogResultLine()).toContain('1 lines dropped')
+
+    // A real approval, so the row carries facts the next project must not
+    // inherit.
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    expect(recoveryRows()[0]?.[7]).toBe(APPROVED_RECOVERY_CELL)
+    const before = calls.length
+    const previewsBefore = previews
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+
+    expect(catalogResultLine()).toBeNull()
+    expect(catalogLine()).toBe(CATALOG_NOT_PREVIEWED_LINE)
+    expect(catalogDropLines()).toEqual([])
+    // The listing is read afresh for the new project, and the previous
+    // project's approval progress is gone with it.
+    expect(calls.slice(before).map((call) => call.cmd)).toContain('recovery_list')
+    await waitFor(() => {
+      expect(recoveryRows()[0]?.[7]).toBe('Approve')
+    })
+    // The Catalog is not read on a pick: previewing stays a user act.
+    expect(previews).toBe(previewsBefore)
+  })
+
+  it('takes an open repair block with its typed gate and an open recovery approval with its own on the same pick, so no decision stands over the previous project\'s facts', async () => {
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'catalog_repair_preview') return catalogPreview()
+      if (cmd === 'recovery_list') return [RECOVERY_USABLE]
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    fireEvent.click(previewButton())
+    await flush()
+    typeCatalogGate(CATALOG_SHORT)
+    expect(catalogRepairButton().disabled).toBe(false)
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    expect(recoveryApproveButton().disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+
+    expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+    expect(screen.queryByLabelText('Recovery approval')).toBeNull()
+    expect(catalogLine()).toBe(CATALOG_NOT_PREVIEWED_LINE)
+  })
+
+  it("drops a catalog_repair_preview that resolves after a workspace pick: one project's plan never stands in the next project's block, and its digest is exactly the fact two catalogs from one template share", async () => {
+    let resolvePreview: (plan: CatalogRepairPreview) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'catalog_repair_preview') {
+        return new Promise<CatalogRepairPreview>((resolve) => {
+          resolvePreview = resolve
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+    fireEvent.click(previewButton())
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      resolvePreview(catalogPreview())
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(catalogLine()).toBe(CATALOG_NOT_PREVIEWED_LINE)
+    expect(catalogDropLines()).toEqual([])
+    expect(screen.queryByLabelText('Catalog repair confirmation')).toBeNull()
+  })
+
+  it('drops a catalog_repair_preview that *rejects* after a workspace pick, so the new project is not told its own catalog could not be read', async () => {
+    let rejectPreview: (reason: unknown) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'catalog_repair_preview') {
+        return new Promise<CatalogRepairPreview>((_resolve, reject) => {
+          rejectPreview = reject
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+    fireEvent.click(previewButton())
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      rejectPreview({ code: 'catalog-unavailable', message: 'the catalog could not be read' })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(catalogFaultLine()).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it("drops a catalog_repair that resolves after a workspace pick: a receipt naming a rewritten catalog never posts under the project the user moved to", async () => {
+    let resolveRepair: (repaired: unknown) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'catalog_repair_preview') return catalogPreview()
+      if (cmd === 'catalog_repair') {
+        return new Promise((resolve) => {
+          resolveRepair = resolve
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+    fireEvent.click(previewButton())
+    await flush()
+    typeCatalogGate(CATALOG_SHORT)
+    fireEvent.click(catalogRepairButton())
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      resolveRepair({
+        originalSha256: CATALOG_SHA256,
+        sha256: REPAIRED_SHA256,
+        droppedLines: 1,
+        keptRecords: 2,
+      })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(catalogResultLine()).toBeNull()
+  })
+
+  // R1-003 / R3-064: each of these three acts guards its **resolve** path
+  // against a workspace pick, and each guards its reject path too -- but
+  // only the resolve paths were tested, so all three reject-path guards
+  // were removable with the suite green. A rejection is not a quieter
+  // event than a resolution here: it raises a banner, and one of them
+  // re-reads a listing.
+  it("drops a catalog_repair that REJECTS after a workspace pick: the previous project's refusal never raises a banner under the project the user moved to", async () => {
+    let rejectRepair: (reason: unknown) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'catalog_repair_preview') return catalogPreview()
+      if (cmd === 'catalog_repair') {
+        return new Promise((_resolve, reject) => {
+          rejectRepair = reject
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+    fireEvent.click(previewButton())
+    await flush()
+    typeCatalogGate(CATALOG_SHORT)
+    fireEvent.click(catalogRepairButton())
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      rejectRepair({ code: 'catalog-changed', message: 'the catalog moved under the repair' })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it("drops a recovery_approve that REJECTS after a workspace pick: neither the banner nor the recovery-unknown refetch belongs to the project the user moved to", async () => {
+    let rejectApprove: (reason: unknown) => void = () => {}
+    const calls = mountRecovery([RECOVERY_USABLE], (cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'recovery_approve') {
+        return new Promise((_resolve, reject) => {
+          rejectApprove = reject
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    const listsAfterPick = countCalls(calls, 'recovery_list')
+    await act(async () => {
+      rejectApprove({
+        code: 'recovery-unknown',
+        message: 'no recovery entry with that digest is recorded for this device',
+      })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+    // And no extra read: the pick already re-read this block, and the
+    // refusal belongs to the project the user left.
+    expect(countCalls(calls, 'recovery_list')).toBe(listsAfterPick)
+  })
+
+  it("drops an artifact_publish that REJECTS after a Start: the previous run's failure never raises a banner over the run that replaced it", async () => {
+    let rejectPublish: (reason: unknown) => void = () => {}
+    mountRecovery([RECOVERY_USABLE], (cmd) => {
+      if (cmd === 'harness_spawn') return 7
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      if (cmd === 'artifact_publish') {
+        return new Promise((_resolve, reject) => {
+          rejectPublish = reject
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    fireEvent.click(within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Publish' }))
+    await flush()
+
+    // A new run replaces the generation the publish was started in.
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    await act(async () => {
+      rejectPublish({ code: 'destination-invalid', message: 'the project declares no asset root' })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it("drops a recovery_list that resolves after a workspace pick: one device reading is still one project's table, and the entries a user may approve must be the ones read under the project they are looking at", async () => {
+    let resolveList: (entries: RecoveryEntry[]) => void = () => {}
+    let listCalls = 0
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'recovery_list') {
+        listCalls += 1
+        if (listCalls === 1) {
+          return new Promise<RecoveryEntry[]>((resolve) => {
+            resolveList = resolve
+          })
+        }
+        return []
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(listCalls).toBe(1)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      resolveList([RECOVERY_USABLE])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(screen.queryByRole('table', { name: 'Recovery entries' })).toBeNull()
+    expect(recoveryCountLine()).toBe('recovery entries: 0')
+  })
+
+  it("drops a recovery_list that *rejects* after a workspace pick, leaving the new project's own answer standing rather than replacing it with the previous project's failure", async () => {
+    let rejectList: (reason: unknown) => void = () => {}
+    let listCalls = 0
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'recovery_list') {
+        listCalls += 1
+        if (listCalls === 1) {
+          return new Promise<RecoveryEntry[]>((_resolve, reject) => {
+            rejectList = reject
+          })
+        }
+        return [RECOVERY_USABLE]
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(recoveryCountLine()).not.toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      rejectList({ code: 'work-area-invalid', message: 'the publication journal could not be read' })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(recoveryUnavailableLine()).toBeNull()
+    expect(recoveryRows()).toHaveLength(1)
+  })
+
+  it("drops a recovery_approve that resolves after a workspace pick: one project's approval never gives the next project's table a row to publish", async () => {
+    let resolveApprove: (approval: ArtifactApproval) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'recovery_list') return [RECOVERY_USABLE]
+      if (cmd === 'recovery_approve') {
+        return new Promise<ArtifactApproval>((resolve) => {
+          resolveApprove = resolve
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    await act(async () => {
+      resolveApprove(RECOVERY_APPROVAL)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    await waitFor(() => {
+      expect(recoveryRows()[0]?.[7]).toBe('Approve')
+    })
+  })
+
+  /**
+   * `handleRecoveryPublish` carries the same context check on its resolve
+   * path, and it was the one guard on this surface with no row in the
+   * mutation table and no test behind it (slice 5e re-review, R3-100).
+   *
+   * It is not redundant with anything: the workspace pick is deliberately
+   * *not* held while a recovery write is in flight (the deviation this
+   * slice records), `recoveryProgress` is keyed by digest alone, and the
+   * listing is **device-wide** -- so the very same digest is a row in the
+   * next project's table, and a receipt from the project the user left
+   * lands on it. That is the failure this test names: not a receipt that
+   * goes nowhere, but one that posts under the wrong project.
+   */
+  it("drops an artifact_publish that resolves after a workspace pick: the listing is device-wide, so the same digest is a row in the next project's table, and one project's publication must not post its receipt there", async () => {
+    let resolvePublish: (publication: Publication) => void = () => {}
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'recovery_list') return [RECOVERY_USABLE]
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      if (cmd === 'artifact_publish') {
+        return new Promise<Publication>((resolve) => {
+          resolvePublish = resolve
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Publish' }),
+    )
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await flush()
+    // The entry really is listed again under the new project -- that is
+    // what device-wide means -- so there is a row for the receipt to land
+    // on, and the assertion below is about the guard and not about an
+    // absent row.
+    await waitFor(() => {
+      expect(recoveryRows()[0]?.[7]).toBe('Approve')
+    })
+
+    await act(async () => {
+      resolvePublish(PUBLISHED_REPORT)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(recoveryRows()).toHaveLength(1)
+    expect(recoveryRows()[0]?.[7]).toBe('Approve')
+  })
+
+  it('applies only the latest recovery_list when an earlier one resolves after it: an overtaken listing would otherwise put entries back that a later read no longer carries', async () => {
+    const pending: ((entries: RecoveryEntry[]) => void)[] = []
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/other', workArea: 'valid' }
+      if (cmd === 'recovery_list') {
+        return new Promise<RecoveryEntry[]>((resolve) => {
+          pending.push(resolve)
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(pending).toHaveLength(1)
+    })
+    // A pick starts a second listing while the first is still out -- and
+    // the pick bumps the context generation before it starts that listing,
+    // so the first belongs to the *previous* generation and is dropped by
+    // the generation check, not by the sequence number. This test proves
+    // the generation guard; the sequence guard has its own test below,
+    // taking the one route that reaches it (R3-061). The comment here used
+    // to claim the opposite of what the test does.
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await waitFor(() => {
+      expect(pending).toHaveLength(2)
+    })
+
+    await act(async () => {
+      pending[1]!([])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    await act(async () => {
+      pending[0]!([RECOVERY_USABLE])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(screen.queryByRole('table', { name: 'Recovery entries' })).toBeNull()
+    expect(recoveryCountLine()).toBe('recovery entries: 0')
+  })
+
+  // The route where the sequence number is the ONLY thing separating two
+  // listings (R3-061). `handleConfirmRecoveryApproval`'s `recovery-unknown`
+  // branch calls `refreshRecovery()` **without** bumping the context, so a
+  // second refusal starts a second listing inside one generation and the
+  // generation check cannot tell them apart. Every other test that
+  // exercises two listings gets a context bump from the workspace pick
+  // between them, which is why removing the sequence check left the whole
+  // suite green.
+  //
+  // Two refusals in a row are reachable exactly as written: the branch
+  // closes the block and re-reads, the listing it re-reads is still out, so
+  // the table still shows the entry and the user can open it again.
+  it('applies only the latest of two recovery_list reads started inside one generation by successive recovery-unknown refusals -- the generation cannot separate them, the sequence number can', async () => {
+    const pending: ((entries: RecoveryEntry[]) => void)[] = []
+    let listCount = 0
+    const other = recoveryEntry({ sha256: `22222222${'e'.repeat(56)}`, displayName: 'other.pdf' })
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'recovery_list') {
+        listCount += 1
+        // The mount read answers at once so the table renders; every
+        // later read is held open by this test.
+        if (listCount === 1) return [RECOVERY_USABLE, other]
+        return new Promise<RecoveryEntry[]>((resolve) => {
+          pending.push(resolve)
+        })
+      }
+      if (cmd === 'recovery_approve') {
+        return Promise.reject({
+          code: 'recovery-unknown',
+          message: 'no recovery entry with that digest is recorded for this device',
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    expect(recoveryRows()).toHaveLength(2)
+
+    // First refusal: the block closes and listing #2 starts, and stays out.
+    const approveOnce = async () => {
+      fireEvent.click(
+        within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+      )
+      await screen.findByLabelText('Recovery approval')
+      typeRecoveryGate(RECOVERY_SHORT)
+      fireEvent.click(recoveryApproveButton())
+      await flush()
+    }
+    await approveOnce()
+    expect(pending).toHaveLength(1)
+    // The table is untouched -- listing #2 has not answered -- so the same
+    // entry is still there to be approved again.
+    await approveOnce()
+    expect(pending).toHaveLength(2)
+
+    // The later read answers first, with one entry gone.
+    await act(async () => {
+      pending[1]!([other])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(recoveryRows()).toHaveLength(1)
+
+    // The overtaken read answers second, still carrying the entry the
+    // later read no longer does. Without the sequence check it puts that
+    // entry back -- and offers an Approve for something this device no
+    // longer accounts for, which is what the refusals were telling it.
+    await act(async () => {
+      pending[0]!([RECOVERY_USABLE, other])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(recoveryRows()).toHaveLength(1)
+    expect(recoveryRows()[0]?.[1]).toBe('other.pdf')
+    expect(recoveryCountLine()).toBe('recovery entries: 1')
+  })
+
+  // The same route on the **reject** side. An overtaken listing that fails
+  // is worse than one that succeeds: it clears the table and raises the
+  // fault line, so a read that nobody is waiting on any more would replace
+  // a good listing with "the recovery entries could not be read". Both
+  // guards on that path survived alone until this test existed, the pair
+  // being caught only together (R3-060's shape, on the reject path).
+  it('ignores the rejection of a recovery_list an already-answered later read overtook, rather than replacing a good listing with the fault line', async () => {
+    const settle: { resolve: (entries: RecoveryEntry[]) => void; reject: (reason: unknown) => void }[] =
+      []
+    let listCount = 0
+    mountWithWorkspace((cmd) => {
+      if (cmd === 'recovery_list') {
+        listCount += 1
+        if (listCount === 1) return [RECOVERY_USABLE]
+        return new Promise<RecoveryEntry[]>((resolve, reject) => {
+          settle.push({ resolve, reject })
+        })
+      }
+      if (cmd === 'recovery_approve') {
+        return Promise.reject({
+          code: 'recovery-unknown',
+          message: 'no recovery entry with that digest is recorded for this device',
+        })
+      }
+      return undefined
+    })
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    const approveOnce = async () => {
+      fireEvent.click(
+        within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+      )
+      await screen.findByLabelText('Recovery approval')
+      typeRecoveryGate(RECOVERY_SHORT)
+      fireEvent.click(recoveryApproveButton())
+      await flush()
+    }
+    await approveOnce()
+    await approveOnce()
+    expect(settle).toHaveLength(2)
+
+    // The later read answers with an entry.
+    await act(async () => {
+      settle[1]!.resolve([RECOVERY_USABLE])
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(recoveryRows()).toHaveLength(1)
+
+    // The overtaken read then fails. Nothing about that failure is news.
+    await act(async () => {
+      settle[0]!.reject({ code: 'work-area-invalid', message: 'the journal could not be read' })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(recoveryUnavailableLine()).toBeNull()
+    expect(recoveryRows()).toHaveLength(1)
+    expect(recoveryCountLine()).toBe('recovery entries: 1')
+  })
+})
+
+/**
+ * **What these prove, and what they do not.**
+ *
+ * React stopped warning about a state update on an unmounted component, so
+ * "no `console.error`" is satisfied by a settled promise whether or not the
+ * `mountedRef` guard is there: on its own it proves the continuation does
+ * not *throw*, and nothing more (R3-070; the claim in the title used to be
+ * "the unmount guard holds", which the body could not show).
+ *
+ * The assertion with teeth is the one slice 5c arrived at for the guidance
+ * commands: **no IPC call after the unmount**. It bites on exactly the
+ * paths whose settlement makes one -- `catalog_repair`'s resolve, which
+ * re-reads the publications, and `recovery_approve`'s `recovery-unknown`,
+ * which re-reads the listing -- and those two have their own tests below.
+ * For `catalog_repair_preview` and `recovery_list`, whose settlements only
+ * set state, no black-box assertion distinguishes a guarded continuation
+ * from an unguarded one; the matrix below is a no-throw test for them and
+ * is titled as one.
+ */
+describe('AgentPanel catalog and recovery unmount guards (slice 5e; slice 5c review, R3-001)', () => {
+  it.each(['catalog_repair_preview', 'catalog_repair', 'recovery_list', 'recovery_approve'])(
+    'settles an in-flight %s after unmount without throwing and without console.error, on both the resolve and the reject path',
+    async (command) => {
+      for (const settle of ['resolve', 'reject'] as const) {
+        let settlePending: ((value: unknown) => void) | undefined
+        let called = false
+        mountWithWorkspace((cmd) => {
+          if (cmd === 'catalog_repair_preview' && command !== 'catalog_repair_preview') {
+            return catalogPreview()
+          }
+          if (cmd === 'recovery_list' && command !== 'recovery_list') return [RECOVERY_USABLE]
+          if (cmd === command) {
+            called = true
+            return new Promise((resolve, reject) => {
+              settlePending = settle === 'resolve' ? resolve : reject
+            })
+          }
+          return undefined
+        })
+
+        if (command === 'catalog_repair_preview') {
+          await waitFor(() => {
+            expect(catalogLine()).not.toBeNull()
+          })
+          fireEvent.click(previewButton())
+        } else if (command === 'catalog_repair') {
+          await waitFor(() => {
+            expect(catalogLine()).not.toBeNull()
+          })
+          fireEvent.click(previewButton())
+          await flush()
+          typeCatalogGate(CATALOG_SHORT)
+          fireEvent.click(catalogRepairButton())
+        } else if (command === 'recovery_approve') {
+          await screen.findByRole('table', { name: 'Recovery entries' })
+          fireEvent.click(
+            within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+          )
+          await screen.findByLabelText('Recovery approval')
+          typeRecoveryGate(RECOVERY_SHORT)
+          fireEvent.click(recoveryApproveButton())
+        }
+        await waitFor(() => {
+          expect(called).toBe(true)
+        })
+
+        cleanup()
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        await act(async () => {
+          settlePending?.({ code: 'work-area-invalid', message: 'settled after unmount' })
+          await new Promise((resolve) => {
+            setTimeout(resolve, 0)
+          })
+        })
+
+        expect(consoleErrorSpy).not.toHaveBeenCalled()
+        consoleErrorSpy.mockRestore()
+        clearMocks()
+      }
+    },
+  )
+
+  it("a catalog_repair that resolves after unmount makes no publications_list: the guard is what stops the refetch, and the refetch is what an unguarded continuation would show", async () => {
+    let resolveRepair: (value: unknown) => void = () => {}
+    const calls = mountWithWorkspace((cmd) => {
+      if (cmd === 'catalog_repair_preview') return catalogPreview()
+      if (cmd === 'catalog_repair') {
+        return new Promise((resolve) => {
+          resolveRepair = resolve
+        })
+      }
+      return undefined
+    })
+    await waitFor(() => {
+      expect(catalogLine()).not.toBeNull()
+    })
+    fireEvent.click(previewButton())
+    await flush()
+    typeCatalogGate(CATALOG_SHORT)
+    fireEvent.click(catalogRepairButton())
+    await flush()
+
+    cleanup()
+    const afterUnmount = calls.length
+    await act(async () => {
+      resolveRepair({
+        originalSha256: CATALOG_SHA256,
+        sha256: REPAIRED_SHA256,
+        droppedLines: 1,
+        keptRecords: 2,
+      })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(calls.slice(afterUnmount)).toEqual([])
+  })
+
+  it('a recovery_approve that rejects recovery-unknown after unmount makes no recovery_list: the same assertion on the branch that re-reads', async () => {
+    let rejectApprove: (reason: unknown) => void = () => {}
+    const calls = mountRecovery([RECOVERY_USABLE], (cmd) =>
+      cmd === 'recovery_approve'
+        ? new Promise((_resolve, reject) => {
+            rejectApprove = reject
+          })
+        : undefined,
+    )
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(
+      within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Approve' }),
+    )
+    await screen.findByLabelText('Recovery approval')
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+
+    cleanup()
+    const afterUnmount = calls.length
+    await act(async () => {
+      rejectApprove({
+        code: 'recovery-unknown',
+        message: 'no recovery entry with that digest is recorded for this device',
+      })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+
+    expect(calls.slice(afterUnmount)).toEqual([])
+  })
+})
+
+// -- Slice 5e: the carried debt of slice 5d's second review --
+
+/**
+ * The thirteen wire-typed switches slice 5d's second review counted and
+ * left without a runtime default (`docs/spike-log.md` § Slice 5d → Renderer,
+ * R3-050). Each returns `undefined` for a token its union does not name, and
+ * `undefined` either reaches `PlainTextLine` and throws `Array.from(undefined)`
+ * mid-render -- closing this whole panel, the wrong-roots table, the freeze
+ * guards and Stop with it -- or interpolates into a line as the literal
+ * string `undefined`, which reads as a fact. Each now answers with the raw
+ * token through `unrecognizedWireToken`: visible, inert, and reportable.
+ *
+ * Every test below asserts the **exact rendered text**, not merely that
+ * nothing threw: the interpolating half does not throw either way, and a
+ * test that only watched for a throw would pass with `undefined` on the
+ * screen.
+ */
+describe('AgentPanel wire-typed formatters without a runtime default (slice 5e, carried R3-050)', () => {
+  /** Asserts the panel is still mounted and nothing was logged as a render error. */
+  function expectPanelStanding(spy: ReturnType<typeof vi.spyOn>): void {
+    expect(screen.queryByRole('region', { name: 'Agent' })).not.toBeNull()
+    expect(spy).not.toHaveBeenCalled()
+  }
+
+  it('formatTerminalActionLabel: renders an unrecognized terminal action as the raw token beside its text', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const channel = await startAndCaptureChannel(undefined, 'pty-cli')
+
+    act(() => {
+      channel.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 1,
+          droppedBefore: 0,
+          kind: 'terminal-action',
+          payload: { action: 'progress' as never, text: 'building' },
+        },
+      })
+    })
+
+    expect(leavesContaining('progress: building')).not.toHaveLength(0)
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatOutboxReason: renders an unrecognized outbox reason as the raw token inside the declared line', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await renderReady(undefined, 'claude-code', {
+      outbox: {
+        ...OUTBOX_STATUS_VALID,
+        state: 'outbox-invalid',
+        reason: 'policy-signed-elsewhere' as OutboxReason,
+      },
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'Outbox' })?.textContent).toBe(
+        'outbox invalid: .omnifrons/outbox (policy-signed-elsewhere)',
+      )
+    })
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatOutboxStatusLine: renders an unrecognized outbox state as the raw token rather than a blank status line', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await renderReady(undefined, 'claude-code', {
+      outbox: { ...OUTBOX_STATUS_VALID, state: 'outbox-frozen' as OutboxStatus['state'] },
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'Outbox' })?.textContent).toBe(
+        'outbox: outbox-frozen',
+      )
+    })
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatWorkAreaLine: renders an unrecognized work-area token as the raw token rather than an empty line that reads as a valid area', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountWithWorkspace(undefined, {
+      workspace: {
+        displayPath: '/home/user/project',
+        workArea: 'work-area-elsewhere' as Workspace['workArea'],
+      },
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'Work area' })?.textContent).toBe(
+        'work area: work-area-elsewhere',
+      )
+    })
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatAttribution and formatCandidateState: render an unrecognized attribution kind and state as the raw tokens in the candidates row', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const channel = await startAndCaptureChannel(
+      (cmd) => {
+        if (cmd === 'candidates_list') {
+          return [
+            {
+              ...SAMPLE_CANDIDATES[0],
+              attribution: { kind: 'tool' } as unknown as Candidate['attribution'],
+              state: 'held' as Candidate['state'],
+            },
+          ]
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+      'claude-code',
+      { outbox: OUTBOX_STATUS_VALID },
+    )
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+
+    expect(candidateRows()[0]?.[5]).toBe('tool')
+    expect(candidateRows()[0]?.[6]).toBe('held refused')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+    await endRun(channel)
+  })
+
+  it('formatArtifactState, formatProviderState and formatAvailability: render unrecognized publication tokens as the raw tokens in the publications row', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockMountWithPublications(() => [
+      {
+        ...REGISTERED_PUBLICATION,
+        state: 'archived' as Publication['state'],
+        providerState: 'stale' as Publication['providerState'],
+        availability: 'remote' as Publication['availability'],
+      },
+    ])
+    render(<AgentPanel />)
+    await screen.findByRole('region', { name: 'Publications' })
+
+    expect(publicationRows()[0]?.[1]).toBe('archived')
+    expect(publicationRows()[0]?.[2]).toBe('stale')
+    expect(publicationRows()[0]?.[5]).toBe('remote')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatAttributionFact: renders an unrecognized attribution kind as the raw token on the approval block', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const channel = await startAndCaptureChannel(
+      (cmd) => {
+        if (cmd === 'candidates_list') {
+          return [
+            {
+              ...SAMPLE_CANDIDATES[0],
+              attribution: { kind: 'tool' } as unknown as Candidate['attribution'],
+            },
+          ]
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+      'claude-code',
+      { outbox: OUTBOX_STATUS_VALID },
+    )
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channel)
+    const block = await openApproval(`${RUN_ID}/report.pdf`)
+
+    expect(
+      Array.from(block.querySelectorAll('p')).map((line) => line.textContent),
+    ).toContain('attribution: tool')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  // `formatInstant` belongs to this class and was not in it (R3-066). It
+  // is not a token switch, but it is the same shape of guard for the same
+  // reason: a wire value the shell never sends, met with a stated absence
+  // rather than a throw. `recoveredAt` is typed `number` and `NaN` is a
+  // number, so `isRecoveryEntry` passes it through -- and without the
+  // guard `new Date(NaN).toISOString()` throws a `RangeError` in render,
+  // which closes the whole Agent panel.
+  it('formatInstant: renders an instant that is not representable as a null fact rather than throwing in render', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountRecovery([recoveryEntry({ recoveredAt: Number.NaN })])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryRows()[0]?.[3]).toBe('—')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatInstant: renders an instant beyond the representable range as a null fact too, the other way a Date goes invalid', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    // One millisecond past `Date`'s maximum (8.64e15).
+    mountRecovery([recoveryEntry({ recoveredAt: 8.64e15 + 1 })])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+
+    expect(recoveryRows()[0]?.[3]).toBe('—')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatManagedBlockState: renders an unrecognized managed token as the raw token in the guidance status line', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountGuidance({
+      note: noteStatus({ managed: 'signed' as GuidanceStatus['managed'] }),
+    })
+
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+    expect(noteStatusLine()).toContain('AGENTS.md: block signed;')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('formatGuidanceAction: renders an unrecognized action token as the raw token on the write block', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) =>
+      cmd === 'guidance_preview'
+        ? { ...PREVIEW_REPLACE, action: 'rewrite' as GuidancePreview['action'] }
+        : undefined,
+    )
+    await openNotePreview()
+
+    expect(writeBlockLines()).toContain('action: rewrite')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('guidanceBlockLabel: renders an unrecognized managed kind as the raw token in the write receipt', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      if (cmd === 'guidance_apply') {
+        return { ...APPLIED_REPLACE, kind: 'policy' as GuidanceApplied['kind'] }
+      }
+      return undefined
+    })
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    fireEvent.click(finalButton('Write'))
+    await waitFor(() => {
+      expect(resultLine()).not.toBeNull()
+    })
+
+    expect(resultLine()).toContain('policy AGENTS.md: written replace,')
+    expectPanelStanding(consoleErrorSpy)
+    consoleErrorSpy.mockRestore()
+  })
+})
+
+/**
+ * The ten handlers slice 5d's second review counted as reading `runActive`
+ * from render with no synchronous ref beneath it (`docs/spike-log.md` §
+ * Slice 5d → Renderer, R3-051). `handleStart` raises the run inside a click
+ * handler, so a click batched into the same tick as Start reaches each of
+ * them with `disabled` **and** the closure's `runActive` still `false`;
+ * measured on the wrong-root remedies, that window let a click through both
+ * halves of the freeze at once. Each now reads `runActiveRef` first.
+ *
+ * Every test below dispatches Start and the action inside one `act`, which
+ * is the only way to reach the handler with the button still enabled --
+ * `fireEvent.click` is `act`-wrapped and React flushes between clicks.
+ */
+describe('AgentPanel handlers that read runActive from render (slice 5e, carried R3-051)', () => {
+  /** Arms Start without clicking it, over whatever mount the caller made. */
+  async function armStartHere(): Promise<HTMLElement> {
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+    expect(start.disabled).toBe(false)
+    return start
+  }
+
+  /**
+   * A `change` on a controlled `<select>` with **no** act flush before it.
+   *
+   * `fireEvent.change` is itself `act`-wrapped, and React flushes the inner
+   * act: the first `fireEvent` after a raw Start dispatch still reaches the
+   * stale closure, and every one after it sees a re-rendered `runActive`.
+   * That is measured, not assumed -- with two `fireEvent.change` calls in
+   * one `act`, removing the *approval* select's ref left the suite green
+   * while removing the *adapter* select's did not, purely because of their
+   * order. Setting the value through the prototype's own setter (so React's
+   * value tracker sees the change) and dispatching a raw `change` keeps the
+   * whole tick unflushed, which is what the guard under test needs.
+   */
+  function changeSelectWithoutRerender(select: HTMLSelectElement, value: string): void {
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set
+    if (!setter) throw new Error('no HTMLSelectElement value setter')
+    setter.call(select, value)
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+
+  it('handleListOutbox: a List outbox click batched into the same tick as Start sends no candidates_list', async () => {
+    const calls = mountWithWorkspace((cmd) => (cmd === 'harness_spawn' ? 7 : undefined), {
+      outbox: OUTBOX_STATUS_VALID,
+    })
+    await screen.findByLabelText('Adapter')
+    const start = await armStartHere()
+    const listOutbox = screen.getByRole('button', { name: 'List outbox' })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      listOutbox.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'candidates_list')).toBe(0)
+  })
+
+  // One select per test, and measured to need it: React flushes between two
+  // `change` dispatches in the same `act` even when both are raw, so only
+  // the first of them reaches the stale closure. With both in one test,
+  // removing the *approval* select's ref left the suite green while removing
+  // the *adapter* select's did not -- purely because of their order, which
+  // is a property of the test and not of the guard.
+  it('the adapter select: a selection change batched into the same tick as Start is refused', async () => {
+    mountWithWorkspace((cmd) => (cmd === 'harness_spawn' ? 7 : undefined), {
+      outbox: OUTBOX_STATUS_VALID,
+    })
+    await screen.findByLabelText('Adapter')
+    const start = await armStartHere()
+    const adapter = screen.getByLabelText('Adapter') as HTMLSelectElement
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      changeSelectWithoutRerender(adapter, 'pty-cli')
+    })
+    await flush()
+
+    expect(adapter.value).toBe('claude-code')
+  })
+
+  it('the approval select: a selection change batched into the same tick as Start is refused', async () => {
+    mountWithWorkspace((cmd) => (cmd === 'harness_spawn' ? 7 : undefined), {
+      outbox: OUTBOX_STATUS_VALID,
+    })
+    await screen.findByLabelText('Adapter')
+    const start = await armStartHere()
+    const approval = screen.getByLabelText('Approval') as HTMLSelectElement
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      changeSelectWithoutRerender(approval, '')
+    })
+    await flush()
+
+    expect(approval.value).toBe('42')
+  })
+
+  it('handleGuidancePreview and openGuidanceRemove: a Preview click and a Remove click batched into the same tick as Start send no guidance_preview and open no write block', async () => {
+    const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) =>
+      cmd === 'harness_spawn' ? 7 : undefined,
+    )
+    await waitFor(() => {
+      expect(noteStatusLine()).not.toBeNull()
+    })
+    const start = await armStartHere()
+    const preview = within(noteBlock()).getByRole('button', { name: 'Preview' })
+    const remove = within(noteBlock()).getByRole('button', { name: 'Remove' })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      preview.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      remove.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'guidance_preview')).toBe(0)
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+  })
+
+  it('openGuidanceRestore: a Restore click batched into the same tick as Start opens no write block', async () => {
+    mountGuidance(
+      { note: noteStatus({ managed: 'current', snapshots: 3, pinned: 1 }), noteSnapshots: NOTE_SNAPSHOTS },
+      (cmd) => (cmd === 'harness_spawn' ? 7 : undefined),
+    )
+    await waitFor(() => {
+      expect(screen.queryByRole('table', { name: 'Guidance note snapshots' })).not.toBeNull()
+    })
+    const start = await armStartHere()
+    const restore = within(snapshotRow('89abcdef01234567')).getByRole('button', { name: 'Restore' })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      restore.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(screen.queryByLabelText('Guidance write')).toBeNull()
+  })
+
+  it('handleGuidanceWrite: a Write click on an already-confirmed block batched into the same tick as Start sends no guidance_apply', async () => {
+    const calls = mountGuidance({ note: noteStatus({ managed: 'outdated' }) }, (cmd) => {
+      if (cmd === 'harness_spawn') return 7
+      if (cmd === 'guidance_preview') return PREVIEW_REPLACE
+      return undefined
+    })
+    await openNotePreview()
+    typeGate(FILE_SHORT)
+    expect(finalButton('Write').disabled).toBe(false)
+    const start = await armStartHere()
+    const write = finalButton('Write')
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      write.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'guidance_apply')).toBe(0)
+  })
+
+  it('openApproval: an Approve click on a candidates row batched into the same tick as Start opens no approval block', async () => {
+    const channel = await startAndCaptureChannel(
+      (cmd) => {
+        if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+      'claude-code',
+      { outbox: OUTBOX_STATUS_VALID },
+    )
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channel)
+    const start = screen.getByRole('button', { name: 'Start' })
+    expect((start as HTMLButtonElement).disabled).toBe(false)
+    const approve = within(candidateRow(`${RUN_ID}/report.pdf`)).getByRole('button', {
+      name: 'Approve',
+    })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      approve.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(screen.queryByLabelText('Publication approval')).toBeNull()
+  })
+
+  it('handleConfirmApproval: an Approve publication click on a confirmed block batched into the same tick as Start sends no artifact_approve', async () => {
+    let approves = 0
+    const channel = await startAndCaptureChannel(
+      (cmd) => {
+        if (cmd === 'candidates_list') return SAMPLE_CANDIDATES
+        if (cmd === 'artifact_approve') {
+          approves += 1
+          return SAMPLE_ARTIFACT_APPROVAL
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      },
+      'claude-code',
+      { outbox: OUTBOX_STATUS_VALID },
+    )
+    deliverCandidates(channel)
+    await screen.findByRole('region', { name: 'Candidates' })
+    await endRun(channel)
+    await openApproval(`${RUN_ID}/report.pdf`)
+    // The gate only: `confirmReportApproval` would click the button too.
+    typeDigest(REPORT_SHORT)
+    expect(confirmButton().disabled).toBe(false)
+    const start = screen.getByRole('button', { name: 'Start' })
+    const confirm = confirmButton()
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      confirm.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(approves).toBe(0)
+  })
+
+  it('handlePublish: a Publish click on an approved row batched into the same tick as Start sends no artifact_publish', async () => {
+    let publishes = 0
+    const { calls } = await approveReport(() => {
+      publishes += 1
+      return PUBLISHED_REPORT
+    })
+    expect(publishButton().disabled).toBe(false)
+    const start = screen.getByRole('button', { name: 'Start' })
+    const publish = publishButton()
+    const before = calls.length
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      publish.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(publishes).toBe(0)
+    expect(calls.slice(before).map((call) => call.cmd)).not.toContain('artifact_publish')
+  })
+})
+
+describe('AgentPanel recovery gate and publish refusals (slice 5e)', () => {
+  it('refuses an entry whose digest is empty: the gate the label names is empty too, and an empty input would otherwise satisfy it in front of a re-publication', async () => {
+    const calls = mountRecovery([recoveryEntry({ sha256: '' })])
+    await screen.findByRole('table', { name: 'Recovery entries' })
+    fireEvent.click(within(recoveryTableRow('')).getByRole('button', { name: 'Approve' }))
+    await screen.findByLabelText('Recovery approval')
+
+    expect(recoveryGate().value).toBe('')
+    expect(recoveryApproveButton().disabled).toBe(true)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    expect(countCalls(calls, 'recovery_approve')).toBe(0)
+  })
+
+  it('refuses a second recovery Publish that lands before React has re-rendered the disabled button: the approved bytes are published once, never twice', async () => {
+    const calls = await openRecoveryApprovalBlock((cmd) => {
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      if (cmd === 'artifact_publish') {
+        return new Promise(() => {
+          // Never settles: the publication stays in flight for both clicks.
+        })
+      }
+      return undefined
+    })
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    const publish = within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', {
+      name: 'Publish',
+    }) as HTMLButtonElement
+    expect(publish.disabled).toBe(false)
+
+    act(() => {
+      publish.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      publish.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'artifact_publish')).toBe(1)
+  })
+
+  it('refuses a recovery Publish click batched into the same tick as Start', async () => {
+    const calls = await openRecoveryApprovalBlock((cmd) => {
+      if (cmd === 'recovery_approve') return RECOVERY_APPROVAL
+      if (cmd === 'harness_spawn') return 7
+      return undefined
+    })
+    typeRecoveryGate(RECOVERY_SHORT)
+    fireEvent.click(recoveryApproveButton())
+    await flush()
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' })
+    const publish = within(recoveryTableRow(RECOVERY_SHORT)).getByRole('button', { name: 'Publish' })
+
+    act(() => {
+      start.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      publish.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await flush()
+
+    expect(countCalls(calls, 'artifact_publish')).toBe(0)
   })
 })

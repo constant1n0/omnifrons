@@ -7,6 +7,8 @@ import {
   artifactApprove,
   artifactPublish,
   candidatesList,
+  catalogRepair,
+  catalogRepairPreview,
   guidanceApply,
   guidancePin,
   guidancePreview,
@@ -21,6 +23,8 @@ import {
   misplacedRemedy,
   outboxStatus,
   publicationsList,
+  recoveryApprove,
+  recoveryList,
   workspaceCurrent,
   workspacePick,
   wrongRootScan,
@@ -38,6 +42,8 @@ import {
   type Candidate,
   type CandidateState,
   type CandidatesSummary,
+  type CatalogRepaired,
+  type CatalogRepairPreview,
   type GuidanceAction,
   type GuidanceApplied,
   type GuidanceKind,
@@ -53,9 +59,14 @@ import {
   type ProcessTerminalState,
   type ProviderState,
   type Publication,
+  type RecoveryEntry,
+  type RefusalReason,
   type Remedy,
   type RemedyDetail,
   type RemedyOutcome,
+  type RepairDrop,
+  type RepairRefusal,
+  type RepairRule,
   type ScanSummary,
   type ScopeMode,
   type ShellError,
@@ -206,6 +217,8 @@ function formatTerminalActionLabel(action: TerminalActionKind): string {
       return 'title'
     case 'notification':
       return 'notification'
+    default:
+      return unrecognizedWireToken(action)
   }
 }
 
@@ -254,6 +267,8 @@ function formatOutboxReason(reason: OutboxReason | null): string {
       return 'the classification policy is invalid'
     case null:
       return 'reason unreported'
+    default:
+      return unrecognizedWireToken(reason)
   }
 }
 
@@ -286,7 +301,11 @@ function formatDeclaredReason(status: OutboxStatus): string {
  * project-originated text.
  */
 function formatOutboxStatusLine(status: OutboxStatus): string {
-  switch (status.state) {
+  // Read into a local first, so the `default` arm narrows to `never` for
+  // {@link unrecognizedWireToken} whatever TypeScript does with a property
+  // access -- the same shape every switch-on-a-field here takes.
+  const state = status.state
+  switch (state) {
     case 'valid':
       return status.exists && status.outbox !== null
         ? `outbox: ${status.outbox} (declared ${status.declared ?? NULL_FACT})`
@@ -295,6 +314,8 @@ function formatOutboxStatusLine(status: OutboxStatus): string {
       return `outbox invalid: ${formatDeclaredReason(status)}`
     case 'outbox-unavailable':
       return `outbox unavailable: ${formatDeclaredReason(status)}`
+    default:
+      return `outbox: ${unrecognizedWireToken(state)}`
   }
 }
 
@@ -312,6 +333,8 @@ function formatWorkAreaLine(state: WorkAreaState): string | null {
       return null
     case 'work-area-invalid':
       return 'work area invalid — publication refused until it is fixed'
+    default:
+      return `work area: ${unrecognizedWireToken(state)}`
   }
 }
 
@@ -357,11 +380,14 @@ function formatCandidatesSummary(summary: CandidatesSummary): string {
  * (HAP-001-R11), so `run` here means the run's own proposal named the entry.
  */
 function formatAttribution(attribution: Attribution): string {
-  switch (attribution.kind) {
+  const kind = attribution.kind
+  switch (kind) {
     case 'run':
       return 'run'
     case 'unattributed':
       return 'unattributed'
+    default:
+      return unrecognizedWireToken(kind)
   }
 }
 
@@ -379,6 +405,8 @@ function formatCandidateState(state: CandidateState): string {
       return 'outbox-escape'
     case 'outbox-linked':
       return 'outbox-linked'
+    default:
+      return unrecognizedWireToken(state)
   }
 }
 
@@ -410,6 +438,8 @@ function formatArtifactState(state: ArtifactState): string {
       return 'outbox-escape'
     case 'outbox-linked':
       return 'outbox-linked'
+    default:
+      return unrecognizedWireToken(state)
   }
 }
 
@@ -426,6 +456,8 @@ function formatProviderState(state: ProviderState | null): string {
       return 'unavailable'
     case null:
       return NULL_FACT
+    default:
+      return unrecognizedWireToken(state)
   }
 }
 
@@ -436,6 +468,8 @@ function formatAvailability(availability: Availability): string {
       return 'local'
     case 'unknown':
       return 'unknown'
+    default:
+      return unrecognizedWireToken(availability)
   }
 }
 
@@ -498,11 +532,14 @@ function PublicationRow({ publication }: { publication: Publication }) {
  * with nothing standing in for a producer. Exhaustive over the closed kinds.
  */
 function formatAttributionFact(attribution: Attribution): string {
-  switch (attribution.kind) {
+  const kind = attribution.kind
+  switch (kind) {
     case 'run':
       return `run ${attribution.runId}`
     case 'unattributed':
       return 'unattributed'
+    default:
+      return unrecognizedWireToken(kind)
   }
 }
 
@@ -964,6 +1001,8 @@ function guidanceBlockLabel(kind: GuidanceKind): string {
       return 'Guidance note'
     case 'ignore':
       return 'Ignore rule'
+    default:
+      return unrecognizedWireToken(kind)
   }
 }
 
@@ -977,7 +1016,8 @@ function guidanceBlockLabel(kind: GuidanceKind): string {
  * refuses to overwrite either.
  */
 function formatManagedBlockState(status: GuidanceStatus): string {
-  switch (status.managed) {
+  const managed = status.managed
+  switch (managed) {
     case 'absent':
       return 'block absent'
     case 'current':
@@ -988,6 +1028,8 @@ function formatManagedBlockState(status: GuidanceStatus): string {
       return 'block modified — resolve by hand or restore'
     case 'malformed':
       return 'block malformed — resolve by hand'
+    default:
+      return `block ${unrecognizedWireToken(managed)}`
   }
 }
 
@@ -1023,6 +1065,8 @@ function formatGuidanceAction(action: GuidanceAction): string {
       return 'remove'
     case 'restore':
       return 'restore'
+    default:
+      return unrecognizedWireToken(action)
   }
 }
 
@@ -1032,18 +1076,20 @@ function formatYesNo(value: boolean): string {
 }
 
 /**
- * A snapshot's instant as an ISO 8601 time. A `takenAt` that is not a
- * representable instant -- which the shell never sends -- reads as a null
- * fact rather than throwing during render.
+ * A wire instant -- milliseconds since the epoch -- as an ISO 8601 time:
+ * a snapshot's `takenAt` (slice 5c) and a recovery entry's `recoveredAt`
+ * (slice 5e) alike. A value that is not a representable instant -- which
+ * the shell never sends -- reads as a null fact rather than throwing during
+ * render.
  */
-function formatSnapshotInstant(takenAt: number): string {
-  const instant = new Date(takenAt)
+function formatInstant(millis: number): string {
+  const instant = new Date(millis)
   return Number.isNaN(instant.getTime()) ? NULL_FACT : instant.toISOString()
 }
 
 /** The restore block's snapshot fact: everything the manifest records about the bytes it would write back. */
 function formatSnapshotFact(snapshot: Snapshot): string {
-  return `snapshot: ${snapshot.id}, taken at ${formatSnapshotInstant(snapshot.takenAt)}, sha256 short ${snapshot.sha256Short}, size ${snapshot.size}, existed ${formatYesNo(snapshot.existed)}`
+  return `snapshot: ${snapshot.id}, taken at ${formatInstant(snapshot.takenAt)}, sha256 short ${snapshot.sha256Short}, size ${snapshot.size}, existed ${formatYesNo(snapshot.existed)}`
 }
 
 /**
@@ -1712,6 +1758,423 @@ function isQuarantineConfirmed(row: MisplacedRow, input: string): boolean {
   return input === row.sha256Short
 }
 
+// -- Slice 5e: catalog repair and recovery re-approval (HAP-001-R18, R23, R39, R40) --
+
+/**
+ * Stated in place of the catalog line before any preview has arrived: the
+ * product has not read the Catalog for repairable damage, which is a fact
+ * and is said rather than left as a blank space that reads like a clean
+ * one -- the {@link OUTPUT_DISCIPLINE_UNKNOWN_LINE} discipline. Fixed copy.
+ *
+ * It said "previewing reads and writes nothing", which is false of the
+ * half that matters to a user deciding whether to press it: previewing
+ * reads the **whole** Catalog -- `catalog_repair_preview` replays every
+ * line of it under the publication surface lock -- and writes nothing
+ * (slice 5e review, R1-009). "Reads nothing" was a claim about holding no
+ * handle, said as though it were a claim about reading no data.
+ */
+const CATALOG_NOT_PREVIEWED_LINE =
+  'catalog: not previewed — nothing here has read it yet; previewing reads the whole catalog and writes nothing'
+
+/**
+ * Stated when `catalog_repair_preview` did not answer, or did not answer
+ * the shape its DTO promises.
+ *
+ * A failed preview and a catalog with nothing to repair are opposite facts,
+ * and this is the {@link MISPLACED_UNAVAILABLE_SENTENCE} argument applied to
+ * the Catalog: an empty drops list is exactly what a healthy catalog looks
+ * like, so "I could not look" must never render as "there is nothing
+ * wrong". Fixed copy.
+ */
+const CATALOG_PREVIEW_UNAVAILABLE_SENTENCE =
+  'the repair preview could not be read; this is not a report that the catalog is healthy'
+
+/** What a repairable preview means, in words rather than a bare boolean. Fixed copy. */
+const CATALOG_REPAIRABLE_VERDICT =
+  'a repair would drop the lines below and remove no registration'
+
+/**
+ * What a non-repairable preview means. Both halves are said, because either
+ * one alone misleads: a preview is non-repairable when a line refuses the
+ * whole apply (HAP-001-R39) *and* when there is simply nothing to drop, and
+ * "no repair is offered" would read as damage the product declines to fix.
+ * Fixed copy.
+ */
+const CATALOG_NOT_REPAIRABLE_VERDICT =
+  'no repair is offered: either a line below may not be dropped, or there is nothing to drop'
+
+/**
+ * The catalog line once a preview has arrived: the three counts in a fixed
+ * order, zeros included -- every count always accounted for, like
+ * {@link formatScanSummary}'s five -- the digest the apply would bind to in
+ * its short form, and the verdict the preview's own `repairable` carries.
+ * Never a line's content and never a path.
+ */
+function formatCatalogPreviewLine(preview: CatalogRepairPreview): string {
+  const counts = [
+    `${preview.drops.length} drops`,
+    `${preview.refusals.length} refusals`,
+    `${preview.keptRecords} records kept`,
+  ]
+  const verdict = preview.repairable ? CATALOG_REPAIRABLE_VERDICT : CATALOG_NOT_REPAIRABLE_VERDICT
+  return `catalog: ${counts.join(', ')}; sha256 short ${shortDigest(preview.sha256)} — ${verdict}`
+}
+
+/**
+ * Which rule would drop a line: fixed copy per closed token through an
+ * exhaustive switch, never the wire token echoed, with
+ * {@link unrecognizedWireToken} answering for a token the union does not
+ * name. Neither rule removes a registration, and each arm says why rather
+ * than leaving the user to trust the word "duplicate".
+ */
+function formatRepairRule(rule: RepairRule): string {
+  switch (rule) {
+    case 'duplicate-record':
+      return 'a later record line for a publication an earlier line already registers'
+    case 'dangling-alias':
+      return 'an alias line no earlier record line carries'
+    default:
+      return unrecognizedWireToken(rule)
+  }
+}
+
+/**
+ * Why a line refuses the whole repair: fixed copy per closed token through
+ * an exhaustive switch, the {@link formatRepairRule} discipline.
+ */
+function formatRefusalReason(reason: RefusalReason): string {
+  switch (reason) {
+    case 'catalog-id-mismatch':
+      return 'a record line whose catalog identity disagrees with the identity it registers'
+    case 'duplicate-across-asset-roots':
+      // Said at length on purpose: this reads like `duplicate-record`, the
+      // rule that *is* dropped, and the difference is the whole reason it
+      // is refused -- these two lines register two artifacts, not one, so
+      // the later is not a duplicate of the earlier at all.
+      return 'a record line for a publication an earlier line already registers, under a different asset root, so each registers an artifact of its own'
+    case 'unparsable':
+      return 'a line this version cannot read'
+    default:
+      return unrecognizedWireToken(reason)
+  }
+}
+
+/**
+ * Stated on every refusal line (HAP-001-R39): the line is the only one
+ * registering that artifact, or content this version cannot decode, so it
+ * is left exactly where it is. There is no sidecar, no quarantine file and
+ * no other way to get it out of the way from this product. Fixed copy.
+ */
+const REFUSAL_NEEDS_OWNER_DECISION =
+  'it is not dropped: this needs an owner decision, not a repair'
+
+/**
+ * One line a repair would drop, named by its **number** and never by its
+ * content -- the Catalog is synchronized, untrusted text (HAP-001-R40,
+ * RCS-001-R14), and a number identifies exactly one line without putting
+ * any of it on the screen.
+ *
+ * The publication identity is shown in its short form when the line carries
+ * one, and its absence is stated rather than left blank: a dangling alias
+ * whose identity is not 64 hex characters carries `null`, which is exactly
+ * why no record carries it.
+ */
+function formatRepairDrop(drop: RepairDrop): string {
+  const publication =
+    drop.publicationId === null
+      ? 'publication not reported'
+      : `publication ${shortDigest(drop.publicationId)}`
+  return `line ${drop.line}: ${formatRepairRule(drop.rule)}; ${publication}`
+}
+
+/** One line that refuses the repair, named the same way, with what that means for the user. */
+function formatRepairRefusal(refusal: RepairRefusal): string {
+  return `line ${refusal.line}: ${formatRefusalReason(refusal.reason)}; ${REFUSAL_NEEDS_OWNER_DECISION}`
+}
+
+/**
+ * Stated on the repair confirmation block before the decision (HAP-001-R5,
+ * R39; `docs/spike-log.md` § Slice 5e, D3): the repair rewrites a file
+ * inside the project, and neither the button name nor the `repair` word
+ * says what happens to what it takes out.
+ *
+ * What is true is that the catalog as it stands is copied into the product
+ * work area first, and that **nothing in this product lists or restores
+ * that copy** -- the same absence the quarantine line states, and for the
+ * same reason: stating it is the more useful warning, because it is what
+ * makes the act hard to undo from here.
+ */
+const CATALOG_REPAIR_SCOPE_LINE =
+  'the lines above will be REMOVED from the project catalog; the catalog as it stands is copied into the product work area first, and this product offers no way to list, open or restore that copy'
+
+/**
+ * Whether `input` confirms the repair of `preview`: an exact,
+ * case-sensitive match against the short form of the digest the block shows
+ * -- slice 2's shape and its R1-001 discipline, the same gate the 5b
+ * approval, the 5c guidance write and the 5d quarantine use. The typed
+ * value is a gate only: the request carries the preview's own full
+ * `sha256`, never anything typed.
+ *
+ * An empty short digest confirms nothing. A preview whose `sha256` is the
+ * empty string is not one the shell produces, but were one to arrive, an
+ * empty input would otherwise satisfy the gate in front of a rewrite of the
+ * project's Catalog -- a gate a blank payload satisfies is not a gate
+ * (the R3-018 lesson, applied here).
+ */
+function isCatalogRepairConfirmed(preview: CatalogRepairPreview, input: string): boolean {
+  const short = shortDigest(preview.sha256)
+  if (short === '') return false
+  return input === short
+}
+
+/**
+ * Whether `preview` has the shape `CatalogRepairPreviewDto` promises,
+ * checked field by field before it is allowed to reach render.
+ *
+ * The same decision {@link isMisplacedRow} makes about a listing row, made
+ * about the whole payload: `drops` and `refusals` are typed as arrays and
+ * the wire types them as whatever arrives, so `.map` off either one
+ * unchecked throws mid-render -- and a render throw inside this panel
+ * closes the panel entire, the wrong-roots table and every freeze guard
+ * with it. A payload that fails this is dropped whole and
+ * {@link CATALOG_PREVIEW_UNAVAILABLE_SENTENCE} says so, rather than a
+ * half-read plan standing behind a button that rewrites the Catalog.
+ */
+function isCatalogRepairPreview(preview: unknown): preview is CatalogRepairPreview {
+  if (typeof preview !== 'object' || preview === null) return false
+  const candidate = preview as Record<string, unknown>
+  if (typeof candidate.sha256 !== 'string') return false
+  if (typeof candidate.repairable !== 'boolean') return false
+  if (typeof candidate.keptRecords !== 'number') return false
+  if (!Array.isArray(candidate.drops) || !Array.isArray(candidate.refusals)) return false
+  const drops = candidate.drops.every((drop: unknown) => {
+    if (typeof drop !== 'object' || drop === null) return false
+    const row = drop as Record<string, unknown>
+    return (
+      typeof row.line === 'number' &&
+      typeof row.rule === 'string' &&
+      (row.publicationId === null || typeof row.publicationId === 'string')
+    )
+  })
+  const refusals = candidate.refusals.every((refusal: unknown) => {
+    if (typeof refusal !== 'object' || refusal === null) return false
+    const row = refusal as Record<string, unknown>
+    return typeof row.line === 'number' && typeof row.reason === 'string'
+  })
+  return drops && refusals
+}
+
+/**
+ * The receipt of a completed repair: what it dropped, what it kept, and
+ * both digests in short form -- the bytes that were repaired (the content
+ * of the copy now in the work area) and the catalog as it now stands.
+ * Never a path.
+ */
+function formatCatalogRepairedLine(repaired: CatalogRepaired): string {
+  return `catalog repaired: ${repaired.droppedLines} lines dropped, ${repaired.keptRecords} records kept; was ${shortDigest(repaired.originalSha256)}, now ${shortDigest(repaired.sha256)}`
+}
+
+/**
+ * The Recovery block's standing disclaimer (HAP-001-R18, R22, D3): a
+ * recovery entry is bytes a publication held when its outbox path stopped
+ * naming the file, kept so that what was digested and approved survives.
+ * Re-publishing one is a fresh, explicit, per-artifact approval that no
+ * standing policy covers, and the entry itself is never removed by this
+ * product. Fixed copy, never wire text.
+ */
+const RECOVERY_ADVISORY_LINE =
+  'advisory: these are bytes a publication held when its outbox path stopped naming them; re-publishing one is a fresh approval no standing policy covers, and nothing here ever removes an entry'
+
+/**
+ * Stated when `recovery_list` did not answer, or did not answer a list.
+ *
+ * An empty table is pixel-for-pixel what a device with no recovery entries
+ * looks like, and the two are opposite facts -- the
+ * {@link MISPLACED_UNAVAILABLE_SENTENCE} argument, which this surface needs
+ * for the same reason: an entry that is not listed is an approval that
+ * cannot be given, and the user would have no way to tell that from having
+ * nothing to approve. Fixed copy.
+ */
+const RECOVERY_UNAVAILABLE_SENTENCE =
+  'the recovery entries could not be read; this is not a report that there are none'
+
+/**
+ * Stated when `recovery_list` answered `workspace-unavailable`, which is
+ * the shell's answer while **no workspace is active** -- idle, not a read
+ * that failed (slice 5e review, R1-007).
+ *
+ * `refreshOutboxStatus` and `refreshPublications` have always told those
+ * two apart; this fetch did not, so at idle the panel said the entries
+ * "could not be read" and that this was not a report that there are none.
+ * Both halves of that are the wrong claim before a workspace is picked,
+ * and worse: it made a genuine read failure say exactly what idle says,
+ * which inverts the purpose of the sentence beside it. The one clause that
+ * stays is the one that is still true -- an unread listing is not an empty
+ * device. Fixed copy, its own accessible name.
+ */
+const RECOVERY_NO_WORKSPACE_SENTENCE =
+  'no workspace is active, so the recovery entries were not read; this is not a report that there are none'
+
+/**
+ * Stated when the listing answered but some of its rows did not have the
+ * shape the DTO promises and were dropped ({@link isRecoveryEntry}), so a
+ * shortened table is never read as a shorter list of entries. Fixed copy.
+ */
+const RECOVERY_ROWS_DROPPED_SENTENCE =
+  'some recovery entries could not be read and are not listed; the table below is incomplete'
+
+/** The count line: how many entries this device's journal accounts for. */
+function formatRecoveryCountLine(entries: RecoveryEntry[]): string {
+  return `recovery entries: ${entries.length}`
+}
+
+/**
+ * Marked beside an entry the probe could not confirm, and never used to
+ * hide one (HAP-001-R18): an entry that stopped being what it was filed as
+ * is exactly what a user needs told, and the reason it can no longer be
+ * approved. Fixed copy; the entry stays in the table with no Approve
+ * button.
+ */
+const RECOVERY_UNUSABLE_MARK =
+  'unusable: it did not open as a regular file with a link count of one, or its bytes no longer hash to the digest it is filed under; it cannot be approved'
+
+/**
+ * Marked beside an entry whose class is not `generated-heavy`
+ * (HAP-001-R18, R4; slice 5e review, R1-004). The class is read from the
+ * display name beside it, so an entry whose bytes are perfectly intact --
+ * `usable: yes` -- is still refused by the shell when its recovered name
+ * carries, say, an executable extension. The row stays with no Approve
+ * button, the {@link RECOVERY_UNUSABLE_MARK} shape: the reason is said, and
+ * the entry is never hidden. Fixed copy.
+ */
+const RECOVERY_UNAPPROVABLE_CLASS_MARK =
+  'this class cannot be approved for publication: only a generated-heavy entry can be, and the class is read from the name above'
+
+/**
+ * Stated on the Recovery block (slice 5e review, R1-005).
+ *
+ * The work area these entries live in is device configuration
+ * (HAP-001-R5) and the journal that accounts for them is one per device,
+ * so `recovery_list` answers device-wide: the `outbox-escape` step that
+ * writes an entry carries no project identity, and there is nothing to
+ * filter on. The block sits among project-scoped blocks -- the Catalog,
+ * the publications table, the quarantine findings -- and said nothing
+ * about it, which left its position to imply a scope it does not have.
+ * Fixed copy.
+ */
+const RECOVERY_DEVICE_WIDE_LINE =
+  'this list is every recovery entry this device holds, including entries preserved while another project was open; it is not filtered by the active project'
+
+/**
+ * The same fact stated where it changes what happens (R1-005): the entries
+ * come from the device, the publication goes to the project that is active
+ * **now**. `recovery_approve` derives the identity from the active project
+ * and takes that project's asset root, so an entry an escape wrote under
+ * another project is registered here as this project's artifact -- and
+ * `recovered from` above then names a publication this project's catalog
+ * does not hold. Fixed copy, on the block where the decision is made.
+ */
+const RECOVERY_DEVICE_SCOPE_LINE =
+  'these entries belong to this device, not to this project; approving one registers those bytes in the project that is active now, under its identity and its asset root'
+
+/**
+ * Stated on the recovery approval block before the decision
+ * (`docs/spike-log.md` § Slice 5e, D9, D10): the two facts the row's
+ * columns do not carry and a user would otherwise have to assume.
+ *
+ * The identity registered comes from the **bytes that were read**, which is
+ * not always the escaped publication's -- the file behind a held handle can
+ * have been rewritten in place before the escape was detected -- so
+ * `recovered from` above is a location fact and not what this will be
+ * filed as. And the entry is kept afterwards: registering these bytes does
+ * not make the preserved copy disposable, and this product defines no way
+ * to remove one.
+ */
+const RECOVERY_APPROVAL_SCOPE_LINE =
+  're-publishing registers these bytes under the identity they hash to, which is not always the identity of the publication they were recovered from; the recovery entry itself is kept'
+
+/**
+ * Stated on the recovery approval block as the attribution fact
+ * (HAP-001-R11, R22, R36): fixed copy, not a wire value. Nothing about a
+ * recovery entry attributes it to a run -- the shell records
+ * `Attribution::Unattributed` for every one -- so the block states the bare
+ * unattributed fact with nothing standing in for a producer, exactly as the
+ * 5b approval block does for an entry location alone cannot attribute.
+ */
+const RECOVERY_ATTRIBUTION_LINE = 'attribution: unattributed'
+
+/**
+ * Whether `entry` has the shape `RecoveryEntryDto` promises, checked field
+ * by field before it reaches render -- the {@link isMisplacedRow}
+ * discipline, and for the same measured reason: a row missing `sha256`
+ * reaches `PlainTextLine` as `undefined` and throws `Array.from(undefined)`
+ * mid-render, which closes this whole panel.
+ *
+ * A row that fails is dropped rather than repaired: there is no honest way
+ * to render an entry whose digest or provenance is missing, and this
+ * surface offers to re-publish what it lists.
+ */
+function isRecoveryEntry(entry: unknown): entry is RecoveryEntry {
+  if (typeof entry !== 'object' || entry === null) return false
+  const candidate = entry as Record<string, unknown>
+  return (
+    typeof candidate.sha256 === 'string' &&
+    (candidate.size === null || typeof candidate.size === 'number') &&
+    typeof candidate.recoveredFrom === 'string' &&
+    typeof candidate.recoveredAt === 'number' &&
+    typeof candidate.displayName === 'string' &&
+    (candidate.class === null || typeof candidate.class === 'string') &&
+    typeof candidate.usable === 'boolean'
+  )
+}
+
+/**
+ * Whether a recovery row offers approval: the probe confirmed the entry is
+ * still what it is filed under, **and** its class is `generated-heavy`.
+ *
+ * Both halves refuse, and the shell refuses on both too -- so the panel
+ * offers no button it knows the shell would answer `refused` to, exactly
+ * as {@link isApprovable} does for a candidates row. The class is the half
+ * that is easy to miss: it is read from the display name above it, so a
+ * recovered name carrying an executable extension classifies as
+ * `executable` whatever the bytes are (HAP-001-R4 is name-and-type, never
+ * content shape) while `usable` still says yes (R1-004).
+ *
+ * A `null` class is not a classification, so it is not `generated-heavy`
+ * either; such an entry is unusable anyway.
+ */
+function isRecoveryApprovable(entry: RecoveryEntry): boolean {
+  return entry.usable && entry.class === 'generated-heavy'
+}
+
+/**
+ * Whether `input` confirms the approval of `entry`: an exact,
+ * case-sensitive match against the short form of the digest the block
+ * shows, and nothing else -- the gate every act on this surface has used
+ * since slice 2. The request carries the entry's own full `sha256`, never
+ * anything typed, and the shell re-derives the digest from its own handle
+ * regardless.
+ */
+function isRecoveryApprovalConfirmed(entry: RecoveryEntry, input: string): boolean {
+  const short = shortDigest(entry.sha256)
+  if (short === '') return false
+  return input === short
+}
+
+/**
+ * One recovery entry's publication progress, tracked by the panel per
+ * entry digest from the approval on -- the same three phases
+ * {@link RowPublication} tracks for a candidate row, because the act that
+ * follows is the same one: the existing `artifact_publish`, carrying the
+ * approval `recovery_approve` returned.
+ */
+type RecoveryProgress =
+  | { phase: 'approved'; approval: ArtifactApproval }
+  | { phase: 'publishing'; approval: ArtifactApproval }
+  | { phase: 'published'; publication: Publication }
+
+const EMPTY_RECOVERY_PROGRESS: ReadonlyMap<string, RecoveryProgress> = new Map()
+
 /**
  * First built-in harness adapter control panel (`docs/spike-log.md` §
  * Slice 3): pick a workspace, pick a built-in adapter and an approved
@@ -1799,22 +2262,55 @@ export function AgentPanel() {
    * then discards, leaving a running process with no active id, no Stop
    * button and no transcript.
    *
-   * It is allowed to lag in the other direction: an effect clears it after
-   * the run ends, so it stays `true` a moment longer than necessary and
-   * refuses a remedy that would have been permitted a tick later. That is
-   * the conservative direction, and it is the one the shell also takes --
+   * **It is cleared synchronously too, at every place the run stops being
+   * in flight**, and not by an effect mirroring {@link runActive}. An
+   * effect was what cleared it, and an effect runs *after* the commit it
+   * belongs to: React had already painted the run's end -- the badge
+   * reading its terminal token, Start enabled again -- while this still
+   * read `true`. A Start click landing in that window reached
+   * `handleStart`, was refused by a run that had already ended, and
+   * spawned nothing, silently; the user's click simply did not happen.
+   * The window opens whenever React's scheduler yields between the commit
+   * and the passive-effect flush, which is why it never reproduced in
+   * isolation and cost this file an intermittent second-Start failure in
+   * three of its multi-run tests (slice 5e review, R3-071 -- the
+   * `selectOption` race the log blamed is not it: every one of those
+   * failures is downstream of a selection the helper already asserted,
+   * and the first run of each had spawned).
+   *
+   * There are exactly three places a run stops being in flight, and each
+   * clears this beside the state update it mirrors: the terminal `state`
+   * frame in `handleFrame`, a confirmed stop in `handleStop`, and a
+   * rejected spawn in `handleStart` -- the last two after their generation
+   * check, so a spawn or a stop a later Start already replaced clears
+   * nothing (R3-034's rule, applied to the ref rather than to a flag).
+   * `handleStop`'s check was added by the scoped re-review (R3-071b): the
+   * clear alone, without it, released the freeze while the **next** run's
+   * child was live, which is the one thing this ref must never do.
+   *
+   * **That invariant is held by a guard over this file's own source**, not
+   * only by the three tests that reach the three sites: `AgentPanel.test.tsx`
+   * reads this module through Vite's `?raw` and asserts that every
+   * `setActiveId(null)` here sits beside a `runActiveRef.current = false`,
+   * and that the only other `setActiveId` call is the one that raises an
+   * id. A fourth clearing site added later is the failure mode no timing
+   * test can reach, and that is exactly how `handleStop` came to be the
+   * one async handler on this panel without a generation check.
+   *
+   * The conservative lag the remedy handlers want is still there, and it
+   * always came from the other half of their guard: they read
+   * `runActiveRef.current || runActive`, and `runActive` is the render
+   * value, one render behind. `handleStart` reads the ref alone because
+   * it is the one entry point whose refusal costs a dropped click rather
+   * than a deferred remedy. The shell refuses independently either way --
    * `misplaced_remedy` holds the publication surface lock and re-checks
-   * `any_running()` itself, so this guard exists to make the surface answer
-   * the same way the shell does, not to be the only thing standing between
-   * a click and a moved file. What it must never do is lag the *other* way,
-   * which is why {@link pendingSpawns} counts rather than flags: the effect
-   * mirrors `runActive`, and `runActive` used to go false in the `finally`
-   * of whichever spawn settled first rather than the last (R3-034).
+   * `any_running()` itself -- so this guard exists to make the surface
+   * answer the same way the shell does, not to be the only thing standing
+   * between a click and a moved file. What it must never do is go false
+   * while a run is live, which is why {@link pendingSpawns} counts rather
+   * than flags (R3-034).
    */
   const runActiveRef = useRef(false)
-  useEffect(() => {
-    runActiveRef.current = runActive
-  }, [runActive])
 
   /**
    * Tracks whether this component instance is still mounted, guarding
@@ -2295,6 +2791,170 @@ export function AgentPanel() {
     setQuarantineInput('')
   }, [])
 
+  /**
+   * The active project's Catalog repair state (slice 5e; HAP-001-R23, R39,
+   * R40): the plan `catalog_repair_preview` answered, or `null` while none
+   * has been asked for or the last one could not be read; whether that
+   * absence is a fault rather than "nothing asked yet"; the digest typed
+   * into the repair gate; and the last completed repair's receipt.
+   */
+  const [catalogPreview, setCatalogPreview] = useState<CatalogRepairPreview | null>(null)
+  const [catalogFault, setCatalogFault] = useState(false)
+  /**
+   * The digest the user has typed into the repair gate. Only ever set from
+   * the input's own change events -- never from the preview, a drop's
+   * publication identity, or any other harness-originated string
+   * (TM-001-R1).
+   */
+  const [catalogInput, setCatalogInput] = useState('')
+  const [catalogResult, setCatalogResult] = useState<string | null>(null)
+
+  /**
+   * True while a `catalog_repair_preview` is in flight, and the same flag
+   * set synchronously so a second click landing before React has
+   * re-rendered the disabled button starts no second read. The preview is
+   * the section's **read**: it is not among the commands the shell refuses
+   * with `run-active`, so it stays live while a run is active, exactly as
+   * Scan does (slice 5e, D4).
+   *
+   * It is not lock-free, and this said it was (R1-009):
+   * `catalog_repair_preview_for` takes the publication surface lock for
+   * the length of the replay -- not against staleness but against tearing,
+   * since a replay racing an append reads a half-written line and calls
+   * the Catalog corrupt. What it takes no part in is the **run** freeze.
+   */
+  const [catalogPreviewBusy, setCatalogPreviewBusy] = useState(false)
+  const catalogPreviewBusyRef = useRef(false)
+
+  /**
+   * The same pair for the **write**. A repair rewrites a file inside the
+   * project, so it is frozen while a run is active -- the shell refuses it
+   * with `run-active` in the same window -- and it runs once per confirmed
+   * gate, never twice.
+   */
+  const [catalogRepairBusy, setCatalogRepairBusy] = useState(false)
+  const catalogRepairBusyRef = useRef(false)
+
+  /**
+   * The generation of the Catalog block's context: the workspace it is
+   * about. Bumped by a workspace pick, the guard `guidanceContextRef` and
+   * `wrongRootContextRef` already put on their sections. A preview or a
+   * repair that resolves after the user has picked another project is
+   * dropped whole rather than posting one project's plan, receipt or
+   * digest binding under the next -- and the digest binding is exactly the
+   * fact that two projects whose catalogs came byte-identical from one
+   * template cannot be told apart by.
+   */
+  const catalogContextRef = useRef(0)
+
+  /**
+   * This device's recovery entries (slice 5e, HAP-001-R18), each entry's
+   * publication progress from its approval on, and why the table is short
+   * or empty when it is empty for a reason other than "there are none".
+   */
+  const [recovery, setRecovery] = useState<RecoveryEntry[]>([])
+  /**
+   * Why the table is short or empty for a reason other than "there are
+   * none". `no-workspace` is idle -- nothing was read because nothing
+   * could be asked -- and is a different fact from `unavailable`, a read
+   * that was made and failed (R1-007).
+   */
+  const [recoveryFault, setRecoveryFault] = useState<
+    'unavailable' | 'no-workspace' | 'dropped' | null
+  >(null)
+  const [recoveryProgress, setRecoveryProgress] =
+    useState<ReadonlyMap<string, RecoveryProgress>>(EMPTY_RECOVERY_PROGRESS)
+
+  /** The digest of the entry whose approval block is open, or `null`. */
+  const [approvingRecovery, setApprovingRecovery] = useState<string | null>(null)
+
+  /**
+   * The digest the user has typed into the recovery approval gate. Only
+   * ever set from the input's own change events -- never from an entry's
+   * digest, its provenance, or any other harness-originated string
+   * (TM-001-R1).
+   */
+  const [recoveryInput, setRecoveryInput] = useState('')
+
+  /**
+   * True while a `recovery_approve` or the `artifact_publish` that follows
+   * one is in flight, and the same flag set synchronously so a second click
+   * landing before React has re-rendered the disabled buttons is still
+   * refused. Both are writes and both freeze while a run is active; the
+   * listing beside them does not.
+   */
+  const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const recoveryBusyRef = useRef(false)
+
+  /** The generation of the Recovery block's context, bumped by a workspace pick like the Catalog block's. */
+  const recoveryContextRef = useRef(0)
+
+  /**
+   * The sequence number of the most recently *started* `recovery_list`
+   * fetch -- the sequenced-fetch pattern every listing here uses (R3-008):
+   * only the latest fetch's response is applied.
+   */
+  const latestRecoveryRef = useRef(0)
+
+  /**
+   * Fetches this device's recovery entries: on mount, and again after a
+   * successful workspace pick. An automatic refresh is not a user act, so a
+   * rejection raises no banner -- but it does record *why* the table is
+   * empty, the `misplaced_list` discipline: "there are none" and "they
+   * could not be read" are opposite facts on a surface whose whole job is
+   * to say what survived.
+   */
+  const refreshRecovery = useCallback(() => {
+    const context = recoveryContextRef.current
+    const requestId = (latestRecoveryRef.current += 1)
+    recoveryList()
+      .then((entries) => {
+        if (!mountedRef.current) return
+        if (context !== recoveryContextRef.current) return
+        if (requestId !== latestRecoveryRef.current) return
+        if (!Array.isArray(entries)) {
+          setRecovery([])
+          setRecoveryFault('unavailable')
+          return
+        }
+        const listed = entries.filter(isRecoveryEntry)
+        setRecovery(listed)
+        setRecoveryFault(listed.length === entries.length ? null : 'dropped')
+      })
+      .catch((listError: unknown) => {
+        if (!mountedRef.current) return
+        if (context !== recoveryContextRef.current) return
+        if (requestId !== latestRecoveryRef.current) return
+        setRecovery([])
+        // Idle is not a failure (R1-007): `workspace-unavailable` is the
+        // shell's answer while no workspace is active, the same answer
+        // `outbox_status` and `publications_list` give, and each of those
+        // has always met it with its own quiet state rather than the fault
+        // line. Told apart here so the fault line keeps meaning "a read
+        // was made and it failed".
+        setRecoveryFault(
+          isShellError(listError) && listError.code === 'workspace-unavailable'
+            ? 'no-workspace'
+            : 'unavailable',
+        )
+      })
+  }, [])
+
+  useEffect(() => {
+    refreshRecovery()
+  }, [refreshRecovery])
+
+  /**
+   * Closes the recovery approval block and clears its typed gate. The two
+   * always move together -- a gate that outlived its block would pre-fill
+   * the next one, which is what TM-001-R1 forbids -- so they are cleared
+   * from one place, the {@link closeQuarantineBlock} shape.
+   */
+  const closeRecoveryApproval = useCallback(() => {
+    setApprovingRecovery(null)
+    setRecoveryInput('')
+  }, [])
+
   useEffect(() => {
     adaptersList()
       .then((list) => {
@@ -2450,6 +3110,10 @@ export function AgentPanel() {
       // killed/orphan-risk/uncertain), so the run is over: free the single
       // active slot here, not only from the Stop path (R3-002).
       runEndedRef.current = true
+      // Beside the state update, not an effect behind it (R3-071): this
+      // commit re-enables Start, and a click on it must not meet a freeze
+      // the run it named has already left.
+      runActiveRef.current = false
       setActiveId(null)
       const token = formatTerminalToken(frame.body)
       setBadge(token)
@@ -2587,6 +3251,26 @@ export function AgentPanel() {
       setRemedyResult(null)
       closeQuarantineBlock()
       refreshWrongRoot()
+      // The Catalog is the project's and the recovery entries are read
+      // against it, so both blocks reset before either is asked again
+      // (slice 5e): the plan, its typed gate, the last receipt, the open
+      // approval and every entry's publication progress belong to the
+      // project that was active when they were made. Each context
+      // generation bumps with its reset, so a preview, a repair, a listing
+      // or an approval still in flight for the previous project posts
+      // nothing here -- and the Catalog's digest binding is precisely the
+      // fact two projects whose catalogs came from one template share.
+      catalogContextRef.current += 1
+      setCatalogPreview(null)
+      setCatalogFault(false)
+      setCatalogInput('')
+      setCatalogResult(null)
+      recoveryContextRef.current += 1
+      setRecovery([])
+      setRecoveryFault(null)
+      setRecoveryProgress(EMPTY_RECOVERY_PROGRESS)
+      closeRecoveryApproval()
+      refreshRecovery()
     } catch (pickError: unknown) {
       if (!mountedRef.current) return
       if (isShellError(pickError) && pickError.code === 'no-workspace') {
@@ -2658,6 +3342,12 @@ export function AgentPanel() {
     } catch (spawnError: unknown) {
       if (!mountedRef.current) return
       if (generation !== spawnGenerationRef.current) return
+      // No process started, so nothing is in flight any more -- and the
+      // retry the banner invites is a Start click that must not be
+      // refused by this generation's own freeze (R3-071). After the
+      // generation check, never before it: a spawn a later Start already
+      // replaced must clear nothing (R3-034).
+      runActiveRef.current = false
       // No process, so no run to echo a prompt for: withdraw this
       // generation's own echoed prompt -- only that entry, so a frame that
       // already reached the current channel before the rejection is kept
@@ -2681,20 +3371,42 @@ export function AgentPanel() {
     }
   }
 
+  /**
+   * Stops the run `activeId` names, and applies the confirmed terminal
+   * state to **that** run alone.
+   *
+   * The generation is captured before the await and re-read after it, the
+   * check every other async handler on this panel already carries
+   * (R1-001/R3-001). It is not defence in depth here: the renderer gives
+   * the supervisor {@link STOP_DEADLINE_MS} to confirm, and the run's own
+   * terminal `state` frame can land inside that window on its own channel
+   * -- ending the run, clearing the id and re-enabling Start -- so the
+   * user can start the next run before this stop ever answers. Without
+   * the check that answer writes run 1's badge over run 2's, nulls run 2's
+   * id and leaves a live child with no Stop button (R3-106), and clears
+   * the synchronous freeze **while run 2's child is live**, which is the
+   * one thing {@link runActiveRef} must never do (R3-071b).
+   */
   async function handleStop() {
     if (activeId === null) return
     setError(null)
+    const generation = spawnGenerationRef.current
     try {
       const state = await harnessStop(activeId, STOP_DEADLINE_MS)
       if (!mountedRef.current) return
+      if (generation !== spawnGenerationRef.current) return
       setBadge(formatTerminalToken(state))
       runEndedRef.current = true
+      // The confirmed stop is the run's end; the freeze ends with it and
+      // not an effect later (R3-071).
+      runActiveRef.current = false
       setActiveId(null)
     } catch (stopError: unknown) {
       // A failed stop leaves the run exactly as it was -- active id kept,
       // Stop still enabled -- rather than pretending the process ended
       // (R3-006): the supervisor never confirmed a terminal state.
       if (!mountedRef.current) return
+      if (generation !== spawnGenerationRef.current) return
       setError(isShellError(stopError) ? stopError : 'unexpected')
     }
   }
@@ -2711,7 +3423,12 @@ export function AgentPanel() {
    * the button's own `disabled`.
    */
   async function handleListOutbox() {
-    if (runActive || isListingOutbox) return
+    // The ref first, then the render value: `runActive` is one render
+    // behind a run that has just started, so a click batched into the same
+    // tick as Start reaches here with both `disabled` and the closure stale
+    // (slice 5d review, R3-051 -- this handler is one of the ten that
+    // paragraph counted, closed here in slice 5e).
+    if (runActiveRef.current || runActive || isListingOutbox) return
     const generation = spawnGenerationRef.current
     const requestId = (latestCandidatesRequestRef.current += 1)
     setError(null)
@@ -2795,7 +3512,7 @@ export function AgentPanel() {
    * belongs to a context the user has left names no act to retry.
    */
   async function handleGuidancePreview(kind: GuidanceKind) {
-    if (runActive || guidanceBusyRef.current) return
+    if (runActiveRef.current || runActive || guidanceBusyRef.current) return
     const status = managed[kind].status
     if (status === null) return
 
@@ -2843,7 +3560,7 @@ export function AgentPanel() {
    * removes is the block the status line already reports.
    */
   function openGuidanceRemove(kind: GuidanceKind) {
-    if (runActive || guidanceBusyRef.current) return
+    if (runActiveRef.current || runActive || guidanceBusyRef.current) return
     const status = managed[kind].status
     if (status === null || !isGuidanceBlockRemovable(status)) return
     setGuidanceWrite({
@@ -2871,7 +3588,7 @@ export function AgentPanel() {
    * restorable, and it invokes nothing until the gate confirms.
    */
   function openGuidanceRestore(kind: GuidanceKind, snapshot: Snapshot) {
-    if (runActive || guidanceBusyRef.current) return
+    if (runActiveRef.current || runActive || guidanceBusyRef.current) return
     const status = managed[kind].status
     if (status === null || snapshot.kind !== kind || snapshot.file !== status.file) return
     const short = status.fileSha256Short
@@ -2911,7 +3628,7 @@ export function AgentPanel() {
    * the user has moved to would read as a write into *that* project.
    */
   async function handleGuidanceWrite() {
-    if (runActive || guidanceBusyRef.current) return
+    if (runActiveRef.current || runActive || guidanceBusyRef.current) return
     const write = guidanceWrite
     if (write === null) return
     if (!isGuidanceConfirmed(write, guidanceInput)) return
@@ -3139,7 +3856,7 @@ export function AgentPanel() {
    * flight, belt and braces with the buttons' own `disabled`.
    */
   function openApproval(name: string) {
-    if (runActive || isApproving) return
+    if (runActiveRef.current || runActive || isApproving) return
     setApprovingName(name)
     setApprovalInput('')
   }
@@ -3157,7 +3874,7 @@ export function AgentPanel() {
    * has since been replaced.
    */
   async function handleConfirmApproval() {
-    if (runActive || isApproving) return
+    if (runActiveRef.current || runActive || isApproving) return
     if (candidates === null || approvingName === null) return
     const row = candidates.rows.find((candidate) => candidate.name === approvingName)
     if (row === undefined || row.sha256 === null) return
@@ -3203,17 +3920,25 @@ export function AgentPanel() {
    * returns the row to `approved` with Publish enabled again: the shell
    * decides whether the same approval can be retried.
    */
-  async function handlePublish(name: string) {
-    if (runActive) return
-    const progress = rowPublications.get(name)
-    if (progress === undefined || progress.phase !== 'approved') return
-
-    const { approval } = progress
-    const inventory = appliedInventoryRef.current
+  /**
+   * The publication itself, shared by the candidates table and the recovery
+   * listing (slice 5b, HAP-001-R35; slice 5e): `artifact_publish` with the
+   * approval id and a channel, every `artifact-state` frame rendered as a
+   * transcript line under the run generation the click happened in, and the
+   * resolved publication merged into the Publications table -- the
+   * project's own truth, unless a `publications_list` refresh started
+   * since, whose own response then defines the table.
+   *
+   * Resolves with the publication, or `null` when the transaction failed
+   * and the banner now carries its code. There is **one** publish flow: a
+   * recovery approval is an `ArtifactApproval` like any other, and
+   * HAP-001-R18's "a fresh explicit approval" is about the approval, not
+   * about a second way to publish one.
+   */
+  async function runPublish(approval: ArtifactApproval): Promise<Publication | null> {
     const generation = spawnGenerationRef.current
     const publicationsRequestId = latestPublicationsRequestRef.current
     setError(null)
-    setRowPublications((previous) => new Map(previous).set(name, { phase: 'publishing', approval }))
     try {
       const publication = await artifactPublish(approval.approvalId, (frame) => {
         if (!mountedRef.current) return
@@ -3227,7 +3952,7 @@ export function AgentPanel() {
           }),
         )
       })
-      if (!mountedRef.current) return
+      if (!mountedRef.current) return null
       if (publicationsRequestId === latestPublicationsRequestRef.current) {
         setPublications((previous) => [
           ...(previous ?? []).filter(
@@ -3236,22 +3961,259 @@ export function AgentPanel() {
           publication,
         ])
       }
-      if (inventory !== appliedInventoryRef.current) return
-      setRowPublications((previous) =>
-        new Map(previous).set(name, { phase: 'published', publication }),
-      )
+      return publication
     } catch (publishError: unknown) {
+      if (!mountedRef.current) return null
+      if (generation !== spawnGenerationRef.current) return null
+      setError(isShellError(publishError) ? publishError : 'unexpected')
+      return null
+    }
+  }
+
+  async function handlePublish(name: string) {
+    if (runActiveRef.current || runActive) return
+    const progress = rowPublications.get(name)
+    if (progress === undefined || progress.phase !== 'approved') return
+
+    const { approval } = progress
+    const inventory = appliedInventoryRef.current
+    setRowPublications((previous) => new Map(previous).set(name, { phase: 'publishing', approval }))
+    const publication = await runPublish(approval)
+    if (!mountedRef.current) return
+    if (inventory !== appliedInventoryRef.current) return
+    if (publication === null) {
+      // A failure returns the row to `approved` with Publish enabled
+      // again: the shell decides whether the same approval can be retried.
+      setRowPublications((previous) => {
+        const current = previous.get(name)
+        return current?.phase === 'publishing'
+          ? new Map(previous).set(name, { phase: 'approved', approval: current.approval })
+          : previous
+      })
+      return
+    }
+    setRowPublications((previous) =>
+      new Map(previous).set(name, { phase: 'published', publication }),
+    )
+  }
+
+  /**
+   * The Catalog repair proposal (slice 5e; HAP-001-R23, R39, R40): asks the
+   * shell what a repair would drop and what refuses it, and opens the
+   * confirmation block on the answer when -- and only when -- the plan says
+   * it is repairable. Read-only: nothing is copied or rewritten, so it
+   * stays live while a run is active, exactly as Scan does and exactly as
+   * the shell's own `catalog_repair_preview` does (D4). One at a time, by a
+   * ref set synchronously as well as by the button's own `disabled`.
+   *
+   * A payload that is not the plan its DTO promises becomes no plan at all
+   * rather than throwing mid-render -- the fail-safe-to-nothing discipline
+   * `handleFrame`, `fetchGuidanceSnapshots`, `handleListOutbox` and
+   * `refreshMisplaced` already apply -- and the fault is stated, because an
+   * empty drops list is what a healthy catalog looks like.
+   */
+  async function handleCatalogPreview() {
+    if (catalogPreviewBusyRef.current) return
+    const context = catalogContextRef.current
+    catalogPreviewBusyRef.current = true
+    setCatalogPreviewBusy(true)
+    setError(null)
+    // A new proposal replaces the old one, gate and receipt included: the
+    // block that may be open is bound to the previous plan's digest.
+    setCatalogPreview(null)
+    setCatalogInput('')
+    setCatalogResult(null)
+    try {
+      const preview = await catalogRepairPreview()
       if (!mountedRef.current) return
-      if (inventory === appliedInventoryRef.current) {
-        setRowPublications((previous) => {
-          const current = previous.get(name)
+      if (context !== catalogContextRef.current) return
+      if (!isCatalogRepairPreview(preview)) {
+        setCatalogPreview(null)
+        setCatalogFault(true)
+        return
+      }
+      setCatalogPreview(preview)
+      setCatalogFault(false)
+    } catch (previewError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== catalogContextRef.current) return
+      setCatalogPreview(null)
+      setCatalogFault(true)
+      setError(isShellError(previewError) ? previewError : 'unexpected')
+    } finally {
+      catalogPreviewBusyRef.current = false
+      if (mountedRef.current) setCatalogPreviewBusy(false)
+    }
+  }
+
+  /**
+   * The repair itself (slice 5e, D2; TM-001-R1/R7): only the user's click on
+   * the final button reaches here, and only once the typed short digest
+   * confirms the plan -- re-checked here rather than trusted to the button's
+   * `disabled`. The request carries the **preview's own full digest**, never
+   * the typed value; the shell compares it with the catalog as it stands and
+   * refuses with `catalog-changed` if it moved.
+   *
+   * Frozen while a run is active, the ref read first because both `disabled`
+   * and the closure are one render behind a run that has just started.
+   *
+   * A refusal keeps the block open with the typed gate intact, so the user
+   * can read the banner and retry -- except `catalog-changed`, where the
+   * plan the block was bound to is stale by definition: the block closes and
+   * the plan is dropped, so the next act has to be a fresh preview. That is
+   * the `guidance-file-changed` precedent.
+   */
+  async function handleCatalogRepair() {
+    if (runActiveRef.current || runActive || catalogRepairBusyRef.current) return
+    const preview = catalogPreview
+    if (preview === null || !preview.repairable) return
+    if (!isCatalogRepairConfirmed(preview, catalogInput)) return
+
+    const context = catalogContextRef.current
+    catalogRepairBusyRef.current = true
+    setCatalogRepairBusy(true)
+    setError(null)
+    try {
+      const repaired = await catalogRepair(preview.sha256)
+      if (!mountedRef.current) return
+      if (context !== catalogContextRef.current) return
+      setCatalogPreview(null)
+      setCatalogFault(false)
+      setCatalogInput('')
+      setCatalogResult(formatCatalogRepairedLine(repaired))
+      // The Catalog is where `publications_list` reads the project's
+      // records, and a repair has just rewritten it: the table follows the
+      // file rather than standing on a listing taken before the drop.
+      refreshPublications()
+    } catch (repairError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== catalogContextRef.current) return
+      setError(isShellError(repairError) ? repairError : 'unexpected')
+      if (isShellError(repairError) && repairError.code === 'catalog-changed') {
+        setCatalogPreview(null)
+        setCatalogFault(false)
+        setCatalogInput('')
+      }
+    } finally {
+      catalogRepairBusyRef.current = false
+      if (mountedRef.current) setCatalogRepairBusy(false)
+    }
+  }
+
+  /**
+   * Opens the recovery approval block for the entry `digest` names
+   * (HAP-001-R18, R22): the block shows that entry's identity-bound facts,
+   * the publication it was recovered from, what re-publishing does, and an
+   * empty input -- nothing pre-fills it. Invokes nothing. Frozen while a run
+   * is active or a recovery write is in flight, belt and braces with the
+   * buttons' own `disabled`.
+   *
+   * An entry the listing reports as unusable never reaches here, and nor
+   * does one whose class the shell would refuse: the probe already said
+   * the bytes are not what the entry is filed under, or the policy already
+   * said the name is not a `generated-heavy` artifact, and the shell would
+   * answer `refused` either way (R1-004).
+   */
+  function openRecoveryApproval(entry: RecoveryEntry) {
+    if (runActiveRef.current || runActive || recoveryBusyRef.current) return
+    if (!isRecoveryApprovable(entry)) return
+    setApprovingRecovery(entry.sha256)
+    setRecoveryInput('')
+  }
+
+  /**
+   * The recovery approval itself (HAP-001-R18, R22, D3; TM-001-R1/R7): only
+   * the user's click on the final button reaches here, and only once the
+   * typed short digest confirms the entry -- re-checked here rather than
+   * trusted to the button's `disabled`. The request carries the entry's own
+   * full digest, the name the journal attests to, and never the typed
+   * value.
+   *
+   * It used to carry that digest twice, as `digest` and as `sha256`, on
+   * the reading that the second was "the binding this surface showed". A
+   * recovery entry has one digest and it is the name, so the two could
+   * never differ from here and the shell's second comparison was the first
+   * one repeated (R1-006 / R3-069).
+   */
+  async function handleConfirmRecoveryApproval() {
+    if (runActiveRef.current || runActive || recoveryBusyRef.current) return
+    const entry = approvingRecoveryEntry
+    if (entry === null) return
+    if (!isRecoveryApprovalConfirmed(entry, recoveryInput)) return
+    // No approval toward a destination the surface could not show
+    // (HAP-001-R22): the shell would refuse it as `destination-invalid`.
+    if (destinationAssetRootId === null) return
+
+    const context = recoveryContextRef.current
+    const digest = entry.sha256
+    recoveryBusyRef.current = true
+    setRecoveryBusy(true)
+    setError(null)
+    try {
+      const approval = await recoveryApprove(digest)
+      if (!mountedRef.current) return
+      if (context !== recoveryContextRef.current) return
+      setRecoveryProgress((previous) =>
+        new Map(previous).set(digest, { phase: 'approved', approval }),
+      )
+      closeRecoveryApproval()
+    } catch (approveError: unknown) {
+      if (!mountedRef.current) return
+      if (context !== recoveryContextRef.current) return
+      setError(isShellError(approveError) ? approveError : 'unexpected')
+      // A stale surface is stale by definition: the block's facts name an
+      // entry this device's journal no longer accounts for, so it closes
+      // and the listing is read afresh -- the `guidance-file-changed` and
+      // `misplaced-unknown` precedent.
+      if (isShellError(approveError) && approveError.code === 'recovery-unknown') {
+        closeRecoveryApproval()
+        refreshRecovery()
+      }
+    } finally {
+      recoveryBusyRef.current = false
+      if (mountedRef.current) setRecoveryBusy(false)
+    }
+  }
+
+  /**
+   * Publishes an approved recovery entry through the **existing** publish
+   * path (HAP-001-R18): {@link runPublish}, the same body the candidates
+   * table's Publish uses, with the approval `recovery_approve` returned.
+   * Nothing about the transaction is special-cased here; the entry is kept
+   * either way, which is the shell's own `recovery-entry-retained`
+   * deferral and not something this surface decides.
+   */
+  async function handleRecoveryPublish(digest: string) {
+    if (runActiveRef.current || runActive || recoveryBusyRef.current) return
+    const progress = recoveryProgress.get(digest)
+    if (progress === undefined || progress.phase !== 'approved') return
+
+    const { approval } = progress
+    const context = recoveryContextRef.current
+    recoveryBusyRef.current = true
+    setRecoveryBusy(true)
+    setRecoveryProgress((previous) =>
+      new Map(previous).set(digest, { phase: 'publishing', approval }),
+    )
+    try {
+      const publication = await runPublish(approval)
+      if (!mountedRef.current) return
+      if (context !== recoveryContextRef.current) return
+      if (publication === null) {
+        setRecoveryProgress((previous) => {
+          const current = previous.get(digest)
           return current?.phase === 'publishing'
-            ? new Map(previous).set(name, { phase: 'approved', approval: current.approval })
+            ? new Map(previous).set(digest, { phase: 'approved', approval: current.approval })
             : previous
         })
+        return
       }
-      if (generation !== spawnGenerationRef.current) return
-      setError(isShellError(publishError) ? publishError : 'unexpected')
+      setRecoveryProgress((previous) =>
+        new Map(previous).set(digest, { phase: 'published', publication }),
+      )
+    } finally {
+      recoveryBusyRef.current = false
+      if (mountedRef.current) setRecoveryBusy(false)
     }
   }
 
@@ -3293,6 +4255,33 @@ export function AgentPanel() {
   /** Whether the typed gate confirms the open guidance write block. */
   const guidanceConfirmed =
     guidanceWrite !== null && isGuidanceConfirmed(guidanceWrite, guidanceInput)
+
+  /** Whether the typed gate confirms the open Catalog repair, and the plan still says one is offered. */
+  const catalogRepairConfirmed =
+    catalogPreview !== null &&
+    catalogPreview.repairable &&
+    isCatalogRepairConfirmed(catalogPreview, catalogInput)
+
+  /**
+   * The recovery entry whose approval block is open, if the listing still
+   * reports it. The block is bound to the entry's **digest**, which is its
+   * whole identity here -- unlike a misplaced finding, a recovery entry has
+   * no name beside it that could name other bytes -- so a refetch that no
+   * longer carries that digest closes the block rather than leaving a
+   * decision open over facts nothing reports any more.
+   */
+  const approvingRecoveryEntry =
+    approvingRecovery === null
+      ? null
+      : (recovery.find((entry) => entry.sha256 === approvingRecovery) ?? null)
+  const recoveryApprovalConfirmed =
+    approvingRecoveryEntry !== null &&
+    // The same pair the row's own button is offered on, re-read from the
+    // refetched entry: a listing that arrived while the block was open can
+    // report the entry unusable, or reclassify it, and the gate must
+    // follow the entry rather than the click that opened it (R1-004).
+    isRecoveryApprovable(approvingRecoveryEntry) &&
+    isRecoveryApprovalConfirmed(approvingRecoveryEntry, recoveryInput)
 
   /**
    * One managed kind's block (slice 5c): its own header -- the editable
@@ -3352,7 +4341,7 @@ export function AgentPanel() {
                     <PlainTextLine text={snapshot.id} />
                   </td>
                   <td>
-                    <PlainTextLine text={formatSnapshotInstant(snapshot.takenAt)} />
+                    <PlainTextLine text={formatInstant(snapshot.takenAt)} />
                   </td>
                   <td>
                     <PlainTextLine text={snapshot.sha256Short} />
@@ -3507,6 +4496,63 @@ export function AgentPanel() {
     ))
   }
 
+  /**
+   * One recovery entry's action cell (slice 5e): Approve for a usable entry
+   * with no progress yet; once approved, the approval's facts and Publish;
+   * once published, the transaction's own state token and the
+   * publication's short id. An **unusable** entry gets no button at all --
+   * the probe already said its bytes are not what it is filed under, so the
+   * shell would refuse the approval and offering it would be a button whose
+   * only outcome is a banner. The entry is still listed, with the reason
+   * beside it (HAP-001-R18).
+   *
+   * Every button is frozen while a run is active or a recovery write is in
+   * flight, mirroring the shell's own `run-active` refusal so direct IPC
+   * and this surface answer alike.
+   */
+  function renderRecoveryAction(entry: RecoveryEntry): ReactNode {
+    const progress = recoveryProgress.get(entry.sha256)
+    if (progress === undefined) {
+      // Both refusing facts, not just `usable` (R1-004): the class is the
+      // one the row can carry while every other column reads clean.
+      if (!isRecoveryApprovable(entry)) return null
+      return (
+        <button
+          type="button"
+          onClick={() => openRecoveryApproval(entry)}
+          disabled={runActive || recoveryBusy}
+        >
+          Approve
+        </button>
+      )
+    }
+    if (progress.phase === 'published') {
+      return (
+        <PlainTextLine
+          text={`${formatArtifactState(progress.publication.state)} ${shortDigest(progress.publication.publicationId)}`}
+        />
+      )
+    }
+    return (
+      <>
+        <PlainTextLine text={formatApprovedCell(progress.approval)} />
+        {!progress.approval.handleHeld && (
+          <>
+            {' '}
+            <mark>{HANDLE_NOT_HELD_MARK}</mark>
+          </>
+        )}{' '}
+        <button
+          type="button"
+          onClick={() => handleRecoveryPublish(entry.sha256)}
+          disabled={runActive || recoveryBusy || progress.phase === 'publishing'}
+        >
+          Publish
+        </button>
+      </>
+    )
+  }
+
   const activeApprovals = approvals.filter((approval) => approval.status === 'active')
   const selectedAdapter = adapters.find((adapter) => adapter.id === adapterId) ?? null
   const promptTooLarge = promptByteLength(prompt) > PROMPT_MAX_BYTES
@@ -3625,8 +4671,10 @@ export function AgentPanel() {
           disabled={runActive}
           onChange={(event) => {
             // A `change` dispatched at a disabled select still reaches
-            // React; the guard keeps the selection frozen regardless.
-            if (runActive) return
+            // React; the guard keeps the selection frozen regardless -- and
+            // the ref is read first, because `runActive` and `disabled` are
+            // both one render behind a run that has just started.
+            if (runActiveRef.current || runActive) return
             setAdapterId(event.target.value === '' ? null : event.target.value)
           }}
         >
@@ -3652,7 +4700,7 @@ export function AgentPanel() {
           value={approvalId === null ? '' : String(approvalId)}
           disabled={runActive}
           onChange={(event) => {
-            if (runActive) return
+            if (runActiveRef.current || runActive) return
             setApprovalId(event.target.value === '' ? null : Number(event.target.value))
           }}
         >
@@ -4141,6 +5189,305 @@ export function AgentPanel() {
           <p role="status" aria-label="Remedy result">
             <PlainTextLine text={remedyResult} />
           </p>
+        )}
+      </section>
+
+      {/*
+        The Catalog repair (slice 5e; HAP-001-R23, R39, R40, D18): a sibling
+        of the transcript, the Candidates region, the Guidance region, the
+        Wrong roots region and the Publications region, never inside any of
+        them (RCS-001-R6). The system proposes -- a preview naming the lines
+        by number -- and the user disposes, through a typed short-digest
+        gate over the catalog's own digest. **No line's content is ever
+        rendered**: the Catalog is synchronized, portable, untrusted text
+        (HAP-001-R40), and a line number identifies exactly one line without
+        putting any of it on the screen.
+      */}
+      <section aria-label="Catalog">
+        {catalogPreview !== null ? (
+          <p role="status" aria-label="Catalog plan">
+            <PlainTextLine text={formatCatalogPreviewLine(catalogPreview)} />
+          </p>
+        ) : catalogFault ? (
+          // Why there is no plan, when there is no plan for a reason other
+          // than "none was asked for". It **replaces** the not-previewed
+          // line rather than standing beside it: a preview that was asked
+          // for and did not answer is not a catalog "nothing here has read
+          // yet", and saying both would make one of the two false. Its own
+          // accessible name, so "the plan says X", "no plan was asked for"
+          // and "the plan could not be read" are three facts downstream can
+          // never confuse -- the `Output discipline unavailable` shape.
+          <p role="status" aria-label="Catalog preview unavailable">
+            {CATALOG_PREVIEW_UNAVAILABLE_SENTENCE}
+          </p>
+        ) : (
+          <p role="status" aria-label="Catalog plan">{CATALOG_NOT_PREVIEWED_LINE}</p>
+        )}
+        {/*
+          The preview reads the whole Catalog and holds no handle, so it
+          stays live while a run is active -- the shell's own
+          `catalog_repair_preview` refuses no run, and seeing what is wrong
+          is not a write (slice 5e, D4). It does take the publication
+          surface lock for the length of the read, so it is serialized
+          against a publication in progress rather than free of the shell's
+          locking altogether (R1-009).
+        */}
+        <button type="button" onClick={handleCatalogPreview} disabled={catalogPreviewBusy}>
+          Preview repair
+        </button>
+
+        {catalogPreview !== null && catalogPreview.drops.length > 0 && (
+          <ul aria-label="Catalog repair drops">
+            {catalogPreview.drops.map((drop, index) => (
+              // An index key is sound here: the list is replaced whole by
+              // each preview and is never reordered or edited in place.
+              <li key={index}>
+                <PlainTextLine text={formatRepairDrop(drop)} />
+              </li>
+            ))}
+          </ul>
+        )}
+        {catalogPreview !== null && catalogPreview.refusals.length > 0 && (
+          <ul aria-label="Catalog repair refusals">
+            {catalogPreview.refusals.map((refusal, index) => (
+              <li key={index}>
+                <PlainTextLine text={formatRepairRefusal(refusal)} />
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {catalogPreview !== null && catalogPreview.repairable && (
+          // The repair confirmation (TM-001-R1/R7): the plan's identity
+          // facts verbatim, the sentence saying what the rewrite removes
+          // and that this product offers no way back to the copy it keeps,
+          // the act-as identity as fixed copy, and a digest-typed
+          // confirmation the user fills. A plan whose `repairable` is false
+          // renders none of this -- there is no Repair button at all.
+          <section aria-label="Catalog repair confirmation">
+            <p>
+              sha256: <PlainTextLine text={catalogPreview.sha256} />
+            </p>
+            <p>
+              sha256 short: <PlainTextLine text={shortDigest(catalogPreview.sha256)} />
+            </p>
+            <p>
+              lines to drop: <PlainTextLine text={String(catalogPreview.drops.length)} />
+            </p>
+            <p>
+              records kept: <PlainTextLine text={String(catalogPreview.keptRecords)} />
+            </p>
+            <p>{CATALOG_REPAIR_SCOPE_LINE}</p>
+            <p>{APPROVAL_ACT_AS_LINE}</p>
+            <label htmlFor="agent-catalog-gate">
+              Type the short digest (
+              <PlainTextLine text={shortDigest(catalogPreview.sha256)} />) to repair
+            </label>
+            <input
+              id="agent-catalog-gate"
+              value={catalogInput}
+              disabled={runActive || catalogRepairBusy}
+              onChange={(event) => setCatalogInput(event.target.value)}
+            />
+            <button
+              type="button"
+              onClick={handleCatalogRepair}
+              disabled={!catalogRepairConfirmed || runActive || catalogRepairBusy}
+            >
+              Repair catalog
+            </button>
+          </section>
+        )}
+
+        {catalogResult !== null && (
+          <p role="status" aria-label="Catalog repair result">
+            <PlainTextLine text={catalogResult} />
+          </p>
+        )}
+      </section>
+
+      {/*
+        Recovery entries (slice 5e; HAP-001-R18, R22, D3): the bytes a
+        publication held when its outbox path stopped naming them. Another
+        sibling region, never nested. Every entry this device's journal
+        accounts for is listed -- an unusable one included, with the reason
+        said and no Approve button -- and re-publishing one goes through the
+        5b approval shape and then the existing Publish path, unchanged.
+      */}
+      <section aria-label="Recovery">
+        <p>{RECOVERY_ADVISORY_LINE}</p>
+        <p>{RECOVERY_DEVICE_WIDE_LINE}</p>
+        {recoveryFault === 'unavailable' ? (
+          // A listing that did not answer **replaces** the count rather
+          // than standing beside it: `recovery entries: 0` is a claim about
+          // this device, and it is the one claim a failed read must not
+          // make. Three faults, three accessible names, the R3-047 shape.
+          <p role="status" aria-label="Recovery entries unavailable">
+            {RECOVERY_UNAVAILABLE_SENTENCE}
+          </p>
+        ) : recoveryFault === 'no-workspace' ? (
+          // Idle replaces the count for the same reason and says a
+          // different thing: nothing was read, because nothing was asked
+          // (R1-007).
+          <p role="status" aria-label="Recovery entries not read">
+            {RECOVERY_NO_WORKSPACE_SENTENCE}
+          </p>
+        ) : (
+          <p role="status" aria-label="Recovery count">
+            <PlainTextLine text={formatRecoveryCountLine(recovery)} />
+          </p>
+        )}
+        {recoveryFault === 'dropped' && (
+          // The count beside it is real and the table below is short of the
+          // listing, which is a different fact from "there is no table".
+          <p role="status" aria-label="Recovery entries incomplete">
+            {RECOVERY_ROWS_DROPPED_SENTENCE}
+          </p>
+        )}
+
+        {recovery.length > 0 && (
+          <table aria-label="Recovery entries">
+            <thead>
+              <tr>
+                <th>sha256 short</th>
+                <th>name</th>
+                <th>size</th>
+                <th>recovered at</th>
+                <th>recovered from</th>
+                <th>class</th>
+                <th>usable</th>
+                <th>action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recovery.map((entry, index) => (
+                // An index key is sound here: the list is replaced whole by
+                // each fetch and is never reordered or edited in place.
+                <tr key={index}>
+                  <td>
+                    <PlainTextLine text={shortDigest(entry.sha256)} />
+                  </td>
+                  <td>
+                    {/* The name the re-publication would register and write
+                        this under, in full: it is what the class below is
+                        read from, and a short form would hide the extension
+                        that decides it (R1-004). */}
+                    <PlainTextLine text={entry.displayName} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={entry.size === null ? NULL_FACT : String(entry.size)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={formatInstant(entry.recoveredAt)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={shortDigest(entry.recoveredFrom)} />
+                  </td>
+                  <td>
+                    <PlainTextLine text={entry.class ?? NULL_FACT} />
+                    {/* Marked only for an entry the probe *did* confirm: an
+                        unusable one already carries its own mark, and two
+                        marks saying "no button" would not say more than
+                        one. */}
+                    {entry.usable && !isRecoveryApprovable(entry) && (
+                      <>
+                        {' '}
+                        <mark>{RECOVERY_UNAPPROVABLE_CLASS_MARK}</mark>
+                      </>
+                    )}
+                  </td>
+                  <td>
+                    <PlainTextLine text={formatYesNo(entry.usable)} />
+                    {!entry.usable && (
+                      <>
+                        {' '}
+                        <mark>{RECOVERY_UNUSABLE_MARK}</mark>
+                      </>
+                    )}
+                  </td>
+                  <td>{renderRecoveryAction(entry)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {approvingRecoveryEntry && (
+          // The recovery approval surface (HAP-001-R18, R22; TM-001-R1/R7):
+          // the entry's identity-bound facts verbatim, each through
+          // PlainTextLine, **the publication it was recovered from in full**
+          // -- so the user knows what they are re-publishing -- the
+          // unattributed fact with nothing standing in for a producer, the
+          // destination, what re-publishing actually registers, the act-as
+          // identity as fixed copy, and a digest-typed confirmation the user
+          // fills. Beside the table, outside the transcript (RCS-001-R6).
+          <section aria-label="Recovery approval">
+            <p>
+              sha256: <PlainTextLine text={approvingRecoveryEntry.sha256} />
+            </p>
+            <p>
+              sha256 short: <PlainTextLine text={shortDigest(approvingRecoveryEntry.sha256)} />
+            </p>
+            <p>
+              {/* What this will be registered and written as -- the fact the
+                  block asked permission for without showing (R1-004). */}
+              name: <PlainTextLine text={approvingRecoveryEntry.displayName} />
+            </p>
+            <p>
+              size:{' '}
+              <PlainTextLine
+                text={
+                  approvingRecoveryEntry.size === null
+                    ? NULL_FACT
+                    : String(approvingRecoveryEntry.size)
+                }
+              />
+            </p>
+            <p>
+              recovered at: <PlainTextLine text={formatInstant(approvingRecoveryEntry.recoveredAt)} />
+            </p>
+            <p>
+              recovered from: <PlainTextLine text={approvingRecoveryEntry.recoveredFrom} />
+            </p>
+            <p>
+              {/* The class this project's policy gives that name and these
+                  bytes: the fact that decides whether the approval is
+                  allowed at all (R1-004). */}
+              class: <PlainTextLine text={approvingRecoveryEntry.class ?? NULL_FACT} />
+            </p>
+            <p>
+              usable: <PlainTextLine text={formatYesNo(approvingRecoveryEntry.usable)} />
+            </p>
+            <p>{RECOVERY_ATTRIBUTION_LINE}</p>
+            <p>
+              destination: <PlainTextLine text={formatDestinationFact(outbox)} />
+            </p>
+            <p>{RECOVERY_APPROVAL_SCOPE_LINE}</p>
+            <p>{RECOVERY_DEVICE_SCOPE_LINE}</p>
+            <p>{APPROVAL_ACT_AS_LINE}</p>
+            <label htmlFor="agent-recovery-gate">
+              Type the short digest (
+              <PlainTextLine text={shortDigest(approvingRecoveryEntry.sha256)} />) to approve
+            </label>
+            <input
+              id="agent-recovery-gate"
+              value={recoveryInput}
+              disabled={runActive || recoveryBusy}
+              onChange={(event) => setRecoveryInput(event.target.value)}
+            />
+            <button
+              type="button"
+              onClick={handleConfirmRecoveryApproval}
+              disabled={
+                !recoveryApprovalConfirmed ||
+                destinationAssetRootId === null ||
+                runActive ||
+                recoveryBusy
+              }
+            >
+              Approve recovery entry
+            </button>
+          </section>
         )}
       </section>
 

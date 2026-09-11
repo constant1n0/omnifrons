@@ -4,6 +4,24 @@ import { defineConfig } from 'vite'
 
 // https://vite.dev/config/
 export default defineConfig({
+  server: {
+    fs: {
+      // `src/ipc/harness.test.ts` reads the shell's own `src-tauri/src/ipc/
+      // dto.rs` through Vite's `?raw`, and that file sits outside this
+      // package. Vite serves a file outside the project root only when
+      // `server.fs.allow` lists it, and it is listed today only because
+      // Vite *infers* the pnpm workspace root from the manifests above
+      // this directory. That inference is not a contract: with the root
+      // manifest absent the import is denied -- `Denied ID
+      // …/src-tauri/src/ipc/dto.rs?raw` -- and the whole file loads with
+      // **no tests at all**, taking the cross-language DTO guard and
+      // every other test in that file offline in one line (R3-105,
+      // measured).
+      // Explicit rather than inferred, the same reasoning as `allowOnly`
+      // below.
+      allow: ['..'],
+    },
+  },
   plugins: [react()],
   test: {
     environment: 'jsdom',

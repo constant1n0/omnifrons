@@ -396,6 +396,37 @@ export type ShellErrorCode =
    * nothing was misplaced.
    */
   | 'scan-failed'
+  /**
+   * The project's Catalog is corrupt: it has lines this version cannot
+   * read, and {@link catalogRepairPreview} says which. Distinct from
+   * `catalog-unavailable`, which is a catalog that could not be read or
+   * written at all and has no repair to offer (spike slice 5e).
+   *
+   * This is a **wire change to a slice-5b code**: `CatalogStoreError::Corrupt`
+   * rendered `catalog-unavailable` until this slice, so `publications_list`
+   * and `artifact_publish` answer a corrupt catalog with this code now.
+   */
+  | 'catalog-corrupt'
+  /**
+   * {@link catalogRepair}'s `sha256` is not the catalog's own digest any
+   * more: the preview is stale and nothing was rewritten (spike slice 5e).
+   */
+  | 'catalog-changed'
+  /**
+   * The catalog carries a line this repair may not drop -- a `record` whose
+   * `catalogId` disagrees with its identity, which is the only line
+   * registering that artifact (HAP-001-R39), or a line this version cannot
+   * decode (HAP-001-R40) -- or there is nothing to drop at all, or the
+   * rules would not yield a readable catalog. Nothing was rewritten (spike
+   * slice 5e).
+   */
+  | 'repair-refused'
+  /**
+   * {@link recoveryApprove} named a digest no recovery entry of this
+   * device's journal carries, or whose entry could not be opened at all
+   * (HAP-001-R18; spike slice 5e).
+   */
+  | 'recovery-unknown'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {
@@ -860,6 +891,21 @@ export interface ArtifactApproval {
   actAs: ActAs
   approvedAt: number
   /**
+   * The publication whose `outbox-escape` preserved these bytes
+   * (HAP-001-R18), for an approval {@link recoveryApprove} made; `null` for
+   * every outbox approval (spike slice 5e).
+   *
+   * A **location fact**, never provenance: the record this approval
+   * registers carries `producer: unattributed`, because nothing about a
+   * recovery entry attributes it to a run (HAP-001-R11, R36). It is also
+   * not the identity being registered -- HAP-001-R23 derives that from the
+   * bytes the shell read, which differ from the escaped publication's
+   * whenever the file behind the held handle was rewritten in place before
+   * the escape was detected. A surface shows it so the user knows what they
+   * are re-publishing, and states nothing further about it.
+   */
+  recoveredFrom: PublicationId | null
+  /**
    * Whether the entry's handle is held for the publication that follows
    * (HAP-001-R17): `false` when HAP-001 D22's cap left no room for it, in
    * which case the publication re-opens the entry under the single-handle
@@ -961,8 +1007,12 @@ export async function artifactApprove(
  * matching code: `integrity-mismatch`, `duplicate-publication` (its
  * `detail` the existing record's two ids), `outbox-escape`,
  * `outbox-linked`, `refused`, `destination-invalid`, `work-area-invalid`,
- * `catalog-unavailable`, `invalid-request` (a malformed or unrecorded
- * approval id), `run-active` (a supervised process is still running), or
+ * `catalog-corrupt` (the Catalog has lines this version cannot read;
+ * {@link catalogRepairPreview} says which -- since spike slice 5e, where a
+ * corrupt catalog stopped rendering `catalog-unavailable`),
+ * `catalog-unavailable` (a Catalog that could not be read or written at
+ * all), `invalid-request` (a malformed or unrecorded approval id),
+ * `run-active` (a supervised process is still running), or
  * `workspace-unavailable`.
  */
 export async function artifactPublish(
@@ -983,8 +1033,11 @@ export async function artifactPublish(
  * `[]`.
  *
  * # Errors
- * Rejects with `catalog-unavailable`, `work-area-invalid`, or
- * `workspace-unavailable` if no workspace is active.
+ * Rejects with `catalog-corrupt` (the Catalog has lines this version cannot
+ * read; spike slice 5e re-mapped this case off `catalog-unavailable`),
+ * `catalog-unavailable` (it could not be read or written at all),
+ * `work-area-invalid`, or `workspace-unavailable` if no workspace is
+ * active.
  */
 export async function publicationsList(): Promise<Publication[]> {
   return invoke('publications_list')
@@ -1514,4 +1567,277 @@ export async function misplacedRemedy(
   remedy: Remedy,
 ): Promise<MisplacedRemedy> {
   return invoke('misplaced_remedy', { name, sha256, remedy })
+}
+
+// -- Slice 5e: catalog repair and recovery re-approval --
+
+/**
+ * Which repair rule would drop a Catalog line (`docs/spike-log.md` § Slice
+ * 5e, D1), mirroring `dto.rs`'s `RepairRuleTag`: the two rules that delete
+ * no registration, and nothing else.
+ *
+ * `duplicate-record` is the **later** of two `record` lines carrying one
+ * publication identity -- the surviving line still registers it --
+ * and `dangling-alias` is an `alias` no **earlier** `record` line carries,
+ * which is a display name attached to nothing at the point the Catalog's
+ * own reader meets it. The third rule, a `record` whose `catalogId`
+ * disagrees with its identity, is **refused** and never applied
+ * (HAP-001-R39): it is the only line registering that artifact, so it
+ * arrives as a {@link RepairRefusal} instead.
+ */
+export type RepairRule = 'duplicate-record' | 'dangling-alias'
+
+/**
+ * Why a Catalog line refuses the whole repair (`docs/spike-log.md` § Slice
+ * 5e), mirroring `dto.rs`'s `RepairRefusalTag`: **three** tokens, never
+ * dropped, because the Catalog is synchronized, portable, untrusted
+ * content (HAP-001-R40).
+ *
+ * - `catalog-id-mismatch`: a `record` whose `catalogId` is not
+ *   `<assetRootId>/<publicationId>` (HAP-001-R39).
+ * - `duplicate-across-asset-roots`: a `record` carrying a `publicationId`
+ *   an earlier `record` already carries, under a **different**
+ *   `assetRootId`. Two `catalogId`s, so two registered artifacts:
+ *   dropping the later one deletes the second asset root's registration,
+ *   which is the one thing a repair may never do. It is the token
+ *   `duplicate-record` is *not*, and telling them apart is the whole
+ *   point -- the rule drops the later of two lines that register **one**
+ *   artifact; this refusal is the case where they register two.
+ * - `unparsable`: a line this version cannot decode.
+ *
+ * This set is closed by `dto.rs` and not by this file. It drifted once
+ * already -- the Rust added `duplicate-across-asset-roots`, this union did
+ * not, and the surface's exhaustive switch fell through and rendered the
+ * wire token raw (R1-001 / R1-002 / R1-011). `harness.test.ts` now reads
+ * the enum out of `dto.rs` and fails on any difference, in either
+ * direction, rather than switching this union over its own members.
+ */
+export type RefusalReason =
+  | 'catalog-id-mismatch'
+  | 'duplicate-across-asset-roots'
+  | 'unparsable'
+
+/**
+ * One line {@link catalogRepair} would drop, named by its **one-based
+ * number** and never by its content (HAP-001-R40, RCS-001-R14). Mirrors
+ * `CatalogRepairDropDto` field-for-field.
+ *
+ * `publicationId` is the identity the line names when this version can
+ * parse it as 64 hex characters, and `null` for a dangling alias whose
+ * identity is not -- which is exactly why no record carries it.
+ */
+export interface RepairDrop {
+  line: number
+  rule: RepairRule
+  publicationId: PublicationId | null
+}
+
+/** One line that refuses the repair, named the same way. Mirrors `CatalogRepairRefusalDto`. */
+export interface RepairRefusal {
+  line: number
+  reason: RefusalReason
+}
+
+/**
+ * `catalog_repair_preview`'s answer (`docs/spike-log.md` § Slice 5e): what
+ * a repair would drop, what refuses it, and the digest the apply has to be
+ * given back. Mirrors `CatalogRepairPreviewDto` field-for-field. Never a
+ * device path, and never a line's content.
+ *
+ * `repairable` is `true` only when `refusals` is empty and `drops` is not:
+ * the shell's own `RepairPlan::is_repairable`, carried as a fact rather
+ * than recomputed by a consumer.
+ */
+export interface CatalogRepairPreview {
+  sha256: string
+  repairable: boolean
+  drops: RepairDrop[]
+  refusals: RepairRefusal[]
+  keptRecords: number
+}
+
+/**
+ * `catalog_repair`'s answer (`docs/spike-log.md` § Slice 5e): the binding
+ * the request carried, the digest the catalog now has, and the two counts.
+ * Mirrors `CatalogRepairedDto` field-for-field.
+ *
+ * Never a path: the pre-repair copy of `originalSha256`'s bytes lives in
+ * the product work area, which is device configuration and never crosses
+ * IPC (HAP-001-R5). Nothing lists or restores that copy either.
+ */
+export interface CatalogRepaired {
+  originalSha256: string
+  sha256: string
+  droppedLines: number
+  keptRecords: number
+}
+
+/**
+ * One recovery entry (`docs/spike-log.md` § Slice 5e, HAP-001-R18): the
+ * bytes a publication held when its outbox path stopped naming them, kept
+ * in the product work area so that what was digested and approved
+ * survives. Mirrors `RecoveryEntryDto` field-for-field. Never a path.
+ *
+ * `sha256` is the digest the entry is **filed under** -- a locator, not a
+ * verified fact. `usable` is the probe's own answer: `false` when the entry
+ * did not open as a regular file with a link count of one (in which case
+ * `size` is `null` too), and `false` when the bytes at that name no longer
+ * hash to it. {@link recoveryApprove} re-verifies from its own handle
+ * whatever this said.
+ *
+ * `recoveredFrom` is the publication whose `outbox-escape` wrote the entry,
+ * read from this device's journal and never inferred from the file name;
+ * `recoveredAt` is when that step was journaled, in milliseconds since the
+ * epoch.
+ *
+ * `displayName` is the name the re-publication would register and write
+ * this under, and `class` the project policy's verdict on that name beside
+ * the type and size read from the entry's own handle -- the two facts that
+ * decide what lands on disk and whether the approval is allowed at all
+ * (R1-004). `class` is `null` for an entry whose probe yielded nothing to
+ * classify, the same fact `size: null` reports.
+ *
+ * **The listing is this device's, not the active project's** (R1-005). The
+ * work area holding these entries is device configuration and its journal
+ * is one per device, so `recoveryList` returns every entry the device
+ * holds whatever workspace is active -- including entries an escape wrote
+ * under another project. {@link recoveryApprove} then registers the bytes
+ * into the project that is active **now**, under that project's identity
+ * and asset root.
+ */
+export interface RecoveryEntry {
+  sha256: string
+  size: number | null
+  recoveredFrom: PublicationId
+  recoveredAt: number
+  displayName: string
+  class: ArtifactClass | null
+  usable: boolean
+}
+
+/**
+ * What a repair of the active project's Catalog would drop, and the digest
+ * {@link catalogRepair} has to be given back (`docs/spike-log.md` § Slice
+ * 5e; HAP-001-R23, R39, R40). Read-only: nothing is copied or rewritten,
+ * and a live run does not freeze it -- seeing what is wrong is not a write.
+ * Invokes `catalog_repair_preview` with no arguments.
+ *
+ * It **reads the whole Catalog**, under the publication surface lock, for
+ * the length of the replay (R1-009): not against staleness but against
+ * tearing, since a replay racing an append reads a half-written line and
+ * reports the Catalog corrupt. Read-only is a statement about what it
+ * writes, never about what it reads or what it holds while reading.
+ *
+ * # Errors
+ * Rejects with `catalog-unavailable` (the project has no catalog, or it
+ * could not be read) or `workspace-unavailable` if no workspace is active.
+ * A **corrupt** catalog is not an error here: previewing it is the whole
+ * point, and the refused lines come back in `refusals`.
+ */
+export async function catalogRepairPreview(): Promise<CatalogRepairPreview> {
+  return invoke('catalog_repair_preview')
+}
+
+/**
+ * Apply the repair to the bytes `sha256` names (`docs/spike-log.md` § Slice
+ * 5e, D2): the preview's own digest, which the shell compares against the
+ * catalog as it stands and refuses with `catalog-changed` when it has
+ * moved. The catalog is copied into the product work area before a byte is
+ * rewritten. Invokes `catalog_repair` with exactly `{ sha256 }`; never a
+ * path.
+ *
+ * # Errors
+ * Rejects with `run-active` (a supervised process is still running -- this
+ * is a write to project content, so the shell refuses it like every other
+ * one), `invalid-request` (a digest that is not 64 hex characters),
+ * `work-area-invalid` (the work area failed its check, or the pre-repair
+ * copy could not be written into it), `catalog-changed` (the file is no
+ * longer those bytes: nothing was rewritten), `repair-refused` (a line may
+ * not be dropped, nothing may be dropped, or the rules would not yield a
+ * readable catalog), `catalog-unavailable` (the catalog could not be read
+ * or written), or `workspace-unavailable` if no workspace is active.
+ *
+ * Seven codes; `src-tauri/src/ipc/catalog_repair.rs` reaches exactly these.
+ */
+export async function catalogRepair(sha256: string): Promise<CatalogRepaired> {
+  return invoke('catalog_repair', { sha256 })
+}
+
+/**
+ * Every recovery entry this device's journal knows about, earliest first
+ * (`docs/spike-log.md` § Slice 5e, HAP-001-R18). Read-only: listing opens
+ * each entry once to take its facts and holds **no handle** afterwards --
+ * unlike {@link recoveryApprove}, which keeps one for the publication that
+ * follows -- and a live run does not freeze it. Invokes `recovery_list`
+ * with no arguments.
+ *
+ * It is not lock-free, and this used to read as though it were (R1-009):
+ * `recovery_list_for` takes the publication surface lock for the length of
+ * the journal replay, as every reader of that surface does, so a listing
+ * is serialized against a publication in progress. "Holds nothing" was
+ * about handles and was said as though it were about locks.
+ *
+ * An entry on disk that no `outbox-escape` step of this device's journal
+ * names is not listed and is not approvable -- fail-closed rather than
+ * attributing bytes nobody can account for.
+ *
+ * # Errors
+ * Rejects with `work-area-invalid` (the work area failed its check, or the
+ * publication journal could not be read), `outbox-invalid` (the
+ * classification policy could not be loaded -- the listing carries each
+ * entry's class, so it loads the policy the approval classifies against),
+ * or `workspace-unavailable` if no workspace is active. The last one is
+ * idle rather than a failure, and the panel says so separately (R1-007).
+ */
+export async function recoveryList(): Promise<RecoveryEntry[]> {
+  return invoke('recovery_list')
+}
+
+/**
+ * Approve one recovery entry for re-publication (`docs/spike-log.md` §
+ * Slice 5e; HAP-001-R18, R22, D3): a fresh, explicit, per-artifact act that
+ * no standing policy covers. `digest` is the digest the entry is filed
+ * under, taken from the row itself and never from anything typed. Invokes
+ * `recovery_approve` with exactly `{ digest }`; never a path.
+ *
+ * The shell opens the entry once without following a link, digests it from
+ * that handle, and refuses with `integrity-mismatch` unless what it read is
+ * the name the journal attests to.
+ *
+ * **One digest, not two** (slice 5e review, R1-006 / R3-069). This took a
+ * second, `sha256`, described as "the digest the listing showed" -- but a
+ * {@link RecoveryEntry} carries exactly one digest and it *is* the name, so
+ * this function's only caller passed `entry.sha256` as both and the shell's
+ * two comparisons were one comparison made twice. The shape was
+ * {@link artifactApprove}'s, where `name` and `sha256` are independent
+ * facts about an outbox entry; a recovery entry's name is its digest, so it
+ * has no second fact to bind to. Staleness is caught where it is real: the
+ * surface re-binds its open block to the entry's digest on every refetch,
+ * and the shell re-derives from its own handle regardless.
+ *
+ * The approval that comes back goes to the **existing**
+ * {@link artifactPublish}, unchanged. Its `publicationId` is derived from
+ * the bytes that were read, which is not always the escaped publication's;
+ * that publication travels as {@link ArtifactApproval.recoveredFrom}, a
+ * location fact and never provenance.
+ *
+ * # Errors
+ * Rejects with `run-active` (a supervised process is still running),
+ * `invalid-request` (a digest that is not 64 hex characters, or a derived
+ * approval id already recorded), `work-area-invalid` (the work area failed
+ * its check, or the journal could not be read or written),
+ * `recovery-unknown` (no `outbox-escape` of this device's journal wrote
+ * that entry, or it could not be opened at all), `outbox-invalid` (the
+ * classification policy could not be loaded -- reached from
+ * `policy_store.load`, which `recovery_approve_for`'s own `# Errors` list
+ * omits), `destination-invalid` (the project declares no asset root),
+ * `refused` (the entry is not a regular file, its link count is greater
+ * than one, or its class is not `generated-heavy`), `integrity-mismatch`
+ * (the bytes read are not the digest the entry is filed under), or
+ * `workspace-unavailable` if no workspace is active.
+ *
+ * Nine codes; `src-tauri/src/ipc/recovery.rs` reaches exactly these.
+ */
+export async function recoveryApprove(digest: string): Promise<ArtifactApproval> {
+  return invoke('recovery_approve', { digest })
 }
