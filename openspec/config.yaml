@@ -1,0 +1,64 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Rust 1.98.1 workspace (edition 2024) with Tauri 2.
+  Architecture: Domain, application, adapters, supervisor, and Tauri crates.
+  Testing: Cargo integration/contract tests plus renderer Vitest/jsdom tests.
+  Style: rustfmt (100 columns), Clippy workspace lints, unsafe code denied.
+  Delivery: mandatory small, stacked-to-main chained slices; review budget 400 changed lines.
+
+testing:
+  strict_tdd: true
+  test_command: cargo test --workspace
+  commands:
+    rust:
+      working_directory: .
+      test: cargo test --workspace
+      lint: cargo clippy --workspace --all-targets -- -D warnings
+      typecheck: cargo check --workspace
+      format: cargo fmt --all -- --check
+    renderer:
+      working_directory: renderer
+      test: pnpm test
+      lint: pnpm lint
+      typecheck: tsc -b
+      build: pnpm build
+  layers:
+    rust_integration_contract:
+      available: true
+      command: cargo test --workspace
+      working_directory: .
+    renderer_component:
+      available: true
+      framework: Vitest 4 with React Testing Library and jsdom
+      command: pnpm test
+      working_directory: renderer
+    e2e:
+      available: false
+      command: ""
+  coverage:
+    available: false
+    command: ""
+  quality:
+    linter: cargo clippy --workspace --all-targets -- -D warnings
+    type_checker: cargo check --workspace
+    formatter: cargo fmt --all -- --check
+
+rules:
+  proposal:
+    - Keep changes independently reviewable and within the 400-line review budget.
+    - Include rollback and chain placement for risky changes.
+  specs:
+    - Use Given/When/Then scenarios and RFC 2119 language.
+  design:
+    - Preserve publication safety invariants and document rationale.
+  tasks:
+    - Keep every task completable in one small chained slice.
+  apply:
+    - Follow existing Rust patterns and strict TDD.
+  verify:
+    test_command: cargo test --workspace
+    build_command: cargo check --workspace
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas.
