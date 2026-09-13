@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Estimated implementation total | 970 changed lines (code, tests, docs, progress) |
-| Planning aggregate (exact) | 426 lines: existing 368 + this file 58 |
+| Planning aggregate (exact) | 437 lines: Plan A 368 + replacement Plan B 69 |
 | Delivery | `auto-chain`; stacked-to-main; no size exception |
 | Dominant risks | Unix identity/TOCTOU proof, FIFO blocking, locked activation |
 
@@ -18,8 +18,8 @@ Chain strategy: stacked-to-main
 
 | Unit | Likely PR / base | Start → finish; verification; rollback | Est. |
 |---|---|---|---:|
-| Plan A | PR 0A → main | Existing OpenSpec/config artifacts → reviewed design gate; inspect line count; revert docs only | 357 |
-| Plan B | PR 0B → main | This task plan → task guard recorded; inspect line count; revert tasks only | 58 |
+| Plan A | PR #18 → main | Existing OpenSpec/config artifacts → reviewed design gate; inspect line count; revert docs only | 368 |
+| Plan B | Replacement PR → main | This task plan plus verified CI ledger status → task guard recorded; inspect line count; revert docs only | 69 |
 | 1 | PR 1 → main | No cleanup API → inert grammar/age/PID seams; Rust tests; revert inert module | 220 |
 | 2 | PR 2 → main | Inert seams → bounded retain-first scanner/evidence; Rust tests; revert scanner | 280 |
 | 3 | PR 3 → main | Scanner not invoked → Unix unlink engine; Rust tests; revert engine, still uninvoked | 280 |
