@@ -119,13 +119,10 @@ fn a_17th_concurrently_running_process_is_refused() {
 
     // On Windows, `stop` is the honest Job Object placeholder (VP-001
     // VP-S5, `crates/omnifrons-supervisor/src/lib.rs` `windows::stop`): it
-    // cannot prove a descendant-free reap, so it reports
-    // `OrphanRiskUncertain` and deliberately never evicts the entry to
-    // `Terminal`. The running count (entries still `Tracked::Running`)
-    // therefore never drops, and the 16-running cap, once reached, stays
-    // reached permanently -- a real, documented limitation, not a bug in
-    // this test -- until Job Object containment lands
-    // (`docs/spike-log.md` § Windows deferral).
+    // cannot prove descendant containment, so its immediate result is
+    // `OrphanRiskUncertain`. A later `observe` may still confirm that the
+    // direct child reaped and move the entry to `Terminal`; that confirmed
+    // terminal state releases the running-process quota.
     #[cfg(windows)]
     {
         for &id in &spawned {
@@ -140,19 +137,18 @@ fn a_17th_concurrently_running_process_is_refused() {
         }
 
         for &id in &spawned {
-            assert_eq!(
-                supervisor.observe(id),
-                Some(ProcessStatus::Running),
-                "an entry stop could not confirm Terminal must stay Running on Windows, \
-                 matching stop's own honest OrphanRiskUncertain report"
-            );
+            wait_for_terminal(&supervisor, id);
         }
 
-        let refused_again = supervisor.spawn_harness(&long_lived()).expect_err(
-            "the 16-running cap must stay permanently reached on Windows: an unproven \
-                 stop never evicts an entry, so an 18th spawn must still be refused",
+        let after_cleanup =
+            supervisor.spawn_harness(&HarnessRequest::new(HarnessKind::DemoLines, 200, 1).unwrap());
+        assert!(
+            after_cleanup.is_ok(),
+            "spawning must succeed again once every previous direct child is confirmed Terminal, got {after_cleanup:?}"
         );
-        assert_eq!(refused_again, SupervisorError::TooManyProcesses);
+        if let Ok(id) = after_cleanup {
+            wait_for_terminal(&supervisor, id);
+        }
     }
 }
 
