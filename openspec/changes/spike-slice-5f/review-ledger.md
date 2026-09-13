@@ -26,3 +26,14 @@ One reliability sweep and one general batched refuter independently confirmed th
 | R3-001 | reliability | crates/omnifrons-supervisor/tests/output_backpressure.rs:96-105 | BLOCKER | verified | Scoped review confirms the 92-line test-only correction preserves integration guarantees and deterministically proves saturation and refill/drop accounting. Independent execution audit selected and passed each of the two new unit tests and the integration test (1/1 each). Linux workspace tests, fmt and supervisor clippy also pass. Separate PR #17 is merged at the recorded SHA with all required cross-platform checks passing. |
 
 Evidence: PR #17 https://github.com/constant1n0/omnifrons/pull/17, merged by normal fast-forward at `f1b9cfe2f48791c3aa4d29aa7a0fe98154e232bc`.
+
+## Task Plan Delivery — Windows CI
+
+Plan A replacement PR #18 is merged. Plan B PR #19 at `5d369c54078a12f61f779c93c467c49099507963` changes only the task plan; Ubuntu, macOS, docs-links, and gitleaks passed, but Windows failed. No rerun-to-green occurred.
+One reliability sweep and one general batched refuter confirmed a separate pre-existing test-contract defect. Separate test-only PR #20 merged by normal fast-forward at `47204379f535c13037926467fef6d4d01e8dd722`; GitHub signature and DCO verification passed, as did Ubuntu, macOS, Windows, docs-links, and gitleaks.
+
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| R3-002 | reliability | crates/omnifrons-supervisor/tests/bookkeeping_caps.rs:120-155 | BLOCKER | verified | A 30-line test-only correction preserves the 16/17 process-cap and OrphanRiskUncertain assertions, waits through the existing confirmed-terminal helper, and proves quota release with a new spawn. Linux focused bookkeeping tests passed 3/3; supervisor/workspace tests, fmt and clippy passed. No runtime changes; scoped review #8721 and all required cross-platform CI are verified. |
+
+Evidence: PR #20 https://github.com/constant1n0/omnifrons/pull/20, merged by normal fast-forward at `47204379f535c13037926467fef6d4d01e8dd722`.
