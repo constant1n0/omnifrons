@@ -1,4 +1,4 @@
-# Apply Progress: spike-slice-5f — Batches 1 and 2a
+# Apply Progress: spike-slice-5f — Batches 1, 2a, and 2b
 
 ## Completed
 - [x] 1.1 Exact local staging basename parser and retention tables.
@@ -69,3 +69,29 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
   the bounded scanner is implemented in the next slice.
 - Tasks 2.1–2.3 remain unchecked: scanning, cap/count/truncation semantics, final identity
   rechecks, public inert entry, and all deletion/activation behavior are still pending.
+
+## Batch 2b: Bounded Retain-First Walker (Implemented, Private-Core Gate Passed; Pending Delivery)
+- Held-root `Dir::from_fd` listing admits the root once, streams at most 256 names, and opens
+  candidates only relative to that root. Reports now count inspected, retained, removed, failures,
+  and truncation without paths.
+- Production is retain-only: `removed` remains zero and no unlink, rename, payload read, staging,
+  IPC, or application hook was added. A private simulated-action seam proves the 32-action cap.
+- Tasks 2.1–2.3 remain unchecked: integration/public `LocalDirBlobStore` entry, final identity
+  rechecks/native unlink, FIFO coverage, and activation are deferred to dependency-closed slices.
+
+### Batch 2b TDD Cycle Evidence
+| Slice | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| bounded retain-first walker | `local_staging_cleanup.rs` | Unit, real filesystem | 13/13 | missing `scan_staging_with` (E0425) | 14/14 focused | mixed/excluded, 32 simulated cap, 256 inspection cap, live/unknown, root failure | root admission and candidate open split; held-FD listing |
+
+### Batch 2b Verification
+- RED: pinned focused walker test failed with `E0425` for the missing walker; cap test then failed with missing action seam.
+- GREEN: focused module tests passed 18/18; `cargo fmt --all -- --check`, Linux and Windows-GNU adapter clippy `-D warnings`, `cargo check --workspace`, and `cargo test --workspace --all-targets --all-features` passed.
+- Windows evidence is compile-only; runtime evidence is Linux-only.
+
+### Batch 2b Runtime Receipt
+- Historical attempts 1 and 2 remain preserved. Generation 3, ordinal 3 is finished `passed` with
+  receipt `batch2b-gate-finish-20260913-01` and runtime revision
+  `sha256:eb2d617c9fb411eabda8f3c25cc1bc6878e964a33aaee0398463ca934bd56c0f`.
+- Native control is complete (`complete=true`, `next_action=complete`); this is not a native Windows
+  runtime claim. Batch 2b private-core is ready for standard risk review and remains pending delivery.

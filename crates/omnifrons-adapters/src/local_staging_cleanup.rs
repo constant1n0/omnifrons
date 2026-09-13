@@ -20,6 +20,7 @@ pub const MAX_REMOVED_ENTRIES: usize = 32;
 #[derive(Debug, PartialEq, Eq)]
 pub struct CleanupReport {
     pub inspected: usize,
+    pub retained: usize,
     pub removed: usize,
     pub truncated: bool,
     pub supported: bool,
@@ -32,6 +33,7 @@ impl CleanupReport {
     pub const fn unsupported() -> Self {
         Self {
             inspected: 0,
+            retained: 0,
             removed: 0,
             truncated: false,
             supported: false,
@@ -130,6 +132,20 @@ struct StagingCandidateEvidence {
     modified_at: SystemTime,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct StagingCandidateFacts {
+    pid: u32,
+    handle: std::fs::File,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    link_count: u64,
+    size: u64,
+    modified_at: SystemTime,
+}
+
 /// Open a root and one exact candidate without following links or reading data.
 ///
 /// Every failure is retained by returning `None`. This read-only primitive
@@ -141,14 +157,27 @@ fn open_staging_evidence(
     root_path: &std::path::Path,
     name: &OsStr,
 ) -> Option<StagingCandidateEvidence> {
-    use std::fs::File;
+    let root = admit_staging_root(root_path)?;
+    let candidate = open_staging_candidate(&root, name).ok()??;
+    Some(StagingCandidateEvidence {
+        root,
+        handle: candidate.handle,
+        dev: candidate.dev,
+        ino: candidate.ino,
+        uid: candidate.uid,
+        mode: candidate.mode,
+        link_count: candidate.link_count,
+        size: candidate.size,
+        modified_at: candidate.modified_at,
+    })
+}
+
+#[cfg(unix)]
+fn admit_staging_root(root_path: &std::path::Path) -> Option<StagingRootEvidence> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    use nix::fcntl::{OFlag, openat};
-    use nix::sys::stat::Mode;
     use nix::unistd::Uid;
 
-    parse_staging_basename(name)?;
     let root = crate::fs_run_outbox_preparer::open_directory_no_follow(root_path).ok()?;
     let root_metadata = root.metadata().ok()?;
     let owner = Uid::effective().as_raw();
@@ -156,13 +185,31 @@ fn open_staging_evidence(
     if root_metadata.uid() != owner || root_mode != 0o700 {
         return None;
     }
-    let root = StagingRootEvidence {
+    Some(StagingRootEvidence {
         dev: root_metadata.dev(),
         ino: root_metadata.ino(),
         uid: root_metadata.uid(),
         mode: root_mode,
         handle: root,
+    })
+}
+
+#[cfg(unix)]
+fn open_staging_candidate(
+    root: &StagingRootEvidence,
+    name: &OsStr,
+) -> Result<Option<StagingCandidateFacts>, ()> {
+    use std::fs::File;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::Uid;
+
+    let Some(parsed) = parse_staging_basename(name) else {
+        return Ok(None);
     };
+    let owner = Uid::effective().as_raw();
 
     let candidate = openat(
         &root.handle,
@@ -170,20 +217,20 @@ fn open_staging_evidence(
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
-    .ok()
-    .map(File::from)?;
-    let metadata = candidate.metadata().ok()?;
+    .map(File::from)
+    .map_err(|_| ())?;
+    let metadata = candidate.metadata().map_err(|_| ())?;
     let mode = metadata.permissions().mode() & 0o777;
     if !metadata.file_type().is_file()
         || metadata.uid() != owner
         || mode != 0o600
         || metadata.nlink() != 1
     {
-        return None;
+        return Ok(None);
     }
 
-    Some(StagingCandidateEvidence {
-        root,
+    Ok(Some(StagingCandidateFacts {
+        pid: parsed.pid,
         handle: candidate,
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -191,8 +238,93 @@ fn open_staging_evidence(
         mode,
         link_count: metadata.nlink(),
         size: metadata.size(),
-        modified_at: metadata.modified().ok()?,
-    })
+        modified_at: metadata.modified().map_err(|_| ())?,
+    }))
+}
+
+/// Inspect at most [`MAX_INSPECTED_ENTRIES`] names through one admitted root.
+///
+/// This is retain-only production behavior: candidates that satisfy every
+/// read-only predicate still remain in place. `removed` therefore stays zero;
+/// a later phase owns final rechecks and native removal.
+#[cfg(unix)]
+#[allow(dead_code)] // The adapter entry point remains deferred to task 2.3.
+fn scan_staging_with(
+    root_path: &std::path::Path,
+    now: SystemTime,
+    pid_state: impl FnMut(u32) -> PidState,
+) -> CleanupReport {
+    scan_staging_with_simulated_action(root_path, now, pid_state, |_| false)
+}
+
+/// Test-only policy seam that models an acknowledged action without a native
+/// filesystem mutation. Production always supplies the retain closure above.
+#[cfg(unix)]
+fn scan_staging_with_simulated_action(
+    root_path: &std::path::Path,
+    now: SystemTime,
+    mut pid_state: impl FnMut(u32) -> PidState,
+    mut action: impl FnMut(&StagingCandidateFacts) -> bool,
+) -> CleanupReport {
+    use nix::dir::Dir;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut report = CleanupReport::default();
+    let Some(root) = admit_staging_root(root_path) else {
+        report.failures = 1;
+        return report;
+    };
+    let Ok(duplicate) = root.handle.try_clone() else {
+        report.failures = 1;
+        return report;
+    };
+    let Ok(mut listing) = Dir::from_fd(std::os::fd::OwnedFd::from(duplicate)) else {
+        report.failures = 1;
+        return report;
+    };
+
+    for entry in listing.iter() {
+        let Ok(entry) = entry else {
+            report.failures += 1;
+            break;
+        };
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        if report.inspected == MAX_INSPECTED_ENTRIES {
+            report.truncated = true;
+            break;
+        }
+        report.inspected += 1;
+        match open_staging_candidate(&root, name) {
+            Ok(Some(candidate)) => {
+                let eligible = is_old_enough(now, candidate.modified_at)
+                    && pid_state(candidate.pid) == PidState::NotLive;
+                if eligible && report.removed < MAX_REMOVED_ENTRIES && action(&candidate) {
+                    report.removed += 1;
+                } else {
+                    report.retained += 1;
+                }
+            }
+            Ok(None) => report.retained += 1,
+            Err(()) => {
+                report.retained += 1;
+                report.failures += 1;
+            }
+        }
+    }
+    report
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)] // The adapter entry point remains deferred to task 2.3.
+fn scan_staging_with(
+    _root_path: &std::path::Path,
+    _now: SystemTime,
+    _pid_state: impl FnMut(u32) -> PidState,
+) -> CleanupReport {
+    CleanupReport::unsupported()
 }
 
 /// A conservative creator-process liveness result.
@@ -374,12 +506,167 @@ mod tests {
             CleanupReport::default(),
             CleanupReport {
                 inspected: 0,
+                retained: 0,
                 removed: 0,
                 truncated: false,
                 supported: cfg!(unix),
                 failures: 0,
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_retains_eligible_and_excluded_entries_without_mutating_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("retain-first-walker");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let eligible = root.path().join(format!(".{PUBLICATION_HEX}.42-7.part"));
+        let excluded = root.path().join(".outbox.42-7.part");
+        std::fs::write(&eligible, b"staging").expect("eligible candidate");
+        std::fs::write(&excluded, b"outbox candidate").expect("excluded candidate");
+        for path in [&eligible, &excluded] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("owner-only candidate");
+        }
+        let now = eligible
+            .metadata()
+            .expect("candidate metadata")
+            .modified()
+            .expect("candidate modification time")
+            + MIN_STAGING_AGE
+            + Duration::from_millis(1);
+
+        let report = super::scan_staging_with(root.path(), now, |_| PidState::NotLive);
+
+        assert_eq!(report.inspected, 2);
+        assert_eq!(report.retained, 2);
+        assert_eq!(report.removed, 0);
+        assert!(!report.truncated);
+        assert_eq!(report.failures, 0);
+        assert!(eligible.exists());
+        assert!(excluded.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simulated_action_never_exceeds_the_removal_policy_cap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("walker-action-cap");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let candidates: Vec<_> = (0..=super::MAX_REMOVED_ENTRIES)
+            .map(|sequence| {
+                let path = root
+                    .path()
+                    .join(format!(".{PUBLICATION_HEX}.42-{sequence}.part"));
+                std::fs::write(&path, b"staging").expect("candidate");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("owner-only candidate");
+                path
+            })
+            .collect();
+        let newest = candidates
+            .iter()
+            .map(|path| {
+                path.metadata()
+                    .expect("metadata")
+                    .modified()
+                    .expect("mtime")
+            })
+            .max()
+            .expect("candidate times");
+
+        let report = super::scan_staging_with_simulated_action(
+            root.path(),
+            newest + MIN_STAGING_AGE + Duration::from_millis(1),
+            |_| PidState::NotLive,
+            |_| true,
+        );
+
+        assert_eq!(report.inspected, super::MAX_REMOVED_ENTRIES + 1);
+        assert_eq!(report.removed, super::MAX_REMOVED_ENTRIES);
+        assert_eq!(report.retained, 1);
+        assert!(candidates.iter().all(|path| path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_marks_an_uninspected_remainder_as_truncated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("walker-inspection-cap");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        for sequence in 0..=super::MAX_INSPECTED_ENTRIES {
+            let path = root.path().join(format!("foreign-{sequence}"));
+            std::fs::write(path, b"unrelated").expect("foreign entry");
+        }
+
+        let report =
+            super::scan_staging_with(root.path(), SystemTime::now(), |_| PidState::Unknown);
+
+        assert_eq!(report.inspected, super::MAX_INSPECTED_ENTRIES);
+        assert_eq!(report.retained, super::MAX_INSPECTED_ENTRIES);
+        assert_eq!(report.removed, 0);
+        assert!(report.truncated);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_and_unknown_pids_remain_even_when_the_action_seam_accepts_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("walker-pid-retention");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        for pid in [42, 43] {
+            let path = root.path().join(format!(".{PUBLICATION_HEX}.{pid}-7.part"));
+            std::fs::write(&path, b"staging").expect("candidate");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("owner-only candidate");
+        }
+        let now = SystemTime::now() + MIN_STAGING_AGE + Duration::from_millis(1);
+
+        let report = super::scan_staging_with_simulated_action(
+            root.path(),
+            now,
+            |pid| {
+                if pid == 42 {
+                    PidState::Live
+                } else {
+                    PidState::Unknown
+                }
+            },
+            |_| true,
+        );
+
+        assert_eq!(report.inspected, 2);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.retained, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_reports_an_unadmitted_root_as_a_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("walker-root-failure");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("shared root");
+
+        let report =
+            super::scan_staging_with(root.path(), SystemTime::now(), |_| PidState::Unknown);
+
+        assert_eq!(report.inspected, 0);
+        assert_eq!(report.retained, 0);
+        assert_eq!(report.removed, 0);
+        assert!(!report.truncated);
+        assert_eq!(report.failures, 1);
     }
 
     #[cfg(unix)]
