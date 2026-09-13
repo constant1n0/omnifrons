@@ -16,6 +16,8 @@
 - RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 /home/dcm/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters local_staging_cleanup` failed on unresolved parser, age/report, then PID imports.
 - GREEN: the same command passed 3/3, 5/5, and 8/8; triangulation/refactor finished 9/9.
 - Gates passed: `cargo fmt --all -- --check`, adapter clippy/check, and `cargo test --workspace --all-targets --all-features`.
+- CI correction RED: Windows-target adapter clippy reproduced `derivable_impls` (exit 101).
+- CI correction GREEN: cross-Windows and Linux adapter clippy, fmt, and the focused 9 tests passed; Windows runtime remains CI-only.
 
 ## Boundary
 Cleanup remains inert: no `LocalDirBlobStore`, filesystem, IPC, UI, or deletion-path changes.

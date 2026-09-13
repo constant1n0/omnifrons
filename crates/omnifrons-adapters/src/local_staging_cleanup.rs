@@ -16,6 +16,7 @@ pub const MAX_INSPECTED_ENTRIES: usize = 256;
 pub const MAX_REMOVED_ENTRIES: usize = 32;
 
 /// Path-free aggregate results for one cleanup attempt.
+#[cfg_attr(not(unix), derive(Default))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct CleanupReport {
     pub inspected: usize,
@@ -39,6 +40,7 @@ impl CleanupReport {
     }
 }
 
+#[cfg(unix)]
 impl Default for CleanupReport {
     fn default() -> Self {
         Self {

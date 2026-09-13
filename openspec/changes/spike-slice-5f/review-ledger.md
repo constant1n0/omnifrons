@@ -49,3 +49,11 @@ Automatic batch gate #8740 passed: nine focused tests, workspace tests, adapter 
 
 No corrective round was needed. Tasks 1.1–1.3 are complete; scanning, filesystem deletion, provider/IPC activation, and all later phases remain unimplemented.
 Standard risk review #8743: EMPTY; delivery is authorized with source/config unchanged.
+
+## CI Corrective Round 1 — Unit 1
+
+| id | location | severity | status | evidence |
+|---|---|---|---|---|
+| R3-101 | `local_staging_cleanup.rs:42-48` | BLOCKER | verified | Fresh scoped re-review verified the cfg-only fix; cross-Windows clippy and focused tests pass. |
+
+Correction budget: 1/2 used; no source scope beyond R3-101.
