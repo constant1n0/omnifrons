@@ -234,7 +234,7 @@ mod tests {
 
         assert!(is_old_enough(
             now,
-            now - MIN_STAGING_AGE - Duration::from_nanos(1)
+            now - MIN_STAGING_AGE - Duration::from_millis(1)
         ));
         assert!(!is_old_enough(now, now - MIN_STAGING_AGE));
         assert!(!is_old_enough(now, now + Duration::from_secs(1)));

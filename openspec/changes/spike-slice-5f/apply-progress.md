@@ -18,6 +18,7 @@
 - Gates passed: `cargo fmt --all -- --check`, adapter clippy/check, and `cargo test --workspace --all-targets --all-features`.
 - CI correction RED: Windows-target adapter clippy reproduced `derivable_impls` (exit 101).
 - CI correction GREEN: cross-Windows and Linux adapter clippy, fmt, and the focused 9 tests passed; Windows runtime remains CI-only.
+- R3-102: Windows-native RED was 30/31; the one-millisecond test fixture is locally green (9 focused); fresh Windows CI is required.
 
 ## Boundary
 Cleanup remains inert: no `LocalDirBlobStore`, filesystem, IPC, UI, or deletion-path changes.

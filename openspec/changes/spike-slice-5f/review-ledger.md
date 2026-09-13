@@ -55,5 +55,6 @@ Standard risk review #8743: EMPTY; delivery is authorized with source/config unc
 | id | location | severity | status | evidence |
 |---|---|---|---|---|
 | R3-101 | `local_staging_cleanup.rs:42-48` | BLOCKER | verified | Fresh scoped re-review verified the cfg-only fix; cross-Windows clippy and focused tests pass. |
+| R3-102 | `local_staging_cleanup.rs:235-240` | BLOCKER | verified | Scoped review #8776 verified the millisecond fixture; fresh Windows CI pending. |
 
-Correction budget: 1/2 used; no source scope beyond R3-101.
+Correction budget: 2/2 used; no source scope beyond R3-102.
