@@ -4,7 +4,7 @@
 
 Target: `design.md` and its proposal/specification contracts; no implementation exists.
 First-pass dual review independently confirmed two critical findings; both fresh judges verified their round-1 corrections. Scoped re-review used only the ledger and fix diff.
-Current state: JUDGMENT: APPROVED. Automatic design-gate refresh passed (#8528); planning tasks are complete, but cleanup implementation has not started.
+Current state: JUDGMENT: APPROVED. Automatic design-gate refresh passed (#8528); implementation evidence is tracked in the batch sections below.
 
 | id | lens | location | severity | status | evidence |
 |---|---|---|---|---|---|
@@ -37,3 +37,15 @@ One reliability sweep and one general batched refuter confirmed a separate pre-e
 | R3-002 | reliability | crates/omnifrons-supervisor/tests/bookkeeping_caps.rs:120-155 | BLOCKER | verified | A 30-line test-only correction preserves the 16/17 process-cap and OrphanRiskUncertain assertions, waits through the existing confirmed-terminal helper, and proves quota release with a new spawn. Linux focused bookkeeping tests passed 3/3; supervisor/workspace tests, fmt and clippy passed. No runtime changes; scoped review #8721 and all required cross-platform CI are verified. |
 
 Evidence: PR #20 https://github.com/constant1n0/omnifrons/pull/20, merged by normal fast-forward at `47204379f535c13037926467fef6d4d01e8dd722`.
+
+## Apply Batch 1 — Inert Safety Primitives
+
+JUDGMENT: APPROVED. Two blind judges performed one exhaustive sweep each; neither found a BLOCKER or CRITICAL defect. Judge A's findings ledger is empty.
+Automatic batch gate #8740 passed: nine focused tests, workspace tests, adapter checks/clippy, and formatting. Windows was compile-checked only; runtime CI remains required before delivery.
+
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| JD-B-101 | judgment-day | openspec/changes/spike-slice-5f/apply-progress.md:11 | SUGGESTION | info | The progress table says five parser tests; the current module has four parser-focused functions on Unix and three on non-Unix. The nine-test total and recorded progression are otherwise consistent. Reported once; no fix or re-review is driven by this entry. |
+
+No corrective round was needed. Tasks 1.1–1.3 are complete; scanning, filesystem deletion, provider/IPC activation, and all later phases remain unimplemented.
+Standard risk review #8743: EMPTY; delivery is authorized with source/config unchanged.

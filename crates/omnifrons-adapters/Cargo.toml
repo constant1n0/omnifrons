@@ -16,13 +16,14 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# `fs` gates everything this crate needs from `nix`: `OFlag::O_NOFOLLOW`
+# `fs` gates the filesystem APIs this crate needs from `nix`: `OFlag::O_NOFOLLOW`
 # (`fs_prober::open_checked`), `sys::memfd::{memfd_create, MFdFlags}`, and
 # `fcntl`'s `FcntlArg::F_ADD_SEALS`/`SealFlag` (`fs_prober`'s Linux
 # sealed-memfd path). Verified against the vendored 0.31.3 source
 # (`nix::fcntl`/`nix::sys::memfd` are both gated by this one Cargo
 # feature, not a separate "fcntl" feature -- 0.31.3 has none by that
-# name) rather than assumed. `user` additionally gates
+# name) rather than assumed. `signal` gates the signal-free `kill(pid,
+# None)` liveness probe for inert local staging cleanup primitives. `user` additionally gates
 # `nix::unistd::Uid::effective`/`is_root`, used only by this crate's own
 # tests to skip a permission-bit assertion when running as root. `dir`
 # gates `nix::dir::Dir` (`fdopendir`), which is what lets
@@ -32,7 +33,7 @@ sha2 = { workspace = true }
 # Verified against the vendored 0.31.3 source: `dir = ["fs"]` in its
 # `[features]` table, so this adds no crate to the dependency graph and
 # `cargo tree -e normal` is unchanged.
-nix = { version = "0.31.3", default-features = false, features = ["dir", "fs", "user"] }
+nix = { version = "0.31.3", default-features = false, features = ["dir", "fs", "signal", "user"] }
 
 [dev-dependencies]
 omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }

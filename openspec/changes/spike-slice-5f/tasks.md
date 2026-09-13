@@ -29,9 +29,9 @@ No parallel writers. Planning PRs land before code; every PR targets `main` afte
 
 ## Phase 1: Inert Safety Primitives — PR 1
 
-- [ ] 1.1 **RED**: add parser tables in `crates/omnifrons-adapters/src/local_staging_cleanup.rs` for exact local grammar and malformed/foreign/non-UTF-8 names; assert R28/R39 entries retain.
-- [ ] 1.2 **GREEN**: implement canonical basename, 24-hour age, limits, `CleanupReport`, and cfg-gated `PidState`; keep cleanup unreachable from `LocalDirBlobStore`.
-- [ ] 1.3 **RED/GREEN/REFACTOR evidence**: test zero/out-of-signed-`pid_t` PIDs return `Unknown` without `kill`; child process proves real `Live` then `NotLive`; Windows returns `Unknown`.
+- [x] 1.1 **RED**: add parser tables in `crates/omnifrons-adapters/src/local_staging_cleanup.rs` for exact local grammar and malformed/foreign/non-UTF-8 names; assert R28/R39 entries retain.
+- [x] 1.2 **GREEN**: implement canonical basename, 24-hour age, limits, `CleanupReport`, and cfg-gated `PidState`; keep cleanup unreachable from `LocalDirBlobStore`.
+- [x] 1.3 **RED/GREEN/REFACTOR evidence**: test zero/out-of-signed-`pid_t` PIDs return `Unknown` without `kill`; child process proves real `Live` then `NotLive`; Windows returns `Unknown`.
 
 ## Phase 2: Bounded Retain-First Scanner — PR 2
 

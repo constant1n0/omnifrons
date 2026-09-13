@@ -73,6 +73,7 @@ pub mod jsonl_ignore_ledger;
 pub mod jsonl_publication_journal;
 pub mod line_agent;
 pub mod local_dir_blob_store;
+pub mod local_staging_cleanup;
 pub mod pty_cli;
 pub mod sha2_hasher;
 
