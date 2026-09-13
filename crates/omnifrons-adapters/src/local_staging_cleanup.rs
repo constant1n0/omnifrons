@@ -97,6 +97,104 @@ pub fn is_old_enough(now: SystemTime, modified_at: SystemTime) -> bool {
         .is_ok_and(|age| age > MIN_STAGING_AGE)
 }
 
+/// Initial handle-derived evidence for one local staging candidate.
+///
+/// This is deliberately not a deletion authority. The future bounded walker
+/// must still revalidate the held root and candidate immediately before any
+/// mutation.
+#[cfg(unix)]
+// Batch 2a establishes evidence before the bounded walker consumes it.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct StagingRootEvidence {
+    handle: std::fs::File,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+// Batch 2a establishes evidence before the bounded walker consumes it.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct StagingCandidateEvidence {
+    root: StagingRootEvidence,
+    handle: std::fs::File,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    link_count: u64,
+    size: u64,
+    modified_at: SystemTime,
+}
+
+/// Open a root and one exact candidate without following links or reading data.
+///
+/// Every failure is retained by returning `None`. This read-only primitive
+/// intentionally does not enumerate, delete, rename, or invoke staging.
+#[cfg(unix)]
+// Batch 2a establishes evidence before the bounded walker consumes it.
+#[allow(dead_code)]
+fn open_staging_evidence(
+    root_path: &std::path::Path,
+    name: &OsStr,
+) -> Option<StagingCandidateEvidence> {
+    use std::fs::File;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::Uid;
+
+    parse_staging_basename(name)?;
+    let root = crate::fs_run_outbox_preparer::open_directory_no_follow(root_path).ok()?;
+    let root_metadata = root.metadata().ok()?;
+    let owner = Uid::effective().as_raw();
+    let root_mode = root_metadata.permissions().mode() & 0o777;
+    if root_metadata.uid() != owner || root_mode != 0o700 {
+        return None;
+    }
+    let root = StagingRootEvidence {
+        dev: root_metadata.dev(),
+        ino: root_metadata.ino(),
+        uid: root_metadata.uid(),
+        mode: root_mode,
+        handle: root,
+    };
+
+    let candidate = openat(
+        &root.handle,
+        std::path::Path::new(name),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+    .map(File::from)?;
+    let metadata = candidate.metadata().ok()?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != owner
+        || mode != 0o600
+        || metadata.nlink() != 1
+    {
+        return None;
+    }
+
+    Some(StagingCandidateEvidence {
+        root,
+        handle: candidate,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        mode,
+        link_count: metadata.nlink(),
+        size: metadata.size(),
+        modified_at: metadata.modified().ok()?,
+    })
+}
+
 /// A conservative creator-process liveness result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PidState {
@@ -171,6 +269,36 @@ mod tests {
 
     const PUBLICATION_HEX: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[cfg(unix)]
+    struct TestDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "omnifrons-staging-cleanup-{}-{label}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("fixture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn parses_only_the_canonical_local_staging_basename() {
@@ -251,6 +379,142 @@ mod tests {
                 supported: cfg!(unix),
                 failures: 0,
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opens_owner_only_root_and_records_regular_single_link_candidate_evidence() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("candidate-evidence");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+
+        let evidence = super::open_staging_evidence(root.path(), OsStr::new(&name))
+            .expect("safe candidate evidence");
+
+        assert_eq!(evidence.size, 7);
+        assert_eq!(evidence.link_count, 1);
+        assert_eq!(evidence.mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retains_initial_root_identity_and_handles_after_root_path_replacement() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let fixture = TestDir::new("retained-handles");
+        let root = fixture.path().join("admitted-root");
+        std::fs::create_dir(&root).expect("admitted root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let initial_root = std::fs::metadata(&root).expect("initial root metadata");
+        let initial_candidate = std::fs::metadata(&candidate).expect("initial candidate metadata");
+
+        let evidence = super::open_staging_evidence(&root, OsStr::new(&name))
+            .expect("safe candidate evidence");
+
+        std::fs::rename(&root, fixture.path().join("replaced-root")).expect("replace root path");
+        std::fs::create_dir(&root).expect("replacement root");
+
+        assert_eq!(evidence.root.dev, initial_root.dev());
+        assert_eq!(evidence.root.ino, initial_root.ino());
+        assert_eq!(evidence.root.uid, initial_root.uid());
+        assert_eq!(
+            evidence.root.mode,
+            initial_root.permissions().mode() & 0o777
+        );
+        assert_eq!(
+            evidence.root.handle.metadata().expect("held root").ino(),
+            initial_root.ino()
+        );
+        assert_eq!(
+            evidence.handle.metadata().expect("held candidate").ino(),
+            initial_candidate.ino()
+        );
+        assert_eq!(evidence.ino, initial_candidate.ino());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retains_excluded_linked_and_non_regular_candidates_without_reading_them() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = TestDir::new("unsafe-candidates");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let exact = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&exact);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+
+        assert!(
+            super::open_staging_evidence(root.path(), OsStr::new(".outbox.42-7.part")).is_none(),
+            "excluded producers never become candidates"
+        );
+
+        let linked = root.path().join(format!(".{PUBLICATION_HEX}.42-8.part"));
+        std::fs::hard_link(&candidate, &linked).expect("hard link");
+        assert!(
+            super::open_staging_evidence(root.path(), linked.file_name().expect("name")).is_none(),
+            "a multi-link candidate is retained"
+        );
+
+        let linked_path = root.path().join(format!(".{PUBLICATION_HEX}.42-9.part"));
+        symlink(&candidate, &linked_path).expect("symbolic link");
+        assert!(
+            super::open_staging_evidence(root.path(), linked_path.file_name().expect("name"))
+                .is_none(),
+            "a symbolic link is not followed"
+        );
+
+        let directory = root.path().join(format!(".{PUBLICATION_HEX}.42-10.part"));
+        std::fs::create_dir(&directory).expect("directory");
+        assert!(
+            super::open_staging_evidence(root.path(), directory.file_name().expect("name"))
+                .is_none(),
+            "a directory is retained without reading payload data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retains_roots_and_candidates_that_are_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("owner-mode");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("shared root");
+
+        assert!(
+            super::open_staging_evidence(root.path(), OsStr::new(&name)).is_none(),
+            "a root readable by another user is retained"
+        );
+
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o640))
+            .expect("shared candidate");
+        assert!(
+            super::open_staging_evidence(root.path(), OsStr::new(&name)).is_none(),
+            "a candidate readable by another user is retained"
         );
     }
 

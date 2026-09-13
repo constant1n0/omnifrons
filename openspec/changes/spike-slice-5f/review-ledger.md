@@ -50,11 +50,24 @@ Automatic batch gate #8740 passed: nine focused tests, workspace tests, adapter 
 No corrective round was needed. Tasks 1.1–1.3 are complete; scanning, filesystem deletion, provider/IPC activation, and all later phases remain unimplemented.
 Standard risk review #8743: EMPTY; delivery is authorized with source/config unchanged.
 
-## CI Corrective Round 1 — Unit 1
+## CI Corrections — Unit 1 (Closed)
 
-| id | location | severity | status | evidence |
-|---|---|---|---|---|
-| R3-101 | `local_staging_cleanup.rs:42-48` | BLOCKER | verified | Fresh scoped re-review verified the cfg-only fix; cross-Windows clippy and focused tests pass. |
-| R3-102 | `local_staging_cleanup.rs:235-240` | BLOCKER | verified | Scoped review #8776 verified the millisecond fixture; fresh Windows CI pending. |
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| R3-101 | reliability | crates/omnifrons-adapters/src/local_staging_cleanup.rs:42-48 | BLOCKER | verified | Scoped review verified the cfg-only fix; cross-Windows clippy, focused tests, and final native CI passed. |
+| R3-102 | reliability | crates/omnifrons-adapters/src/local_staging_cleanup.rs:235-240 | BLOCKER | verified | Scoped review #8776 verified the millisecond fixture; final native Windows CI passed before PR #22 integration. |
 
 Correction budget: 2/2 used; no source scope beyond R3-102.
+Delivery: PR #22 merged at `ef0b16cedec8fbd20a883402dd2f36e55f9ea6fd` with all five required checks passing.
+
+## Apply Batch 2a — Initial Root/Candidate Evidence
+
+JUDGMENT: APPROVED. Both fresh scoped judges verified the approved round-1 JD-201 correction; automatic gate retry #8791 passed and Batch 2a is pending delivery.
+
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| JD-201 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:109-195,399-446 | CRITICAL | verified | Round 1 retains owned root and candidate handles plus the initial root dev/ino/UID/mode snapshot. The real-FS regression replaces the root path and proves both handles remain bound to their admitted objects. Scoped reviews #8814 and `batch2a-rejudge-b` verified the correction. This is not a RootAsset logical binding, final recheck, walker, or deletion claim. |
+
+Native attempt 2 is settled after the authorized append-only Phase 1 rollover: verified receipt `batch2a-gate-retry-8791-finish-20260913` recorded a passed result. Phase 1 attempt 1 remains immutable. This metadata update does not backdate a receipt.
+Batch 2a corrective budget: at most two rounds; one used, scoped re-reviews and automatic runtime gate retry #8791 passed, pending delivery. No scanner, deletion, or application activation is present.
+Standard risk review #8818: EMPTY; the 337-line Batch 2a diff is authorized for delivery.
