@@ -547,8 +547,8 @@ mod tests {
     use tokio::io::{AsyncRead, ReadBuf};
 
     use super::{
-        MAX_LINE_BYTES, OutputTable, drain_stream, emit_stdin_write_failed, new_channel,
-        take_receiver,
+        CHANNEL_CAPACITY, MAX_LINE_BYTES, OutputTable, drain_stream, emit_stdin_write_failed,
+        new_channel, take_receiver, try_send,
     };
 
     /// An `AsyncRead` handing out exactly one predefined chunk per read
@@ -613,6 +613,78 @@ mod tests {
 
     fn x_times(count: usize) -> Vec<u8> {
         vec![b'x'; count]
+    }
+
+    fn stdout_text(text: impl Into<String>) -> FramePayload {
+        FramePayload::Text {
+            stream: OutputStream::Stdout,
+            text: text.into(),
+            continued: false,
+        }
+    }
+
+    #[test]
+    fn paused_consumer_drops_newest_frame_at_fixed_channel_capacity() {
+        let (mut state, handles) = new_channel(1);
+
+        for line in 0..CHANNEL_CAPACITY {
+            try_send(&handles, stdout_text(format!("buffered-{line}")));
+        }
+        try_send(&handles, stdout_text("dropped-while-paused"));
+
+        assert_eq!(handles.seq.load(Ordering::Acquire), CHANNEL_CAPACITY as u64);
+        assert_eq!(
+            handles.pending_drops.load(Ordering::Acquire),
+            1,
+            "the frame sent after a paused consumer filled the channel must be dropped"
+        );
+
+        let receiver = state
+            .receiver
+            .take()
+            .expect("a new output channel must retain its receiver");
+        let delivered: Vec<_> = receiver.try_iter().collect();
+
+        assert_eq!(delivered.len(), CHANNEL_CAPACITY);
+        assert_eq!(delivered.first().map(|frame| frame.seq), Some(0));
+        assert_eq!(
+            delivered.last().map(|frame| frame.seq),
+            Some((CHANNEL_CAPACITY - 1) as u64)
+        );
+        assert!(
+            delivered.iter().all(|frame| frame.dropped_before == 0),
+            "a pending drop is attached to the next successful delivery, not retroactively"
+        );
+    }
+
+    #[test]
+    fn draining_then_refilling_can_exceed_capacity_over_the_receiver_lifetime() {
+        let (mut state, handles) = new_channel(1);
+
+        for line in 0..CHANNEL_CAPACITY {
+            try_send(&handles, stdout_text(format!("buffered-{line}")));
+        }
+        try_send(&handles, stdout_text("dropped-while-paused"));
+
+        let receiver = state
+            .receiver
+            .take()
+            .expect("a new output channel must retain its receiver");
+        let first = receiver
+            .try_recv()
+            .expect("the paused consumer must have a buffered first frame");
+        assert_eq!(first.seq, 0);
+
+        try_send(&handles, stdout_text("refilled-after-drain"));
+        let delivered_after_refill: Vec<_> = receiver.try_iter().collect();
+
+        assert_eq!(delivered_after_refill.len(), CHANNEL_CAPACITY);
+        let refill = delivered_after_refill
+            .last()
+            .expect("the consumer must receive the refilled frame");
+        assert_eq!(refill.seq, CHANNEL_CAPACITY as u64);
+        assert_eq!(refill.dropped_before, 1);
+        assert_eq!(refill.payload, stdout_text("refilled-after-drain"));
     }
 
     /// R3-012: an exactly-cap line terminated by CRLF, the CRLF arriving in

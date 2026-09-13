@@ -1,8 +1,8 @@
 //! A fast, undrained demo harness must never make `spawn` or the capture
 //! reader tasks block: `spawn` returns immediately, the child overflows the
 //! bounded output channel and exits on its own, and once a consumer finally
-//! drains it, the delivered frames stay bounded by the channel's own
-//! capacity, at least one of them surfaces the drops that piled up while
+//! drains it, frames may refill the channel while readers are still reaching
+//! EOF, at least one of them surfaces the drops that piled up while
 //! nothing was consuming as a nonzero `dropped_before`, and the guaranteed
 //! terminal `State` frame still arrives last. `stop` on the already-exited
 //! child then still reports `Exited`, not an error or a hang.
@@ -32,12 +32,6 @@ use omnifrons_supervisor::TokioProcessSupervisor;
 /// Comfortably more than the channel's 1024 capacity, so the burst is
 /// guaranteed to overflow it regardless of scheduling.
 const BURST_LINES: u32 = 20_000;
-
-/// The per-child channel's own bound (`CHANNEL_CAPACITY` in
-/// `src/output_capture.rs`) plus a small margin for the one guaranteed
-/// terminal `State` frame, which is delivered outside the bounded
-/// best-effort path and so can land as the one frame past capacity.
-const MAX_DELIVERED: usize = 1024 + 8;
 
 /// `stop`'s own deadline: irrelevant to how long this actually takes, since
 /// the child is already `Terminal` by the time `stop` is called here (see
@@ -101,12 +95,6 @@ fn undrained_high_rate_output_never_blocks_spawn_or_stop() {
 
     let delivered: Vec<_> = rx.iter().collect();
 
-    assert!(
-        delivered.len() <= MAX_DELIVERED,
-        "backpressure must keep total delivered at most the channel's own capacity plus a \
-         small margin for the guaranteed state frame, got {} (burst was {BURST_LINES} lines)",
-        delivered.len()
-    );
     assert!(
         delivered.iter().any(|frame| frame.dropped_before > 0),
         "at least one delivered frame must surface a nonzero dropped_before, proving the \
