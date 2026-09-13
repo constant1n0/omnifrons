@@ -95,3 +95,23 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
   `sha256:eb2d617c9fb411eabda8f3c25cc1bc6878e964a33aaee0398463ca934bd56c0f`.
 - Native control is complete (`complete=true`, `next_action=complete`); this is not a native Windows
   runtime claim. Batch 2b private-core is ready for standard risk review and remains pending delivery.
+
+## Batch 2c: Public Inert Inspection Entry (Implemented, Gate Passed, Pending Delivery)
+- `LocalDirBlobStore::inspect_abandoned_staging` delegates to the read-only walker; it is not called
+  by open, stage, publication, IPC, or UI paths. Production still reports `removed: 0`.
+- Public integration coverage proves retained exact/excluded entries and content, root-admission
+  failure accounting, and the 256-entry truncated bound. Existing Batch2a/2b real-FS tests cover
+  owner/mode, metadata, liveness, and private 32-policy seam without duplicating the walker.
+
+### Batch 2c TDD Cycle Evidence
+| Tasks | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 2.1–2.3 | `publication_fs.rs` | Integration, real filesystem | 18 private + 23 public | missing `inspect_abandoned_staging` (E0599) | 1/1 | retained/excluded/failure and truncated public cases: 2/2 | public wrapper only; no activation |
+
+### Batch 2c Verification
+- Independent gate #8909 passed the read-only Phase 2 contract: public integration 2/2, adapter tests 192/192, workspace 804/804, Linux and Windows-GNU clippy/check, and fmt. Windows evidence is compile-only.
+- Phase 2 is complete as a read-only inspection capability. Phase 3 final rechecks/native unlink/FIFO evidence and Phase 4 activation remain deferred.
+
+### Batch 2c Runtime Receipt
+- The source and RED/GREEN work above predate native Batch 2c control; this receipt is recorded only after independent validation.
+- Generation 4, ordinal 4 finished `passed` for objective `sha256:21e75779416a4b75551bc2d43660575431528c0acb2561bdf23a534ea3842e65` with receipt `batch2c-gate-finish-20260913-01` and runtime revision `sha256:6aaf1e4113a05a693efed59d878585d7d5001fd5169aad2baa3f6c5f2552d1ca`. Ordinals 1–3 remain preserved.

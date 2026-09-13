@@ -247,8 +247,12 @@ fn open_staging_candidate(
 /// This is retain-only production behavior: candidates that satisfy every
 /// read-only predicate still remain in place. `removed` therefore stays zero;
 /// a later phase owns final rechecks and native removal.
+#[must_use]
+pub fn inspect_staging(root_path: &std::path::Path) -> CleanupReport {
+    scan_staging_with(root_path, SystemTime::now(), pid_state)
+}
+
 #[cfg(unix)]
-#[allow(dead_code)] // The adapter entry point remains deferred to task 2.3.
 fn scan_staging_with(
     root_path: &std::path::Path,
     now: SystemTime,
@@ -318,7 +322,6 @@ fn scan_staging_with_simulated_action(
 }
 
 #[cfg(not(unix))]
-#[allow(dead_code)] // The adapter entry point remains deferred to task 2.3.
 fn scan_staging_with(
     _root_path: &std::path::Path,
     _now: SystemTime,

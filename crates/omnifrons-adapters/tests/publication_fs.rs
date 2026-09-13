@@ -161,6 +161,100 @@ fn local_dir_capabilities_are_copy_only_with_no_remote() {
     );
 }
 
+/// Batch2c: the public inspection entry delegates to the inert retain-first
+/// walker. Exact and excluded names are counted, but neither is mutated.
+#[cfg(unix)]
+#[test]
+fn local_dir_inspection_retains_staging_and_excluded_entries() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let base = TempDir::new("inspection-retains");
+    let project = TempDir::new("inspection-retains-project");
+    let provider = open_provider(&base, &project);
+    let root = base.path().join("roots/main");
+    let staging = root.join(format!(".{}.42-7.part", "ab".repeat(32)));
+    let excluded = root.join(".outbox.42-7.part");
+    std::fs::write(&staging, b"staging").expect("staging fixture");
+    std::fs::write(&excluded, b"outbox").expect("excluded fixture");
+    for path in [&staging, &excluded] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only fixture");
+    }
+
+    let report = provider.inspect_abandoned_staging();
+
+    assert_eq!(report.inspected, 2);
+    assert_eq!(report.retained, 2);
+    assert_eq!(report.removed, 0);
+    assert!(!report.truncated);
+    assert_eq!(report.failures, 0);
+    assert_eq!(
+        std::fs::read(&staging).expect("staging remains"),
+        b"staging"
+    );
+    assert_eq!(
+        std::fs::read(&excluded).expect("excluded remains"),
+        b"outbox"
+    );
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+        .expect("make root ineligible");
+    let failed = provider.inspect_abandoned_staging();
+    assert_eq!(failed.inspected, 0);
+    assert_eq!(failed.retained, 0);
+    assert_eq!(failed.removed, 0);
+    assert_eq!(failed.failures, 1);
+}
+
+/// Public inspection reports a bounded incomplete scan rather than silently
+/// claiming the remaining names were considered.
+#[cfg(unix)]
+#[test]
+fn local_dir_inspection_reports_the_inspection_bound_without_mutation() {
+    let base = TempDir::new("inspection-bound");
+    let project = TempDir::new("inspection-bound-project");
+    let provider = open_provider(&base, &project);
+    let root = base.path().join("roots/main");
+    for sequence in 0..=256 {
+        std::fs::write(root.join(format!("foreign-{sequence}")), b"retained")
+            .expect("foreign fixture");
+    }
+
+    let report = provider.inspect_abandoned_staging();
+
+    assert_eq!(report.inspected, 256);
+    assert_eq!(report.retained, 256);
+    assert_eq!(report.removed, 0);
+    assert!(report.truncated);
+    assert_eq!(report.failures, 0);
+    assert_eq!(
+        std::fs::read(root.join("foreign-256")).expect("uninspected entry remains"),
+        b"retained"
+    );
+}
+
+/// Platforms without handle-relative inspection expose an inert unsupported
+/// report and leave the provider root untouched.
+#[cfg(not(unix))]
+#[test]
+fn local_dir_inspection_is_unsupported_without_mutation() {
+    let base = TempDir::new("inspection-unsupported");
+    let project = TempDir::new("inspection-unsupported-project");
+    let provider = open_provider(&base, &project);
+    let root = base.path().join("roots/main");
+    let marker = root.join("foreign");
+    std::fs::write(&marker, b"retained").expect("fixture");
+
+    let report = provider.inspect_abandoned_staging();
+
+    assert!(!report.supported);
+    assert_eq!(report.inspected, 0);
+    assert_eq!(report.retained, 0);
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.failures, 0);
+    assert_eq!(std::fs::read(marker).expect("marker remains"), b"retained");
+}
+
 /// A committed copy lands at `<root>/<publication hex>` with the locator
 /// `local-dir:<asset root id>/<publication hex>`, is owner-only on unix,
 /// and nothing is visible at the final name before `commit`.

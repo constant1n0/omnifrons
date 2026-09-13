@@ -1,10 +1,19 @@
 # Review Ledger: spike-slice-5f
 
+## Apply Batch 2c — Public Inert Inspection Entry
+
+JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep; both ledgers are empty (#8897, #8899). Independent gate #8909 passed the read-only Phase 2 contract: public 2/2, adapter 192/192, workspace 804/804, Linux and Windows-GNU clippy/check, and fmt. No destructive behavior or application invocation is introduced.
+Native generation 4, ordinal 4 finished `passed` with receipt `batch2c-gate-finish-20260913-01` and runtime revision `sha256:6aaf1e4113a05a693efed59d878585d7d5001fd5169aad2baa3f6c5f2552d1ca`; ordinals 1–3 remain preserved. Final identity rechecks, native deletion, and activation remain Phase 3/4 work.
+
 ## Apply Batch 2b — Private Retain-First Walker
 
 JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep of the 332-line private-core diff; both findings ledgers are empty (#8863, #8868). No corrective round was needed. Independent automatic gate #8843 passed: focused 18/18, workspace 802/802, Linux and Windows-GNU all-target/all-feature clippy/check, and fmt.
 Native generation 3, ordinal 3 is finished `passed` with receipt `batch2b-gate-finish-20260913-01` and runtime revision `sha256:eb2d617c9fb411eabda8f3c25cc1bc6878e964a33aaee0398463ca934bd56c0f`; old ordinals 1/2 are preserved and `complete=true`, `next_action=complete`. Windows evidence is compile-only, not a native runtime claim.
 This approves Batch 2b private core pending delivery only. Broader Phase 2 remains partial: public integration, final identity rechecks, native deletion, and activation remain deferred; whole tasks 2.1–2.3 stay unchecked.
+
+## Apply Batch 2c — Public Inert Inspection Entry
+
+Historical pre-gate record: the public adapter entry delegates only to the read-only retain-first walker; no stage, publication, IPC, UI, deletion, or final identity recheck path invokes it. Phase 2 task completion is limited to inert inspection; Phase 3 and 4 obligations remain deferred.
 
 ## Design — Judgment Day, corrective round 1
 

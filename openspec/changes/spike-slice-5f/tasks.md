@@ -35,9 +35,9 @@ No parallel writers. Planning PRs land before code; every PR targets `main` afte
 
 ## Phase 2: Bounded Retain-First Scanner — PR 2
 
-- [ ] 2.1 **RED**: extend `crates/omnifrons-adapters/tests/publication_fs.rs` for eligible root/owner/mode, age/time/metadata/liveness uncertainty, excluded producers, 256 inspected/32 removed caps, counts and `truncated`.
-- [ ] 2.2 **GREEN**: implement root-handle evidence and bounded scanner in `local_staging_cleanup.rs`; retain on root/link/identity/time/I/O uncertainty and do not invoke unlink.
-- [ ] 2.3 **REFACTOR evidence**: expose the inert entry through `local_dir_blob_store.rs` and `lib.rs` without calling it; focused tests plus `cargo test --workspace`, fmt, clippy, and check pass.
+- [x] 2.1 **RED**: extend `crates/omnifrons-adapters/tests/publication_fs.rs` for eligible root/owner/mode, age/time/metadata/liveness uncertainty, excluded producers, 256 inspected/32 removed caps, counts and `truncated`.
+- [x] 2.2 **GREEN**: implement root-handle evidence and bounded scanner in `local_staging_cleanup.rs`; retain on root/link/identity/time/I/O uncertainty and do not invoke unlink.
+- [x] 2.3 **REFACTOR evidence**: expose the inert entry through `local_dir_blob_store.rs` and `lib.rs` without calling it; focused tests plus `cargo test --workspace`, fmt, clippy, and check pass.
 
 ## Phase 3: Unix Positive Deletion Engine — PR 3
 

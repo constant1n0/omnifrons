@@ -38,6 +38,8 @@ use omnifrons_app::blob_store::{
 };
 use omnifrons_domain::publication::{AssetRootId, ProviderLocator, PublicationIdentity};
 
+use crate::local_staging_cleanup::CleanupReport;
+
 /// The local-directory provider.
 #[derive(Debug, Clone)]
 pub struct LocalDirBlobStore {
@@ -60,6 +62,12 @@ impl LocalDirBlobStore {
             root: device_path.path().to_path_buf(),
             asset_root_id,
         }
+    }
+
+    /// Inspect stale local staging entries without mutating the asset root.
+    #[must_use]
+    pub fn inspect_abandoned_staging(&self) -> CleanupReport {
+        crate::local_staging_cleanup::inspect_staging(&self.root)
     }
 
     fn locator_prefix(&self) -> String {
