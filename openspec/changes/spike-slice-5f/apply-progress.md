@@ -1,4 +1,4 @@
-# Apply Progress: spike-slice-5f — Batches 1, 2a, and 2b
+# Apply Progress: spike-slice-5f — Batches 1, 2a–2c, and 3a–3c
 
 ## Completed
 - [x] 1.1 Exact local staging basename parser and retention tables.
@@ -208,3 +208,47 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
   and deterministic FIFO/nonblocking proof, which are deferred to the next dependency-closed
   slice. No public `LocalDirBlobStore` cleanup entry, publication-mutex proof, or activation was
   added; Phase 4 owns locked invocation and observability.
+
+## Batch 3c: Bound Cleanup Entry and FIFO Contract (JD Approved, Gate Passed, Pending Delivery)
+- `LocalDirBlobStore::cleanup_abandoned_staging` composes the crate-private Unix engine through
+  the provider's existing validated device-root binding. Non-Unix builds return the existing
+  path-free unsupported report. No raw-root destructive API is public.
+- Public real-filesystem coverage proves one owned old exact candidate whose owned child has
+  exited is removed through the bound provider API. The fixture uses explicit `FileTimes` and
+  removes only its own temporary root. The Windows-only public test asserts unsupported retention.
+- The shell test creates only an owned FIFO, starts a worker which takes the real
+  `PublicationState::lock_surface` guard and calls the bound provider API, then uses bounded
+  channels to prove cleanup returns while that actual guard remains held. The FIFO is retained;
+  no dummy mutex, sleep-based correctness, production callsite, IPC change, stage call, or UI
+  path was added.
+
+### Batch 3c TDD Cycle Evidence
+| Tasks | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 3.1, 3.3 bound entry | `publication_fs.rs` | Public integration, real filesystem | 25/25 public | missing `cleanup_abandoned_staging` (E0599) | owned dead-child cleanup 1/1 | Unix removal plus Windows unsupported retention | provider wrapper only; private engine unchanged |
+| 3.2 FIFO contract | `publication_state.rs` | Shell integration, real FIFO | 2/2 shell | bound API prerequisite unavailable (E0599) | actual `lock_surface` FIFO test 1/1 | retained FIFO plus held-guard assertion | bounded channel handshake; no sleeps |
+
+### Batch 3c Verification
+- Baseline: public adapter integration passed 25/25; shell publication-state tests passed 2/2.
+- RED: pinned public integration compilation failed with E0599 because the bound provider entry
+   did not exist. GREEN: its focused test passed 1/1; the real-lock FIFO test passed 1/1.
+- Refactor/gates: pinned `cargo fmt --all -- --check`, workspace all-target/all-feature check and
+  tests, Linux adapter clippy, and Windows-GNU adapter clippy all passed. Whole-workspace Windows
+  clippy was intentionally not run because the environment lacks `windres`.
+- JD approved: both blind judges completed an exhaustive sweep with empty ledgers (#9112, #9114).
+- Independent gate #9117 passed: public cleanup 1/1, native 4/4, real `PublicationState` FIFO
+  1/1, adapter 201/201, shell 234/234, workspace 818/818, doctest 1/1, Linux and Windows-GNU
+  adapter clippy/check, and `cargo fmt --all -- --check`. The frozen PR #21 diff is 211 lines
+  (208 additions, 3 deletions).
+
+### Batch 3c Runtime Handoff
+- Authorized append-only rollover from completed generation 6 used request
+  `batch3c-rollover-20260914-01`; it preserved ordinals 1–6. Historical pre-gate state: generation 7 / ordinal 7 was
+  `batch3c-bound-cleanup-fifo-contract`, objective
+  `prove-bound-cleanup-and-nonblocking-fifo-under-publication-lock`, revision
+  `sha256:7d52511395ec8f57dd29f78d9a3574be584adf27e6bd7400b659d3c5d7b1462c`.
+- Generation 7 / ordinal 7 finished `passed` with receipt
+  `batch3c-gate-finish-20260914-01` and revision
+  `sha256:1bbba8d61e0967f0e75ebbd42fd8d2e9e5ca89f8106447ac8bd08a85feb85637`.
+  Ordinals 1–6 remain preserved. Batch 3c is JD approved, gate passed, and pending delivery;
+  no production activation, publication/IPC/UI callsite, or provider-policy expansion occurred.

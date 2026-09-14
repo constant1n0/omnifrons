@@ -70,6 +70,20 @@ impl LocalDirBlobStore {
         crate::local_staging_cleanup::inspect_staging(&self.root)
     }
 
+    /// Remove only provably abandoned staging entries under this provider's
+    /// already-validated device asset root. Shell activation remains separate.
+    #[must_use]
+    pub fn cleanup_abandoned_staging(&self) -> CleanupReport {
+        #[cfg(unix)]
+        {
+            crate::local_staging_cleanup::cleanup_staging(&self.root)
+        }
+        #[cfg(not(unix))]
+        {
+            CleanupReport::unsupported()
+        }
+    }
+
     fn locator_prefix(&self) -> String {
         format!("{}:{}/", Self::ADAPTER_ID, self.asset_root_id)
     }

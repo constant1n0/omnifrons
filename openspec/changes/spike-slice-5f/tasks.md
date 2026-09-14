@@ -41,9 +41,9 @@ No parallel writers. Planning PRs land before code; every PR targets `main` afte
 
 ## Phase 3: Unix Positive Deletion Engine — PR 3
 
-- [ ] 3.1 **RED**: add Unix real-FS tests for only old exact dead-PID regular single-link deletion; links, swaps, final identity mismatch, failed unlink, and nonregular entries retain with correct counts.
-- [ ] 3.2 **RED**: add deterministic FIFO coverage proving `O_NONBLOCK|O_NOFOLLOW` refusal returns without blocking while the publication mutex is held (JD-002).
-- [ ] 3.3 **GREEN/REFACTOR evidence**: use handle-relative no-follow open, `fstat`/`fstatat` root-and-candidate rechecks, and `unlinkat`; count only `Ok(())`, disclose residual race, retain unsupported cfg.
+- [x] 3.1 **RED**: add Unix real-FS tests for only old exact dead-PID regular single-link deletion; links, swaps, final identity mismatch, failed unlink, and nonregular entries retain with correct counts.
+- [x] 3.2 **RED**: add deterministic FIFO coverage proving `O_NONBLOCK|O_NOFOLLOW` refusal returns without blocking while the publication mutex is held (JD-002).
+- [x] 3.3 **GREEN/REFACTOR evidence**: use handle-relative no-follow open, `fstat`/`fstatat` root-and-candidate rechecks, and `unlinkat`; count only `Ok(())`, disclose residual race, retain unsupported cfg.
 
 ## Phase 4: Locked Activation and Regression Gates — PR 4
 

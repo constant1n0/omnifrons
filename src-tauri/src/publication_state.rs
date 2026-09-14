@@ -87,6 +87,12 @@ impl PublicationState {
 #[cfg(test)]
 mod tests {
     use super::{ASSET_ROOTS_DIR, PublicationState, QUARANTINE_DIR, WORK_AREA_DIR};
+    #[cfg(unix)]
+    use omnifrons_adapters::LocalDirBlobStore;
+    #[cfg(unix)]
+    use omnifrons_app::{WorkspaceRoot, blob_store::DeviceAssetPath};
+    #[cfg(unix)]
+    use omnifrons_domain::publication::AssetRootId;
 
     #[test]
     fn the_default_paths_sit_under_the_application_data_directory() {
@@ -115,5 +121,84 @@ mod tests {
         assert!(state.surface.try_lock().is_err(), "held");
         drop(guard);
         assert!(state.surface.try_lock().is_ok(), "released");
+    }
+
+    /// A nonblocking provider cleanup must not stall the actual shell
+    /// publication surface guard when a staging FIFO is encountered.
+    #[cfg(unix)]
+    #[test]
+    fn bound_cleanup_returns_for_a_fifo_while_the_publication_surface_is_held() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        use std::time::Duration;
+
+        struct TestDir(std::path::PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "omnifrons-publication-state-fifo-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("owned fixture root");
+        let fixture = TestDir(root);
+        let workspace_path = fixture.0.join("workspace");
+        std::fs::create_dir(&workspace_path).expect("owned workspace");
+        let workspace = WorkspaceRoot::new(&workspace_path).expect("workspace");
+        let asset_path = DeviceAssetPath::open(&fixture.0.join("assets/main"), &[&workspace])
+            .expect("validated provider root");
+        std::fs::set_permissions(asset_path.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only provider root");
+        let fifo = asset_path
+            .path()
+            .join(format!(".{}.42-7.part", "ab".repeat(32)));
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("owned FIFO fixture command")
+                .success(),
+            "mkfifo creates the owned fixture"
+        );
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only FIFO");
+
+        let provider = LocalDirBlobStore::open(&asset_path, AssetRootId::new("main").expect("id"));
+        let state = Arc::new(PublicationState::under(&fixture.0));
+        let (done, received) = sync_channel(1);
+        let (release, continue_worker) = sync_channel(1);
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            let _surface_guard = worker_state.lock_surface();
+            done.send(provider.cleanup_abandoned_staging())
+                .expect("test receiver remains available");
+            continue_worker
+                .recv_timeout(Duration::from_secs(1))
+                .expect("test releases the guarded worker");
+        });
+
+        let report = received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FIFO cleanup returns while the real surface guard is held");
+        assert!(
+            state.surface.try_lock().is_err(),
+            "real surface guard remains held"
+        );
+        release.send(()).expect("worker awaits release");
+        worker.join().expect("bounded worker exits");
+        assert_eq!(report.inspected, 1);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failures, 0);
+        assert!(fifo.exists(), "the owned FIFO remains");
     }
 }

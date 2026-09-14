@@ -1,5 +1,10 @@
 # Review Ledger: spike-slice-5f
 
+## Apply Batch 3c — Bound Provider Cleanup and FIFO Proof
+
+JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep of the frozen 211-line change (208 additions, 3 deletions); both ledgers are empty (#9112, #9114). Gate #9117 PASSED: public cleanup 1/1, native 4/4, real `PublicationState` FIFO 1/1, adapter 201/201, shell 234/234, workspace 818/818, doctest 1/1, Linux and Windows-GNU adapter clippy/check, and fmt. The provider-bound API and real publication-mutex FIFO proof support Phase 3 completion without application activation.
+Native generation 7 / ordinal 7 finished `passed` with receipt `batch3c-gate-finish-20260914-01` and revision `sha256:1bbba8d61e0967f0e75ebbd42fd8d2e9e5ca89f8106447ac8bd08a85feb85637`; ordinals 1–6 are preserved. Batch 3c is JD approved, gate passed, and pending delivery. Source mutations during verification were restricted to owned temporary test fixtures. Native Windows/macOS runtime CI remains deferred to later delivery work.
+
 ## Apply Batch 3b — Protected Native Unlink
 
 JUDGMENT: APPROVED. JD-601 is verified by fresh scoped judges `batch3b-rejudge-a` and #9031; no new BLOCKER or CRITICAL finding was raised.

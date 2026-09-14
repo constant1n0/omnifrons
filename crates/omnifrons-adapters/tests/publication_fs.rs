@@ -233,6 +233,50 @@ fn local_dir_inspection_reports_the_inspection_bound_without_mutation() {
     );
 }
 
+/// Batch3c: the bound cleanup entry uses the provider's validated root, but
+/// remains dormant until a later shell activation slice composes it.
+#[cfg(unix)]
+#[test]
+fn local_dir_cleanup_removes_an_owned_old_candidate_with_a_dead_creator() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let base = TempDir::new("cleanup-removes");
+    let project = TempDir::new("cleanup-removes-project");
+    let provider = open_provider(&base, &project);
+    let candidate = base.path().join("roots/main").join(format!(
+        ".{}.{}-7.part",
+        "ab".repeat(32),
+        exited_child_pid()
+    ));
+    std::fs::write(&candidate, b"abandoned staging").expect("candidate fixture");
+    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+        .expect("owner-only fixture");
+    File::open(&candidate)
+        .expect("open fixture")
+        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .expect("old fixture time");
+
+    let report = provider.cleanup_abandoned_staging();
+
+    assert_eq!(report.inspected, 1);
+    assert_eq!(report.retained, 0);
+    assert_eq!(report.removed, 1);
+    assert!(!report.truncated);
+    assert!(report.supported);
+    assert_eq!(report.failures, 0);
+    assert!(!candidate.exists(), "only the owned fixture was removed");
+}
+
+#[cfg(unix)]
+fn exited_child_pid() -> u32 {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("owned child");
+    let pid = child.id();
+    child.wait().expect("owned child exits");
+    pid
+}
+
 /// Platforms without handle-relative inspection expose an inert unsupported
 /// report and leave the provider root untouched.
 #[cfg(not(unix))]
@@ -246,6 +290,26 @@ fn local_dir_inspection_is_unsupported_without_mutation() {
     std::fs::write(&marker, b"retained").expect("fixture");
 
     let report = provider.inspect_abandoned_staging();
+
+    assert!(!report.supported);
+    assert_eq!(report.inspected, 0);
+    assert_eq!(report.retained, 0);
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.failures, 0);
+    assert_eq!(std::fs::read(marker).expect("marker remains"), b"retained");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn local_dir_cleanup_is_unsupported_without_mutation() {
+    let base = TempDir::new("cleanup-unsupported");
+    let project = TempDir::new("cleanup-unsupported-project");
+    let provider = open_provider(&base, &project);
+    let root = base.path().join("roots/main");
+    let marker = root.join("foreign");
+    std::fs::write(&marker, b"retained").expect("fixture");
+
+    let report = provider.cleanup_abandoned_staging();
 
     assert!(!report.supported);
     assert_eq!(report.inspected, 0);
