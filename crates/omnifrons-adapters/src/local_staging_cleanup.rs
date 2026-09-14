@@ -242,6 +242,93 @@ fn open_staging_candidate(
     }))
 }
 
+/// Recheck the admitted root and basename through their original handles.
+///
+/// This is deliberately non-mutating. A later deletion slice may use this
+/// proof immediately before `unlinkat`, while still disclosing that another
+/// same-user process can race the final lookup and unlink.
+#[cfg(unix)]
+#[allow(dead_code)] // Batch3a supplies proof; a later deletion slice consumes it before unlinkat.
+fn final_identity_matches(
+    root_path: &std::path::Path,
+    name: &OsStr,
+    evidence: &StagingCandidateEvidence,
+) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::fstatat;
+
+    let Ok(current_root) = std::fs::symlink_metadata(root_path) else {
+        return false;
+    };
+    let root_mode = current_root.permissions().mode() & 0o777;
+    if !current_root.file_type().is_dir()
+        || current_root.dev() != evidence.root.dev
+        || current_root.ino() != evidence.root.ino
+        || current_root.uid() != evidence.root.uid
+        || root_mode != evidence.root.mode
+    {
+        return false;
+    }
+    let Ok(held_root) = evidence.root.handle.metadata() else {
+        return false;
+    };
+    if held_root.dev() != evidence.root.dev
+        || held_root.ino() != evidence.root.ino
+        || held_root.uid() != evidence.root.uid
+        || (held_root.permissions().mode() & 0o777) != evidence.root.mode
+    {
+        return false;
+    }
+    let Ok(held_candidate) = evidence.handle.metadata() else {
+        return false;
+    };
+    if !held_candidate.file_type().is_file()
+        || held_candidate.dev() != evidence.dev
+        || held_candidate.ino() != evidence.ino
+        || held_candidate.uid() != evidence.uid
+        || (held_candidate.permissions().mode() & 0o777) != evidence.mode
+        || held_candidate.nlink() != evidence.link_count
+        || held_candidate.len() != evidence.size
+        || held_candidate.modified().ok() != Some(evidence.modified_at)
+    {
+        return false;
+    }
+    let Ok(current) = fstatat(
+        &evidence.root.handle,
+        std::path::Path::new(name),
+        AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) else {
+        return false;
+    };
+    let Some(seconds) = u64::try_from(current.st_mtime).ok() else {
+        return false;
+    };
+    let Some(nanoseconds) = u64::try_from(current.st_mtime_nsec).ok() else {
+        return false;
+    };
+    stat_field_matches(current.st_dev, evidence.dev)
+        && stat_field_matches(current.st_ino, evidence.ino)
+        && stat_field_matches(current.st_uid, u64::from(evidence.uid))
+        && stat_field_matches(current.st_mode & 0o777, u64::from(evidence.mode))
+        && stat_field_matches(current.st_nlink, evidence.link_count)
+        && stat_field_matches(current.st_size, evidence.size)
+        && SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(seconds))
+            .and_then(|time| time.checked_add(Duration::from_nanos(nanoseconds)))
+            == Some(evidence.modified_at)
+}
+
+/// Fallibly normalize a native stat field before comparison with captured evidence.
+#[allow(dead_code)] // Batch3a supplies proof; a later deletion slice consumes it before unlinkat.
+fn stat_field_matches<T>(field: T, evidence: u64) -> bool
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(field).ok() == Some(evidence)
+}
+
 /// Inspect at most [`MAX_INSPECTED_ENTRIES`] names through one admitted root.
 ///
 /// This is retain-only production behavior: candidates that satisfy every
@@ -433,6 +520,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    fn final_recheck_fixture(
+        label: &str,
+    ) -> (
+        TestDir,
+        String,
+        std::path::PathBuf,
+        super::StagingCandidateEvidence,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new(label);
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let evidence =
+            super::open_staging_evidence(root.path(), OsStr::new(&name)).expect("initial evidence");
+
+        (root, name, candidate, evidence)
     }
 
     #[test]
@@ -692,6 +804,188 @@ mod tests {
         assert_eq!(evidence.size, 7);
         assert_eq!(evidence.link_count, 1);
         assert_eq!(evidence.mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_recheck_accepts_unchanged_held_root_and_candidate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("final-recheck-stable");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+
+        let evidence =
+            super::open_staging_evidence(root.path(), OsStr::new(&name)).expect("initial evidence");
+
+        assert!(super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+    }
+
+    #[test]
+    fn stat_field_comparison_accepts_representable_apple_width_values() {
+        assert!(super::stat_field_matches(42_i32, 42));
+        assert!(super::stat_field_matches(0o600_u16, 0o600));
+        assert!(super::stat_field_matches(1_u16, 1));
+    }
+
+    #[test]
+    fn stat_field_comparison_rejects_negative_and_overflowing_values() {
+        assert!(!super::stat_field_matches(-1_i32, u64::MAX));
+        assert!(!super::stat_field_matches(-1_i32, 1));
+        assert!(!super::stat_field_matches(
+            0o600_u16,
+            u64::from(u16::MAX) + 1
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_recheck_rejects_a_replaced_candidate_basename() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("final-recheck-replaced");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let evidence =
+            super::open_staging_evidence(root.path(), OsStr::new(&name)).expect("initial evidence");
+        std::fs::remove_file(&candidate).expect("replace fixture");
+        std::fs::write(&candidate, b"other").expect("replacement");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only replacement");
+
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_recheck_rejects_a_root_path_replaced_by_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let fixture = TestDir::new("final-recheck-root-symlink");
+        let root = fixture.path().join("admitted-root");
+        let held_root_path = fixture.path().join("held-root");
+        std::fs::create_dir(&root).expect("admitted root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let evidence =
+            super::open_staging_evidence(&root, OsStr::new(&name)).expect("initial evidence");
+
+        std::fs::rename(&root, &held_root_path).expect("move admitted root");
+        symlink(&held_root_path, &root).expect("replace root path with symlink");
+
+        assert!(
+            !super::final_identity_matches(&root, OsStr::new(&name), &evidence),
+            "a replacement root path must fail closed even when it resolves to the held directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_recheck_rejects_candidate_metadata_changes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (root, name, candidate, evidence) = final_recheck_fixture("final-recheck-metadata");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o640))
+            .expect("change candidate mode");
+
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("restore candidate mode");
+        std::thread::sleep(Duration::from_millis(1));
+        std::fs::write(&candidate, b"changed").expect("change candidate contents");
+
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_recheck_rejects_missing_candidate_and_root() {
+        let (root, name, candidate, evidence) = final_recheck_fixture("final-recheck-missing");
+        std::fs::remove_file(&candidate).expect("remove candidate fixture");
+
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+
+        let (root, name, _candidate, evidence) =
+            final_recheck_fixture("final-recheck-missing-root");
+        std::fs::rename(root.path(), root.path().with_extension("missing"))
+            .expect("remove root fixture path");
+
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_recheck_rejects_linked_symbolic_and_non_regular_replacements() {
+        use std::os::unix::fs::symlink;
+
+        let (root, name, candidate, evidence) = final_recheck_fixture("final-recheck-hard-link");
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, b"replacement").expect("replacement file");
+        std::fs::remove_file(&candidate).expect("remove candidate fixture");
+        std::fs::hard_link(&replacement, &candidate).expect("hard-link replacement");
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+
+        let (root, name, candidate, evidence) = final_recheck_fixture("final-recheck-symlink");
+        std::fs::remove_file(&candidate).expect("remove candidate fixture");
+        symlink("replacement", &candidate).expect("symbolic-link replacement");
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
+
+        let (root, name, candidate, evidence) = final_recheck_fixture("final-recheck-directory");
+        std::fs::remove_file(&candidate).expect("remove candidate fixture");
+        std::fs::create_dir(&candidate).expect("directory replacement");
+        assert!(!super::final_identity_matches(
+            root.path(),
+            OsStr::new(&name),
+            &evidence
+        ));
     }
 
     #[cfg(unix)]

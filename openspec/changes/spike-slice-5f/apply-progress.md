@@ -115,3 +115,42 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
 ### Batch 2c Runtime Receipt
 - The source and RED/GREEN work above predate native Batch 2c control; this receipt is recorded only after independent validation.
 - Generation 4, ordinal 4 finished `passed` for objective `sha256:21e75779416a4b75551bc2d43660575431528c0acb2561bdf23a534ea3842e65` with receipt `batch2c-gate-finish-20260913-01` and runtime revision `sha256:6aaf1e4113a05a693efed59d878585d7d5001fd5169aad2baa3f6c5f2552d1ca`. Ordinals 1–3 remain preserved.
+
+## Batch 3a: Final Identity Recheck Core (Implemented, Pending Independent Review)
+- Private, non-mutating `final_identity_matches` now rejects a root path replacement that is a
+  symlink even if it resolves to the admitted directory. It uses `symlink_metadata` to require the
+  current root path itself to be the original directory identity, while candidate lookup remains
+  `fstatat` on the held root handle with `AT_SYMLINK_NOFOLLOW`.
+- Rechecks fail closed on missing roots/candidates, root or candidate metadata mismatch, hard-link,
+  symlink, and non-regular replacements. The held root and candidate handles are rechecked against
+  their captured dev/ino/UID/mode, regularity, link count, size, and high-resolution mtime facts.
+- This slice remains inert: no `unlinkat`, native deletion engine, public cleanup entry, staging,
+  publication, IPC, or UI activation was added. Phase 3 tasks 3.1–3.3 stay unchecked because FIFO
+  and deletion obligations are intentionally deferred.
+
+### Batch 3a TDD Cycle Evidence
+| Slice | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| final identity recheck core | `local_staging_cleanup.rs` | Unit, real filesystem | 20/20 focused | root-path symlink replacement failed: the old `metadata` followed it | focused recheck tests: 6/6 | mode and same-size write/mtime mutation; missing candidate/root; hard-link, symlink, and directory replacements | replaced root-path `metadata` with no-follow `symlink_metadata`; tests remain 6/6 |
+
+### Batch 3a Verification
+- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 /home/dcm/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters final_recheck_rejects_a_root_path_replaced_by_a_symlink` failed (0/1) because `metadata` followed the replacement symlink.
+- GREEN: the same pinned command passed (1/1); focused `final_recheck_` passed 6/6 and the complete `local_staging_cleanup::tests::` module passed 24/24.
+- Gates passed with the pinned toolchain: `cargo fmt --all -- --check`; Linux and `x86_64-pc-windows-gnu` adapter `cargo clippy -p omnifrons-adapters --all-targets --all-features -- -D warnings`; `cargo check --workspace --all-targets --all-features`; and `cargo test --workspace --all-targets --all-features`. Windows evidence is compile-only.
+
+### Batch 3a JD-501 Corrective Round 1 (Verified, Native Gate Passed)
+- TDD safety net: `final_recheck_` passed 6/6. RED: `stat_field_comparison` failed with E0425 because the checked comparison helper did not exist. GREEN: representable Apple-width i32/u16 values pass; negative i32 and out-of-range evidence fail closed. Triangulation: two behavioral tests, six assertions.
+- The helper fallibly converts every raw `fstatat` field compared to fixed-width evidence (dev, ino, uid, mode, link count, size); it preserves held-root `fstatat(AT_SYMLINK_NOFOLLOW)`, metadata, UID, mode, link, size, and mtime semantics with no mutation or activation.
+- Post-GREEN: focused module tests passed 26/26; formatter, Linux and Windows-GNU adapter all-target/all-feature clippy with `-D warnings`, and workspace all-target/all-feature check passed. The Apple target is not installed; this is not a macOS compile or runtime claim.
+- Skill resolution injected: `/home/dcm/.config/opencode/skills/judgment-day/SKILL.md`, `/home/dcm/.claude/skills/secret-safe-diagnostics/SKILL.md`, and `/home/dcm/.config/opencode/skills/sdd-apply/strict-tdd.md`.
+- Both fresh scoped judges approved the correction: `batch3a-rejudge-a` and #8985. JD-501 is verified;
+  1 of 2 corrective rounds is used. Independent Batch 3a gate #8939 passed: final 6/6, stat-width 2/2,
+  module 26/26, adapter 200/200, workspace 812/812, Linux and Windows-GNU clippy/check, and fmt.
+
+### Batch 3a Runtime Handoff
+- Native attempt finished `passed`: generation 5,
+  ordinal 5, work unit `batch3a-final-identity-recheck-core`, objective
+  `sha256:83c37f7022de9ff348d78e3510151e7dd319c4cbd64c90e64e5d717aa4a36973`, receipt
+  `batch3a-gate-finish-20260914-01`, and revision
+  `sha256:1beea844b71ff99f927d1cae561570dcd7cbab9247706505538c54a223ec6368`.
+- Ordinals 1–5 are preserved. Batch3a is pending delivery; macOS CI remains required.

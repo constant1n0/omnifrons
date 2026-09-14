@@ -1,5 +1,18 @@
 # Review Ledger: spike-slice-5f
 
+## Apply Batch 3a — Final Identity Rechecks
+
+JUDGMENT: APPROVED. JD-501 is verified; independent Batch 3a gate #8939 passed and native runtime verification finished passed. Pending delivery.
+
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| JD-501 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:311-316,323-330 | BLOCKER | verified | Round 1 normalizes every compared `fstatat` field with `u64::try_from`, failing closed on conversion failure; Apple-width i32/u16 valid, negative, and overflow inputs have RED/GREEN coverage. Both fresh scoped judges approved: `batch3a-rejudge-a` and #8985. Independent gate #8939 passed; pending delivery. |
+| JD-A-502 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:827-964 | WARNING | info | Several negative tests unlink the original first; held nlink becomes zero, so earlier checks reject before final no-follow basename lookup. This limits the coverage those tests demonstrate. Reported once; not a fix/re-review driver. |
+| JD-B-502 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:936-945 | WARNING | info | The hard-link replacement test changes inode, so it does not isolate the case of adding a link to the originally held candidate. Reported once; not a fix/re-review driver. |
+| JD-B-503 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:895-904 | WARNING | info | The mtime-change test relies on a one-millisecond sleep and may be nondeterministic on coarse-resolution filesystems. Reported once; not a fix/re-review driver. |
+
+Batch 3a remains uncommitted and nonmutating. Native generation 5 / ordinal 5 finished `passed` with receipt `batch3a-gate-finish-20260914-01` and revision `sha256:1beea844b71ff99f927d1cae561570dcd7cbab9247706505538c54a223ec6368`; ordinals 1–5 are preserved. Corrective budget: 1 of 2 fix rounds used; judgment approved, pending delivery. macOS CI remains required.
+
 ## Apply Batch 2c — Public Inert Inspection Entry
 
 JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep; both ledgers are empty (#8897, #8899). Independent gate #8909 passed the read-only Phase 2 contract: public 2/2, adapter 192/192, workspace 804/804, Linux and Windows-GNU clippy/check, and fmt. No destructive behavior or application invocation is introduced.
