@@ -154,3 +154,57 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
   `batch3a-gate-finish-20260914-01`, and revision
   `sha256:1beea844b71ff99f927d1cae561570dcd7cbab9247706505538c54a223ec6368`.
 - Ordinals 1–5 are preserved. Batch3a is pending delivery; macOS CI remains required.
+
+## Batch 3b: Protected Native Unlink (Verified Private Engine, Pending Delivery)
+- `cleanup_staging` remains uninvoked by `LocalDirBlobStore`, staging, publication, IPC, and UI.
+  `inspect_staging` remains retain-only. The Unix-only action constructs fresh evidence from the
+  admitted root and candidate handles, calls `final_identity_matches`, then calls handle-relative
+  `unlinkat` on the canonical basename. Only `Ok(())` increments `removed`; mismatches retain and
+  operational unlink errors retain while incrementing `failures`, with no paths or wire states.
+- Linux real-filesystem tests use only owned `TestDir` fixtures and explicit `FileTimes`: an old
+  exact dead-PID candidate is removed; basename substitution preserves the original held object;
+  a second link added after admission rejects unlink; and an injected operational failure leaves
+  the file with `removed: 0` and `failures: 1`. Existing merged tests continue to cover excluded,
+  live/unknown, unsafe, young, future, root, and cap retention paths.
+- The residual same-user final-check/unlink race remains explicitly documented in the low-level
+  API; this slice does not claim atomicity or cross-shell exclusion.
+
+### Batch 3b TDD Cycle Evidence
+| Slice | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| protected native unlink | `local_staging_cleanup.rs` | Unit, real filesystem | 26/26 focused | missing `cleanup_staging_with` and `native_unlink_if_unchanged` (E0425) | 4/4 native focused; 30/30 module | substitution and post-admission hard-link cases | shared action seam reports retain vs operational failure without paths |
+
+### Batch 3b Verification
+- RED: pinned `cargo test -p omnifrons-adapters native_cleanup_` failed with E0425 for both new
+  action symbols before production implementation.
+- GREEN: the same command passed 4/4; module tests passed 30/30. Pinned formatter, Linux and
+  Windows-GNU adapter all-target/all-feature clippy with `-D warnings`, workspace all-target/all-
+  feature check, and workspace all-target/all-feature test passed. Windows evidence is compile-only.
+
+### Batch 3b Runtime Handoff
+- Authorized append-only CAS rollover preserved generations 1–5. Generation 6 / ordinal 6 for
+  `batch3b-protected-native-unlink` finished `passed` with receipt
+  `batch3b-gate-retry-9051-finish-20260914-01` and revision
+  `c9c934288048a7e07b989c02103c8ce2d349ffe87f2ee7e419949a78f349b2d2`.
+- Gate #9051 retry passed against the frozen 322-line diff (313 additions, 9 deletions): native 4/4,
+  module 30/30, doctest 1/1, workspace 816/816, Linux and Windows-GNU adapter clippy, fmt, and check. Drift audit #9057 reconciled prior arithmetic; metadata was updated after the gate.
+
+### Batch 3b JD-601 Corrective Round 1 (Verified, Pending Independent Native Gate)
+- TDD safety net: focused `local_staging_cleanup::tests::` passed 30/30. RED: a public-module
+  `compile_fail` doctest referenced `cleanup_staging` as a function pointer and failed because the
+  old public API compiled. GREEN: `cleanup_staging` is now `pub(crate)`; the doctest passed 1/1,
+  and an owned external compile-only fixture failed specifically with E0603 (`private function`).
+  Neither check invokes cleanup or provides a filesystem path.
+- The correction changes only the raw cleanup entry visibility and adds targeted dormant-engine
+  `dead_code` allowances required by non-test `-D warnings`; no unlink behavior, root predicate,
+  read-only API, `LocalDirBlobStore` composition, warning reporting, or activation changed.
+- Post-GREEN: native focused tests passed 4/4, module tests 30/30, formatter, Linux adapter
+  clippy, workspace all-target/all-feature check and tests, plus Windows-GNU adapter clippy/check
+   passed. Windows evidence is compile-only; whole-workspace cross-clippy was not run because it
+   needs unavailable `windres`. Fresh scoped judges `batch3b-rejudge-a` and #9031 verified the correction with no new BLOCKER or CRITICAL finding. Native gate #9051 retry then passed; the engine remains private and pending delivery.
+
+### Batch 3b Deferred Scope
+- Tasks 3.1–3.3 remain unchecked: the full stated task criteria include additional engine cases
+  and deterministic FIFO/nonblocking proof, which are deferred to the next dependency-closed
+  slice. No public `LocalDirBlobStore` cleanup entry, publication-mutex proof, or activation was
+  added; Phase 4 owns locked invocation and observability.

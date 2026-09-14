@@ -73,6 +73,10 @@ pub mod jsonl_ignore_ledger;
 pub mod jsonl_publication_journal;
 pub mod line_agent;
 pub mod local_dir_blob_store;
+/// ```compile_fail
+/// use omnifrons_adapters::local_staging_cleanup::{cleanup_staging, CleanupReport};
+/// let _: fn(&std::path::Path) -> CleanupReport = cleanup_staging;
+/// ```
 pub mod local_staging_cleanup;
 pub mod pty_cli;
 pub mod sha2_hasher;

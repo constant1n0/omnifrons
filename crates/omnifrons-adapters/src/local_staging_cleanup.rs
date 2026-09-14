@@ -332,11 +332,27 @@ where
 /// Inspect at most [`MAX_INSPECTED_ENTRIES`] names through one admitted root.
 ///
 /// This is retain-only production behavior: candidates that satisfy every
-/// read-only predicate still remain in place. `removed` therefore stays zero;
-/// a later phase owns final rechecks and native removal.
+/// read-only predicate still remain in place.
 #[must_use]
 pub fn inspect_staging(root_path: &std::path::Path) -> CleanupReport {
     scan_staging_with(root_path, SystemTime::now(), pid_state)
+}
+
+/// Remove only staging entries that retain their final handle-derived identity.
+///
+/// Callers must hold the publication surface lock. This adapter operation does
+/// not provide cross-process exclusion: a same-user process can still replace
+/// a basename after the final check and before `unlinkat`.
+#[cfg(unix)]
+#[allow(dead_code)] // Dormant until a validated provider entry composes this engine.
+#[must_use]
+pub(crate) fn cleanup_staging(root_path: &std::path::Path) -> CleanupReport {
+    cleanup_staging_with(
+        root_path,
+        SystemTime::now(),
+        pid_state,
+        native_unlink_if_unchanged,
+    )
 }
 
 #[cfg(unix)]
@@ -345,17 +361,20 @@ fn scan_staging_with(
     now: SystemTime,
     pid_state: impl FnMut(u32) -> PidState,
 ) -> CleanupReport {
-    scan_staging_with_simulated_action(root_path, now, pid_state, |_| false)
+    cleanup_staging_with(root_path, now, pid_state, |_, _, _, _| Ok(false))
 }
 
-/// Test-only policy seam that models an acknowledged action without a native
-/// filesystem mutation. Production always supplies the retain closure above.
 #[cfg(unix)]
-fn scan_staging_with_simulated_action(
+fn cleanup_staging_with(
     root_path: &std::path::Path,
     now: SystemTime,
     mut pid_state: impl FnMut(u32) -> PidState,
-    mut action: impl FnMut(&StagingCandidateFacts) -> bool,
+    mut action: impl FnMut(
+        &std::path::Path,
+        &OsStr,
+        &StagingCandidateEvidence,
+        &StagingCandidateFacts,
+    ) -> Result<bool, ()>,
 ) -> CleanupReport {
     use nix::dir::Dir;
     use std::os::unix::ffi::OsStrExt as _;
@@ -392,8 +411,42 @@ fn scan_staging_with_simulated_action(
             Ok(Some(candidate)) => {
                 let eligible = is_old_enough(now, candidate.modified_at)
                     && pid_state(candidate.pid) == PidState::NotLive;
-                if eligible && report.removed < MAX_REMOVED_ENTRIES && action(&candidate) {
-                    report.removed += 1;
+                if eligible && report.removed < MAX_REMOVED_ENTRIES {
+                    let Ok(root_handle) = root.handle.try_clone() else {
+                        report.retained += 1;
+                        report.failures += 1;
+                        continue;
+                    };
+                    let Ok(candidate_handle) = candidate.handle.try_clone() else {
+                        report.retained += 1;
+                        report.failures += 1;
+                        continue;
+                    };
+                    let evidence = StagingCandidateEvidence {
+                        root: StagingRootEvidence {
+                            handle: root_handle,
+                            dev: root.dev,
+                            ino: root.ino,
+                            uid: root.uid,
+                            mode: root.mode,
+                        },
+                        handle: candidate_handle,
+                        dev: candidate.dev,
+                        ino: candidate.ino,
+                        uid: candidate.uid,
+                        mode: candidate.mode,
+                        link_count: candidate.link_count,
+                        size: candidate.size,
+                        modified_at: candidate.modified_at,
+                    };
+                    match action(root_path, name, &evidence, &candidate) {
+                        Ok(true) => report.removed += 1,
+                        Ok(false) => report.retained += 1,
+                        Err(()) => {
+                            report.retained += 1;
+                            report.failures += 1;
+                        }
+                    }
                 } else {
                     report.retained += 1;
                 }
@@ -406,6 +459,42 @@ fn scan_staging_with_simulated_action(
         }
     }
     report
+}
+
+#[cfg(unix)]
+#[allow(dead_code)] // Reached only by the dormant cleanup engine above.
+fn native_unlink_if_unchanged(
+    root_path: &std::path::Path,
+    name: &OsStr,
+    evidence: &StagingCandidateEvidence,
+    _candidate: &StagingCandidateFacts,
+) -> Result<bool, ()> {
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    if !final_identity_matches(root_path, name, evidence) {
+        return Ok(false);
+    }
+    unlinkat(
+        &evidence.root.handle,
+        std::path::Path::new(name),
+        UnlinkatFlags::NoRemoveDir,
+    )
+    .map(|()| true)
+    .map_err(|_| ())
+}
+
+/// Test-only policy seam that models an acknowledged action without a native
+/// filesystem mutation.
+#[cfg(all(test, unix))]
+fn scan_staging_with_simulated_action(
+    root_path: &std::path::Path,
+    now: SystemTime,
+    pid_state: impl FnMut(u32) -> PidState,
+    mut action: impl FnMut(&StagingCandidateFacts) -> bool,
+) -> CleanupReport {
+    cleanup_staging_with(root_path, now, pid_state, |_, _, _, candidate| {
+        Ok(action(candidate))
+    })
 }
 
 #[cfg(not(unix))]
@@ -782,6 +871,152 @@ mod tests {
         assert_eq!(report.removed, 0);
         assert!(!report.truncated);
         assert_eq!(report.failures, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_cleanup_removes_only_an_old_exact_dead_pid_candidate() {
+        use std::fs::FileTimes;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("native-unlink-positive");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::File::open(&candidate)
+            .expect("candidate handle")
+            .set_times(FileTimes::new().set_modified(old))
+            .expect("controlled old timestamp");
+
+        let report = super::cleanup_staging_with(
+            root.path(),
+            old + MIN_STAGING_AGE + Duration::from_millis(1),
+            |_| PidState::NotLive,
+            super::native_unlink_if_unchanged,
+        );
+
+        assert_eq!(report.inspected, 1);
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.retained, 0);
+        assert_eq!(report.failures, 0);
+        assert!(!candidate.exists(), "only successful unlink is removal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_cleanup_retains_the_held_object_when_its_basename_is_substituted() {
+        use std::fs::FileTimes;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = TestDir::new("native-unlink-substitution");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let name = format!(".{PUBLICATION_HEX}.42-7.part");
+        let candidate = root.path().join(&name);
+        let held = root.path().join("held-original");
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::File::open(&candidate)
+            .expect("candidate handle")
+            .set_times(FileTimes::new().set_modified(old))
+            .expect("controlled old timestamp");
+
+        let report = super::cleanup_staging_with(
+            root.path(),
+            old + MIN_STAGING_AGE + Duration::from_millis(1),
+            |_| PidState::NotLive,
+            |root_path, name, evidence, candidate_facts| {
+                std::fs::rename(root_path.join(name), &held).expect("preserve held object");
+                let replacement = root_path.join(name);
+                std::fs::write(&replacement, b"replacement").expect("replacement candidate");
+                std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                    .expect("owner-only replacement");
+                super::native_unlink_if_unchanged(root_path, name, evidence, candidate_facts)
+            },
+        );
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.failures, 0);
+        assert_eq!(held.metadata().expect("held original").nlink(), 1);
+        assert!(candidate.exists(), "replacement basename must remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_cleanup_rechecks_a_link_added_to_the_held_candidate_after_admission() {
+        use std::fs::FileTimes;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("native-unlink-link-count");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let candidate = root.path().join(format!(".{PUBLICATION_HEX}.42-7.part"));
+        let second_link = root.path().join("second-link");
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::File::open(&candidate)
+            .expect("candidate handle")
+            .set_times(FileTimes::new().set_modified(old))
+            .expect("controlled old timestamp");
+
+        let report = super::cleanup_staging_with(
+            root.path(),
+            old + MIN_STAGING_AGE + Duration::from_millis(1),
+            |_| PidState::NotLive,
+            |root_path, name, evidence, candidate_facts| {
+                std::fs::hard_link(root_path.join(name), &second_link)
+                    .expect("add link after admission");
+                super::native_unlink_if_unchanged(root_path, name, evidence, candidate_facts)
+            },
+        );
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.failures, 0);
+        assert!(candidate.exists());
+        assert!(second_link.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_cleanup_counts_operational_unlink_failure_separately_from_retention() {
+        use std::fs::FileTimes;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestDir::new("native-unlink-failure");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only root");
+        let candidate = root.path().join(format!(".{PUBLICATION_HEX}.42-7.part"));
+        std::fs::write(&candidate, b"staging").expect("candidate");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::File::open(&candidate)
+            .expect("candidate handle")
+            .set_times(FileTimes::new().set_modified(old))
+            .expect("controlled old timestamp");
+
+        let report = super::cleanup_staging_with(
+            root.path(),
+            old + MIN_STAGING_AGE + Duration::from_millis(1),
+            |_| PidState::NotLive,
+            |_, _, _, _| Err(()),
+        );
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.failures, 1);
+        assert!(candidate.exists(), "failed unlink keeps the fixture file");
     }
 
     #[cfg(unix)]

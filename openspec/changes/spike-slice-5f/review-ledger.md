@@ -1,5 +1,16 @@
 # Review Ledger: spike-slice-5f
 
+## Apply Batch 3b — Protected Native Unlink
+
+JUDGMENT: APPROVED. JD-601 is verified by fresh scoped judges `batch3b-rejudge-a` and #9031; no new BLOCKER or CRITICAL finding was raised.
+
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| JD-601 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:348; crates/omnifrons-adapters/src/lib.rs:76-79 | CRITICAL | verified | Corrective round 1 narrows `cleanup_staging` to `pub(crate)` without changing unlink logic or the public read-only API. A public-module `compile_fail` doctest uses a function pointer only; RED proved the prior export compiled, GREEN passed after the boundary change, and an owned external compile-only fixture failed specifically with E0603. Fresh scoped judges `batch3b-rejudge-a` and #9031 verified the correction. |
+| JD-602 | judgment-day | crates/omnifrons-adapters/src/local_staging_cleanup.rs:262-303,464-481 | WARNING | info | Both judges observed that final-recheck I/O errors collapse into false and are counted as retention rather than failures. Deletion stays fail-closed, but reporting may appear clean. Reported once; not a fix/re-review driver. |
+
+The engine remains uninvoked by application flows. Native generation 6 / ordinal 6 finished `passed` with receipt `batch3b-gate-retry-9051-finish-20260914-01` and revision `c9c934288048a7e07b989c02103c8ce2d349ffe87f2ee7e419949a78f349b2d2`; ordinals 1–5 are preserved. Batch 3b corrective budget: one of at most two rounds used; judgment approved, pending delivery.
+
 ## Apply Batch 3a — Final Identity Rechecks
 
 JUDGMENT: APPROVED. JD-501 is verified; independent Batch 3a gate #8939 passed and native runtime verification finished passed. Pending delivery.
