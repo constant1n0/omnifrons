@@ -1,5 +1,15 @@
 # Review Ledger: spike-slice-5f
 
+## Apply Batch 4 — Locked Publication Activation
+
+JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep of the 140-line activation diff. Neither found a BLOCKER or CRITICAL defect; Judge B's ledger is empty. Production ordering and lock lifetime are correct.
+
+| id | lens | location | severity | status | evidence |
+|---|---|---|---|---|---|
+| JD-A-801 | judgment-day | src-tauri/src/ipc/publication.rs:1805-1824 | WARNING | info | The invalid-root test's candidate is independently ineligible, so it does not isolate whether cleanup ran before root validation. Reported once; not a fix/re-review driver. |
+
+Gate #9156 PASSED the scoped Phase 4 contract: `publishing_` 8/8, adapter `cleanup` 31/31, shell 236/236, adapter 205/205, workspace 820/820, Rust fmt/check/Linux clippy, Windows-GNU adapter check/clippy, and renderer test/lint/build all passed. The actual full candidate is 147 additions + 3 deletions = 150 lines, below the native 200-line cap and review 400-line cap. Native generation 8 / ordinal 8 finished `passed` with receipt `batch4-gate-finish-20260914-01` and runtime revision `sha256:fd093b19d416c6b451d2db53897b3cac12129f64ab8d98e6727a78bcd8bff7af`; ordinals 1–8 are preserved, native control is complete, and Batch 4 is pending delivery. Cleanup during tests is restricted to owned temporary fixtures. The SDD change remains 12/15 with tasks 5.1–5.3 pending the standard risk review and stacked delivery boundary; it is not archive-ready.
+
 ## Apply Batch 3c — Bound Provider Cleanup and FIFO Proof
 
 JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep of the frozen 211-line change (208 additions, 3 deletions); both ledgers are empty (#9112, #9114). Gate #9117 PASSED: public cleanup 1/1, native 4/4, real `PublicationState` FIFO 1/1, adapter 201/201, shell 234/234, workspace 818/818, doctest 1/1, Linux and Windows-GNU adapter clippy/check, and fmt. The provider-bound API and real publication-mutex FIFO proof support Phase 3 completion without application activation.

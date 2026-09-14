@@ -47,9 +47,9 @@ No parallel writers. Planning PRs land before code; every PR targets `main` afte
 
 ## Phase 4: Locked Activation and Regression Gates — PR 4
 
-- [ ] 4.1 **RED**: add `src-tauri/src/ipc/publication.rs` tests proving `open_provider` → optional cleanup → staging under `lock_surface`, and cleanup failure preserves publication and IPC frames.
-- [ ] 4.2 **GREEN**: invoke cleanup after revalidated provider opening; trace only `supported`, counts, `truncated`, and failures—never paths or publication wire states.
-- [ ] 4.3 **REFACTOR/verification evidence**: document same-user final-check/unlink residual in `docs/heavy-asset-publication.md`; run Cargo workspace test/fmt/clippy/check, Linux and Windows cfg builds, and unchanged renderer `pnpm test`, `pnpm lint`, `pnpm build`.
+- [x] 4.1 **RED**: add `src-tauri/src/ipc/publication.rs` tests proving `open_provider` → optional cleanup → staging under `lock_surface`, and cleanup failure preserves publication and IPC frames.
+- [x] 4.2 **GREEN**: invoke cleanup after revalidated provider opening; trace only `supported`, counts, `truncated`, and failures—never paths or publication wire states.
+- [x] 4.3 **REFACTOR/verification evidence**: document same-user final-check/unlink residual in `docs/heavy-asset-publication.md`; run Cargo workspace test/fmt/clippy/check, Linux and Windows cfg builds, and unchanged renderer `pnpm test`, `pnpm lint`, `pnpm build`.
 
 ## Phase 5: Review Boundaries
 

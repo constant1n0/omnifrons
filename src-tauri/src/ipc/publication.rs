@@ -976,6 +976,16 @@ pub fn publish_approved(
         on_state,
     )?;
     let provider = open_provider(publication, workspace, &approval.asset_root_id)?;
+    let cleanup = provider.cleanup_abandoned_staging();
+    tracing::info!(
+        supported = cleanup.supported,
+        inspected = cleanup.inspected,
+        retained = cleanup.retained,
+        removed = cleanup.removed,
+        failures = cleanup.failures,
+        truncated = cleanup.truncated,
+        "local staging cleanup completed"
+    );
     let entry_ops = FsOutboxEntryOps::new();
     let mut sink = |event: StateEvent| on_state(ArtifactStateFrame::from_event(&event));
     let published: Published = publish(
@@ -1731,6 +1741,87 @@ mod tests {
             "approved, published-local, registered, cleanup"
         );
         assert!(!journal.contains(&fixture.device.path().to_string_lossy().to_string()));
+    }
+
+    /// A completed publication removes only an eligible stale local staging
+    /// fixture before it stages the approved bytes, without changing frames.
+    #[cfg(unix)]
+    #[test]
+    fn publishing_cleans_an_owned_stale_local_staging_fixture_before_staging() {
+        use std::fs::{FileTimes, OpenOptions};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let fixture = Fixture::new("publish-cleanup");
+        let approval = fixture.approve("report.pdf", PDF).expect("approved");
+        let root = fixture.device.path().join("asset-roots/main");
+        std::fs::create_dir_all(&root).expect("owned provider root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only provider root");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("owned child starts");
+        let pid = child.id();
+        assert!(child.wait().expect("owned child exits").success());
+        let stale = root.join(format!(".{}.{}-0.part", "ab".repeat(32), pid));
+        let stale_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stale)
+            .expect("owned stale fixture");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only stale fixture");
+        stale_file
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(172_801)),
+            )
+            .expect("old stale fixture");
+        let failed_candidate = root.join(format!(".{}.{}-1.part", "cd".repeat(32), pid));
+        symlink("not-a-staging-file", &failed_candidate).expect("owned unsafe fixture");
+
+        let (result, frames) = fixture.publish(&approval.approval_id);
+
+        assert_eq!(
+            result.expect("publication succeeds").state,
+            ArtifactStateTag::Registered
+        );
+        assert!(!stale.exists(), "only the owned stale fixture is removed");
+        assert!(
+            std::fs::symlink_metadata(&failed_candidate).is_ok(),
+            "an unsafe cleanup failure is retained"
+        );
+        assert_eq!(
+            states(&frames),
+            vec![
+                ArtifactStateTag::PublishedLocal,
+                ArtifactStateTag::Registered
+            ]
+        );
+    }
+
+    /// A destination rejected during provider opening never authorizes a
+    /// staging cleanup attempt.
+    #[cfg(unix)]
+    #[test]
+    fn publishing_revalidates_the_destination_before_cleanup() {
+        let mut fixture = Fixture::new("publish-cleanup-invalid-root");
+        let approval = fixture.approve("report.pdf", PDF).expect("approved");
+        let root = fixture.project.path().join("asset-roots/main");
+        std::fs::create_dir_all(&root).expect("owned invalid-root fixture");
+        let retained = root.join(format!(".{}.1-0.part", "ab".repeat(32)));
+        std::fs::write(&retained, b"fixture").expect("owned staging fixture");
+        fixture.publication.asset_roots = fixture.project.path().join("asset-roots");
+
+        let (result, frames) = fixture.publish(&approval.approval_id);
+
+        assert_eq!(
+            result.expect_err("destination invalid").code,
+            ShellErrorCode::DestinationInvalid
+        );
+        assert!(
+            retained.exists(),
+            "cleanup cannot run before root validation"
+        );
+        assert!(frames.is_empty(), "cleanup adds no publication frames");
     }
 
     /// The same bytes approved again under another name: the second

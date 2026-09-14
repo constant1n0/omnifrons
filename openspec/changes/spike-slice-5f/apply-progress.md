@@ -252,3 +252,41 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
   `sha256:1bbba8d61e0967f0e75ebbd42fd8d2e9e5ca89f8106447ac8bd08a85feb85637`.
   Ordinals 1–6 remain preserved. Batch 3c is JD approved, gate passed, and pending delivery;
   no production activation, publication/IPC/UI callsite, or provider-policy expansion occurred.
+
+## Batch 4: Locked Publication Activation (Implemented, Gate #9156 Passed, Native Finished, Pending Delivery)
+- `publish_approved` holds the existing `PublicationState::lock_surface` guard, opens and
+  revalidates the provider root, runs provider-bound cleanup, then enters the unchanged staging
+  transaction. The cleanup report is optional: its aggregates are emitted through tracing and never
+  alter publication errors, state frames, outbox handling, catalog handling, or journal handling.
+- Tracing emits only `supported`, `inspected`, `retained`, `removed`, `failures`, and `truncated`
+  with a static message. No device root, outbox, recovery, candidate, or content data is emitted.
+- Cleanup remains local-directory-only and dev-mode-only. The public inspection API remains
+  read-only; Windows retains entries through its unsupported report and has no native runtime claim.
+
+### Batch 4 TDD Cycle Evidence
+| Tasks | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 4.1–4.2 locked activation | `src-tauri/src/ipc/publication.rs` | Shell integration, real owned filesystem | existing publication path 1/1 | stale owned candidate remained after a normal approved publication | stale owned candidate removed and normal `published-local`, `registered` frames preserved | invalid destination retains the owned candidate and emits no frames; existing Unix FIFO test proves the actual surface guard remains held during bound cleanup | provider report is consumed only as path-free tracing fields; staging transaction remains unchanged |
+| 4.3 rollout documentation and gates | `docs/heavy-asset-publication.md` | Documentation and regression | N/A | N/A | workspace and renderer gates passed | local cleanup activation and invalid-root branches | concise rollout-limit section preserves scope and residual disclosures |
+
+### Batch 4 Verification
+- Safety net: pinned `cargo test -p omnifrons-shell publishing_an_approval_registers_the_artifact_and_emits_the_transitions` passed 1/1.
+- RED: pinned `cargo test -p omnifrons-shell publishing_cleans_an_owned_stale_local_staging_fixture_before_staging` failed 0/1 because the owned stale fixture remained.
+- GREEN/triangulation: the focused stale-fixture test passed 1/1; it removes one owned old dead-PID candidate, retains an owned unsafe symlink whose no-follow open reports a cleanup failure, and preserves normal frames. `publishing_` passed 8/8, including destination revalidation before cleanup. Every cleanup execution used only an owned temporary fixture root; no configured asset root, outbox, recovery entry, or user data was supplied to cleanup.
+- Gates passed with pinned Rust 1.98.1: `cargo fmt --all -- --check`; workspace all-target/all-feature test, clippy with `-D warnings`, and check; Linux workspace coverage; and adapter-only `x86_64-pc-windows-gnu` clippy/check. Whole-workspace Windows linking/clippy remains out of scope because `windres` is unavailable; this is not a Windows or macOS runtime claim.
+- Unchanged renderer gates passed from `renderer/`: `pnpm test` (7 files, 762 tests), `pnpm lint`, and `pnpm build`.
+- Gate #9156 PASSED the scoped Phase 4 contract: `publishing_` 8/8, adapter `cleanup` 31/31, shell 236/236, adapter 205/205, workspace 820/820, Rust fmt/check/Linux clippy, Windows-GNU adapter check/clippy, and renderer test/lint/build all passed. The actual full candidate is 147 additions + 3 deletions = 150 lines, below the native 200-line cap and review 400-line cap.
+
+### Batch 4 Native Runtime Handoff
+- Authorized reset request `batch4-rollover-20260914-01` preserved generations 1–7 from settled
+  generation 7 / ordinal 7, objective `sha256:e7668d4f5977082b9982fbdec5ffab146af92147409e9458c68efdd915a3ad5d`,
+  revision `sha256:1bbba8d61e0967f0e75ebbd42fd8d2e9e5ca89f8106447ac8bd08a85feb85637`.
+- Generation 8 / ordinal 8 for `batch4-locked-publication-activation` finished `passed` after
+  Gate #9156 with receipt `batch4-gate-finish-20260914-01`, objective
+  `sha256:11ad96d097a66cdb241d071d7a77d836e31cb8b8014a675e003201ac5a66cc9b`, evidence revision
+  `sha256:e67619879c6a3947d8cf623b031292d584a31d5f8cefe50f4f8e034647396e1f`, and runtime revision
+  `sha256:fd093b19d416c6b451d2db53897b3cac12129f64ab8d98e6727a78bcd8bff7af`.
+- Native control is complete (`complete=true`, `next_action=complete`, `decision_required=false`);
+  the active attempt is absent. Ordinals 1–8 and all historical charges are preserved. Batch 4 is
+  gate passed and pending delivery; the SDD change remains 12/15, with tasks 5.1–5.3 pending the
+  standard risk review and stacked delivery boundary. It is not archive-ready.
