@@ -1,5 +1,26 @@
 # Review Ledger: spike-slice-5f
 
+## Phase 5 Delivery-Boundary Closure
+
+JUDGMENT: FACTUALLY SATISFIED. Read-only GitHub and Git history inspection confirms merged mainline
+PRs #18, #21–#29 are each at or below 400 additions plus deletions; exact heads/counts are preserved
+in `apply-progress.md`. PR #17/#20 are auxiliary CI repairs and superseded #16/#19 are not merged
+feature boundaries. Existing receipts preserve JD-001 PID conversion and JD-002 FIFO regression
+evidence. JD-B-003 remains INFO only; JD-B-004 remains refuted and has no remediation task.
+
+CodeGraph source review confirms production activation is first present in Phase 4 PR #29:
+`publish_approved` holds the surface lock, revalidates through `open_provider`, runs provider-bound
+cleanup, then stages. Scope remains local-dir-only; the six other producers, provider expansion, and
+VP-001 remain out of scope. No source, test, config, cleanup execution, or final-verification result
+was produced by this closure.
+
+## Archive Completion — 2026-09-14
+
+JUDGMENT: ARCHIVE READY. Native generation 9 / ordinal 9 finished `passed`; the current status
+reports apply/verify `all_done`, archive `ready`, and no blocked reasons. R2-001 stale pre-finish
+handoff wording, R2-002 command shorthand, and R2-003 assertion-quality wording remain
+informational and are preserved without a warning-fix or re-review loop. Delivery remains out of scope.
+
 ## Apply Batch 4 — Locked Publication Activation
 
 JUDGMENT: APPROVED. Both blind judges completed one exhaustive sweep of the 140-line activation diff. Neither found a BLOCKER or CRITICAL defect; Judge B's ledger is empty. Production ordering and lock lifetime are correct.

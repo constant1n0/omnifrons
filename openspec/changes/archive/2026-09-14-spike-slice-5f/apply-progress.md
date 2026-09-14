@@ -290,3 +290,66 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
   the active attempt is absent. Ordinals 1–8 and all historical charges are preserved. Batch 4 is
   gate passed and pending delivery; the SDD change remains 12/15, with tasks 5.1–5.3 pending the
   standard risk review and stacked delivery boundary. It is not archive-ready.
+
+## Phase 5: Delivery-Boundary Closure (Evidence Only)
+
+### 5.1 Actual merged review boundaries
+
+GitHub confirms each merged mainline work unit targets `main`, its merge head is ancestral to
+`a87ba282a25b4c3d746b1f76e82e4ad1b9e4fcc2`, and its additions plus deletions stay within 400:
+
+| PR | Head | GitHub additions + deletions | Total | Check record |
+|---:|---|---:|---:|---|
+| 18 | `bb464b532709e140c15033b49e55b2dee6d84637` | 368 + 0 | 368 | 10/10 successful |
+| 21 | `84253cdde07fe3d26f3e02cc6c357b308542aa56` | 69 + 0 | 69 | 10/10 successful |
+| 22 | `ef0b16cedec8fbd20a883402dd2f36e55f9ea6fd` | 389 + 7 | 396 | 10/10 successful; existing ledger records final five required checks green |
+| 23 | `a4457491edad29e34c6fd032416114b551bc9069` | 330 + 8 | 338 | 10/10 successful |
+| 24 | `ffa852da70947d67b746e684d2a4cfda6e063ca5` | 333 + 14 | 347 | 10/10 successful |
+| 25 | `b5872415c0d2786c4d7fb0f6b2713627b89e2527` | 139 + 5 | 144 | 10/10 successful |
+| 26 | `2169fcdc21a18aaed8853fa4f290dd59ecb71834` | 346 + 0 | 346 | 10/10 successful |
+| 27 | `7ab14ccbddceddc10b4740eadc11ad54282aa1fe` | 313 + 9 | 322 | 9 successful, 1 non-success rollup entry; existing reviewed receipt records required delivery checks green |
+| 28 | `b89507105a903a772dfee36cd5b72defb130d878` | 216 + 4 | 220 | 10/10 successful |
+| 29 | `a87ba282a25b4c3d746b1f76e82e4ad1b9e4fcc2` | 152 + 3 | 155 | 10/10 successful; final five required checks green |
+
+PRs #17 and #20 are auxiliary CI-test repairs; superseded #16 and #19 are not merged feature
+boundaries. No issue or label requirement applies to this repository.
+
+### 5.2 Preserved regression and limitation evidence
+
+- JD-001 remains implemented by checked positive signed-`pid_t` conversion before `Pid::from_raw`
+  and `kill`; invalid or unrepresentable values return `Unknown`. Existing RED/GREEN and gate
+  receipts remain in the Batch 1 and Batch 3a records.
+- JD-002 remains implemented by nonblocking/no-follow candidate handling; the real
+  `PublicationState::lock_surface` FIFO regression is recorded as passing in Batch 3c and Gate
+  #9117.
+- JD-B-003 remains INFO only: the bounded 256-entry prefix may starve later candidates. No test,
+  report, or remediation loop was changed for it. JD-B-004 remains refuted; no remediation task
+  was created.
+
+### 5.3 Activation and scope boundary
+
+Structural source review confirms `publish_approved` takes `lock_surface`, calls `open_provider`,
+then `cleanup_abandoned_staging`, and only then calls `publish`/local `stage`. The cleanup call first
+arrived in reviewed Phase 4 PR #29, never in the earlier delivered units. The provider API remains
+bound to its validated local root; no other six `.part` producers, provider expansion, or VP-001
+claim was added. This is documentation-only closure; no cleanup was run.
+
+### Final Verification Native Handoff
+
+After confirming completed generation 8 / ordinal 8, its objective
+`sha256:11ad96d097a66cdb241d071d7a77d836e31cb8b8014a675e003201ac5a66cc9b`, revision
+`sha256:fd093b19d416c6b451d2db53897b3cac12129f64ab8d98e6727a78bcd8bff7af`, and preserved passed
+history 1–8, the authorized append-only reset `request-final-verify-rollover-20260914-01` opened
+the new final-verification/boundary scope. Native generation 9 / ordinal 9 is ACTIVE for
+`final-spec-and-delivery-verification` with objective
+`sha256:b56f6ae49370fec4d0fea1363d8317dccebbbef36eae966e4bf49b796dcdb9f6`, request
+`final-verify-begin-20260914-01`, maximum two attempts, and 400 changed lines. It remains active
+for a fresh `sdd-verify`; this closure neither runs tests nor finishes, resets, backdates, archives,
+  or claims final verification.
+
+### Archive Completion Record — 2026-09-14
+
+- Native generation 9 / ordinal 9 subsequently finished `passed` atomically with 207 changed
+  lines, `complete=true`, `next_action=complete`, and `decision_required=false`.
+- The archived verification report records 15/15 tasks, 4/4 requirements, 8/8 scenarios, 820/820
+  Rust tests, and 762/762 renderer tests. This closes the SDD cycle locally; delivery is not done.

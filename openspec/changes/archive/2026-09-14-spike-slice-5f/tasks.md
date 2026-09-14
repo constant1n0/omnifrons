@@ -53,6 +53,6 @@ No parallel writers. Planning PRs land before code; every PR targets `main` afte
 
 ## Phase 5: Review Boundaries
 
-- [ ] 5.1 Keep each PR below 400 additions+deletions including tests/docs/progress; record actual `git diff --numstat` before review and split again if needed.
-- [ ] 5.2 Preserve JD-001/JD-002 regression evidence; record JD-B-003 only as the known bounded-prefix limitation, and do not create a remediation task for refuted JD-B-004.
-- [ ] 5.3 Do not activate deletion before PR 4 review; keep local-dir-only scope, six other producers, providers, and VP-001 out of scope.
+- [x] 5.1 Keep each PR below 400 additions+deletions including tests/docs/progress; record actual `git diff --numstat` before review and split again if needed. Closure evidence: merged mainline PRs #18, #21–#29 are each at or below 400 changed lines; exact GitHub counts and heads are recorded in `apply-progress.md`.
+- [x] 5.2 Preserve JD-001/JD-002 regression evidence; record JD-B-003 only as the known bounded-prefix limitation, and do not create a remediation task for refuted JD-B-004. Closure evidence: source/test and verified-gate receipts remain recorded; limitations are retained without a new remediation task.
+- [x] 5.3 Do not activate deletion before PR 4 review; keep local-dir-only scope, six other producers, providers, and VP-001 out of scope. Closure evidence: production activation first appears in reviewed and merged PR #29; source and delivery records retain the stated scope boundary.
