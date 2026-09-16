@@ -6,3 +6,4 @@
 //! binary).
 
 pub mod record;
+pub mod validate;
