@@ -338,3 +338,249 @@ about delivery mechanics rather than behavior:
 commits. Delivered as seven chained commits, each under the 400-line budget — see Delivery Split
 above. Ready for `sdd-verify` on this slice, or for `sdd-apply` to continue with Phase 3a in a
 later batch.
+
+## Slice 3a (Phase 3a, PR 3a): Harness Scaffolding and Feasibility Gate
+
+### Scope
+
+Phase 3a only: "Harness Scaffolding and Feasibility Gate" (tasks 3a.1–3a.8). No `docs/evidence/VP-001/{baselines,records}.md`
+row is written — the feasibility-gate outcome below is a **local feasibility
+observation**, not VP-001 evidence, per this batch's own instructions. No
+`tools/vp-s6-agent/` (Slice 3b) exists yet; the throwaway placeholder
+executable used for F3 was compiled locally, used only for this run, and is
+not part of the repository.
+
+**Outcome: the disclosed-uncertain branch (3a.7) was taken.** F1 and F2
+passed; F3 failed on a genuine, pre-existing product defect (not a
+harness/tooling limitation) — see "Feasibility Gate Execution" below. Per
+this batch's own instructions ("If a gate cannot be passed, that is a
+legitimate result... STOP the slice there"), Slices 3b and 4 do not start in
+this apply batch. The green scaffolding this slice produced (webdriver
+client, its unit tests, the CI step, the AV1/AV2/F1 shell scaffold, and the
+workflow wiring) is committed regardless, per the same instructions.
+
+### Completed Tasks
+
+- [x] 3a.1 RED: `docs/evidence/VP-001/procedures/webdriver-session.test.mjs` — 22 `node --test`
+      assertions across 6 groups (`buildNewSessionRequest`, `buildElementLocator`,
+      `buildEndpointUrl`, `unwrapValue`, `unwrapElementId`, `toWebDriverError`), written against
+      not-yet-existing exports.
+- [x] 3a.2 GREEN: `docs/evidence/VP-001/procedures/webdriver-session.mjs` — pure builders
+      implemented, exported separately from the `fetch`-based transport (`createSession`,
+      `deleteSession`, `findElement`, `clickElement`, `sendKeysToElement`, `getElementText`).
+- [x] 3a.3 `.github/workflows/ci.yml` — one `node --test` step added to `build-test`, run
+      unconditionally on all three runners. **Deviation** (see below): the exact command tasks.md
+      names does not work on the pinned Node; the step uses a shell glob instead.
+- [x] 3a.4 `docs/evidence/VP-001/procedures/vp-s6-linux.sh` — `--mode=feasibility-check`: AV1
+      (re-`sha256sum` vs. `build_channel_digest`, abort `artifact-digest-mismatch`), AV2
+      (`--appimage-extract` + byte-scan the payload for the literal `--demo-harness`, abort
+      `feature-enabled-variant`), then create and close one `tauri-driver` session against the
+      gated file (F1). No scenario logic (dialogs, Start/Stop, `/proc` enumeration) — Slice 3b's job.
+- [x] 3a.5 `.github/workflows/tauri-build.yml` — Linux-guarded steps: `extra-apt-packages` gains
+      `xvfb webkit2gtk-driver xdotool`; a new "Install tauri-driver" step pins `tauri-driver@2.0.6`
+      (`--locked`, matching the parent's own verified local install); a new "VP-001 feasibility gate
+      (AV1/AV2, F1)" step locates the built `.AppImage`, reads its recorded digest, and runs
+      `xvfb-run -- bash -c '... vp-s6-linux.sh --mode=feasibility-check ...'` with a bounded
+      `/status` readiness poll before invoking it.
+- [x] 3a.6 **Feasibility gate execution (not a repository test)** — see below. **F1 PASS, F2 PASS,
+      F3 FAIL.**
+- [x] 3a.7 **Disclosed-uncertain branch taken** — see below. Slices 3b and 4 do not start.
+- [x] 3a.8 Rollback boundary confirmed: reverting the two commits below (workflow harness step, both
+      `webdriver-session.*` files, `vp-s6-linux.sh`, the `ci.yml` step) returns the repository to
+      Slice 2's state; nothing downstream exists yet to depend on any of it.
+
+### Deviations from Design
+
+1. **`node --test <directory>` does not work as tasks.md 3a.3 literally specifies.** On the pinned
+   Node 22.23.2, `node --test docs/evidence/VP-001/procedures` (a bare directory, no glob) tries to
+   `import()`/`require()` the directory path itself as a single module and fails with
+   `ERR_MODULE_NOT_FOUND`/`MODULE_NOT_FOUND`, rather than walking the directory for test files as
+   Node's own docs describe. Verified with two independent minimal repros outside this repository
+   (a fresh scratch directory, and a directory literally named `test/`) before concluding this is a
+   genuine behavior of this Node version/invocation shape, not a repository-specific issue. `node
+   --test` with **no** path argument, run from inside a directory, does perform the documented
+   recursive walk correctly. The `ci.yml` step instead runs
+   `node --test docs/evidence/VP-001/procedures/*.test.mjs`, letting the shell (not Node) expand the
+   glob to the concrete file — verified locally to run and report all 22 tests correctly.
+2. **AV1/AV2/F1's node invocation reaches the client through `process.env`, not a spliced path or
+   argv.** `vp-s6-linux.sh` calls `node -e '...'` with the procedures directory, base URL, and
+   application path passed as environment variables and dynamically `import()`ed/read from
+   `process.env` inside the script, rather than interpolating the shell variables into the JS source
+   text. This mirrors the `Digest artifact`/new `VP001_DIGEST_PATHS` pattern already established in
+   `tauri-build.yml` (and Slice 1's own post-verification correction) for exactly the same reason:
+   no path ever gets spliced into a script body that something else could break out of.
+3. Everything else in 3a.1–3a.5 matches design.md D5–D8 and the Honesty Machinery section with no
+   content deviation.
+
+### TDD Cycle Evidence
+
+| Task | Layer | RED (observed) | GREEN (observed) |
+|---|---|---|---|
+| 3a.1/3a.2 | Unit (`node --test`) | `ERR_MODULE_NOT_FOUND: Cannot find module '.../webdriver-session.mjs'` (module did not exist yet) | `node --test docs/evidence/VP-001/procedures/webdriver-session.test.mjs` → `# tests 22 / # pass 22 / # fail 0` |
+
+### Work Unit Evidence
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --test docs/evidence/VP-001/procedures/*.test.mjs` → `# tests 22`, `# pass 22`, `# fail 0` (run from the repository root, the exact `ci.yml` step command) |
+| Runtime harness command/scenario and exact result | See "Feasibility Gate Execution" below — F1/F2 PASS, F3 FAIL, with the exact commands and output |
+| Rollback boundary | Revert commits `85b4b97` and `58321a0` (4 files: `webdriver-session.mjs`, `webdriver-session.test.mjs`, `vp-s6-linux.sh`, plus the `ci.yml`/`tauri-build.yml` edits); nothing downstream exists yet |
+
+### Commits
+
+| # | Commit | Subject | Authored lines (excl. lockfiles) | Contents |
+|---|---|---|---|---|
+| 1 | `85b4b97` | feat(evidence): add zero-dependency W3C WebDriver client | 317 | `webdriver-session.mjs` (182), `webdriver-session.test.mjs` (135) |
+| 2 | `58321a0` | feat(evidence): wire the VP-S6 feasibility gate (AV1/AV2, F1) | 190 | `ci.yml` (+10), `tauri-build.yml` (+48), `vp-s6-linux.sh` (133, new, mode `0755`) |
+
+Both commits observed green immediately before committing:
+`node --test docs/evidence/VP-001/procedures/*.test.mjs` → 22/22 pass (both commits — commit 2
+touches no JS); `cargo test --workspace` → all suites `test result: ok` (no Rust files touched by
+either commit, re-run as a regression check); `.github/workflows/{ci,tauri-build}.yml` parsed
+successfully with `/usr/bin/python3.12 -c "import yaml; yaml.safe_load(...)"`;
+`shellcheck docs/evidence/VP-001/procedures/vp-s6-linux.sh` reported no findings.
+
+### Files Changed
+
+| File | Action | What Was Done |
+|---|---|---|
+| `docs/evidence/VP-001/procedures/webdriver-session.mjs` | Created | Zero-dependency W3C WebDriver client: pure builders + `fetch`-based transport (design.md D6). |
+| `docs/evidence/VP-001/procedures/webdriver-session.test.mjs` | Created | 22 `node --test` assertions over the pure builders only. |
+| `.github/workflows/ci.yml` | Modified | New "Test VP-001 WebDriver client (node --test)" step in `build-test`, unconditional on all three runners. |
+| `docs/evidence/VP-001/procedures/vp-s6-linux.sh` | Created (mode `0755`) | `--mode=feasibility-check`: AV1, AV2, F1 (session create + close). |
+| `.github/workflows/tauri-build.yml` | Modified | `extra-apt-packages` gains `xvfb webkit2gtk-driver xdotool`; new "Install tauri-driver" and "VP-001 feasibility gate (AV1/AV2, F1)" steps. |
+
+### Review Budget
+
+Authored (additions + deletions): **507 lines** across both commits (317 + 190) — under the
+400-line-per-commit budget on each individual commit; over it as a single combined diff, which is
+why this landed as two commits rather than one, consistent with Slice 1/2's own practice.
+
+### Feasibility Gate Execution (3a.6) — local observation, not VP-001 evidence
+
+**Local build.** `pnpm -r build` (renderer), then `pnpm exec tauri build --bundles deb,rpm,appimage`
+(release profile, `1m 08s` incremental compile on a warm `target/`). Produced
+`target/release/bundle/appimage/Omnifrons_0.1.0_amd64.AppImage`
+(SHA-256 `47dec7632184f46f3cea8c01d377a7412e75e3f888c91b247b989580000f54b7`).
+
+**AV1/AV2/F1 — via the committed `vp-s6-linux.sh` script itself:**
+
+```
+$ xvfb-run --auto-servernum -- bash -c '
+    tauri-driver --native-driver /usr/bin/WebKitWebDriver &
+    ...
+    docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=feasibility-check "$1" "$2"
+  ' vp-s6-feasibility-check "<AppImage>" "<digest>"
+gate=av1-digest-match digest=47dec7632184f46f3cea8c01d377a7412e75e3f888c91b247b989580000f54b7
+gate=av2-variant-scan-absent binary=/tmp/tmp.XXXXXXXXXX/squashfs-root/usr/bin/omnifrons-shell
+gate=f1-session-created session_id=e491650f-ae0d-485d-a283-d32e85574c56
+gate=session-closed session_id=e491650f-ae0d-485d-a283-d32e85574c56
+```
+Exit code `0`. **F1: PASS.** This also answers design.md's open question "whether `ubuntu-24.04` can
+execute the AppImage directly (FUSE) or needs `APPIMAGE_EXTRACT_AND_RUN=1`": FUSE worked directly
+here — the AppImage launched with no `APPIMAGE_EXTRACT_AND_RUN` fallback needed. `libEGL`/DRI3
+warnings appeared in `tauri-driver`'s own stderr (software rendering under Xvfb has no DRI3 device);
+harmless, expected, and did not affect session creation.
+
+**F2 — GTK chooser driving (ad hoc, not a repository test; reuses the committed
+`webdriver-session.mjs` exports directly via a throwaway Node script, never duplicating its logic):**
+a second, persistent `Xvfb :57` + `tauri-driver` pair was started so the same session could be
+driven interactively. `xdotool windowfocus` was used in place of design's literal `windowactivate`
+sequence — this bare `Xvfb` has no window manager installed (none was in the parent's authorized
+tooling list, and none was installed), so `_NET_ACTIVE_WINDOW`-based activation is unavailable;
+`windowfocus` sets input focus directly via `XSetInputFocus` and worked identically for the
+Ctrl+L/type/Enter sequence design.md prescribes. Both choosers completed:
+- "Pick executable" → `Ctrl+L`, typed a throwaway local placeholder path, `Enter` → the
+  "Candidate evidence" panel appeared (`SHA-256 (short): 528d1053`), confirmed via
+  `findElement`+`getElementText` on `//div[@aria-label='Candidate evidence']`.
+- "Pick workspace" → `Ctrl+L`, typed a scratch directory path, `Enter` → `Workspace: <path>`
+  rendered, confirmed the same way.
+
+**F2: PASS** — both GTK choosers completed under `Xvfb` via `xdotool` within a bounded time (well
+under a minute each); the D7 seeded-approval fallback was never needed.
+
+**F3 — FAIL, blocked by a discovered product defect, not a tooling limitation.** After approving a
+throwaway placeholder executable (a locally compiled ELF that ignores argv, drains stdin to EOF,
+then sleeps — never committed to the repository, matching design D8's "no shell script" rationale
+for anything the process-launch path executes) and correctly selecting the `Stream-JSON CLI` adapter
+and that new approval in the **Agent** section's own controls (confirmed via
+`document.querySelector('#agent-adapter').value === 'stream-json-cli'` and
+`#agent-approval.value` holding the new approval's id), clicking **Start** produced:
+
+```
+untrusted unapproved: this executable has not been approved
+```
+
+`State:` stayed `idle`; no child process was spawned. Root cause, traced with `codegraph_explore`:
+- `crates/omnifrons-adapters/src/jsonl_approval_store.rs`'s `derive_approval_id` mints every
+  `ApprovalId` as `u64::from_be_bytes(sha256(...)[..8])` — a uniformly-distributed random 64-bit
+  integer, never a small counter.
+- `renderer/src/ipc/harness.ts` declares `export type ApprovalId = number` — a plain JS/TS number
+  (IEEE-754 f64), safely exact only up to `Number.MAX_SAFE_INTEGER` (2^53 ≈ 9.007×10^15).
+- A uniformly random 64-bit value has only a ~1-in-2048 chance of falling under 2^53, so crossing
+  Tauri's JSON-based IPC bridge loses precision for the approval id on essentially every real
+  approval — reproduced here with the observed id `16973651968280922000` (~1.7×10^19, three orders
+  of magnitude past the safe-integer ceiling).
+- The rounded value the `<select>` sends back as `approval_id` no longer matches the exact `u64`
+  `JsonlApprovalStore` holds on file, so `LaunchGate::decide`
+  (`crates/omnifrons-app/src/launch_gate.rs:96-99`) correctly returns
+  `DenialReason::Unapproved` — the backend is behaving exactly as designed against a numerically
+  corrupted input; the defect is the corruption itself, upstream of `LaunchGate`.
+- This is pre-existing product code, entirely untouched by Slices 1–3a. Design.md's Technical
+  Approach states this change's three new layers touch "none... product code"; fixing this defect is
+  out of scope for this change and is not attempted here. No workaround (seeding approval state
+  differently, retrying, or otherwise bypassing the approval UI) was applied — D7 already forbids
+  bypassing the approval UI, and this batch's own instructions forbid working around a failed gate.
+
+**Additional observation (did not itself block anything — worked around by an ordinary in-app
+action, not a bypass):** `AgentPanel`'s own `approvals_list()` fetch runs once on mount
+(`useEffect(..., [])`), with no refresh triggered by `ApprovalSurface`'s `executable_approve`
+success — a `<select id="agent-approval">` opened before an approval exists will not show one newly
+created afterward without a page reload. Worked around here with one `location.reload()` via the
+WebDriver `execute/sync` endpoint (an ordinary browser/webview action, not a store bypass); a real
+user hitting the same ordering would need the same reload. Independent of, and does not explain, the
+`ApprovalId` defect above (Start still failed identically after the reload, with the approval
+correctly visible and selected).
+
+### Disclosed-Uncertain Branch (3a.7)
+
+**Taken.** F3 failed with no applicable fallback: design.md's only two named fallbacks are F2's
+seeded-approval path (D7) and AV2's `APPIMAGE_EXTRACT_AND_RUN=1` (neither applies to an IPC-layer
+numeric-precision defect). Per this batch's instructions, the chain stops here: **Slices 3b and 4 do
+not start in this apply batch.** The blocker above is recorded here for the eventual VP-S6 row
+(Slice 4) once the evidence store exists to hold it; nothing is written to
+`docs/evidence/VP-001/{baselines,records}.md` — those stay exactly as Slice 2 left them
+(header-only).
+
+### Process Hygiene
+
+Every process started for this feasibility check was terminated before finishing:
+
+```
+$ curl -s -X DELETE http://127.0.0.1:4444/session/<session-id>          # WebDriver session closed
+$ kill <tauri-driver-pid>; kill <Xvfb-:57-pid>
+$ pgrep -af "Xvfb|tauri-driver|WebKitWebDriver|omnifrons-shell|vp-s6-placeholder" | grep -v "eval|zsh -c"
+confirmed: no leftover processes
+```
+
+The throwaway placeholder executable and its scratch workspace directory live only in a
+session-local scratch directory outside the repository.
+
+### Workload / PR Boundary
+
+- Mode: chained PR slice (`auto-chain`, chain strategy `stacked-to-main`); delivered as two stacked
+  commits (`85b4b97`, `58321a0`), each independently under the 400-line budget.
+- Current work unit: Unit 3a — "WebDriver client, CI wiring, AV1/AV2 gate, F1–F3 feasibility" (PR 3a).
+- Boundary: starts from Slice 2's evidence-store/validator baseline and ends with a working,
+  committed feasibility-gate scaffold (client, tests, CI step, shell script, workflow wiring) plus a
+  disclosed, non-repository-test feasibility observation. Introduces no VP-S6 scenario code, no
+  fixture agent, and no evidence rows (those are Slices 3b/4, currently blocked).
+- Estimated review budget impact: two commits, 317 and 190 authored lines — low per commit.
+
+### Status
+
+8/8 Phase 3a tasks complete (3a.1–3a.8). **F1 PASS, F2 PASS, F3 FAIL** — disclosed-uncertain branch
+taken per 3a.7. Slices 3b and 4 are blocked on the `ApprovalId` IPC-precision defect described above
+until it is fixed (out of scope for this change). Ready for `sdd-verify` on this slice's own scope
+(the scaffolding, its tests, and the honest recording of the feasibility outcome); not ready to
+continue to Phase 3b in this change.
