@@ -113,6 +113,42 @@ fn default_capability_grants_only_core_default() {
     );
 }
 
+/// Tauri v2's recognized `BundleType` values (`tauri-utils::config`), so a
+/// typo or unsupported format is caught here instead of failing a build.
+const KNOWN_TAURI_BUNDLE_TYPES: &[&str] = &["deb", "rpm", "appimage", "msi", "nsis", "app", "dmg"];
+
+/// docs/evidence/VP-001 design.md § Architecture Decisions D4: CI pins the
+/// packaging job to `ubuntu-24.04` and an explicit Tauri CLI version, so the
+/// bundle format list must also be explicit rather than the bundler's
+/// implicit `"all"` default -- otherwise a future Tauri release could widen
+/// or narrow the retained artifact's format with no visible config change.
+#[test]
+fn bundle_targets_is_an_explicit_non_default_array() {
+    let config = read_json("tauri.conf.json");
+    let targets = &config["bundle"]["targets"];
+
+    assert!(
+        targets.is_array(),
+        "bundle.targets must be an explicit array, not the default \"all\" string; found: {targets:?}"
+    );
+
+    let targets = targets.as_array().expect("bundle.targets must be an array");
+    assert!(
+        !targets.is_empty(),
+        "bundle.targets must name at least one explicit bundle format"
+    );
+
+    for target in targets {
+        let target = target
+            .as_str()
+            .expect("each bundle.targets entry must be a string");
+        assert!(
+            KNOWN_TAURI_BUNDLE_TYPES.contains(&target),
+            "unexpected bundle target '{target}', expected one of {KNOWN_TAURI_BUNDLE_TYPES:?}"
+        );
+    }
+}
+
 /// `docs/spike-log.md`'s IPC contract keeps this shell's capabilities at
 /// `core:default` only, even after adding the three demo-harness commands:
 /// `build.rs` must never opt into `AppManifest::commands` (a

@@ -28,7 +28,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-24.04 is pinned (not ubuntu-latest) so VP-001 evidence names an
+        # exact runner image rather than a floating alias
+        # (docs/evidence/VP-001 design.md § Architecture Decisions D4).
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - name: Checkout
         # TODO: pin by SHA once this workflow stabilizes
@@ -71,8 +74,75 @@ jobs:
         # Tauri shell (src-tauri/tauri.conf.json) must exist before packaging can run;
         # this step stays inert until a later change adds src-tauri.
         if: hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
-        # TODO: pin by SHA once this workflow stabilizes
-        uses: tauri-apps/tauri-action@v1 # v1
+        id: tauri
+        uses: tauri-apps/tauri-action@action-v1.0.0 # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # No tagName/releaseName/releaseId: builds without creating or uploading a release.
+
+      - name: Record baseline facts
+        # VP-001 evidence exists only for the Linux artifact
+        # (docs/evidence/VP-001 design.md § Evidence field provenance names
+        # this step's exact outputs). The exact runner image version has no
+        # source-confirmed environment variable on hosted runners: it is
+        # transcribed by the operator from this job's own "Set up job" log
+        # entry when the baseline record is authored, not captured here.
+        if: runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        run: |
+          set -euo pipefail
+          {
+            echo "## os_build / architecture (/etc/os-release, uname -rm)"
+            cat /etc/os-release
+            uname -rm
+            echo
+            echo "## webview_runtime (dpkg-query -W libwebkit2gtk-4.1-0)"
+            dpkg-query -W -f='${Package} ${Version}\n' libwebkit2gtk-4.1-0
+            echo
+            echo "## MSRV / toolchain / Tauri patch"
+            grep -m1 '^rust-version' Cargo.toml
+            rustc -V
+            node -v
+            pnpm -v
+            git --version
+            cargo tree -p tauri --depth 0
+          } | tee "${RUNNER_TEMP}/vp-001-baseline-facts.txt"
+
+      - name: Digest artifact
+        # AV1 (docs/evidence/VP-001 design.md § Honesty machinery) recomputes
+        # this digest before the WebDriver harness runs; this step writes the
+        # authoritative build_channel_digest for the retained artifact(s).
+        if: runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        id: digest
+        # artifactPaths reaches the shell through env, never spliced into the
+        # script body: a value carrying a quote would otherwise be parsed as
+        # shell. The digest file records the bare file name, because the
+        # absolute runner path is provenance detail VP-001 keeps out of public
+        # evidence (desktop-stack-verification-plan.md:178).
+        env:
+          ARTIFACT_PATHS_JSON: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'paths<<VP001_ARTIFACT_PATHS'
+            printf '%s' "${ARTIFACT_PATHS_JSON}" | jq -r '.[]'
+            echo 'VP001_ARTIFACT_PATHS'
+          } >> "$GITHUB_OUTPUT"
+          printf '%s' "${ARTIFACT_PATHS_JSON}" | jq -r '.[]' | while IFS= read -r artifact_path; do
+            printf '%s  %s\n' \
+              "$(sha256sum "${artifact_path}" | cut -d' ' -f1)" \
+              "$(basename "${artifact_path}")"
+          done | tee "${RUNNER_TEMP}/vp-001-artifact-digest.txt"
+
+      - name: Upload artifact
+        # Retained, Digest-Addressable Artifact: the packaged Linux bundle is
+        # kept rather than discarded, alongside the facts and digest that bind
+        # it to VP-001 evidence (docs/evidence/VP-001 design.md § File Changes).
+        if: runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        uses: actions/upload-artifact@v7.0.1 # v7.0.1
+        with:
+          name: vp-001-linux-baseline
+          path: |
+            ${{ steps.digest.outputs.paths }}
+            ${{ runner.temp }}/vp-001-baseline-facts.txt
+            ${{ runner.temp }}/vp-001-artifact-digest.txt
+          if-no-files-found: error
