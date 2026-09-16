@@ -73,6 +73,21 @@ export function buildEndpointUrl(baseUrl, ...segments) {
   return [trimmedBase, ...trimmedSegments].join('/');
 }
 
+/**
+ * A W3C "Execute Script" request body (`POST /session/:id/execute/sync`).
+ * Used by the VP-S6 scenario (design.md D5/D7) to set a controlled React
+ * `<select>`'s value and dispatch its `change` event -- the only reliable,
+ * cross-engine way to drive a native `<select>` under `tauri-driver`'s
+ * WebKit backend, since option-click interaction is not guaranteed to open
+ * a real dropdown under a headless/minimal `Xvfb` session.
+ */
+export function buildExecuteScriptRequest(script, args = []) {
+  if (typeof script !== 'string' || script.length === 0) {
+    throw new TypeError('buildExecuteScriptRequest requires a non-empty script');
+  }
+  return { script, args };
+}
+
 /** The W3C "web element reference" object key (WebDriver spec § 12). */
 const WEB_ELEMENT_IDENTIFIER = 'element-6066-11e4-a52e-4f735466cecf';
 
@@ -179,4 +194,29 @@ export async function getElementText(baseUrl, sessionId, elementId) {
     undefined,
   );
   return unwrapValue(responseBody);
+}
+
+/**
+ * Run `script` synchronously in the session's page, returning its `value`.
+ * `arguments[0]`, `arguments[1]`, ... inside `script` are bound to `args`.
+ */
+export async function executeScript(baseUrl, sessionId, script, args) {
+  const body = buildExecuteScriptRequest(script, args);
+  const responseBody = await request(
+    baseUrl,
+    'POST',
+    ['session', sessionId, 'execute', 'sync'],
+    body,
+  );
+  return unwrapValue(responseBody);
+}
+
+/**
+ * Reload the current page (W3C "Navigate To" via a page refresh). Used
+ * after `executable_approve` (design.md's Slice 3a finding: `AgentPanel`'s
+ * approvals list fetches once on mount, with no refresh on a new
+ * approval), so the freshly approved executable appears in `#agent-approval`.
+ */
+export async function refreshPage(baseUrl, sessionId) {
+  await request(baseUrl, 'POST', ['session', sessionId, 'refresh'], {});
 }

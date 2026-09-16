@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import {
   buildElementLocator,
   buildEndpointUrl,
+  buildExecuteScriptRequest,
   buildNewSessionRequest,
   toWebDriverError,
   unwrapElementId,
@@ -112,6 +113,22 @@ test('unwrapElementId', async (t) => {
 
   await t.test('rejects a value carrying no element id', () => {
     assert.throws(() => unwrapElementId({ value: {} }), WebDriverProtocolError);
+  });
+});
+
+test('buildExecuteScriptRequest', async (t) => {
+  await t.test('builds a script/args body, defaulting args to empty', () => {
+    assert.deepEqual(buildExecuteScriptRequest('return 1;'), { script: 'return 1;', args: [] });
+  });
+
+  await t.test('carries given args through verbatim', () => {
+    const body = buildExecuteScriptRequest('return arguments[0];', ['#agent-adapter']);
+    assert.deepEqual(body, { script: 'return arguments[0];', args: ['#agent-adapter'] });
+  });
+
+  await t.test('rejects a non-string script', () => {
+    assert.throws(() => buildExecuteScriptRequest(''), TypeError);
+    assert.throws(() => buildExecuteScriptRequest(undefined), TypeError);
   });
 });
 
