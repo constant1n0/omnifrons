@@ -41,7 +41,11 @@ jobs:
         uses: ./.github/actions/setup-toolchain
         with:
           linux-prereqs: 'true'
-          extra-apt-packages: patchelf
+          # xvfb, webkit2gtk-driver (WebKitWebDriver) and xdotool are the
+          # Slice 3a feasibility-gate harness's own prerequisites
+          # (design.md § D5/D7); only exercised on the Linux-guarded harness
+          # step below.
+          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool
 
       - name: cargo fmt
         if: hashFiles('rust-toolchain.toml') != ''
@@ -146,3 +150,45 @@ jobs:
             ${{ runner.temp }}/vp-001-baseline-facts.txt
             ${{ runner.temp }}/vp-001-artifact-digest.txt
           if-no-files-found: error
+
+      - name: Install tauri-driver
+        # Pinned to the same stable release the parent verified locally
+        # (2.1.0-alpha.0 exists and was deliberately not used, design.md D6
+        # neighbourhood). Runs after packaging, not before: it never gates
+        # the build itself.
+        if: runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        run: cargo install tauri-driver --version 2.0.6 --locked
+
+      - name: VP-001 feasibility gate (AV1/AV2, F1)
+        # design.md § Honesty machinery: this step mechanically proves F1
+        # (tauri-driver creates a session against the retained, digest-gated
+        # artifact) on every run of this job, through
+        # docs/evidence/VP-001/procedures/vp-s6-linux.sh's
+        # --mode=feasibility-check. F2/F3 (both GTK choosers completing, an
+        # approved executable reaching an active state) are disclosed,
+        # non-repository-test facts recorded separately -- Slice 3b extends
+        # this step once the fixture agent and full scenario driving exist
+        # (this step's own scope stops at "no scenario logic yet").
+        if: runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        env:
+          # Reached through env, never spliced into the script body, for the
+          # same reason as the Digest artifact step's ARTIFACT_PATHS_JSON.
+          VP001_DIGEST_PATHS: ${{ steps.digest.outputs.paths }}
+          VP001_DIGEST_FILE: ${{ runner.temp }}/vp-001-artifact-digest.txt
+        run: |
+          set -euo pipefail
+          artifact_path="$(printf '%s\n' "${VP001_DIGEST_PATHS}" | grep -m1 '\.AppImage$')"
+          build_channel_digest="$(
+            awk -v name="$(basename "${artifact_path}")" '$2 == name { print $1 }' "${VP001_DIGEST_FILE}"
+          )"
+          xvfb-run --auto-servernum -- bash -c '
+            set -euo pipefail
+            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
+            driver_pid=$!
+            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
+            for _ in $(seq 1 10); do
+              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
+              sleep 1
+            done
+            docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=feasibility-check "$1" "$2"
+          ' vp-s6-feasibility-check "${artifact_path}" "${build_channel_digest}"

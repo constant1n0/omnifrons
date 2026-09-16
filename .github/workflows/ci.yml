@@ -68,5 +68,15 @@ jobs:
       - name: Test
         run: pnpm -r test
 
+      - name: Test VP-001 WebDriver client (node --test)
+        # docs/evidence/VP-001/procedures/webdriver-session.mjs's pure
+        # builders are zero-dependency and platform-agnostic, so this runs
+        # unconditionally on all three runners (design.md Testing Strategy).
+        # `node --test <directory>` tries to load the directory itself as a
+        # single module on this pinned Node (22.23.2) rather than walking it
+        # for test files, so the glob is expanded by the shell instead of
+        # left to Node's own directory search.
+        run: node --test docs/evidence/VP-001/procedures/*.test.mjs
+
       - name: Build
         run: pnpm -r build
