@@ -584,3 +584,29 @@ taken per 3a.7. Slices 3b and 4 are blocked on the `ApprovalId` IPC-precision de
 until it is fixed (out of scope for this change). Ready for `sdd-verify` on this slice's own scope
 (the scaffolding, its tests, and the honest recording of the feasibility outcome); not ready to
 continue to Phase 3b in this change.
+
+### Addendum (2026-09-17): the ApprovalId defect above is now fixed, unblocking Slice 3b
+
+This note is appended below the original Slice 3a record above without altering it — the original
+run, its `F3 FAIL` outcome, and its root-cause trace remain exactly as recorded.
+
+Commit `5c5f474` ("fix(ipc): carry executable approval ids as hex strings"), landed on `main` after
+this batch's own record above, fixes the `ApprovalId` IPC-precision defect at its source: approval
+ids now cross IPC as 16-lowercase-hex-character strings (`src-tauri/src/ipc/dto.rs`'s
+`ApprovalIdDto`, strict on (de)serialization; `renderer/src/ipc/harness.ts`'s `ApprovalId` is now
+`type ApprovalId = string`), never as a JSON `number` that could round past
+`Number.MAX_SAFE_INTEGER`. This branch is rebased onto `main` at `5c5f474` (confirmed:
+`git merge-base --is-ancestor 5c5f474 HEAD`).
+
+The orchestrator confirmed, in a local run on the combined code (this branch's Slice 1–3a code atop
+`5c5f474`), that the exact same feasibility-gate sequence 3a.6 exercised now reaches **F1 PASS, F2
+PASS, F3 PASS**: the approved fixture placeholder reached `State: running` after Start, then
+`State: exited (code unreported)` after Stop through the UI. This is the parent's own local
+confirmation, not a re-run this apply batch performed itself; this batch's own local preview of the
+full VP-S6 scenario (fixture, dialog driving, Stop, `/proc` enumeration, `derive`) is recorded
+separately under Slice 3b below.
+
+**Consequence for the slice chain**: Phase 3b's own "Depends on" precondition (3a's F1–F3 gate
+having passed) is now satisfied. Slice 3b starts in this apply batch. Slice 4 remains gated
+separately on its own explicit CI-trigger authorization (design.md's Migration/Rollout
+"Authorization" note), unrelated to this fix.

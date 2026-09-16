@@ -77,6 +77,12 @@ Satisfies: packaged-build-evidence / Exercised Artifact Matches Digested Artifac
 
 Depends on: Slice 3a's F1–F3 gate having passed (directly, or via the F2 seeded-approval fallback) — do not start 3b if 3a filed the disclosed-uncertain branch. Not blocked on CI-trigger authorization.
 
+**Status update (2026-09-17)**: this dependency is now satisfied. Slice 3a originally filed the
+disclosed-uncertain branch (F3 FAIL) on a genuine, pre-existing `ApprovalId` IPC-precision product
+defect — fixed on `main` by commit `5c5f474`, which this branch is rebased onto. See
+apply-progress.md's "Addendum (2026-09-17)" under Slice 3a for the parent-confirmed local re-run
+showing F1/F2/F3 all PASS. Phase 3b starts in this apply batch.
+
 Satisfies: verification-evidence-store / VP-S6 Row Content and Recorded Tension, Blocked or Non-Reproducible Verification Attempt (scenario half); Threat Matrix rows Subprocess/process integration, Synthetic input, Executable-file classification.
 
 - [ ] 3b.1 `tools/vp-s6-agent/` — create the fixture ELF (D8): ignores argv/stdin (`StdinThenClose` contract, `crates/omnifrons-adapters/src/line_agent.rs` (read-only)), spawns `setsid sleep <n>` as a breakaway-attempting descendant, writes `pid starttime` for itself and the descendant into its cwd, then sleeps. No repo test drives a live process tree from here; checked by one manual `setsid`/`/proc` invocation before wiring into the harness.
