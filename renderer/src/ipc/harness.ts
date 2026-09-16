@@ -53,8 +53,13 @@ export type ProcessId = number
 /** A probed-but-not-yet-approved candidate's opaque handle. */
 export type CandidateId = number
 
-/** An approval id, as it crosses IPC. */
-export type ApprovalId = number
+/**
+ * An approval id, as it crosses IPC: 16 lowercase hex characters (a derived
+ * `u64` does not survive a JSON number's 53-bit mantissa, so it is a string
+ * on the wire, the same convention {@link ArtifactApprovalId} already uses).
+ * Opaque: never parsed by the renderer.
+ */
+export type ApprovalId = string
 
 /** The closed set of terminal-state tokens a process can report. */
 export type ProcessTerminalStateTag = 'exited' | 'killed' | 'orphan-risk/uncertain'
@@ -839,7 +844,8 @@ export type ActAs = 'device-local-user'
 /**
  * An artifact approval id, as it crosses IPC: 16 lowercase hex characters
  * (a derived `u64` does not survive a JSON number's 53-bit mantissa, so it
- * is a string on the wire, unlike the slice-2 executable {@link ApprovalId}).
+ * is a string on the wire, the same convention the executable
+ * {@link ApprovalId} uses).
  * Opaque: never parsed by the renderer.
  */
 export type ArtifactApprovalId = string

@@ -106,7 +106,7 @@ const SAMPLE_EVIDENCE: Evidence = {
 
 function sampleApproval(overrides: Partial<Approval> = {}): Approval {
   return {
-    approvalId: 42,
+    approvalId: '42',
     evidence: SAMPLE_EVIDENCE,
     approvedAt: 500,
     status: 'active',
@@ -150,12 +150,12 @@ describe('harnessSpawn', () => {
       throw new Error(`unexpected command: ${cmd}`)
     })
 
-    const id = await harnessSpawn({ type: 'approved', approvalId: 42 }, () => {})
+    const id = await harnessSpawn({ type: 'approved', approvalId: '42' }, () => {})
 
     expect(id).toBe(99)
     expect(capturedArgs).toBeDefined()
     expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'onFrame'])
-    expect(capturedArgs!.kind).toEqual({ type: 'approved', approvalId: 42 })
+    expect(capturedArgs!.kind).toEqual({ type: 'approved', approvalId: '42' })
     expect(Object.keys(capturedArgs!.kind as Record<string, unknown>).sort()).toEqual([
       'approvalId',
       'type',
@@ -258,7 +258,7 @@ describe('harnessSpawn', () => {
     })
 
     const id = await harnessSpawn(
-      { type: 'adapter', adapterId: 'claude-code', approvalId: 42, prompt: 'do the thing' },
+      { type: 'adapter', adapterId: 'claude-code', approvalId: '42', prompt: 'do the thing' },
       () => {},
     )
 
@@ -268,7 +268,7 @@ describe('harnessSpawn', () => {
     expect(capturedArgs!.kind).toEqual({
       type: 'adapter',
       adapterId: 'claude-code',
-      approvalId: 42,
+      approvalId: '42',
       prompt: 'do the thing',
     })
     expect(Object.keys(capturedArgs!.kind as Record<string, unknown>).sort()).toEqual([
@@ -366,14 +366,14 @@ describe('executableApprove', () => {
     mockIPC((cmd, args) => {
       if (cmd === 'executable_approve') {
         expect(args).toEqual({ candidateId: 7 })
-        return sampleApproval({ approvalId: 42 })
+        return sampleApproval({ approvalId: '42' })
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
 
     const result = await executableApprove(7)
 
-    expect(result).toEqual(sampleApproval({ approvalId: 42 }))
+    expect(result).toEqual(sampleApproval({ approvalId: '42' }))
   })
 })
 
@@ -388,14 +388,14 @@ describe('executableRevoke', () => {
       throw new Error(`unexpected command: ${cmd}`)
     })
 
-    await expect(executableRevoke(42)).resolves.toBeUndefined()
-    expect(capturedArgs).toEqual({ approvalId: 42 })
+    await expect(executableRevoke('42')).resolves.toBeUndefined()
+    expect(capturedArgs).toEqual({ approvalId: '42' })
   })
 })
 
 describe('approvalsList', () => {
   it('invokes approvals_list with no arguments and returns the list verbatim', async () => {
-    const approvals = [sampleApproval({ approvalId: 1 }), sampleApproval({ approvalId: 2 })]
+    const approvals = [sampleApproval({ approvalId: '1' }), sampleApproval({ approvalId: '2' })]
     mockIPC((cmd, args) => {
       if (cmd === 'approvals_list') {
         expect(args).toEqual({})
@@ -543,7 +543,7 @@ describe('HarnessFrame event stream', () => {
 
     const received: HarnessFrame[] = []
     await harnessSpawn(
-      { type: 'adapter', adapterId: 'claude-code', approvalId: 1, prompt: 'hi' },
+      { type: 'adapter', adapterId: 'claude-code', approvalId: '1', prompt: 'hi' },
       (frame) => {
         received.push(frame)
       },
@@ -588,7 +588,7 @@ async function spawnAdapterAndCapture(
   })
 
   const received: HarnessFrame[] = []
-  await harnessSpawn({ type: 'adapter', adapterId, approvalId: 1, prompt: 'hi' }, (frame) => {
+  await harnessSpawn({ type: 'adapter', adapterId, approvalId: '1', prompt: 'hi' }, (frame) => {
     received.push(frame)
   })
   if (!channelRef) throw new Error('harness_spawn was not called')
@@ -770,7 +770,7 @@ describe('ShellErrorCode pty-unsupported (slice 4)', () => {
     })
 
     await expect(
-      harnessSpawn({ type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: 'hi' }, () => {}),
+      harnessSpawn({ type: 'adapter', adapterId: 'pty-cli', approvalId: '1', prompt: 'hi' }, () => {}),
     ).rejects.toMatchObject(error)
     expect(isShellError(error)).toBe(true)
   })
@@ -788,7 +788,7 @@ describe('ShellErrorCode pty-unsupported (slice 4)', () => {
     const esc = String.fromCharCode(0x1b)
     await expect(
       harnessSpawn(
-        { type: 'adapter', adapterId: 'pty-cli', approvalId: 1, prompt: `hi${esc}[2J` },
+        { type: 'adapter', adapterId: 'pty-cli', approvalId: '1', prompt: `hi${esc}[2J` },
         () => {},
       ),
     ).rejects.toMatchObject(error)
@@ -1056,7 +1056,7 @@ describe('ShellErrorCode outbox codes (slice 5)', () => {
 
     await expect(
       harnessSpawn(
-        { type: 'adapter', adapterId: 'claude-code', approvalId: 1, prompt: 'hi' },
+        { type: 'adapter', adapterId: 'claude-code', approvalId: '1', prompt: 'hi' },
         () => {},
       ),
     ).rejects.toMatchObject(error)

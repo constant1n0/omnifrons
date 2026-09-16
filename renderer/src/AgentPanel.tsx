@@ -4701,7 +4701,7 @@ export function AgentPanel() {
           disabled={runActive}
           onChange={(event) => {
             if (runActiveRef.current || runActive) return
-            setApprovalId(event.target.value === '' ? null : Number(event.target.value))
+            setApprovalId(event.target.value === '' ? null : event.target.value)
           }}
         >
           <option value="">Select an approval</option>

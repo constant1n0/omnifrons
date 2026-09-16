@@ -55,7 +55,7 @@ const SAMPLE_EVIDENCE: Evidence = {
 
 function sampleApproval(overrides: Partial<Approval> = {}): Approval {
   return {
-    approvalId: 42,
+    approvalId: '42',
     evidence: SAMPLE_EVIDENCE,
     approvedAt: 500,
     status: 'active',
@@ -146,7 +146,7 @@ function defaultHandlers(
     // an empty table and the fault line, never an alert.
     if (cmd === 'recovery_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
     if (cmd === 'adapters_list') return options.adapters ?? [SAMPLE_ADAPTER, PTY_ADAPTER]
-    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
     throw new Error(`unexpected command: ${cmd}`)
   }
@@ -764,8 +764,8 @@ describe('AgentPanel', () => {
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
       if (cmd === 'approvals_list') {
         return [
-          sampleApproval({ approvalId: 1, status: 'active' }),
-          sampleApproval({ approvalId: 2, status: 'revoked', revokedAt: 600 }),
+          sampleApproval({ approvalId: '1', status: 'active' }),
+          sampleApproval({ approvalId: '2', status: 'revoked', revokedAt: 600 }),
         ]
       }
       throw new Error(`unexpected command: ${cmd}`)
@@ -1471,6 +1471,41 @@ describe('AgentPanel prompt byte cap (R3-004)', () => {
   })
 })
 
+describe('AgentPanel executable approval id above Number.MAX_SAFE_INTEGER (fix/approval-id-ipc-string)', () => {
+  it('carries an approval id above Number.MAX_SAFE_INTEGER unchanged from approvals_list, through selecting it here, into the harness_spawn launch request', async () => {
+    // The wire form `ApprovalIdDto` now uses: 16 lowercase hex characters,
+    // the value 16973651968280921777 in hex -- an id this far above
+    // `Number.MAX_SAFE_INTEGER` (2**53 - 1) is exactly what a bare-number
+    // encoding silently rounded, denying every real launch under it.
+    const bigApprovalId = 'eb8e8688ee7e86b1'
+    let capturedApprovalId: unknown
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'recovery_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: bigApprovalId })]
+      if (cmd === 'harness_spawn') {
+        capturedApprovalId = (args as { kind: { approvalId: unknown } }).kind.approvalId
+        return 7
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', bigApprovalId)
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+
+    expect(capturedApprovalId).toBe(bigApprovalId)
+  })
+})
+
 describe('AgentPanel unexpected fallback (R3-005)', () => {
   const LEAKY_MESSAGE = 'boom: /home/someone/secret/path'
 
@@ -1527,7 +1562,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
       if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
       if (cmd === 'adapters_list') return [SAMPLE_ADAPTER]
-      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
       throw new Error(`unexpected command: ${cmd}`)
     })
 
@@ -1555,7 +1590,7 @@ describe('AgentPanel failure paths (R3-006)', () => {
       if (cmd === 'adapters_list') {
         return Promise.reject({ code: 'invalid-request', message: 'adapter catalog unavailable' })
       }
-      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
       throw new Error(`unexpected command: ${cmd}`)
     })
 
@@ -1767,7 +1802,7 @@ describe('AgentPanel control stripping per harness string (R3-008)', () => {
       if (cmd === 'approvals_list') {
         return [
           sampleApproval({
-            approvalId: 42,
+            approvalId: '42',
             evidence: { ...SAMPLE_EVIDENCE, canonicalPath: `/opt/tool${esc}/<b>app</b>` },
           }),
         ]
@@ -2598,7 +2633,7 @@ function mockMountWithOutbox(answer: () => unknown) {
   mockIPC((cmd) => {
     if (cmd === 'workspace_current') return { displayPath: '/home/user/project', workArea: 'valid' }
     if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
-    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
     if (cmd === 'outbox_status') return answer()
     if (cmd === 'publications_list') return []
     throw new Error(`unexpected command: ${cmd}`)
@@ -3740,7 +3775,7 @@ function mockMountWithPublications(
   mockIPC((cmd, args) => {
     if (cmd === 'workspace_current') return { displayPath: '/home/user/project', workArea: 'valid' }
     if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
-    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
     if (cmd === 'outbox_status') return OUTBOX_STATUS_VALID
     if (cmd === 'publications_list') return answer()
     if (cmd === 'recovery_list') return []
@@ -5393,7 +5428,7 @@ function mountWithWorkspace(
       return options.workspace === undefined ? WORKSPACE_ACTIVE : options.workspace
     }
     if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
-    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+    if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
     if (cmd === 'outbox_status') return options.outbox ?? OUTBOX_STATUS_VALID
     if (cmd === 'publications_list') return []
     const guidance = answerGuidanceFresh(cmd, args)

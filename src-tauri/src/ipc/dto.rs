@@ -1836,9 +1836,44 @@ impl ShellError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateIdDto(pub u64);
 
-/// An approval id, as it crosses IPC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// An approval id, as it crosses IPC: 16 lowercase hex characters, the same
+/// wire convention [`omnifrons_domain::publication::ArtifactApprovalId`]
+/// already uses (its own `to_hex`/`from_hex`). A plain `u64` derive would
+/// serialize as a bare JSON number -- but this id is derived from a
+/// SHA-256 digest (`derive_approval_id`) and is therefore uniformly random
+/// over the full `u64` range, so a bare number does not reliably survive a
+/// JSON number's 53-bit mantissa: `JSON.parse` silently rounds it in the
+/// renderer, and the rounded id then never matches anything on record.
+/// Deserialization is strict: anything other than exactly 16 hex
+/// characters is rejected, never guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalIdDto(pub u64);
+
+impl Serialize for ApprovalIdDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{:016x}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for ApprovalIdDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        if text.len() != 16 {
+            return Err(serde::de::Error::custom(
+                "approval id must be exactly 16 hex characters",
+            ));
+        }
+        u64::from_str_radix(&text, 16)
+            .map(Self)
+            .map_err(|_| serde::de::Error::custom("approval id is not valid hex"))
+    }
+}
 
 impl From<omnifrons_domain::executable::ApprovalId> for ApprovalIdDto {
     fn from(id: omnifrons_domain::executable::ApprovalId) -> Self {
@@ -2015,7 +2050,7 @@ mod tests {
         );
 
         let approved: HarnessKindDto =
-            serde_json::from_str(r#"{"type":"approved","approvalId":42}"#)
+            serde_json::from_str(r#"{"type":"approved","approvalId":"000000000000002a"}"#)
                 .expect("approved must deserialize");
         assert_eq!(
             approved,
@@ -2055,8 +2090,9 @@ mod tests {
     /// and have it silently dropped rather than surfaced.
     #[test]
     fn harness_kind_dto_rejects_an_extra_field_on_approved() {
-        let result: Result<HarnessKindDto, _> =
-            serde_json::from_str(r#"{"type":"approved","approvalId":42,"rateHz":10}"#);
+        let result: Result<HarnessKindDto, _> = serde_json::from_str(
+            r#"{"type":"approved","approvalId":"000000000000002a","rateHz":10}"#,
+        );
         assert!(
             result.is_err(),
             "an extra field on approved must be rejected, got {result:?}"
@@ -2066,7 +2102,7 @@ mod tests {
     #[test]
     fn harness_kind_dto_deserializes_the_adapter_variant() {
         let adapter: HarnessKindDto = serde_json::from_str(
-            r#"{"type":"adapter","adapterId":"claude-code","approvalId":42,"prompt":"do the thing"}"#,
+            r#"{"type":"adapter","adapterId":"claude-code","approvalId":"000000000000002a","prompt":"do the thing"}"#,
         )
         .expect("adapter must deserialize");
         assert_eq!(
@@ -2082,7 +2118,7 @@ mod tests {
     #[test]
     fn harness_kind_dto_rejects_an_extra_field_on_adapter() {
         let result: Result<HarnessKindDto, _> = serde_json::from_str(
-            r#"{"type":"adapter","adapterId":"claude-code","approvalId":42,"prompt":"x","rateHz":10}"#,
+            r#"{"type":"adapter","adapterId":"claude-code","approvalId":"000000000000002a","prompt":"x","rateHz":10}"#,
         );
         assert!(
             result.is_err(),
@@ -2092,12 +2128,57 @@ mod tests {
 
     #[test]
     fn harness_kind_dto_rejects_adapter_missing_prompt() {
-        let result: Result<HarnessKindDto, _> =
-            serde_json::from_str(r#"{"type":"adapter","adapterId":"claude-code","approvalId":42}"#);
+        let result: Result<HarnessKindDto, _> = serde_json::from_str(
+            r#"{"type":"adapter","adapterId":"claude-code","approvalId":"000000000000002a"}"#,
+        );
         assert!(
             result.is_err(),
             "adapter missing its required prompt field must be rejected, got {result:?}"
         );
+    }
+
+    /// `ApprovalIdDto` must follow `ArtifactApprovalId`'s own wire
+    /// convention (`omnifrons_domain::publication::ArtifactApprovalId::to_hex`):
+    /// 16 lowercase hex characters, never a bare JSON number. An
+    /// `ApprovalId` is derived from a SHA-256 digest and is therefore
+    /// uniformly random over the full `u64` range, so a bare-number
+    /// encoding loses precision the instant the renderer's `JSON.parse`
+    /// rounds it past a JS number's 53-bit mantissa -- exactly the defect
+    /// this test guards against for both ids exercised here.
+    #[test]
+    fn approval_id_dto_round_trips_through_a_16_hex_character_string_above_2_53() {
+        for (id, hex) in [
+            (u64::MAX, "ffffffffffffffff"),
+            (16_973_651_968_280_921_777, "eb8e8688ee7e86b1"),
+        ] {
+            let dto = ApprovalIdDto(id);
+            assert_eq!(
+                json(&dto),
+                serde_json::json!(hex),
+                "id {id} must serialize as {hex}"
+            );
+
+            let parsed: ApprovalIdDto = serde_json::from_value(serde_json::json!(hex))
+                .unwrap_or_else(|error| panic!("{hex} must deserialize back: {error}"));
+            assert_eq!(parsed, dto, "{hex} must round-trip back to {id}");
+        }
+    }
+
+    /// Deserialization is strict: a bare number (the old, precision-losing
+    /// encoding), a wrong-length string, and a string with a non-hex
+    /// character are all rejected rather than guessed at.
+    #[test]
+    fn approval_id_dto_rejects_a_malformed_or_non_string_value() {
+        let cases = [
+            serde_json::json!(42),
+            serde_json::json!("2a"),
+            serde_json::json!("000000000000002a0"),
+            serde_json::json!("000000000000zz2a"),
+        ];
+        for case in cases {
+            let result: Result<ApprovalIdDto, _> = serde_json::from_value(case.clone());
+            assert!(result.is_err(), "{case:?} must be rejected, got {result:?}");
+        }
     }
 
     #[test]

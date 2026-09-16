@@ -24,7 +24,7 @@ const SAMPLE_EVIDENCE: Evidence = {
 
 function sampleApproval(overrides: Partial<Approval> = {}): Approval {
   return {
-    approvalId: 42,
+    approvalId: '42',
     evidence: SAMPLE_EVIDENCE,
     approvedAt: 500,
     status: 'active',
@@ -283,7 +283,7 @@ describe('ApprovalSurface', () => {
       }
       if (cmd === 'executable_approve') {
         capturedArgs = args as Record<string, unknown>
-        return sampleApproval({ approvalId: 42 })
+        return sampleApproval({ approvalId: '42' })
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
@@ -311,8 +311,8 @@ describe('ApprovalSurface', () => {
     mockIPC((cmd, args) => {
       if (cmd === 'approvals_list') {
         listCallCount += 1
-        if (listCallCount === 1) return [sampleApproval({ approvalId: 42 })]
-        return [sampleApproval({ approvalId: 42, status: 'revoked', revokedAt: 600 })]
+        if (listCallCount === 1) return [sampleApproval({ approvalId: '42' })]
+        return [sampleApproval({ approvalId: '42', status: 'revoked', revokedAt: 600 })]
       }
       if (cmd === 'executable_revoke') {
         capturedArgs = args as Record<string, unknown>
@@ -327,7 +327,7 @@ describe('ApprovalSurface', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Revoke' }))
 
     await waitFor(() => {
-      expect(capturedArgs).toEqual({ approvalId: 42 })
+      expect(capturedArgs).toEqual({ approvalId: '42' })
     })
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: 'Revoke' })).toBeNull()
@@ -341,8 +341,8 @@ describe('ApprovalSurface', () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
         listCallCount += 1
-        if (listCallCount === 1) return [sampleApproval({ approvalId: 42 })]
-        return [sampleApproval({ approvalId: 42, status: 'revoked', revokedAt: 600 })]
+        if (listCallCount === 1) return [sampleApproval({ approvalId: '42' })]
+        return [sampleApproval({ approvalId: '42', status: 'revoked', revokedAt: 600 })]
       }
       if (cmd === 'executable_revoke') {
         revokeCallCount += 1
@@ -417,7 +417,7 @@ describe('ApprovalSurface', () => {
             detail: { recordedSha256Short: 'aaaaaaaa', observedSha256Short: 'bbbbbbbb' },
           })
         }
-        return sampleApproval({ approvalId: 99 })
+        return sampleApproval({ approvalId: '99' })
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
@@ -535,7 +535,7 @@ describe('ApprovalSurface', () => {
     unmount()
 
     expect(() => {
-      resolveApprove(sampleApproval({ approvalId: 42 }))
+      resolveApprove(sampleApproval({ approvalId: '42' }))
     }).not.toThrow()
 
     await new Promise((resolve) => {
@@ -549,7 +549,7 @@ describe('ApprovalSurface', () => {
   it('no-ops after unmount: a pending executable_revoke resolving post-unmount throws nothing', async () => {
     let resolveRevoke: (value: unknown) => void = () => {}
     mockIPC((cmd) => {
-      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
       if (cmd === 'executable_revoke') {
         return new Promise((resolve) => {
           resolveRevoke = resolve
@@ -618,7 +618,7 @@ describe('ApprovalSurface', () => {
     unmount()
 
     expect(() => {
-      resolveSecondApprove(sampleApproval({ approvalId: 99 }))
+      resolveSecondApprove(sampleApproval({ approvalId: '99' }))
     }).not.toThrow()
 
     await new Promise((resolve) => {

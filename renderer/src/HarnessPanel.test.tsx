@@ -23,7 +23,7 @@ const SAMPLE_EVIDENCE: Evidence = {
 
 function sampleApproval(overrides: Partial<Approval> = {}): Approval {
   return {
-    approvalId: 42,
+    approvalId: '42',
     evidence: SAMPLE_EVIDENCE,
     approvedAt: 500,
     status: 'active',
@@ -564,7 +564,7 @@ describe('HarnessPanel', () => {
   it('hides the Rate/Lines inputs and shows an approval select when Kind is "approved"', async () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
-        return [sampleApproval({ approvalId: 42 })]
+        return [sampleApproval({ approvalId: '42' })]
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
@@ -581,8 +581,8 @@ describe('HarnessPanel', () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
         return [
-          sampleApproval({ approvalId: 1, status: 'active' }),
-          sampleApproval({ approvalId: 2, status: 'revoked', revokedAt: 600 }),
+          sampleApproval({ approvalId: '1', status: 'active' }),
+          sampleApproval({ approvalId: '2', status: 'revoked', revokedAt: 600 }),
         ]
       }
       throw new Error(`unexpected command: ${cmd}`)
@@ -603,7 +603,7 @@ describe('HarnessPanel', () => {
       if (cmd === 'approvals_list') {
         return [
           sampleApproval({
-            approvalId: 42,
+            approvalId: '42',
             evidence: { ...SAMPLE_EVIDENCE, canonicalPath: `/opt/tool${esc}/app` },
           }),
         ]
@@ -623,7 +623,7 @@ describe('HarnessPanel', () => {
     let capturedArgs: Record<string, unknown> | undefined
     mockIPC((cmd, args) => {
       if (cmd === 'approvals_list') {
-        return [sampleApproval({ approvalId: 42 })]
+        return [sampleApproval({ approvalId: '42' })]
       }
       if (cmd === 'harness_spawn') {
         capturedArgs = args as Record<string, unknown>
@@ -640,13 +640,13 @@ describe('HarnessPanel', () => {
 
     expect(capturedArgs).toBeDefined()
     expect(Object.keys(capturedArgs!).sort()).toEqual(['kind', 'onFrame'])
-    expect(capturedArgs!.kind).toEqual({ type: 'approved', approvalId: 42 })
+    expect(capturedArgs!.kind).toEqual({ type: 'approved', approvalId: '42' })
   })
 
   it('shows a denial in the banner with the public "untrusted" wording for a revoked approval', async () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
-        return [sampleApproval({ approvalId: 42 })]
+        return [sampleApproval({ approvalId: '42' })]
       }
       if (cmd === 'harness_spawn') {
         return Promise.reject({
@@ -671,7 +671,7 @@ describe('HarnessPanel', () => {
   it('shows a denial in the banner with the public "untrusted" wording for an unapproved candidate (R3-014)', async () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
-        return [sampleApproval({ approvalId: 42 })]
+        return [sampleApproval({ approvalId: '42' })]
       }
       if (cmd === 'harness_spawn') {
         return Promise.reject({
@@ -696,7 +696,7 @@ describe('HarnessPanel', () => {
   it('shows a denial in the banner with the public "untrusted" wording for a shadowed path (R3-014)', async () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
-        return [sampleApproval({ approvalId: 42 })]
+        return [sampleApproval({ approvalId: '42' })]
       }
       if (cmd === 'harness_spawn') {
         return Promise.reject({
@@ -721,7 +721,7 @@ describe('HarnessPanel', () => {
   it('shows a changed-since-approval denial with both digests in the banner detail', async () => {
     mockIPC((cmd) => {
       if (cmd === 'approvals_list') {
-        return [sampleApproval({ approvalId: 42 })]
+        return [sampleApproval({ approvalId: '42' })]
       }
       if (cmd === 'harness_spawn') {
         return Promise.reject({
@@ -746,7 +746,7 @@ describe('HarnessPanel', () => {
 
   it('clears the error banner and resets the approval selection when switching away from "approved" (R3-007/R3-011)', async () => {
     mockIPC((cmd) => {
-      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: 42 })]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
       if (cmd === 'harness_spawn') {
         return Promise.reject({
           code: 'revoked',
@@ -802,7 +802,7 @@ describe('HarnessPanel', () => {
 
     // The newer request (#2) resolves first...
     act(() => {
-      resolvers[1]!([sampleApproval({ approvalId: 2 })])
+      resolvers[1]!([sampleApproval({ approvalId: '2' })])
     })
     await waitFor(() => {
       const approvalSelect = screen.getByLabelText('Approval') as HTMLSelectElement
@@ -815,7 +815,7 @@ describe('HarnessPanel', () => {
     // stale response's own .then chain -- two async-function hops plus
     // the effect's own .then -- has fully settled before asserting.
     await act(async () => {
-      resolvers[0]!([sampleApproval({ approvalId: 1 })])
+      resolvers[0]!([sampleApproval({ approvalId: '1' })])
       await new Promise((resolve) => {
         setTimeout(resolve, 0)
       })

@@ -495,7 +495,7 @@ export function HarnessPanel() {
               id="harness-approval"
               value={approvedId === null ? '' : String(approvedId)}
               onChange={(event) =>
-                setApprovedId(event.target.value === '' ? null : Number(event.target.value))
+                setApprovedId(event.target.value === '' ? null : event.target.value)
               }
             >
               <option value="">Select an approval</option>
