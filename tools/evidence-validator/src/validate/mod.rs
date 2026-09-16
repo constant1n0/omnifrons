@@ -8,6 +8,7 @@
 mod v1_mandatory_fields;
 mod v2_result_vocabulary;
 mod v3_baseline_before_scenario;
+mod v4_v5_v6_identifiers_and_provenance;
 
 use crate::record::{Record, Violation};
 
@@ -19,5 +20,6 @@ pub fn validate(records: &[Record]) -> Vec<Violation> {
     v1_mandatory_fields::check(records, &mut violations);
     v2_result_vocabulary::check(records, &mut violations);
     v3_baseline_before_scenario::check(records, &mut violations);
+    v4_v5_v6_identifiers_and_provenance::check(records, &mut violations);
     violations
 }
