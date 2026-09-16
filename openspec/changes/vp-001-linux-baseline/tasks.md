@@ -43,22 +43,22 @@ Satisfies: packaged-build-evidence / Pinned Build Environment, Retained Digest-A
 
 Satisfies: verification-evidence-store / Baseline-Before-Scenario Admission, Closed Outcome Vocabulary, Mandatory-Field Validation, Append-Only Correction, Provenance-Clean Publication; packaged-build-evidence / Packaged-Build-Only Admissibility, Exercised Artifact Matches Digested Artifact (validator half).
 
-- [ ] 2.1 `Cargo.toml` — add `"tools/*"` to `[workspace] members`.
-- [ ] 2.2 RED: `tools/evidence-validator/` table tests — each mandatory field missing in turn, per record kind; a scenario row's `result` and `observed_state` are two distinct mandatory fields (V1, `field-missing`).
-- [ ] 2.3 GREEN: implement `parse(text) -> Result<Vec<Record>, Vec<Violation>>` over the `##`-section / two-column table grammar, and V1 in `validate`.
-- [ ] 2.4 RED: table test — `result` outside `{pass, fail, uncertain}`, including a compound value like `orphan-risk/uncertain`, rejected as `result-out-of-vocabulary` (V2).
-- [ ] 2.5 GREEN: implement V2.
-- [ ] 2.6 RED: table tests — a scenario row with no matching baseline, and a baseline missing a VP-001-R1 field, both rejected as `baseline-unpinned` (V3).
-- [ ] 2.7 GREEN: implement V3 (baseline-before-scenario admission).
-- [ ] 2.8 RED: table tests — duplicate `record_id`, dangling `corrects`, reused `evidence_artifact` for the same `(scenario_id, baseline_id)`, and a path/host-shaped value (V4/V5/V6).
-- [ ] 2.9 GREEN: implement V4/V5/V6.
-- [ ] 2.10 RED: table tests — `exercised_artifact_digest` ≠ `build_channel_digest`, `variant_scan: found`, `variant_scan` missing, a non-`packaged-ci` `build_channel`, a digest with no retained `evidence_artifact` (V7/V8).
-- [ ] 2.11 GREEN: implement V7/V8.
-- [ ] 2.12 RED: derivation table tests for every `derive` row — `pass` (all three positive proofs), `fail` (recorded pid alive, same starttime), `uncertain`/`orphan-risk` for ungated-identity, unreadable-enumeration, and unconfirmed-stop; assert `result` and `observed_state` stay two separate fields, never a compound `result`.
-- [ ] 2.13 GREEN: implement `derive(Observations) -> (result, observed_state)` as a pure function.
-- [ ] 2.14 `docs/evidence/VP-001/README.md` — create: record schema (mirrors VP-001's own vertical `| field | value |` table), append-only rule, correction-by-`corrects` protocol, `record_id` uniqueness.
-- [ ] 2.15 Add fixtures under `tools/evidence-validator/tests/fixtures/` so the integration test (`cargo test --workspace`) has something to parse today; the real `docs/evidence/VP-001/{baselines,records}.md` files are created in Slice 4.
-- [ ] 2.16 Rollback boundary: revert `Cargo.toml`'s member addition and `tools/evidence-validator/`; no rows exist yet to orphan.
+- [x] 2.1 `Cargo.toml` — add `"tools/*"` to `[workspace] members`.
+- [x] 2.2 RED: `tools/evidence-validator/` table tests — each mandatory field missing in turn, per record kind; a scenario row's `result` and `observed_state` are two distinct mandatory fields (V1, `field-missing`).
+- [x] 2.3 GREEN: implement `parse(text) -> Result<Vec<Record>, Vec<Violation>>` over the `##`-section / two-column table grammar, and V1 in `validate`.
+- [x] 2.4 RED: table test — `result` outside `{pass, fail, uncertain}`, including a compound value like `orphan-risk/uncertain`, rejected as `result-out-of-vocabulary` (V2).
+- [x] 2.5 GREEN: implement V2.
+- [x] 2.6 RED: table tests — a scenario row with no matching baseline, and a baseline missing a VP-001-R1 field, both rejected as `baseline-unpinned` (V3).
+- [x] 2.7 GREEN: implement V3 (baseline-before-scenario admission).
+- [x] 2.8 RED: table tests — duplicate `record_id`, dangling `corrects`, reused `evidence_artifact` for the same `(scenario_id, baseline_id)`, and a path/host-shaped value (V4/V5/V6).
+- [x] 2.9 GREEN: implement V4/V5/V6.
+- [x] 2.10 RED: table tests — `exercised_artifact_digest` ≠ `build_channel_digest`, `variant_scan: found`, `variant_scan` missing, a non-`packaged-ci` `build_channel`, a digest with no retained `evidence_artifact` (V7/V8).
+- [x] 2.11 GREEN: implement V7/V8.
+- [x] 2.12 RED: derivation table tests for every `derive` row — `pass` (all three positive proofs), `fail` (recorded pid alive, same starttime), `uncertain`/`orphan-risk` for ungated-identity, unreadable-enumeration, and unconfirmed-stop; assert `result` and `observed_state` stay two separate fields, never a compound `result`.
+- [x] 2.13 GREEN: implement `derive(Observations) -> (result, observed_state)` as a pure function.
+- [x] 2.14 `docs/evidence/VP-001/README.md` — create: record schema (mirrors VP-001's own vertical `| field | value |` table), append-only rule, correction-by-`corrects` protocol, `record_id` uniqueness.
+- [x] 2.15 Add fixtures under `tools/evidence-validator/tests/fixtures/` so the integration test (`cargo test --workspace`) has something to parse today; the real `docs/evidence/VP-001/{baselines,records}.md` files are created in Slice 4.
+- [x] 2.16 Rollback boundary: revert `Cargo.toml`'s member addition and `tools/evidence-validator/`; no rows exist yet to orphan.
 
 ## Phase 3a: Harness Scaffolding and Feasibility Gate — Slice 3a (PR 3a)
 
