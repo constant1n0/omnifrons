@@ -2,6 +2,14 @@ name: Tauri Build
 
 on:
   workflow_dispatch:
+    inputs:
+      vp001_scenario:
+        # Opt-in evidence run: the full VP-001 VP-S6 scenario on the pinned
+        # Linux runner. Off by default, so the nightly schedule and ordinary
+        # dispatches keep running only the F1 feasibility gate.
+        description: Run the full VP-001 VP-S6 scenario (evidence run)
+        type: boolean
+        default: false
   schedule:
     - cron: '0 3 * * *'
 
@@ -191,4 +199,54 @@ jobs:
               sleep 1
             done
             docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=feasibility-check "$1" "$2"
-          ' vp-s6-feasibility-check "${artifact_path}" "${build_channel_digest}"
+          ' vp-s6-feasibility-check "${artifact_path}" "${build_channel_digest}" \
+            | tee "${RUNNER_TEMP}/vp-001-feasibility-transcript.txt"
+
+      - name: Build VP-S6 fixture agent
+        # tools/vp-s6-agent: the native executable the scenario approves and
+        # launches; its breakaway descendant exits on its own after 120s.
+        if: runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.vp001_scenario && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        run: cargo build --release -p vp-s6-agent
+
+      - name: VP-001 VP-S6 scenario (evidence run)
+        # The full scenario runs on this pinned runner, against the same
+        # retained artifact the Digest artifact step recorded: VP-001 admits a
+        # result only from the baseline it was run on. An `uncertain` or `fail`
+        # outcome still exits 0; only the AV1/AV2 gate and usage errors fail
+        # this step (vp-s6-linux.sh header).
+        if: runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.vp001_scenario && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        env:
+          VP001_DIGEST_PATHS: ${{ steps.digest.outputs.paths }}
+          VP001_DIGEST_FILE: ${{ runner.temp }}/vp-001-artifact-digest.txt
+        run: |
+          set -euo pipefail
+          artifact_path="$(printf '%s\n' "${VP001_DIGEST_PATHS}" | grep -m1 '\.AppImage$')"
+          build_channel_digest="$(
+            awk -v name="$(basename "${artifact_path}")" '$2 == name { print $1 }' "${VP001_DIGEST_FILE}"
+          )"
+          workspace_dir="$(mktemp -d "${RUNNER_TEMP}/vp-s6-workspace.XXXXXX")"
+          xvfb-run --auto-servernum -- bash -c '
+            set -euo pipefail
+            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
+            driver_pid=$!
+            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
+            for _ in $(seq 1 10); do
+              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
+              sleep 1
+            done
+            docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=scenario "$1" "$2" "$3" "$4"
+          ' vp-s6-scenario "${artifact_path}" "${build_channel_digest}" \
+            "${GITHUB_WORKSPACE}/target/release/vp-s6-agent" "${workspace_dir}" \
+            | tee "${RUNNER_TEMP}/vp-001-vp-s6-transcript.txt"
+
+      - name: Upload VP-001 transcripts
+        # Kept even when a gate fails: a blocked run is evidence of the
+        # blocker, not something to discard.
+        if: always() && runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        uses: actions/upload-artifact@v7.0.1 # v7.0.1
+        with:
+          name: vp-001-transcripts
+          path: |
+            ${{ runner.temp }}/vp-001-feasibility-transcript.txt
+            ${{ runner.temp }}/vp-001-vp-s6-transcript.txt
+          if-no-files-found: warn
