@@ -610,3 +610,345 @@ separately under Slice 3b below.
 having passed) is now satisfied. Slice 3b starts in this apply batch. Slice 4 remains gated
 separately on its own explicit CI-trigger authorization (design.md's Migration/Rollout
 "Authorization" note), unrelated to this fix.
+
+## Slice 3b (Phase 3b, PR 3b): VP-S6 Scenario
+
+### Scope
+
+Phase 3b only: "VP-S6 Scenario" (tasks 3b.1–3b.7). No `.github/workflows/` change — CI wiring for
+`--mode=scenario` is deferred to Slice 4 (the only slice with an authorized CI-trigger run); this
+slice builds and locally validates the scenario logic against a **locally built** artifact. No
+`docs/evidence/VP-001/{baselines,records}.md` row is written — the derived outcome below is a
+**local preview**, explicitly not VP-001 evidence per this batch's own instructions.
+
+### Completed Tasks
+
+- [x] 3b.1 `tools/vp-s6-agent/` — fixture ELF (design D8): ignores argv, drains stdin to EOF,
+      spawns `setsid sleep 120` as a breakaway-attempting descendant (`process_group(0)` at the
+      supervisor's own spawn time makes this fixture's pid its own pgid --
+      `crates/omnifrons-supervisor/src/lib.rs:181` (read-only) -- so `setsid` moves the descendant
+      into a brand-new session/pgid, detaching it from the group `killpg` targets), writes
+      `self <pid> <starttime>` / `descendant <pid> <starttime>` into its own cwd
+      (`vp-s6-agent.pids`), then sleeps up to 120s (self-bounding: exits on its own even if never
+      killed). Manually verified (not a repository test): a direct invocation confirmed the
+      descendant's pgid/sid differ from the agent's own — see "Manual Fixture Verification" below.
+- [x] 3b.2 Audited 2.12's derivation table tests (`tools/evidence-validator/tests/derive.rs`)
+      against every shape this scenario can emit: survivor (`any_pid_alive_after_wait`,
+      `a_pid_alive_after_the_bounded_wait_yields_fail_and_orphan_risk`), proven-gone (the
+      `all_positive`/`pass` case's own `all_pids_proven_gone: true`), unreadable-enumeration
+      (`unreadable_enumeration_yields_uncertain_and_orphan_risk`), ungated-identity, and
+      unconfirmed-stop. **Recycled-pid** is not a distinct `Observations` field by design: this
+      scenario's own `classifyPidAfterWait` (`vp-s6-observations.mjs`, unit-tested) folds a
+      pid-exists-but-starttime-differs case into `all_pids_proven_gone`, never
+      `any_pid_alive_after_wait` — so the recycled-pid shape is already exercised by the same
+      boolean 2.12 covers, not a seventh shape needing its own row. **No gap found; no new
+      `derive.rs` test case added.**
+- [x] 3b.3 `docs/evidence/VP-001/procedures/vp-s6-linux.sh` — added `--mode=scenario`: runs the
+      shared AV1/AV2 gate (refactored out of `--mode=feasibility-check` into `run_av1`/`run_av2`
+      functions), then delegates to the new `vp-s6-scenario.mjs`, which owns its own session and
+      drives: pick workspace → approve fixture → refresh (Slice 3a's approvals-list finding) →
+      select adapter (`stream-json-cli`) and approval (`executeScript`, since a native `<select>`
+      is not reliably click-driven under this headless `WebKitWebDriver`) → Start → poll `State:`
+      for `running` → read the fixture's pid file → record baseline `(pid, starttime)` for both
+      pids from `/proc` (never trusting the file's own starttime field) → Stop → poll `State:` for
+      a terminal token → a bounded 5s wait → re-read `/proc` for both pids → emit a `key=value`
+      observation transcript. No repository test drives this GUI path; checked by multiple real
+      runs under `Xvfb` + `tauri-driver`, culminating in the retained transcript under "Local
+      Preview Run" below.
+- [x] 3b.4 **Disclosed-deviation branch — N/A this run.** Slice 3a's F2 passed directly (no
+      seeded-approval fallback needed), so this run took the primary `xdotool` path throughout; the
+      deviation-observation line is not wired since it has nothing to record yet.
+- [x] 3b.5 **Bounded-timeout branch.** Implemented generically: every dialog/DOM wait in
+      `vp-s6-scenario.mjs` goes through one `pollUntil(checkFn, timeoutMs)` (no retry beyond the one
+      bound; a rejection during polling is treated as "not ready yet", never silently retried past
+      the deadline) and reports `blocker=<token>` on timeout. Not triggered in the local preview —
+      every chooser and badge transition completed within its bound — so this is a code-review
+      confirmation, not an exercised branch.
+- [x] 3b.6 **Executable-classification branch.** Confirmed: the fixture was approved and launched
+      through the real UI flow (`executable_pick_and_probe` → `executable_approve` →
+      `harness_spawn`), with no seeding, no direct `JsonlApprovalStore` write, and no bypass of
+      `FsExecutableProber`/`LaunchGate::decide`. `derive`'s refusal-on-ungated-identity path is
+      unchanged and already covered by 2.12.
+- [x] 3b.7 Rollback boundary confirmed: reverting `tools/vp-s6-agent/`, the four new
+      `docs/evidence/VP-001/procedures/vp-s6-{scenario,xdotool,observations,observations.test}.mjs`
+      files, and the `--mode=scenario` addition to `vp-s6-linux.sh` returns the repository to Slice
+      3a's state; the feasibility-check harness stays intact and inert, and nothing downstream
+      (Slice 4) exists yet to depend on any of it.
+
+### TDD Cycle Evidence
+
+| Task | Layer | RED (observed) | GREEN (observed) |
+|---|---|---|---|
+| 3b.1 (`tools/vp-s6-agent`) | Unit (`cargo test -p vp-s6-agent`) | Compile error: `format_pid_file`/`parse_proc_stat_starttime` unresolved | `cargo test -p vp-s6-agent`: 4/4 passed after implementing both pure functions |
+| `webdriver-session.mjs` `executeScript`/`refreshPage` | Unit (`node --test`) | `SyntaxError: ... does not provide an export named 'buildExecuteScriptRequest'` | `node --test docs/evidence/VP-001/procedures/*.test.mjs`: 26/26 passed |
+| `vp-s6-observations.mjs` (`parsePidFile`, `parseProcStatStarttime`, `classifyPidAfterWait`) | Unit (`node --test`) | `ERR_TEST_FAILURE`: module did not exist | 37/37 passed (all procedure test files) after implementing all three |
+
+Every check above ships with both a rejecting/edge case and an accepting case (e.g.
+`parseProcStatStarttime`'s comm-with-parens case, `classifyPidAfterWait`'s recycled-vs-alive
+distinction), so no GREEN result is a trivial pass from an empty check.
+
+**Orchestration is the acknowledged no-repo-test path** (`vp-s6-scenario.mjs`'s WebDriver calls,
+`xdotool` driving, `/proc` reads): design.md's own Testing Strategy names "the live browser-driving
+path only" as evidence machinery, never a repository test. What is checked instead: nine real runs
+under `Xvfb` + `tauri-driver` against a locally built artifact (see "Local Preview Run"), each
+iteration fixing a genuine bug the previous run exposed (see "Bugs Found and Fixed" below), ending
+in a clean, reproducible run through the actual committed `vp-s6-linux.sh --mode=scenario` entry
+point twice in a row.
+
+### Manual Fixture Verification (3b.1)
+
+```
+$ target/release/vp-s6-agent   # run under `timeout 5`, cwd = scratch dir
+$ cat vp-s6-agent.pids
+self 2038203 17265427
+descendant 2038204 17265427
+$ ps -o pid,ppid,pgid,sid,comm --pid 2038204
+    PID    PPID    PGID     SID COMMAND
+2038204 2038203 2038204 2038204 sleep
+```
+The descendant's pgid/sid (2038204) differ from its own ppid's pgid context (the agent process),
+confirming the breakaway: `setsid` gave `sleep` a brand-new session and process group, exactly the
+group `killpg` cannot reach unless it targets that new pgid.
+
+### Bugs Found and Fixed During Live Runs
+
+Nine live runs against a locally built artifact under `Xvfb` + `tauri-driver`, each fixing one
+genuine defect the previous run exposed (development iteration on evidence-machinery code, not a
+retry of the VP-S6 outcome itself — no VP-001 row exists yet for this run to game):
+
+1. **Relative artifact path breaks AV2.** `run_av2` does `cd "${extract_dir}"` before invoking the
+   artifact; a relative `artifact_path` no longer resolves after the `cd`. Not a regression from
+   this slice's refactor (the same issue existed in Slice 3a's flat script) — worked around by
+   always passing an absolute artifact path, matching real CI usage.
+2. **`run_av2`'s `EXIT` trap outlived its own function scope.** Moving the AV1/AV2 gate into
+   `run_av2()` kept its original `trap cleanup_extract_dir EXIT`, but `extract_dir` is `local` to
+   that function; the trap still fires at the *script's* real exit (long after `run_av2` returned),
+   where `set -u` rejects the now-unbound variable (`vp-s6-linux.sh: línea 82: extract_dir: variable
+   sin asignar`). Fixed: the trap now fires at the exact `exit 1` sites still inside `run_av2`'s own
+   scope, and is explicitly cleared (`trap - EXIT`) on the success path.
+3. **First `findElement` call raced the page's initial render.** `pickWorkspace`'s first lookup
+   (`Pick workspace` button) sometimes ran before the webview's React app finished its first paint,
+   throwing `no such element`. Fixed: a generic `waitForElement` (bounded `pollUntil` wrapping
+   `findElement`) replaces every "should already exist" lookup, and `pollUntil` itself now treats a
+   thrown rejection the same as a falsy result (keep polling) rather than propagating it.
+4. **`xdotool getwindowfocus`/`getactivewindow` never resolves in this bare `Xvfb`.**
+   `XGetInputFocus` returns the `PointerRoot` placeholder ("window 1") regardless of which window
+   GTK actually mapped, since there is no window manager to reassign real focus — confirmed by
+   direct `xdotool getwindowfocus` calls failing with `BadWindow` even while a dialog was visibly
+   open (`xwininfo -root -tree`). Fixed: `vp-s6-xdotool.mjs`'s `findWindowByName` searches by the
+   dialog's exact `WM_NAME` (`"Select Folder"` / `"Open File"`) instead, then `windowfocus <id>`
+   (an `XSetInputFocus` *call*, not a focus *query*) on that concrete id.
+5. **No pacing between `Ctrl+L`, typing, and `Return`.** The location-bar popup `Ctrl+L` opens is
+   itself a short-lived window that needs a moment to map and take focus; typing immediately (0ms
+   gap) raced ahead of it in the real script even though an ad hoc debug script with 300ms gaps
+   worked. Fixed: `driveChooserWithPath` now sleeps 300ms after `Ctrl+L` and again after typing,
+   before `Return` (verified empirically, not a guess — the same sequence with 0ms gaps reproduced
+   the failure three times in a row, and with 300ms gaps succeeded three times in a row).
+6. **`#agent-adapter` queried before the post-refresh remount completed.** The
+   `location.reload()`-equivalent (`refreshPage`) this design already needs (Slice 3a's
+   approvals-list finding) leaves a brief window before the React app remounts its controls,
+   throwing on the very first `executeScript` (`null is not an object (evaluating
+   'adapterSelect.value = ...')`. Fixed: `waitForElement` for `#agent-adapter` (bounded) now runs
+   between `refreshPage` and the control-selection `executeScript`.
+7. **`main()` executed unconditionally on `import`, not only on direct invocation.** The RED test
+   for `vp-s6-scenario.mjs`'s pure helpers failed at import time because the bottom-of-file
+   `await main();` ran even when the test file only wanted the exported functions. Fixed: guarded
+   with `if (import.meta.url === \`file://${process.argv[1]}\`)`.
+
+None of these were "retries to change the outcome" (VP-001-R prohibition): no VP-001 row exists for
+this slice, the retries were exclusively against this slice's own newly written automation code
+before it had ever run once, and every fix is now part of the committed script, verified by two
+clean, back-to-back runs (see below).
+
+### Local Preview Run — a PREVIEW, not VP-001 evidence
+
+**Build.** Reused the AppImage already built locally for Slice 3a's feasibility run (Sep 16 23:46),
+confirmed newer than the `5c5f474` fix it depends on (23:42) and unaffected by any commit since (no
+product code changed in Slices 2/3a/3b): SHA-256
+`0487ceeff4bd390041efcbaa9f644da59f1fdcabb2b590956f9a64103897f03a`.
+
+**Command (the actual committed entry point, run twice, same result both times):**
+```
+$ DISPLAY=:77 bash docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=scenario \
+    <abs-path>/Omnifrons_0.1.0_amd64.AppImage \
+    0487ceeff4bd390041efcbaa9f644da59f1fdcabb2b590956f9a64103897f03a \
+    <abs-path>/target/release/vp-s6-agent \
+    <scratch-workspace-dir>
+```
+
+**Observed transcript (second, back-to-back confirmation run):**
+```
+gate=av1-digest-match digest=0487ceeff4bd390041efcbaa9f644da59f1fdcabb2b590956f9a64103897f03a
+gate=av2-variant-scan-absent binary=/tmp/tmp.j4XIfDTzR0/squashfs-root/usr/bin/omnifrons-shell
+gate=f1-session-created session_id=f8964db8-92a1-46d1-9168-725034f96c76
+gate=controls-selected approval_id=6ee0b9f9013cb07f
+observation=started value=true
+observation=self_pid=2182349 descendant_pid=2182351
+gate=stop-badge value=exited (code unreported)
+observation=self_after_wait=gone descendant_after_wait=alive
+observation=identity_gated value=true
+observation=descendant_alive_before_stop value=true
+observation=stop_confirmed value=true
+observation=all_pids_proven_gone value=false
+observation=any_pid_alive_after_wait value=true
+observation=enumeration_unreadable value=false
+gate=session-closed session_id=f8964db8-92a1-46d1-9168-725034f96c76
+exit code: 0
+```
+`approval_id=6ee0b9f9013cb07f` is a 16-lowercase-hex-character `ApprovalId` — direct confirmation
+that `5c5f474`'s fix round-trips correctly through the real UI, not just the earlier feasibility
+gate. `State:` progressed `idle → running → exited (code unreported)`, matching the parent's own
+local confirmation cited in the Slice 3a Addendum above.
+
+**Derived outcome — via the actual pure `derive` function, not by hand:**
+```
+$ cargo run --quiet   # scratch binary, path-depending on tools/evidence-validator (not committed)
+result=Fail observed_state=OrphanRisk
+```
+fed the exact six observations from the transcript above
+(`identity_gated=true, descendant_alive_before_stop=true, stop_confirmed=true,
+all_pids_proven_gone=false, any_pid_alive_after_wait=true, enumeration_unreadable=false`) into
+`evidence_validator::derive::derive`.
+
+**Result: `fail` / `orphan-risk`.** The breakaway descendant (`setsid sleep 120`, pid 2182351)
+survived Stop: confirmed alive with its original starttime after the bounded 5s wait, in its own
+process group (2182351/2182351), never reached by `killpg` against the fixture's own pgid. This is
+the **expected and acceptable finding** design.md and this batch's own instructions anticipate: the
+product only implements process-group containment, and a descendant that escapes its process group
+via `setsid` is exactly what that containment cannot reach. It is `fail`, not `uncertain`, because
+containment was fully observed (identity gated, descendant alive before stop, stop confirmed,
+enumeration readable) and the failure is a positive, confirmed proof (a recorded pid alive with the
+same starttime after the wait) — `derive`'s own precedence rule (`any_pid_alive_after_wait` overrides
+every other observation) reflects exactly this. No retry was performed to change this outcome, no
+alternative build, no feature flag, no seeded device state.
+
+**Nothing was written to `docs/evidence/VP-001/{baselines,records}.md`** — those stay exactly as
+Slice 2 left them (header-only). This local preview is not an authorized CI run and is not VP-001
+evidence; the admissible row is filed in Slice 4 from an explicitly authorized `tauri-build.yml`
+dispatch.
+
+### Hygiene
+
+Every process this preview started was terminated:
+```
+$ kill -9 <descendant-pid>          # after recording it as evidence (Threat Matrix requires this, not a silent kill)
+$ kill -9 <tauri-driver-pid> <Xvfb-pid>; pkill -f WebKitWebDriver; pkill -f omnifrons-shell; pkill -f AppImage
+$ pgrep -af "Xvfb|tauri-driver|WebKitWebDriver|omnifrons-shell|vp-s6"
+(no output — confirmed clean)
+$ for p in /proc/[0-9]*; do readlink "$p/exe" | grep -q 'memfd:omnifrons-approved-executable' && echo "$p"; done
+(no output — confirmed no leftover memfd:omnifrons-approved-executable)
+$ pgrep -af "sleep 120"
+(no output — confirmed no leftover breakaway descendant)
+```
+No temporary files were left in the repository (`git status --porcelain` clean before every
+commit); all scratch artifacts (the throwaway `derive-preview` Cargo project, ad hoc debug `.mjs`
+scripts, scratch workspaces) lived only under the session scratchpad and were deleted afterward.
+
+### Work Unit Evidence
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `cargo test -p vp-s6-agent` → 4/4 passed; `node --test docs/evidence/VP-001/procedures/*.test.mjs` → 37/37 passed |
+| Runtime harness command/scenario and exact result | `vp-s6-linux.sh --mode=scenario` under `Xvfb` + `tauri-driver` against the locally built artifact → observed transcript above, `derive` → `Fail`/`OrphanRisk` (local preview, not VP-001 evidence) |
+| Rollback boundary | Revert `tools/vp-s6-agent/`, the four new `vp-s6-{scenario,xdotool,observations,observations.test}.mjs` files, and `vp-s6-linux.sh`'s `--mode=scenario` addition; Slice 3a's feasibility-check harness stays intact |
+
+### Commands Run (exact observed results, beyond those already shown above)
+
+- `cargo test -p vp-s6-agent`: `test result: ok. 4 passed; 0 failed`.
+- `cargo test --workspace` (after every commit): all suites `test result: ok`, zero `FAILED` lines.
+- `cargo fmt --all -- --check`: clean (no output) at every commit.
+- `cargo clippy --workspace --all-targets -- -D warnings`: `Finished` with no warnings at every
+  commit (one documented `#[allow(clippy::zombie_processes)]` on the deliberately-unwaited
+  breakaway descendant in `tools/vp-s6-agent/src/main.rs`).
+- `node --test docs/evidence/VP-001/procedures/*.test.mjs`: `37/37` passing at every commit from
+  `f5e69ba` onward.
+- `shellcheck docs/evidence/VP-001/procedures/vp-s6-linux.sh`: no findings.
+- `node --check` on every new `.mjs` file: clean.
+
+### Files Changed
+
+| File | Action | What Was Done |
+|---|---|---|
+| `tools/vp-s6-agent/Cargo.toml`, `tools/vp-s6-agent/src/main.rs` | Created | The fixture ELF (D8): pure `format_pid_file`/`parse_proc_stat_starttime` (tested) plus `main` (breakaway spawn, pid-file write, self-bounded sleep). |
+| `docs/evidence/VP-001/procedures/webdriver-session.mjs`, `webdriver-session.test.mjs` | Modified | Added `buildExecuteScriptRequest`/`executeScript` and `refreshPage`. |
+| `docs/evidence/VP-001/procedures/vp-s6-observations.mjs`, `vp-s6-observations.test.mjs` | Created | Pure `parsePidFile`, `parseProcStatStarttime`, `classifyPidAfterWait` (unit-tested). |
+| `docs/evidence/VP-001/procedures/vp-s6-scenario.mjs` | Created | The scenario orchestrator: pick workspace, approve fixture, select controls, Start, observe, Stop, bounded wait, re-enumerate, emit transcript. |
+| `docs/evidence/VP-001/procedures/vp-s6-xdotool.mjs` | Created | `findWindowByName`/`driveChooserWithPath` -- search-by-name dialog driving (this bare `Xvfb` has no window manager). |
+| `docs/evidence/VP-001/procedures/vp-s6-linux.sh` | Modified | Added `--mode=scenario`; refactored AV1/AV2 into `run_av1`/`run_av2` shared by both modes; fixed the `EXIT`-trap scope bug. |
+
+### Commits
+
+| # | Commit | Subject | Authored lines (excl. `Cargo.lock`) |
+|---|---|---|---|
+| 1 | `c505582` | feat(evidence): add the VP-S6 fixture agent (tools/vp-s6-agent) | 189 |
+| 2 | `4d7c8a8` | docs(openspec): record that 5c5f474 unblocks Slice 3b's F3 gate | 32 |
+| 3 | `fbcfe3f` | feat(evidence): add executeScript and refreshPage to the WebDriver client | 57 |
+| 4 | `f5e69ba` | feat(evidence): add VP-S6 pure observation helpers | 124 |
+| 5 | `08549d9` | feat(evidence): add the VP-S6 scenario orchestrator | 370 |
+| 6 | `c4e87fb` | feat(evidence): wire vp-s6-linux.sh --mode=scenario | 285 |
+| 7 | (this commit) | docs(openspec): record Slice 3b's VP-S6 scenario and local preview | see this commit's own `git diff --stat` |
+
+Every commit observed green (`cargo test --workspace`/`node --test .../*.test.mjs` plus
+`cargo fmt`/`cargo clippy` where applicable) immediately before committing, and individually under
+the 400-authored-line budget. Commit 5 (370) and commit 6 (285, after extracting
+`vp-s6-xdotool.mjs` to keep it under budget) needed the most headroom, consistent with the parent's
+own warning that Slice 3b's forecast (~260) likely needed splitting further rather than compressing.
+
+### Review Budget
+
+Total authored lines across commits 1–6 (code): 189 + 32 + 57 + 124 + 370 + 285 = **1057**, well
+over design.md's ~260-line forecast for this slice, driven by: (a) the amount of live-GUI-driving
+code strict evidence-machinery honesty requires (bounded polling, no-retry semantics, independent
+`/proc` re-derivation rather than trusting the fixture's own claims), and (b) nine real debugging
+iterations against a genuinely finicky headless-X11 environment, each producing a small, documented
+fix rather than one large speculative rewrite. Delivered as six chained code commits (largest 370
+lines), each independently under the 400-line budget, consistent with Slice 2's own established
+practice of splitting delivery rather than compressing content.
+
+### Deviations from Design
+
+1. **Pid-file starttime is declared but never trusted.** Design.md D8 says the fixture "writes
+   `pid starttime`" for both processes; `vp-s6-agent` does exactly that, but `vp-s6-scenario.mjs`
+   only ever trusts the **pids** from that file, always re-deriving starttime independently from
+   `/proc/<pid>/stat` at each observation point. This is not a content deviation (the file still
+   carries both fields, matching D8's literal text) but a documented security decision: a
+   compromised or misbehaving approved executable must never be able to lie its way into a false
+   containment proof by writing a fabricated starttime.
+2. **Adapter/approval selection via `executeScript`, not a native option click.** Design.md does
+   not specify the mechanism for driving `#agent-adapter`/`#agent-approval`; a native `<select>` is
+   not reliably click-driven under this headless `WebKitWebDriver`/`Xvfb` combination (no visible
+   dropdown rendering to click into), so `vp-s6-scenario.mjs` sets `.value` and dispatches a
+   `change` event via one committed `executeScript` call — the standard, documented way to drive a
+   controlled React `<select>` under WebDriver, and now part of the repository rather than the ad
+   hoc, uncommitted script Slice 3a's manual F2/F3 runs used.
+3. **`xdotool` window targeting uses `search --name` + `windowfocus`, not `getwindowfocus`.**
+   Slice 3a's own narrative described using `windowfocus` "in place of design's literal
+   `windowactivate` sequence"; this slice found empirically that `xdotool getwindowfocus` never
+   resolves past X's `PointerRoot` placeholder in this exact bare-`Xvfb` environment (confirmed via
+   `xwininfo -root -tree` showing a real, mapped dialog window while `getwindowfocus` still failed
+   with `BadWindow`). `findWindowByName` (search by the dialog's own `WM_NAME`) is the mechanism
+   that reliably worked here; `windowfocus <id>` (a `XSetInputFocus` call on a concrete id) is
+   unchanged from Slice 3a's own choice.
+4. **No CI wiring in this slice.** Deferred to Slice 4 per design's own Migration/Rollout table
+   (only Slice 4 has the authorized `tauri-build.yml` dispatch this scenario mode would run under);
+   this slice's own scope (tasks.md Phase 3b) never lists a `.github/workflows/` file.
+
+### Workload / PR Boundary
+
+- Mode: chained PR slice (`auto-chain`, chain strategy `stacked-to-main`); delivered as seven
+  stacked commits (six code, one documentation), each independently under the 400-line budget.
+- Current work unit: Unit 3b — "VP-S6 scenario: fixture, dialog driving, stop, enumeration" (PR 3b).
+- Boundary: starts from Slice 3a's feasibility-gate scaffold (now unblocked by `5c5f474`) and ends
+  with a fully wired, locally-verified VP-S6 scenario producing an honest `fail`/`orphan-risk`
+  local preview; introduces no CI wiring and no VP-001 evidence rows (those are Slice 4).
+- Estimated review budget impact: seven commits, largest 370 authored lines — low per commit; 1057
+  lines of code across the six code commits, reflecting genuine live-GUI-automation complexity, not
+  compression-avoidance padding.
+
+### Status
+
+7/7 Phase 3b tasks complete (3b.1–3b.7). Local preview derived `result: fail`, `observed_state:
+orphan-risk` — the breakaway descendant survived Stop, an expected finding given process-group-only
+containment. Ready for `sdd-verify` on this slice's own scope. Slice 4 (the authorized CI run and
+the real VP-001 row) is next, gated on the explicit one-time CI-trigger authorization design.md
+requires.
