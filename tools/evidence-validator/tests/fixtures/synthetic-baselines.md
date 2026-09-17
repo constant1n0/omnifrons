@@ -18,3 +18,4 @@ row.
 | `packaging_substrate` | appimage |
 | `assistive_technology` | none exercised - VP-S19 out of scope |
 | `test_date` | 2000-01-01 |
+| `runner_image` | synthetic-runner, image version 0.0.0 (fixture only) |

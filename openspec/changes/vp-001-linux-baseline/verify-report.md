@@ -251,6 +251,16 @@ than "an orphan was observed". The evidence pipeline produced, validated, and re
 outcome correctly. The CRITICAL finding above concerns a missing admissibility check, not this
 outcome.
 
+### Resolution (2026-09-17, after this report was filed)
+
+The CRITICAL finding is fixed in the next commit: `runner_image` is now mandatory on a baseline
+record (`tools/evidence-validator/src/validate/v1_mandatory_fields.rs`), proven by a test written
+RED first — omitting it previously produced no violation at all. It was deliberately NOT added to
+`v3_baseline_before_scenario.rs`'s `VP001_R1_FIELDS`, because that list is exactly the field set
+VP-001-R1 itself names, and the runner image pin comes from this change's own spec instead; V1
+already rejects the store when a baseline omits it, so no scenario row can be admitted against such
+a baseline either way. The synthetic fixture gained the field for the same reason.
+
 ### Verdict
 FAIL
 49/49 tasks complete and every executed command green (tests, build, lint, format), but

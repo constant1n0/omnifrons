@@ -17,6 +17,11 @@ const BASELINE_MANDATORY: &[&str] = &[
     "packaging_substrate",
     "assistive_technology",
     "test_date",
+    // Hand-transcribed from the run's own log, since no environment variable
+    // carries it (design.md): without a validator check nothing would block a
+    // baseline that simply omits it (packaged-build-evidence spec, "Missing
+    // runner image version blocks admissibility").
+    "runner_image",
 ];
 
 /// Mandatory fields for a `kind: scenario` record. `result` and

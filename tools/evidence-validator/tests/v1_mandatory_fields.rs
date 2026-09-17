@@ -20,6 +20,11 @@ const BASELINE_FIELDS: &[(&str, &str)] = &[
         "none exercised - VP-S19 out of scope",
     ),
     ("test_date", "2026-09-16"),
+    // The runner image version is transcribed by hand from the run's own log
+    // (design.md), so nothing automated can supply it. Omitting it must block
+    // admissibility (packaged-build-evidence spec, "Missing runner image
+    // version blocks admissibility").
+    ("runner_image", "ubuntu-24.04, image version 20260907.300.1"),
 ];
 
 const SCENARIO_FIELDS: &[(&str, &str)] = &[
