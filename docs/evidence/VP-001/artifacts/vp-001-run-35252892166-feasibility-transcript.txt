@@ -1,0 +1,8 @@
+gate=av1-digest-match digest=d7e1f946ba6bea057626c7d9b5f1986584e6adee58cbbec273085b1c21c94f68
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:26883): dbind-WARNING **: 17:36:01.917: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=510839f9-bc5f-4233-92d7-8d77871b0983
+gate=session-closed session_id=510839f9-bc5f-4233-92d7-8d77871b0983

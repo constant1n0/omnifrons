@@ -14,6 +14,7 @@ becoming a `pass`.
 | `baselines.md` | One `kind: baseline` record per pinned OS/architecture/runtime combination. |
 | `records.md` | One `kind: scenario` record per scenario run against a pinned baseline. |
 | `procedures/` | The scripts a scenario's `procedure_ref` field points to. |
+| `artifacts/` | Retained evidence files (for example redacted CI transcripts) that a record's `evidence_artifact` field names by digest. Every runner-local path in a retained file is redacted to a neutral placeholder (for example `<extract-dir>/...`) before it is committed. |
 
 Both `.md` files are append-only: a record is added at the end of the file
 and never edited or deleted in place (verification-evidence-store spec,

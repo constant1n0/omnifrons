@@ -1,0 +1,22 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+gate=av1-digest-match digest=d7e1f946ba6bea057626c7d9b5f1986584e6adee58cbbec273085b1c21c94f68
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:27142): dbind-WARNING **: 17:36:39.507: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=ae29bb45-9dec-4739-9146-11bda1436832
+
+(omnifrons-shell:27142): Gtk-CRITICAL **: 17:37:11.674: gtk_widget_event: assertion 'WIDGET_REALIZED_FOR_EVENT (widget, event)' failed
+observation=identity_gated value=true
+observation=descendant_alive_before_stop value=false
+observation=stop_confirmed value=false
+observation=all_pids_proven_gone value=false
+observation=any_pid_alive_after_wait value=false
+observation=enumeration_unreadable value=false
+blocker=workspace-chooser-timeout
+gate=session-closed session_id=ae29bb45-9dec-4739-9146-11bda1436832
