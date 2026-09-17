@@ -952,3 +952,157 @@ orphan-risk` — the breakaway descendant survived Stop, an expected finding giv
 containment. Ready for `sdd-verify` on this slice's own scope. Slice 4 (the authorized CI run and
 the real VP-001 row) is next, gated on the explicit one-time CI-trigger authorization design.md
 requires.
+
+## Slice 4 (Phase 4, PR 4): Baseline Record and VP-S6 Row — COMPLETE (4.0–4.6 + 4.4a, 8/8)
+
+### Scope
+
+Phase 4 only: files the real `docs/evidence/VP-001/{baselines,records}.md` first rows from the
+explicitly authorized `tauri-build.yml` run. This apply batch never triggered the workflow itself —
+authorization was requested and granted, and the run executed, before this batch started; this batch
+read the run's own downloaded facts, logs, and transcripts and filed records from them.
+
+### Authorization (task 4.1)
+
+The user explicitly authorized exactly one `workflow_dispatch` of `.github/workflows/tauri-build.yml`
+(`vp001_scenario: true`); it ran once as run `35252892166` on `ubuntu-24.04`, head commit `ab5eda8` on
+`main`, started 2026-09-17T17:27:53Z, conclusion `success`. Cross-checked independently rather than
+merely copied: the runner image facts (`Image: ubuntu-24.04`, `Version: 20260907.300.1`, provisioner
+`20260828.587`, `Current runner version: '2.337.0'`) were read directly from the run's own `Set up
+job` log group; the AppImage SHA-256 (`d7e1f946ba6bea057626c7d9b5f1986584e6adee58cbbec273085b1c21c94f68`)
+was read from the run's own digest file and independently matches the `gate=av1-digest-match` line
+in both downloaded transcripts.
+
+### The scenario outcome, honestly
+
+The full VP-S6 scenario (wired in the prior Slice 3b/4 boundary work, task 4.0) ran on this pinned
+runner against this run's own retained artifact. AV1 (digest) and AV2 (`--demo-harness` byte-scan)
+both matched/were absent; `tauri-driver` created a session (F1). The run then hit
+`blocker=workspace-chooser-timeout`: the native GTK workspace-picker dialog did not complete under
+the runner's `Xvfb` before Start became reachable, so **no fixture process was ever spawned** and the
+process-group `killpg` containment mechanism was never exercised on this baseline. The transcript's
+own recorded observations (`identity_gated=true`, every other observation `false`) fed into
+`evidence_validator::derive::derive` admit exactly one outcome: `result: uncertain`,
+`observed_state: orphan-risk` — disclosed on the row as "termination not proven", explicitly not "an
+orphan was observed", since nothing existed to become one.
+
+### TDD Cycle Evidence (task 4.4a, added — not in the original plan)
+
+No test validated the real `docs/evidence/VP-001/{baselines,records}.md` files before this slice,
+only the synthetic fixtures (`fixtures_parse_and_validate.rs`). Added
+`tools/evidence-validator/tests/real_evidence_store.rs`.
+
+| Step | What was done | Observed result |
+|---|---|---|
+| RED | Filed the real baseline record (`VP-001-BASE-01`) with `test_date` deliberately omitted, plus the complete scenario row | `cargo test -p evidence-validator --test real_evidence_store` → `real_evidence_store_parses_and_validates_clean` **FAILED**: `field-missing` (`test_date`) on the baseline, cascading into `baseline-unpinned` on the scenario row (V3) — proving a malformed real record fails `cargo test --workspace`, exactly what design.md D2 requires |
+| GREEN | Added the missing `test_date`; also hit and fixed one real V6 false positive along the way — `tauri-apps/tauri-action@action-v1.0.0` parsed as `user@host`-shaped by the provenance lint, reworded to `tauri-apps/tauri-action, tag action-v1.0.0` | Both tests pass: `2 passed; 0 failed` |
+| REFACTOR | None needed — the test file and the two record files were already minimal | N/A |
+
+### Work Unit Evidence
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `cargo test -p evidence-validator --test real_evidence_store` → 2/2 passed |
+| Runtime harness command/scenario and exact result | N/A this slice, with reason: the runtime harness is the authorized CI run itself (run 35252892166), already executed by the parent before this apply batch began. This batch performed no runtime invocation — it read the run's own downloaded facts/logs/transcripts and filed records from them |
+| Rollback boundary | Revert this slice's single commit (`fcbc9a8`): removes `VP-001-BASE-01`/`VP-001-VP-S6-01` from `docs/evidence/VP-001/{baselines,records}.md`, the two retained transcript files under `docs/evidence/VP-001/artifacts/`, `tools/evidence-validator/tests/real_evidence_store.rs`, and the README's `artifacts/` layout row. These are the first rows filed — nothing downstream references them, and no `corrects` chain exists yet |
+
+### Retained evidence (provenance)
+
+Both CI transcripts were committed under `docs/evidence/VP-001/artifacts/` (a new subdirectory,
+README extended minimally to document it), each redacted before commit: the one runner-local
+`/tmp/tmp.<random>/squashfs-root/...` path in each transcript (from AV2's `--appimage-extract` step)
+was replaced with the neutral placeholder `<extract-dir>/squashfs-root/...`; nothing else was
+changed (confirmed with `diff` before commit). The retained (redacted) VP-S6 transcript's own
+SHA-256 is the row's `evidence_artifact`; the retained feasibility transcript's is
+`feasibility_evidence_artifact`. Both rows reference the original by run id and workflow name
+(`tauri-build.yml`, run `35252892166`), never by URL, and both note GitHub's own 2026-12-16 retention
+expiry for that run's `vp-001-linux-baseline`/`vp-001-transcripts` artifacts. The earlier Slice 3b
+**local preview** run (`result: fail`, `observed_state: orphan-risk` on a developer machine) is
+**not** cited anywhere in the real records — it is non-evidence, referenced only in Slice 3b's own
+section of this document.
+
+### Commits
+
+| # | Commit | Subject | Authored lines |
+|---|---|---|---|
+| 1 | `fcbc9a8` | feat(evidence): file the VP-001 Linux baseline and VP-S6 row | 143 insertions + 5 deletions = 148 |
+
+### Full Verification (this slice)
+
+- `cargo test --workspace`: every suite `test result: ok`, zero `FAILED` lines (grepped explicitly).
+- `cargo fmt --all -- --check`: clean after one fix (the new test file's `format!` call needed
+  rustfmt's multi-line form).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, no warnings.
+- `node --test docs/evidence/VP-001/procedures/*.test.mjs`: `37/37` passing.
+- Provenance grep over the staged diff, for home and temporary directory prefixes, personal and organisation names, and session directory markers: no matches (exit 1) — both retained transcripts were redacted before staging. The pattern itself is kept out of this file, since writing it down would publish the very strings it searches for.
+- `git diff --cached --check`: clean.
+
+### Status
+
+8/8 Phase 4 tasks complete (4.0–4.6, plus the added 4.4a). Ready for `sdd-verify` on this slice's
+own scope.
+
+## Slice 5 (Phase 5, PR 5): Doc Reconciliation — COMPLETE (5.1–5.3, 3/3)
+
+### Scope
+
+Phase 5 only, independent of Slice 4: `README.md`'s status line and one new `docs/spike-log.md`
+section. No code, no evidence records.
+
+### Task 5.1 — README.md
+
+Replaced the "design phase... does not yet contain a working application" status line with a
+modest, accurate summary: a development-mode desktop spike exists (Rust workspace plus Tauri shell,
+supervised typed IPC, executable approval, line and PTY adapters, publication and recovery
+surfaces), no supported release or installer, VP-001 formal verification under way. No personal
+names or paths.
+
+### Task 5.2 — docs/spike-log.md
+
+This task's own text flagged an ambiguity: design.md's File Changes table names a `## Slice 5f`
+heading for this file, but `docs/spike-log.md`'s own sections run `## Slice 1` through `## Slice 5e`
+for prior ADR-0002 implementation spikes, and `Slice 5f` textually matches only the unrelated,
+already-archived `2026-09-14-spike-slice-5f` change (bounded local staging cleanup). **The parent
+resolved this explicitly** before this apply batch, directing exactly this: add a `## Slice 5f`
+section reconciling that real, merged-and-archived change, sourced only from
+`openspec/changes/archive/2026-09-14-spike-slice-5f/{proposal,design,verify-report}.md` and
+`openspec/specs/local-staging-cleanup/spec.md` — not from design.md's coincidentally-identical
+heading text for this VP-001 change. Added `## Slice 5f — bounded local staging cleanup` after the
+existing `## Slice 5e` section (the file's last section, ending at its own line 1986), matching the
+established per-slice style (Scope, Design decisions, this change's own Delivery/Verification and
+Debt sections), proportionate to the archived change's narrower scope (Rust-only, no renderer half,
+15/15 tasks, 4/4 requirements, 8/8 scenarios, PASS WITH WARNINGS) rather than to Slice 5e's much
+larger two-half entry.
+
+### Work Unit Evidence
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | N/A — docs only, no repository test covers prose content; checked by sourcing every fact from the four named archived documents and re-reading the diff for anything not traceable to them |
+| Runtime harness command/scenario and exact result | N/A — no runtime boundary; these are two Markdown files |
+| Rollback boundary | Revert this slice's single commit (`ff4c9fc`); no code depends on either file's content |
+
+### Commits
+
+| # | Commit | Subject | Authored lines |
+|---|---|---|---|
+| 1 | `ff4c9fc` | docs: reconcile README status and spike-log with the merged state | 27 insertions + 1 deletion = 28 |
+
+### Full Verification (this slice)
+
+Re-ran the full suite after this slice's changes (docs-only, no code touched): `cargo test
+--workspace` all green, `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets
+-- -D warnings` clean, `node --test docs/evidence/VP-001/procedures/*.test.mjs` 37/37, provenance
+grep clean (exit 1), `git diff --cached --check` clean.
+
+### Status
+
+3/3 Phase 5 tasks complete. Ready for `sdd-verify`.
+
+## Overall Status (all slices)
+
+49/49 tasks complete across Phases 1–5 (7 + 16 + 8 + 7 + 8 + 3, where Phase 4's 8 includes the added
+4.4a). Two branches exist: earlier slices (1, 2, 3a, 3b) landed on `main` (see their own sections
+above); Slices 4 and 5 land on `vp-001/pr-20-evidence-records`, branched from `main` at `ab5eda8`,
+as two independent commits (`fcbc9a8`, `ff4c9fc`), each individually well under the 400-line budget.
+Ready for `sdd-verify` across the full change.
