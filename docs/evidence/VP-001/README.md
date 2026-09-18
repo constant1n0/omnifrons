@@ -42,11 +42,13 @@ Open Questions).
 
 ### Baseline record (`kind: baseline`)
 
-Mandatory fields, exactly VP-001-R1 (Baseline-Before-Scenario Admission) plus
-the two store-level identity fields:
+Mandatory fields: the six VP-001-R1 fields (Baseline-Before-Scenario
+Admission), the two store-level identity fields, and `runner_image` — the
+pinned runner image version this change's own spec requires, transcribed by
+hand from the run's log because no automated step produces it:
 
 `record_id`, `kind`, `os_build`, `architecture`, `webview_runtime`,
-`packaging_substrate`, `assistive_technology`, `test_date`.
+`packaging_substrate`, `assistive_technology`, `test_date`, `runner_image`.
 
 ### Scenario record (`kind: scenario`)
 

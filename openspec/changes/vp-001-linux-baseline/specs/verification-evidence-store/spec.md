@@ -66,19 +66,26 @@ automated test run.
 
 ### Requirement: Append-Only Correction
 
-Records MUST be append-only. A wrong or superseded row MUST be corrected
-only by appending a new row referencing the original by identifier; the
-store MUST NOT support rewriting or deleting an existing row.
+Records MUST be append-only: the store MUST NOT support rewriting or
+deleting an existing row, and a wrong or superseded row MUST be corrected
+only by appending a new row referencing the original by identifier. A
+correction row's reference MUST resolve to an existing record, or the row
+MUST be rejected. This validator runs after a row is already filed, against
+Markdown files under version control; it cannot detect or refuse a direct
+edit or deletion that already happened. The prohibition on rewriting an
+already-filed record is therefore enforced by the repository's
+signed-commit, linear-history branch protection on `main` and by review —
+not by this validator.
 
 #### Scenario: Correction appends a new row
 - GIVEN a filed row is later found incorrect
 - WHEN the correction is recorded
 - THEN a new row referencing the original identifier MUST be appended, and the original MUST remain unchanged
 
-#### Scenario: In-place edit is refused
-- GIVEN an existing row is targeted for direct edit or deletion
-- WHEN that is attempted
-- THEN it MUST be refused
+#### Scenario: Unresolved correction reference is rejected
+- GIVEN a row's `corrects` field names an identifier that does not resolve to an existing `record_id`
+- WHEN the row is validated
+- THEN it MUST be rejected as `corrects-unresolved`
 
 ### Requirement: Provenance-Clean Publication
 
@@ -121,20 +128,21 @@ within one row and flags — without resolving — that tension.
 
 ### Requirement: Blocked or Non-Reproducible Verification Attempt
 
-When the harness cannot drive the packaged artifact — for example, the
-WebDriver process cannot attach to the retained binary — or when a run's
-outcome does not reproduce within its bounded attempts, the row MUST record
-`uncertain` with the specific blocker disclosed. Such a row MUST NOT be
-retried in pursuit of a `pass` outcome, MUST NOT be renamed to imply a
-different result, and MUST NOT be replaced by a result obtained from a
-different build than the one its digest identifies.
+When the harness cannot complete a step a scenario requires — for example,
+a WebDriver process that cannot attach to the retained binary, or a native
+dialog that cannot be driven — or when a run's outcome does not reproduce
+within its bounded attempts, the row MUST record `uncertain` with the
+specific blocker disclosed. Such a row MUST NOT be retried in pursuit of a
+`pass` outcome, MUST NOT be renamed to imply a different result, and MUST
+NOT be replaced by a result obtained from a different build than the one
+its digest identifies.
 
-#### Scenario: Driver cannot attach to the packaged binary
-- GIVEN the WebDriver harness cannot attach to the retained packaged artifact on the pinned runner
+#### Scenario: Harness cannot complete a required step
+- GIVEN the harness cannot complete a step the scenario requires, such as a WebDriver process failing to attach to the packaged artifact or a native dialog it cannot drive
 - WHEN the scenario run is attempted
-- THEN the row MUST record `uncertain` with the attach failure disclosed as the blocker
+- THEN the row MUST record `uncertain` with the specific blocker disclosed
 
-#### Scenario: Flaky run does not reproduce within bounded attempts
-- GIVEN a scenario run's outcome differs across its bounded attempts and does not converge
-- WHEN the row is filed
-- THEN the row MUST record `uncertain` with the non-reproducibility disclosed, and MUST NOT be retried again to seek a `pass`
+#### Scenario: No retry, rename, or cross-build substitution
+- GIVEN the procedure runs a scenario exactly once against the digest-gated artifact
+- WHEN the run completes and reports an honest `uncertain` or `fail`
+- THEN the procedure MUST exit without retrying, the row MUST NOT be renamed to imply a different result, and MUST NOT be replaced by a result obtained from a different build than its digest identifies
