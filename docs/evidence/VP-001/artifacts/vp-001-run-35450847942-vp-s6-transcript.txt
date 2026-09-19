@@ -1,0 +1,24 @@
+gate=av1-digest-match digest=17070532b5085d97b72f21badb847c5b9c3180994356c649aff3768a52edbf8e
+Openbox-Message: Unable to find a valid menu file "/var/lib/openbox/debian-menu.xml"
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:13341): dbind-WARNING **: 15:13:08.635: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=6e55a622-a202-4e59-878e-7b6a9e4921c9
+dialog_attempt=1 strategy=bookmark-jump
+dialog_closed=bookmark-jump
+dialog_attempt=1 strategy=focus-ctrl-l
+dialog_closed=focus-ctrl-l
+gate=controls-selected approval_id=24ca77114d33d4e7
+observation=started value=true
+observation=self_pid=13540 descendant_pid=13542
+gate=stop-badge value=exited (code unreported)
+observation=self_after_wait=gone descendant_after_wait=alive
+observation=identity_gated value=true
+observation=descendant_alive_before_stop value=true
+observation=stop_confirmed value=true
+observation=all_pids_proven_gone value=false
+observation=any_pid_alive_after_wait value=true
+observation=enumeration_unreadable value=false
+gate=session-closed session_id=6e55a622-a202-4e59-878e-7b6a9e4921c9
