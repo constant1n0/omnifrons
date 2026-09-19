@@ -13,7 +13,7 @@
 | 1.3 | Unit | unresolved PID imports | 8/8 | 9/9 after probe mappings |
 
 ## Commands
-- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 /home/dcm/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters local_staging_cleanup` failed on unresolved parser, age/report, then PID imports.
+- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 <home>/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters local_staging_cleanup` failed on unresolved parser, age/report, then PID imports.
 - GREEN: the same command passed 3/3, 5/5, and 8/8; triangulation/refactor finished 9/9.
 - Gates passed: `cargo fmt --all -- --check`, adapter clippy/check, and `cargo test --workspace --all-targets --all-features`.
 - CI correction RED: Windows-target adapter clippy reproduced `derivable_impls` (exit 101).
@@ -51,7 +51,7 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
 | 2a JD-201 retained evidence | `local_staging_cleanup.rs` | Unit, real filesystem | 12/12 existing tests | missing `root` and `handle` fields | 13/13 focused tests | owned fixture root-path replacement proves both held descriptors and immutable root identity | root ownership and initial metadata snapshot retained; formatter-only cleanup |
 
 ### Batch 2a Verification
-- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 /home/dcm/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters local_staging_cleanup::tests::opens_owner_only_root_and_records_regular_single_link_candidate_evidence` failed with `E0425` because `open_staging_evidence` did not exist.
+- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 <home>/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters local_staging_cleanup::tests::opens_owner_only_root_and_records_regular_single_link_candidate_evidence` failed with `E0425` because `open_staging_evidence` did not exist.
 - GREEN: the focused `local_staging_cleanup::tests::` command passed 12/12.
 - Gates passed with the same pinned toolchain: `cargo fmt --all -- --check`; Linux and `x86_64-pc-windows-gnu` adapter `cargo clippy --all-targets --all-features -- -D warnings`; `cargo check --workspace`; and `cargo test --workspace --all-targets --all-features`.
 - JD-201 RED: the focused root-replacement test failed with `E0609` because candidate-only evidence had no retained root or candidate handle.
@@ -134,7 +134,7 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
 | final identity recheck core | `local_staging_cleanup.rs` | Unit, real filesystem | 20/20 focused | root-path symlink replacement failed: the old `metadata` followed it | focused recheck tests: 6/6 | mode and same-size write/mtime mutation; missing candidate/root; hard-link, symlink, and directory replacements | replaced root-path `metadata` with no-follow `symlink_metadata`; tests remain 6/6 |
 
 ### Batch 3a Verification
-- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 /home/dcm/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters final_recheck_rejects_a_root_path_replaced_by_a_symlink` failed (0/1) because `metadata` followed the replacement symlink.
+- RED: `RUSTUP_AUTO_INSTALL=0 RUSTUP_NO_UPDATE_CHECK=1 <home>/.cargo/bin/rustup run 1.98.1 cargo test -p omnifrons-adapters final_recheck_rejects_a_root_path_replaced_by_a_symlink` failed (0/1) because `metadata` followed the replacement symlink.
 - GREEN: the same pinned command passed (1/1); focused `final_recheck_` passed 6/6 and the complete `local_staging_cleanup::tests::` module passed 24/24.
 - Gates passed with the pinned toolchain: `cargo fmt --all -- --check`; Linux and `x86_64-pc-windows-gnu` adapter `cargo clippy -p omnifrons-adapters --all-targets --all-features -- -D warnings`; `cargo check --workspace --all-targets --all-features`; and `cargo test --workspace --all-targets --all-features`. Windows evidence is compile-only.
 
@@ -142,7 +142,7 @@ RootAsset logical binding, final recheck, walker, deletion, or activation.
 - TDD safety net: `final_recheck_` passed 6/6. RED: `stat_field_comparison` failed with E0425 because the checked comparison helper did not exist. GREEN: representable Apple-width i32/u16 values pass; negative i32 and out-of-range evidence fail closed. Triangulation: two behavioral tests, six assertions.
 - The helper fallibly converts every raw `fstatat` field compared to fixed-width evidence (dev, ino, uid, mode, link count, size); it preserves held-root `fstatat(AT_SYMLINK_NOFOLLOW)`, metadata, UID, mode, link, size, and mtime semantics with no mutation or activation.
 - Post-GREEN: focused module tests passed 26/26; formatter, Linux and Windows-GNU adapter all-target/all-feature clippy with `-D warnings`, and workspace all-target/all-feature check passed. The Apple target is not installed; this is not a macOS compile or runtime claim.
-- Skill resolution injected: `/home/dcm/.config/opencode/skills/judgment-day/SKILL.md`, `/home/dcm/.claude/skills/secret-safe-diagnostics/SKILL.md`, and `/home/dcm/.config/opencode/skills/sdd-apply/strict-tdd.md`.
+- Skill resolution injected: `<home>/.config/opencode/skills/judgment-day/SKILL.md`, `<home>/.claude/skills/secret-safe-diagnostics/SKILL.md`, and `<home>/.config/opencode/skills/sdd-apply/strict-tdd.md`.
 - Both fresh scoped judges approved the correction: `batch3a-rejudge-a` and #8985. JD-501 is verified;
   1 of 2 corrective rounds is used. Independent Batch 3a gate #8939 passed: final 6/6, stat-width 2/2,
   module 26/26, adapter 200/200, workspace 812/812, Linux and Windows-GNU clippy/check, and fmt.
