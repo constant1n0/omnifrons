@@ -22,6 +22,13 @@
 #   VP001_WEBDRIVER_BASE_URL   tauri-driver's own HTTP endpoint
 #                              (default: http://127.0.0.1:4444)
 #
+# `--mode=scenario` drives native GTK choosers (vp-s6-xdotool.mjs) and expects
+# a window manager already running on the target X display -- tauri-build.yml's
+# "VP-001 VP-S6 scenario" step starts a minimal one (openbox) before this
+# script runs, for the reason recorded in vp-s6-xdotool.mjs's own header. A
+# local invocation under a bare `xvfb-run` with no window manager started
+# first is not equivalent to how CI now runs this mode.
+#
 # Exit codes: 0 once the AV1/AV2 gate passes and the mode's own steps run to
 # completion (a `--mode=scenario` run that observes `uncertain` or `fail`
 # still exits 0 -- only the AV1/AV2 gate and usage errors are fatal here,

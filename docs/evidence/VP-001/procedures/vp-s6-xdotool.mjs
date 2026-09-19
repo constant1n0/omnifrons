@@ -1,10 +1,17 @@
 // `xdotool`-driven native-dialog interaction for the VP-S6 scenario
-// (design.md D7): this bare Xvfb has no window manager, so the usual
-// "activate the active/focused window" idioms are unavailable or
-// unreliable here. No repository test drives the X11 interaction itself
-// (`vp-s6-scenario.mjs`'s own live run under Xvfb is its only exercise);
-// the pure decision/formatting helpers below have no such exemption and
-// are covered by `vp-s6-xdotool.test.mjs`.
+// (design.md D7). This module makes no assumption either way about a window
+// manager being present on the target display -- `--onlyvisible` reads the X
+// server's own `map_state` directly (needs no WM), and `windowfocus` below is
+// `XSetInputFocus`, also WM-independent. But the CI scenario step's own Xvfb
+// display now runs a minimal window manager (openbox, wired in
+// tauri-build.yml's "VP-001 VP-S6 scenario" step only, not the earlier
+// feasibility-gate step, which never drives a chooser); a local invocation
+// of this script against a bare Xvfb with no WM is expected to work the same
+// way this module always has, but is no longer how CI itself exercises it.
+// No repository test drives the X11 interaction itself (`vp-s6-scenario.mjs`'s
+// own live run under Xvfb is its only exercise); the pure decision/formatting
+// helpers below have no such exemption and are covered by
+// `vp-s6-xdotool.test.mjs`.
 //
 // Hardened after CI run 35252892166 (pinned `ubuntu-24.04`, filed as
 // VP-001-VP-S6-01, `uncertain`): the transcript shows `gate=f1-session-
@@ -15,6 +22,25 @@
 // GTK realizes its widgets -- sending keys then trips that assertion, and on
 // a bare Xvfb a dropped keystroke is silent. Slower/loaded CI widens a race
 // this much faster local machine never hits.
+//
+// Run 35440083284 (after that hardening, `x11-utils` present) showed the
+// stability-polled window genuinely `map_state=IsViewable` and still tripped
+// the same assertion on every one of its three attempts: waiting longer for
+// the window to be viewable was not enough. Working theory: with no window
+// manager on the display, nothing ever delivers the WM-mediated focus-in GTK
+// expects before it realizes a dialog's focus widget, so a keystroke can
+// still reach an unrealized widget even once `xwininfo` calls the window
+// viewable. Local testing on this change (both with and without openbox
+// running on a scratch Xvfb display, several runs each) never reproduced the
+// CI assertion either way -- a materially faster, unloaded machine, matching
+// this file's own "Slower/loaded CI widens a race" note above. Openbox is
+// added to CI as a targeted hardening against the theorized mechanism, not a
+// locally verified fix for it. `sendChooserInput` below still uses
+// `windowfocus`, not `windowactivate`: re-verified with openbox running
+// (several passing local runs, see the branch's own commit), it kept working
+// exactly as before, and swapping it for `windowactivate` showed no
+// measurable difference in reliability, so there is no local evidence to
+// prefer it over the mechanism already verified below.
 
 import { execFileSync } from 'node:child_process';
 

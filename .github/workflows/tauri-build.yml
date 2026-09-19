@@ -55,8 +55,21 @@ jobs:
           # step below. x11-utils carries xwininfo, which the harness uses to
           # corroborate that a chooser window is really viewable before
           # driving it: absent from a hosted runner by default, its ENOENT
-          # cost CI run 35437413086 its whole chooser budget.
-          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool x11-utils
+          # cost CI run 35437413086 its whole chooser budget. openbox is a
+          # minimal window manager for the VP-S6 scenario step's own Xvfb
+          # display: run 35440083284 showed a genuinely mapped, viewable
+          # chooser (`window_id=... map_state=IsViewable`) still rejecting
+          # every keystroke with a repeated GTK-CRITICAL
+          # `WIDGET_REALIZED_FOR_EVENT` assertion -- a bare Xvfb has nothing
+          # to deliver the WM-mediated focus-in GTK expects before it
+          # realizes a dialog's focus widget. Chosen over
+          # matchbox-window-manager (built for a single fullscreen kiosk
+          # window, not stacked native dialogs) and i3 (a tiling WM that
+          # would resize/reposition the chooser instead of leaving it
+          # floating): openbox is a conventional stacking WM, packaged for
+          # ubuntu-24.04, and the standard choice for driving GTK/X11 apps
+          # under a headless Xvfb in CI.
+          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool x11-utils openbox
 
       - name: cargo fmt
         if: hashFiles('rust-toolchain.toml') != ''
@@ -230,9 +243,21 @@ jobs:
           workspace_dir="$(mktemp -d "${RUNNER_TEMP}/vp-s6-workspace.XXXXXX")"
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
+            # A minimal window manager, not the feasibility-gate step above:
+            # that step never drives a chooser, only this one does. Started
+            # first and given its own readiness wait (xprop, from x11-utils
+            # already installed above) so it has taken the WM_S0 selection
+            # before the app launches into this display.
+            openbox &
+            wm_pid=$!
+            trap "kill \${wm_pid} 2>/dev/null || true" EXIT
+            for _ in $(seq 1 10); do
+              xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
+              sleep 1
+            done
             tauri-driver --native-driver /usr/bin/WebKitWebDriver &
             driver_pid=$!
-            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
+            trap "kill \${driver_pid} \${wm_pid} 2>/dev/null || true" EXIT
             for _ in $(seq 1 10); do
               curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
               sleep 1
