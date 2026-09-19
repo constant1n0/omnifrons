@@ -52,8 +52,11 @@ jobs:
           # xvfb, webkit2gtk-driver (WebKitWebDriver) and xdotool are the
           # Slice 3a feasibility-gate harness's own prerequisites
           # (design.md § D5/D7); only exercised on the Linux-guarded harness
-          # step below.
-          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool
+          # step below. x11-utils carries xwininfo, which the harness uses to
+          # corroborate that a chooser window is really viewable before
+          # driving it: absent from a hosted runner by default, its ENOENT
+          # cost CI run 35437413086 its whole chooser budget.
+          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool x11-utils
 
       - name: cargo fmt
         if: hashFiles('rust-toolchain.toml') != ''

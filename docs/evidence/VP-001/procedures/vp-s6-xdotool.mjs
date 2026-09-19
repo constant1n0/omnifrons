@@ -44,6 +44,9 @@ const DIALOG_CLOSE_POLL_INTERVAL_MS = 150;
 // exactly once, and a chooser that never closes still surfaces as the same
 // disclosed `blocker=` its caller already names.
 const MAX_DIALOG_ATTEMPTS = 3;
+// Distinguishes "xwininfo could not tell us" from "xwininfo says the window
+// is not viewable": the first must not be read as the second.
+const MAP_STATE_PROBE_UNAVAILABLE = 'probe-unavailable';
 const DIAGNOSTIC_MAX_LINES = 60;
 const DIAGNOSTIC_MAX_LINE_LENGTH = 200;
 
@@ -62,6 +65,23 @@ export function parseSearchIds(output) {
 export function parseMapState(xwininfoOutput) {
   const match = xwininfoOutput.match(/Map State:\s*(\S+)/);
   return match ? match[1] : null;
+}
+
+/**
+ * Decide whether a window `xdotool search --onlyvisible` reported may be
+ * driven, given what `xwininfo` could tell us about it.
+ *
+ * `xwininfo` ships in `x11-utils`, which is NOT installed by default on a
+ * GitHub `ubuntu-24.04` runner: CI run 35437413086 spent its whole chooser
+ * budget rejecting a window that was there, because every map-state probe
+ * failed with `ENOENT` and the caller read that as "not viewable yet".
+ * A corroborating tool that is absent must weaken the check, never fail it
+ * closed against the only signal we do have -- but the weaker check is
+ * disclosed in the transcript rather than passed off as the strong one.
+ */
+export function isWindowDrivable(mapState) {
+  if (mapState === MAP_STATE_PROBE_UNAVAILABLE) return { drivable: true, degraded: true };
+  return { drivable: mapState === 'IsViewable', degraded: false };
 }
 
 /** Count window ids in an `xwininfo -root -tree` snapshot -- a coarse but
@@ -139,8 +159,10 @@ function searchVisibleWindowIds(name) {
 function windowMapState(id) {
   try {
     return parseMapState(execFileSync('xwininfo', ['-id', id], { encoding: 'utf8' }));
-  } catch {
-    return null;
+  } catch (error) {
+    // `xwininfo` missing entirely is a different fact from a window that
+    // vanished, and the caller must not conflate them.
+    return error?.code === 'ENOENT' ? MAP_STATE_PROBE_UNAVAILABLE : null;
   }
 }
 
@@ -157,13 +179,24 @@ function windowTreeSnapshot() {
  * window id, or `null` on timeout. Replaces "trust the first id ever
  * reported", which raced GTK's own widget realization in CI run
  * 35252892166. */
-function waitForUsableWindow(name, timeoutMs) {
+function waitForUsableWindow(name, timeoutMs, emit = defaultEmit) {
   const deadline = Date.now() + timeoutMs;
   let state = { id: null, streak: 0 };
+  let disclosedDegradedProbe = false;
   for (;;) {
     const ids = searchVisibleWindowIds(name);
     const candidateId = ids.length > 0 ? ids[0] : null;
-    const viewable = candidateId !== null && windowMapState(candidateId) === 'IsViewable';
+    let viewable = false;
+    if (candidateId !== null) {
+      const { drivable, degraded } = isWindowDrivable(windowMapState(candidateId));
+      viewable = drivable;
+      if (degraded && !disclosedDegradedProbe) {
+        // Say which check actually ran, rather than letting the transcript
+        // imply the stronger one did.
+        emit('dialog_note', 'xwininfo-unavailable: viewability from xdotool --onlyvisible only');
+        disclosedDegradedProbe = true;
+      }
+    }
     state = nextStabilityState(state, viewable ? candidateId : null);
     if (state.streak >= STABILITY_REQUIRED_POLLS) return state.id;
     if (Date.now() >= deadline) return null;
@@ -248,7 +281,7 @@ function emitDiagnostics(emit, { windowTitle, windowId, attempts }) {
  * its other observations in one stream.
  */
 export function driveChooserWithPath(windowTitle, path, timeoutMs, { emit = defaultEmit } = {}) {
-  const windowId = waitForUsableWindow(windowTitle, timeoutMs);
+  const windowId = waitForUsableWindow(windowTitle, timeoutMs, emit);
   if (windowId === null) {
     emitDiagnostics(emit, { windowTitle, windowId: null, attempts: 0 });
     return false;

@@ -12,6 +12,7 @@ import {
   countWindowIdsInTree,
   formatDiagnostics,
   nextStabilityState,
+  isWindowDrivable,
   parseMapState,
   parseSearchIds,
   redactProvenance,
@@ -86,4 +87,23 @@ test('formatDiagnostics', () => {
     'window_title=Select Folder window_id=12582917 attempts=3 map_state=IsViewable',
     'tree=0x1e00001 "omnifrons-shell" at <home>',
   ]);
+});
+
+// CI run 35437413086: `xwininfo` is not installed on a GitHub ubuntu-24.04
+// runner, every map-state probe failed with ENOENT, and the caller read that
+// as "not viewable yet" until the chooser budget ran out.
+test('isWindowDrivable: a viewable window is drivable on the strong check', () => {
+  assert.deepEqual(isWindowDrivable('IsViewable'), { drivable: true, degraded: false });
+});
+
+test('isWindowDrivable: an unmapped window is not drivable', () => {
+  assert.deepEqual(isWindowDrivable('IsUnMapped'), { drivable: false, degraded: false });
+});
+
+test('isWindowDrivable: a failed probe on an existing window is not drivable', () => {
+  assert.deepEqual(isWindowDrivable(null), { drivable: false, degraded: false });
+});
+
+test('isWindowDrivable: an unavailable probe degrades to the visible-search signal', () => {
+  assert.deepEqual(isWindowDrivable('probe-unavailable'), { drivable: true, degraded: true });
 });
