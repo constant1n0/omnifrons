@@ -41,6 +41,49 @@
 // exactly as before, and swapping it for `windowactivate` showed no
 // measurable difference in reliability, so there is no local evidence to
 // prefer it over the mechanism already verified below.
+//
+// Run 35446989598 (three DIFFERENT strategies, openbox reparenting the
+// dialog and keystrokes genuinely reaching it) never got as far as opening
+// the location entry: `Ctrl+L` produced `WIDGET_REALIZED_FOR_EVENT` or
+// nothing, and `focus-type-path`'s typed characters landed in the file
+// list's own typeahead over a pristine CI runner's empty bookmark/recent
+// history. `WORKSPACE_CHOOSER_STRATEGIES` below adds a `bookmark-jump`
+// attempt that needs no location entry at all -- verified locally (this
+// branch's own commit) against the real packaged AppImage, not a synthetic
+// stand-in:
+//   - Tried and DISPROVEN as a way to steer rfd's GTK3 "Select Folder"
+//     dialog into a chosen directory: the launching shell's own cwd, `HOME`,
+//     and a pre-set `APPDIR` env var. `/proc/<pid>/cwd` of the running
+//     `omnifrons-shell` process showed its real cwd is forced, by the
+//     AppImage runtime's own `AppRun`/`AppRun.wrapped` chdir (present under
+//     both the default FUSE mount and `APPIMAGE_EXTRACT_AND_RUN=1`), into an
+//     ephemeral `<mount>/usr` path that always exists, is never empty, and
+//     is never the workspace directory this scenario needs selected --
+//     regardless of the launching shell's own cwd. GTK's own persisted
+//     "last folder" GSettings key (`org.gtk.Settings.FileChooser`
+//     `last-folder-uri`, written through an isolated `dbus-run-session`)
+//     also lost to this forced cwd every time it was tried.
+//   - Tried and CONFIRMED: seeding exactly one entry in
+//     `~/.config/gtk-3.0/bookmarks` (`file://<workspace-dir>`, done by
+//     tauri-build.yml's own scenario step before the app launches -- this is
+//     read via `$HOME`, independent of the process's own forced cwd) plus
+//     sending `Alt+1` -- GTK3's own `GtkPlacesSidebar` accelerator for its
+//     first shortcut row, wired up by GTK itself, no accessibility bus
+//     needed -- reliably jumps the chooser straight to that folder with no
+//     typing and no `Ctrl+L`. Verified against the actual retained AppImage
+//     through tauri-driver + WebDriver (not just a standalone GTK program):
+//     the app's own "Workspace: ..." confirmation text matched the seeded
+//     directory on every local run.
+// `WorkspaceRoot::new` (src-tauri, read-only) accepts any existing,
+// canonicalizable directory with no allow-list, so a bare `Return` with NO
+// bookmark seeded would silently "succeed" against whatever folder the
+// dialog happens to default to -- never this dialog's own default (proven
+// above), but still a false positive, not this module's honest failure. That
+// is why `bookmark-jump` is scoped to the workspace chooser only, depends on
+// tauri-build.yml's own seeding step, and still sits behind the same
+// disclosed `dialog_attempt`/`dialog_diagnostic` transcript and downstream
+// pid-file check as every other strategy here -- it adds a fast path, it
+// does not weaken the honesty of a miss.
 
 import { execFileSync } from 'node:child_process';
 
@@ -63,13 +106,31 @@ const TYPE_DELAY_MS = 20;
 // `gtk_tree_model_get_iter_first` assertion storm and a chooser that never
 // closed (verified empirically), so it stays a fixed pause.
 const POST_TYPE_SETTLE_MS = 300;
+// After `Alt+1` jumps the places sidebar to its first bookmark row, the
+// browse view needs a moment to repopulate before `Return` confirms it --
+// same empirically-required-pause rationale as `POST_TYPE_SETTLE_MS` above
+// (verified locally: dropping this to 0 on a fast machine still worked, but
+// CI is the slower/loaded machine this file's own header already warns
+// about, so the pause stays).
+const BOOKMARK_JUMP_SETTLE_MS = 400;
 const DIALOG_CLOSE_TIMEOUT_MS = 3_000;
 const DIALOG_CLOSE_POLL_INTERVAL_MS = 150;
 // A retry here is UI-input robustness, not a retry of the scenario: the
 // scenario still runs exactly once, `derive()` still decides the outcome
 // exactly once, and a chooser that never closes still surfaces as the same
-// disclosed `blocker=` its caller already names.
-const MAX_DIALOG_ATTEMPTS = 3;
+// disclosed `blocker=` its caller already names. Four, not three, so the
+// workspace chooser's own four-entry `WORKSPACE_CHOOSER_STRATEGIES` all get
+// tried; the executable chooser's three-entry list simply repeats its first
+// strategy on the fourth attempt (`sendChooserInput`'s own
+// `strategies[attempt - 1] ?? strategies[0]` fallback, unchanged).
+const MAX_DIALOG_ATTEMPTS = 4;
+// `xwd` (from `x11-apps`) captures the whole display so a final chooser
+// failure's real on-screen state -- not just the window-tree text dump
+// above -- rides along with the run's other uploaded diagnostics
+// (tauri-build.yml sets this for the VP-S6 scenario step only; unset
+// locally, so a bare local run never tries to shell out to a tool that may
+// not be installed).
+const DIAGNOSTIC_SCREENSHOT_PATH_ENV = 'VP001_DIAGNOSTIC_SCREENSHOT_PATH';
 // Distinguishes "xwininfo could not tell us" from "xwininfo says the window
 // is not viewable": the first must not be read as the second.
 const MAP_STATE_PROBE_UNAVAILABLE = 'probe-unavailable';
@@ -280,7 +341,17 @@ function waitForWindowCountAtLeast(minCount, timeoutMs) {
  *   attempt tests whether the accelerator, rather than the keystrokes, is
  *   what a runner drops.
  */
-const CHOOSER_INPUT_STRATEGIES = ['focus-ctrl-l', 'activate-ctrl-l', 'focus-type-path'];
+export const CHOOSER_INPUT_STRATEGIES = ['focus-ctrl-l', 'activate-ctrl-l', 'focus-type-path'];
+
+/**
+ * The workspace ("Select Folder") chooser's own strategy order: `bookmark-
+ * jump` first, then every existing strategy unchanged as later attempts
+ * (this file's own header records the local evidence for putting it first).
+ * The executable ("Open File") chooser keeps `CHOOSER_INPUT_STRATEGIES`
+ * as-is -- it must land on one specific file, which a folder-only jump can
+ * never satisfy, so it still needs `Ctrl+L` plus a typed path.
+ */
+export const WORKSPACE_CHOOSER_STRATEGIES = ['bookmark-jump', ...CHOOSER_INPUT_STRATEGIES];
 
 function typePathAndConfirm(path) {
   xdo(['type', '--clearmodifiers', '--delay', String(TYPE_DELAY_MS), path]);
@@ -296,6 +367,19 @@ function openLocationBar() {
 
 function sendChooserInput(windowId, path, strategy) {
   switch (strategy) {
+    case 'bookmark-jump':
+      xdo(['windowfocus', windowId]);
+      // GtkPlacesSidebar's own accelerator for its first shortcut row --
+      // wired up by GTK itself, entirely independent of `Ctrl+L`'s broken
+      // location entry and of AT-SPI (unavailable here, per this file's own
+      // header). Needs exactly one bookmark seeded at
+      // `~/.config/gtk-3.0/bookmarks` naming the target directory
+      // (tauri-build.yml's scenario step does this); `path` is unused here
+      // by design -- this strategy types nothing.
+      xdo(['key', '--clearmodifiers', 'alt+1']);
+      sleepMs(BOOKMARK_JUMP_SETTLE_MS);
+      xdo(['key', '--clearmodifiers', 'Return']);
+      return;
     case 'activate-ctrl-l':
       xdo(['windowactivate', '--sync', windowId]);
       openLocationBar();
@@ -317,12 +401,35 @@ function defaultEmit(key, value) {
   process.stdout.write(`${key}=${value}\n`);
 }
 
+/** Capture the whole display to `VP001_DIAGNOSTIC_SCREENSHOT_PATH` (via
+ * `xwd`, from `x11-apps`) so a final chooser failure's real on-screen state
+ * rides along with the run's other uploaded diagnostics, rather than being
+ * inferred from the window-tree text dump alone. A no-op when the env var
+ * is unset (never set outside tauri-build.yml's own scenario step) or when
+ * `xwd` is missing/fails -- same corroborating-tool-may-be-absent
+ * discipline as `xwininfo` above: disclosed, never fatal, never read as a
+ * harder failure than the dialog timeout it is diagnosing. */
+function captureScreenshot(emit) {
+  const path = process.env[DIAGNOSTIC_SCREENSHOT_PATH_ENV];
+  if (!path) return;
+  try {
+    execFileSync('xwd', ['-root', '-out', path]);
+    emit('dialog_diagnostic', `screenshot_captured=${path}`);
+  } catch (error) {
+    emit(
+      'dialog_diagnostic',
+      `screenshot_unavailable=${redactProvenance(String(error?.message ?? error))}`,
+    );
+  }
+}
+
 function emitDiagnostics(emit, { windowTitle, windowId, attempts }) {
   const mapState = windowId ? windowMapState(windowId) ?? 'window-gone' : 'no-window-found';
   const tree = windowTreeSnapshot();
   for (const line of formatDiagnostics({ windowTitle, windowId: windowId ?? 'none', attempts, mapState, tree })) {
     emit('dialog_diagnostic', line);
   }
+  captureScreenshot(emit);
 }
 
 /**
@@ -342,9 +449,16 @@ function emitDiagnostics(emit, { windowTitle, windowId, attempts }) {
  *
  * `emit(key, value)` defaults to writing `key=value` straight to stdout;
  * `vp-s6-scenario.mjs` passes its own `emit` so these lines interleave with
- * its other observations in one stream.
+ * its other observations in one stream. `strategies` defaults to
+ * `CHOOSER_INPUT_STRATEGIES` (the executable chooser's own order);
+ * `pickWorkspace` passes `WORKSPACE_CHOOSER_STRATEGIES` instead.
  */
-export function driveChooserWithPath(windowTitle, path, timeoutMs, { emit = defaultEmit } = {}) {
+export function driveChooserWithPath(
+  windowTitle,
+  path,
+  timeoutMs,
+  { emit = defaultEmit, strategies = CHOOSER_INPUT_STRATEGIES } = {},
+) {
   const windowId = waitForUsableWindow(windowTitle, timeoutMs, emit);
   if (windowId === null) {
     emitDiagnostics(emit, { windowTitle, windowId: null, attempts: 0 });
@@ -357,7 +471,7 @@ export function driveChooserWithPath(windowTitle, path, timeoutMs, { emit = defa
   // reach a runner having never executed anywhere. It is never set in CI.
   const forced = process.env.VP001_CHOOSER_STRATEGY;
   for (let attempt = 1; attempt <= MAX_DIALOG_ATTEMPTS; attempt += 1) {
-    const strategy = forced ?? (CHOOSER_INPUT_STRATEGIES[attempt - 1] ?? CHOOSER_INPUT_STRATEGIES[0]);
+    const strategy = forced ?? (strategies[attempt - 1] ?? strategies[0]);
     // The strategy is named in the transcript so a failed run reports which
     // input paths a runner refused, not merely how many times it refused.
     emit('dialog_attempt', `${attempt} strategy=${strategy}`);

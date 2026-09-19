@@ -68,8 +68,11 @@ jobs:
           # would resize/reposition the chooser instead of leaving it
           # floating): openbox is a conventional stacking WM, packaged for
           # ubuntu-24.04, and the standard choice for driving GTK/X11 apps
-          # under a headless Xvfb in CI.
-          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool x11-utils openbox
+          # under a headless Xvfb in CI. x11-apps carries xwd, used only by
+          # the VP-S6 scenario step's own final chooser-failure diagnostics
+          # (vp-s6-xdotool.mjs's captureScreenshot) to capture the display's
+          # real on-screen state alongside the transcript.
+          extra-apt-packages: patchelf xvfb webkit2gtk-driver xdotool x11-utils openbox x11-apps
 
       - name: cargo fmt
         if: hashFiles('rust-toolchain.toml') != ''
@@ -234,6 +237,10 @@ jobs:
         env:
           VP001_DIGEST_PATHS: ${{ steps.digest.outputs.paths }}
           VP001_DIGEST_FILE: ${{ runner.temp }}/vp-001-artifact-digest.txt
+          # Read by vp-s6-xdotool.mjs's captureScreenshot on a final chooser
+          # failure only; unset elsewhere, so nothing shells out to `xwd`
+          # outside this step.
+          VP001_DIAGNOSTIC_SCREENSHOT_PATH: ${{ runner.temp }}/vp-001-vp-s6-chooser-failure.xwd
         run: |
           set -euo pipefail
           artifact_path="$(printf '%s\n' "${VP001_DIGEST_PATHS}" | grep -m1 '\.AppImage$')"
@@ -241,6 +248,18 @@ jobs:
             awk -v name="$(basename "${artifact_path}")" '$2 == name { print $1 }' "${VP001_DIGEST_FILE}"
           )"
           workspace_dir="$(mktemp -d "${RUNNER_TEMP}/vp-s6-workspace.XXXXXX")"
+          # Seed exactly one GTK3 places-sidebar bookmark naming
+          # workspace_dir, so the "Select Folder" dialog's own `Alt+1`
+          # accelerator (vp-s6-xdotool.mjs's `bookmark-jump` strategy, tried
+          # first for this chooser) can jump straight there with no typing
+          # and no Ctrl+L. Verified locally against the real packaged
+          # AppImage (see that module's own header): the launching process's
+          # cwd, HOME, and a pre-set APPDIR were all tried first and none
+          # steer the dialog away from the AppImage runtime's own forced
+          # internal chdir target, but this bookmark -- read via $HOME,
+          # independent of that forced cwd -- reliably does.
+          mkdir -p "${HOME}/.config/gtk-3.0"
+          printf 'file://%s\n' "${workspace_dir}" > "${HOME}/.config/gtk-3.0/bookmarks"
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
             # A minimal window manager, not the feasibility-gate step above:
@@ -269,7 +288,10 @@ jobs:
 
       - name: Upload VP-001 transcripts
         # Kept even when a gate fails: a blocked run is evidence of the
-        # blocker, not something to discard.
+        # blocker, not something to discard. The .xwd screenshot only exists
+        # when the VP-S6 scenario step's own chooser driving exhausted every
+        # strategy (vp-s6-xdotool.mjs's captureScreenshot); a run artifact
+        # only, never committed to the repository.
         if: always() && runner.os == 'Linux' && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
         uses: actions/upload-artifact@v7.0.1 # v7.0.1
         with:
@@ -277,4 +299,5 @@ jobs:
           path: |
             ${{ runner.temp }}/vp-001-feasibility-transcript.txt
             ${{ runner.temp }}/vp-001-vp-s6-transcript.txt
+            ${{ runner.temp }}/vp-001-vp-s6-chooser-failure.xwd
           if-no-files-found: warn

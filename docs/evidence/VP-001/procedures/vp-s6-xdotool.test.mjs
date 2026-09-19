@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  CHOOSER_INPUT_STRATEGIES,
   compactLines,
   countWindowIdsInTree,
   formatDiagnostics,
@@ -16,6 +17,7 @@ import {
   parseMapState,
   parseSearchIds,
   redactProvenance,
+  WORKSPACE_CHOOSER_STRATEGIES,
 } from './vp-s6-xdotool.mjs';
 
 test('parseSearchIds', () => {
@@ -106,4 +108,13 @@ test('isWindowDrivable: a failed probe on an existing window is not drivable', (
 
 test('isWindowDrivable: an unavailable probe degrades to the visible-search signal', () => {
   assert.deepEqual(isWindowDrivable('probe-unavailable'), { drivable: true, degraded: true });
+});
+
+// Encodes the task requirement literally: `bookmark-jump` goes first for the
+// workspace chooser, and every existing strategy is kept, unchanged, as a
+// later attempt -- the executable chooser's own order is untouched.
+test('WORKSPACE_CHOOSER_STRATEGIES puts bookmark-jump first and keeps every existing strategy after it', () => {
+  assert.equal(WORKSPACE_CHOOSER_STRATEGIES[0], 'bookmark-jump');
+  assert.deepEqual(WORKSPACE_CHOOSER_STRATEGIES.slice(1), CHOOSER_INPUT_STRATEGIES);
+  assert.deepEqual(CHOOSER_INPUT_STRATEGIES, ['focus-ctrl-l', 'activate-ctrl-l', 'focus-type-path']);
 });

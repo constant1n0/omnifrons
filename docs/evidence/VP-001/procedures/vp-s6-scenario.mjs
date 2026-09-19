@@ -41,7 +41,7 @@ import {
   sendKeysToElement,
 } from './webdriver-session.mjs';
 import { classifyPidAfterWait, parsePidFile, parseProcStatStarttime } from './vp-s6-observations.mjs';
-import { driveChooserWithPath } from './vp-s6-xdotool.mjs';
+import { driveChooserWithPath, WORKSPACE_CHOOSER_STRATEGIES } from './vp-s6-xdotool.mjs';
 
 // -- Bounded polling (design.md Honesty machinery #3: no retry, no loop
 // beyond one bounded wait per observation) --
@@ -189,7 +189,13 @@ async function pickWorkspace(baseUrl, sessionId, workspaceDir) {
   }
   await clickElement(baseUrl, sessionId, pickButton);
   // Same non-branching rationale as approveFixture's own call above.
-  driveChooserWithPath('Select Folder', workspaceDir, CHOOSER_TIMEOUT_MS, { emit });
+  // `WORKSPACE_CHOOSER_STRATEGIES` (vp-s6-xdotool.mjs) tries `bookmark-jump`
+  // first: it needs no location entry and no typing, unlike this file's own
+  // "Open File" chooser below, which must land on one specific file.
+  driveChooserWithPath('Select Folder', workspaceDir, CHOOSER_TIMEOUT_MS, {
+    emit,
+    strategies: WORKSPACE_CHOOSER_STRATEGIES,
+  });
 
   const confirmed = await waitForElement(
     baseUrl,
