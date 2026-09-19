@@ -30,6 +30,10 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub mod demo;
+/// The `/proc`-backed descendant census `stop` uses to prove, on Linux,
+/// that a stopped child left nothing running behind it.
+#[cfg(target_os = "linux")]
+mod descendants;
 mod output_capture;
 #[cfg(unix)]
 mod pty;
@@ -1077,6 +1081,48 @@ mod unix {
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
     const KILL_GRACE: Duration = Duration::from_millis(500);
 
+    /// The descendant census [`stop`] takes before it signals anything, and
+    /// consults again before it reports a clean stop.
+    ///
+    /// On Linux this is the real thing (`crate::descendants`): a
+    /// `(pid, starttime)` snapshot of the child's descendants, a verified
+    /// sweep of whatever survived the group signal, and a process-group
+    /// check -- the machinery that keeps `stop` from claiming a clean stop
+    /// it cannot prove (VP-001 `VP-S6-02`).
+    #[cfg(target_os = "linux")]
+    use crate::descendants::Census;
+
+    /// The descendant census, on a unix without `/proc` to walk.
+    ///
+    /// A deliberate no-op, not an oversight: there is no portable way to
+    /// enumerate a process's descendants on those platforms, so `stop`
+    /// keeps exactly the behaviour it had before the Linux census existed
+    /// -- the direct child's own reap, with descendants neither proven
+    /// stopped nor proven running. That is the same pre-existing gap
+    /// `src-tauri/src/health.rs` already reports as containment
+    /// `"unproven"`, and reporting every macOS stop as
+    /// `orphan-risk/uncertain` instead would be a regression in what this
+    /// crate can say, not an improvement in what it can prove.
+    #[cfg(not(target_os = "linux"))]
+    struct Census;
+
+    #[cfg(not(target_os = "linux"))]
+    impl Census {
+        fn take(_child: Pid) -> Self {
+            Self
+        }
+
+        // Takes `&self` it does not read, so this stub keeps the exact
+        // signature the Linux census has and `stop` stays one
+        // platform-independent call site. Making it an associated function
+        // here, as `clippy::unused_self` suggests, would force `stop` to
+        // branch on the platform at the call site instead.
+        #[allow(clippy::unused_self)]
+        fn settle(&self, _pgid: Pid, reaped: ProcessTerminalState) -> ProcessTerminalState {
+            reaped
+        }
+    }
+
     /// The outcome of a `killpg` call, classified for what the caller can
     /// safely conclude from it.
     #[derive(Debug, PartialEq, Eq)]
@@ -1131,6 +1177,14 @@ mod unix {
         };
         let pgid = Pid::from_raw(raw_pid);
 
+        // Taken *now*, while the child is still unreaped and its
+        // descendants still point back at it: once it is reaped they have
+        // been reparented away and the chain that identifies them as its
+        // descendants is gone for good. A descendant that leaves the
+        // process group (`setsid`) is invisible to every `killpg` below but
+        // is in this census, which is the whole point of taking one.
+        let census = Census::take(pgid);
+
         // Best-effort: a group that has already exited yields ESRCH here,
         // which is not itself a failure -- the loop below confirms the
         // actual terminal state via `try_wait`. Any other error (e.g.
@@ -1151,11 +1205,17 @@ mod unix {
         if let Some(state) = poll_until_reaped(
             children,
             terminal_order,
-            outputs,
             id,
             deadline,
             ProcessTerminalState::Exited { code: None },
         ) {
+            // The direct child is reaped; that alone says nothing about
+            // what it spawned. `settle` sweeps every recorded descendant
+            // that is still running and downgrades this state to
+            // `OrphanRiskUncertain` unless all of them -- and the process
+            // group itself -- are proven gone.
+            let state = census.settle(pgid, state);
+            record_settled_state(children, outputs, id, state);
             tracing::debug!(pid = id.0, ?state, "process group terminated gracefully");
             return Ok(state);
         }
@@ -1179,11 +1239,14 @@ mod unix {
         if let Some(state) = poll_until_reaped(
             children,
             terminal_order,
-            outputs,
             id,
             KILL_GRACE,
             ProcessTerminalState::Killed,
         ) {
+            // Same proof obligation as the graceful path above: a reaped
+            // direct child is not a contained process tree.
+            let state = census.settle(pgid, state);
+            record_settled_state(children, outputs, id, state);
             return Ok(state);
         }
 
@@ -1197,6 +1260,42 @@ mod unix {
         Ok(ProcessTerminalState::OrphanRiskUncertain)
     }
 
+    /// Record `state` as this child's settled terminal state: the one
+    /// [`stop`] is about to return, after the descendant census has had its
+    /// say, not the reap-derived one that preceded it.
+    ///
+    /// The entry is already `Tracked::Terminal` by the time this runs
+    /// ([`poll_until_reaped`] put it there, with the reap-derived state, so
+    /// the `Child` handle is dropped the moment the reap is confirmed).
+    /// Overwriting it here is what keeps a later `observe`, a later `stop`,
+    /// and the final `State` frame telling the same story as the `stop`
+    /// call that proved it -- rather than the strictly weaker claim the
+    /// reap alone supported. During the sweep itself (bounded, and only
+    /// when something was actually found to sweep) a concurrent `observe`
+    /// can still see that earlier reap-derived state: a transient, not a
+    /// final answer, and never one this supervisor reports after `stop`
+    /// has returned.
+    fn record_settled_state(
+        children: &Mutex<HashMap<ProcessId, Tracked>>,
+        outputs: &OutputTable,
+        id: ProcessId,
+        state: ProcessTerminalState,
+    ) {
+        {
+            let mut guard = children
+                .lock()
+                .expect("children mutex poisoned by a prior panic");
+            if let Some(tracked) = guard.get_mut(&id) {
+                *tracked = Tracked::Terminal(state);
+            }
+        }
+        // Output capture learns the terminal state only here, once it is
+        // settled: its final `State` frame is sent at most once, so sending
+        // it with the reap-derived state first would publish a claim this
+        // stop had not yet proven.
+        output_capture::record_confirmed_state(outputs, id, state);
+    }
+
     /// Poll `try_wait` until the child is reaped or `budget` elapses.
     ///
     /// On reap, evicts the entry to `Tracked::Terminal` (dropping the
@@ -1206,10 +1305,14 @@ mod unix {
     /// exit code is meaningful, e.g. after a signal). Until reap is
     /// confirmed, the entry is left `Running`: its pid cannot yet have
     /// been recycled by the OS.
+    ///
+    /// The state recorded here is about the *direct child* only. What the
+    /// caller may finally report also depends on its descendants, so
+    /// publishing it to output capture is deliberately left to
+    /// [`record_settled_state`], after that proof exists.
     fn poll_until_reaped(
         children: &Mutex<HashMap<ProcessId, Tracked>>,
         terminal_order: &Mutex<VecDeque<ProcessId>>,
-        outputs: &OutputTable,
         id: ProcessId,
         budget: Duration,
         on_reap: ProcessTerminalState,
@@ -1234,7 +1337,6 @@ mod unix {
                     *tracked = Tracked::Terminal(state);
                     drop(guard);
                     record_terminal_order(children, terminal_order, id);
-                    output_capture::record_confirmed_state(outputs, id, state);
                     return Some(state);
                 }
             }
