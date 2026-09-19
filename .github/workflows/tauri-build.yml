@@ -248,8 +248,9 @@ jobs:
             awk -v name="$(basename "${artifact_path}")" '$2 == name { print $1 }' "${VP001_DIGEST_FILE}"
           )"
           workspace_dir="$(mktemp -d "${RUNNER_TEMP}/vp-s6-workspace.XXXXXX")"
-          # Seed exactly one GTK3 places-sidebar bookmark naming
-          # workspace_dir, so the "Select Folder" dialog's own `Alt+1`
+          # vp-s6-linux.sh seeds one GTK3 places-sidebar bookmark naming
+          # workspace_dir itself, and restores the caller's own bookmarks on
+          # exit, so the "Select Folder" dialog's own `Alt+1`
           # accelerator (vp-s6-xdotool.mjs's `bookmark-jump` strategy, tried
           # first for this chooser) can jump straight there with no typing
           # and no Ctrl+L. Verified locally against the real packaged
@@ -258,8 +259,6 @@ jobs:
           # steer the dialog away from the AppImage runtime's own forced
           # internal chdir target, but this bookmark -- read via $HOME,
           # independent of that forced cwd -- reliably does.
-          mkdir -p "${HOME}/.config/gtk-3.0"
-          printf 'file://%s\n' "${workspace_dir}" > "${HOME}/.config/gtk-3.0/bookmarks"
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
             # A minimal window manager, not the feasibility-gate step above:

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // VP-S6 scenario orchestrator (design.md D5/D7, "Honesty machinery"): drives
 // the retained packaged artifact's own GUI end to end through `tauri-driver`
-// -- approve the fixture agent, pick a scratch workspace, select the
+// -- pick a scratch workspace, approve the fixture agent, select the
 // adapter and approval, Start, observe the fixture and its
 // breakaway-attempting descendant, Stop through the UI, a bounded wait,
 // then re-enumerate -- and emits a `key=value` transcript of OBSERVATIONS

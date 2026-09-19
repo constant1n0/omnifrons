@@ -6,7 +6,7 @@
 #   --mode=feasibility-check   AV1/AV2 gate, then one session create/close
 #                              (F1). No scenario logic (Slice 3a).
 #   --mode=scenario            AV1/AV2 gate, then the full VP-S6 scenario --
-#                              approve the fixture, pick a workspace, select
+#                              pick a workspace, approve the fixture, select
 #                              adapter/approval, Start, observe, Stop, a
 #                              bounded wait, re-enumerate, and a key=value
 #                              observation transcript on stdout (Slice 3b,
@@ -192,6 +192,30 @@ fi
 
 run_av1 "${artifact_path}" "${build_channel_digest}"
 run_av2 "${artifact_path}"
+
+# The `bookmark-jump` strategy (vp-s6-xdotool.mjs) needs exactly one GTK3
+# places-sidebar bookmark naming workspace_dir, so `Alt+1` lands there. The
+# seeding belongs here rather than in the CI step: a caller's own bookmarks
+# are their data, and a run on a developer machine must leave them exactly as
+# it found them -- an earlier revision wrote this file from the workflow with
+# `>`, which on anything but an ephemeral runner would have destroyed them.
+# The original (or its absence) is restored on exit, including on failure.
+bookmarks_file="${HOME}/.config/gtk-3.0/bookmarks"
+bookmarks_backup=""
+restore_bookmarks() {
+  if [[ -n "${bookmarks_backup}" ]]; then
+    mv -f "${bookmarks_backup}" "${bookmarks_file}"
+  else
+    rm -f "${bookmarks_file}"
+  fi
+}
+mkdir -p "$(dirname "${bookmarks_file}")"
+if [[ -f "${bookmarks_file}" ]]; then
+  bookmarks_backup="$(mktemp "${bookmarks_file}.vp-s6-backup.XXXXXX")"
+  cp -p "${bookmarks_file}" "${bookmarks_backup}"
+fi
+trap restore_bookmarks EXIT
+printf 'file://%s\n' "${workspace_dir}" > "${bookmarks_file}"
 
 # Delegated to vp-s6-scenario.mjs (design.md's own sequence: AV1/AV2 ->
 # create session -> dialog driving -> Start -> observe -> Stop -> bounded
