@@ -65,6 +65,36 @@
 //! synchronization point a test waits on before calling `stop`), then
 //! sleeps until killed.
 //!
+//! Descendant-containment modes (unix; `tests/descendant_containment.rs`),
+//! every one of them self-bounding: each sleeps at most
+//! [`DESCENDANT_LIFETIME_SECS`] and then exits on its own, so a test that
+//! fails to contain what it spawned still leaves nothing running on a
+//! developer's machine or a CI runner.
+//!
+//! `--spawn-escaping-descendant`: spawns this same binary as a child in
+//! `--setsid-sleep` mode -- a descendant that leaves the process group
+//! `killpg` targets, exactly the VP-001 `VP-S6` shape -- prints
+//! `descendant-pid <pid>` once it exists (the synchronization point a test
+//! waits on before calling `stop`), then sleeps out its own lifetime.
+//!
+//! `--spawn-stubborn-descendant`: the same, but the child runs
+//! `--ignore-sigterm-sleep`, so it stays inside the process group and
+//! simply refuses the group's `SIGTERM`.
+//!
+//! `--spawn-late-descendant` (unix): blocks `SIGTERM`, prints `ready`,
+//! waits for the process group's `SIGTERM` to actually arrive, and only
+//! then spawns an `--ignore-sigterm-sleep` descendant -- one that by
+//! construction cannot appear in a census taken before that signal, which
+//! is exactly the residual race the supervisor's census cannot close.
+//! Prints `descendant-pid <pid>` and exits immediately afterwards.
+//!
+//! `--setsid-sleep` (unix): calls `setsid(2)`, leaving this process in a
+//! brand-new session and process group, then sleeps out its lifetime.
+//!
+//! `--ignore-sigterm-sleep` (unix): installs the `SIGTERM`-ignore
+//! disposition, then sleeps out its lifetime, staying in the process group
+//! it was spawned into.
+//!
 //! Spike slice 5's outbox modes (`tests/outbox_launch.rs`; the shell's
 //! own tests cannot spawn this fixture), each reading the declared run
 //! subdirectory from `OMNIFRONS_OUTPUT_DIR` and never printing its value:
@@ -92,7 +122,7 @@
 //! without the privilege) it prints `symlink-skipped` first.
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{BufRead as _, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -100,6 +130,18 @@ use std::process::ExitCode;
 /// (`omnifrons_app::OUTPUT_DIR_ENV_KEY`); named here verbatim so this
 /// fixture reads exactly the key the product declares.
 const OUTPUT_DIR_ENV_KEY: &str = "OMNIFRONS_OUTPUT_DIR";
+
+/// The upper bound on how long any descendant-containment mode sleeps
+/// before exiting on its own.
+///
+/// Self-bounding is a hard requirement of these fixtures, not a
+/// convenience: the whole point of `--spawn-escaping-descendant` is to
+/// create a process the supervisor may fail to contain, and a fixture that
+/// slept forever would then leave a stray process behind on whatever
+/// machine ran the test. Long enough that a stop under test always happens
+/// first (stop deadlines in these tests are seconds), short enough that a
+/// stray never outlives the test run by much.
+const DESCENDANT_LIFETIME_SECS: u64 = 20;
 
 /// The flags this fixture accepts, parsed once from argv. Independent
 /// switches rather than a mode enum, because several combine
@@ -117,6 +159,11 @@ struct Flags {
     pty_echo: bool,
     pty_corpus: bool,
     pty_ignore_sigterm: bool,
+    spawn_escaping_descendant: bool,
+    spawn_stubborn_descendant: bool,
+    spawn_late_descendant: bool,
+    setsid_sleep: bool,
+    ignore_sigterm_sleep: bool,
     report_output_dir: bool,
     write_outbox: Option<u32>,
     propose_missing: bool,
@@ -134,6 +181,11 @@ fn parse_flags(args: &[String]) -> Flags {
             "--pty-echo" => flags.pty_echo = true,
             "--pty-corpus" => flags.pty_corpus = true,
             "--pty-ignore-sigterm" => flags.pty_ignore_sigterm = true,
+            "--spawn-escaping-descendant" => flags.spawn_escaping_descendant = true,
+            "--spawn-stubborn-descendant" => flags.spawn_stubborn_descendant = true,
+            "--spawn-late-descendant" => flags.spawn_late_descendant = true,
+            "--setsid-sleep" => flags.setsid_sleep = true,
+            "--ignore-sigterm-sleep" => flags.ignore_sigterm_sleep = true,
             "--report-output-dir" => flags.report_output_dir = true,
             "--write-outbox" => {
                 i += 1;
@@ -185,6 +237,31 @@ fn main() -> ExitCode {
 
     if flags.pty_report {
         run_pty_report(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
+    if flags.setsid_sleep {
+        run_setsid_sleep(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
+    if flags.ignore_sigterm_sleep {
+        run_ignore_sigterm_sleep(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
+    if flags.spawn_late_descendant {
+        run_spawn_late_descendant(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
+    if flags.spawn_escaping_descendant || flags.spawn_stubborn_descendant {
+        let mode = if flags.spawn_escaping_descendant {
+            "--setsid-sleep"
+        } else {
+            "--ignore-sigterm-sleep"
+        };
+        run_spawn_descendant(&mut stdout, mode);
         return ExitCode::from(exit_code);
     }
 
@@ -309,6 +386,129 @@ fn run_default_sequence(stdout: &mut impl Write, no_eof: bool) {
     emit(stdout, &assistant_text_line(&env_dump));
 
     emit(stdout, r#"{"type":"result","subtype":"success"}"#);
+}
+
+/// Sleep out this fixture's own bounded lifetime and return, so every
+/// descendant-containment mode exits on its own even when nothing ever
+/// stops it. Deliberately a single bounded sleep rather than the
+/// `loop { sleep }` of `--pty-ignore-sigterm`, which has no bound at all.
+fn sleep_out_lifetime() {
+    std::thread::sleep(std::time::Duration::from_secs(DESCENDANT_LIFETIME_SECS));
+}
+
+/// The line a descendant prints on its own stdout once whatever makes it
+/// hard to contain is actually in place, and which its spawning fixture
+/// waits for before announcing it. Without this handshake the announcement
+/// races the descendant's own start-up: a `--setsid-sleep` descendant that
+/// has not yet reached `setsid(2)` is still in the process group, so the
+/// group signal reaches it after all and the test proves nothing.
+const DESCENDANT_READY_LINE: &str = "descendant-ready";
+
+/// `--setsid-sleep`: leave the process group this fixture was spawned
+/// into, the way a real breakaway-attempting descendant does, then sleep.
+///
+/// `setsid(2)` fails with `EPERM` for a process that is already a process
+/// group leader; a descendant spawned by another fixture never is (the
+/// supervisor makes the *direct child* the group leader), so this is
+/// expected to succeed whenever the mode is used as intended.
+fn run_setsid_sleep(stdout: &mut impl Write) {
+    #[cfg(unix)]
+    nix::unistd::setsid().expect("setsid must succeed for a process that is not a group leader");
+    emit(stdout, DESCENDANT_READY_LINE);
+    sleep_out_lifetime();
+}
+
+/// `--ignore-sigterm-sleep`: stay in the process group, but refuse its
+/// `SIGTERM`, so only a direct `SIGKILL` can end this process.
+fn run_ignore_sigterm_sleep(stdout: &mut impl Write) {
+    #[cfg(unix)]
+    omnifrons_supervisor::demo::ignore_sigterm();
+    emit(stdout, DESCENDANT_READY_LINE);
+    sleep_out_lifetime();
+}
+
+/// `--spawn-escaping-descendant` / `--spawn-stubborn-descendant`: spawn
+/// this same binary once more in `mode`, print `descendant-pid <pid>`, then
+/// sleep out this process's own lifetime.
+///
+/// The descendant's stdin and stderr are `/dev/null` and its stdout is a
+/// fresh pipe this process owns, never this process's own inherited
+/// streams: otherwise the descendant would hold the supervisor's stdout
+/// pipe open after this process is stopped, which has nothing to do with
+/// what these tests measure. That private pipe is dropped as soon as the
+/// handshake line has been read, and the descendant never writes again.
+///
+/// The `descendant-pid` line is printed only *after* the descendant has
+/// reported [`DESCENDANT_READY_LINE`] -- so it is a genuine
+/// synchronization point (the same role `demo::run`'s `ready` line plays),
+/// not merely "the fork returned", which would still race the descendant's
+/// own `setsid`/signal-disposition setup.
+fn run_spawn_descendant(stdout: &mut impl Write, mode: &str) {
+    spawn_descendant(stdout, mode);
+    sleep_out_lifetime();
+}
+
+/// `--spawn-late-descendant`: spawn a descendant that cannot possibly be in
+/// a census taken before the process group was signalled.
+///
+/// `SIGTERM` is *blocked* rather than ignored, so it becomes pending and
+/// `sigwait` can report it: that turns "the group has been signalled" into
+/// a synchronization point instead of a timing guess, and is what makes
+/// this fixture's ordering deterministic. This process then exits at once,
+/// so the direct child is reaped well inside the caller's own deadline.
+fn run_spawn_late_descendant(stdout: &mut impl Write) {
+    #[cfg(unix)]
+    {
+        let mut blocked = nix::sys::signal::SigSet::empty();
+        blocked.add(nix::sys::signal::Signal::SIGTERM);
+        nix::sys::signal::pthread_sigmask(
+            nix::sys::signal::SigmaskHow::SIG_BLOCK,
+            Some(&blocked),
+            None,
+        )
+        .expect("blocking SIGTERM must succeed");
+        emit(stdout, "ready");
+        assert_eq!(
+            blocked.wait().expect("waiting for SIGTERM must succeed"),
+            nix::sys::signal::Signal::SIGTERM
+        );
+    }
+    #[cfg(not(unix))]
+    emit(stdout, "ready");
+    spawn_descendant(stdout, "--ignore-sigterm-sleep");
+}
+
+/// Spawn this same binary once more in `mode` and announce its pid, once
+/// the descendant has reported that it is ready.
+fn spawn_descendant(stdout: &mut impl Write, mode: &str) {
+    let executable = std::env::current_exe().expect("this fixture must know its own path");
+    // Deliberately never waited on: this process is about to be stopped,
+    // and whether its descendant outlives it is exactly what the test
+    // measures. `DESCENDANT_LIFETIME_SECS` bounds the descendant itself, so
+    // nothing here can outlive the test run by more than that.
+    #[allow(clippy::zombie_processes)]
+    let mut descendant = std::process::Command::new(executable)
+        .arg(mode)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning this fixture's own descendant must succeed");
+    let mut handshake = String::new();
+    std::io::BufReader::new(
+        descendant
+            .stdout
+            .take()
+            .expect("the descendant's stdout was configured as piped"),
+    )
+    .read_line(&mut handshake)
+    .expect("the descendant must report that it is ready");
+    assert_eq!(
+        handshake.trim_end(),
+        DESCENDANT_READY_LINE,
+        "the descendant must announce itself with the agreed handshake line"
+    );
+    emit(stdout, &format!("descendant-pid {}", descendant.id()));
 }
 
 /// `--pty-report`: whether each standard stream is a terminal, the three
