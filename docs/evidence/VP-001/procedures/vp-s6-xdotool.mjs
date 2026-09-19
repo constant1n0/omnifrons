@@ -264,15 +264,53 @@ function waitForWindowCountAtLeast(minCount, timeoutMs) {
  * mechanism -- passed both choosers on the exact same artifact. Kept for
  * that reason, not out of inertia.
  */
-function sendChooserInput(windowId, path) {
-  xdo(['windowfocus', windowId]);
+/**
+ * The three attempts are three DIFFERENT strategies, not the same one
+ * three times: CI runs 35252892166 and 35440083284 both burned all three
+ * identical attempts against the same failure, which taught us nothing
+ * about the mechanism. Each attempt now varies one thing, so a single run
+ * says which input path a runner accepts.
+ *
+ * - `focus-ctrl-l`: what has always worked on a developer machine.
+ * - `activate-ctrl-l`: `windowactivate` asks the window manager to focus
+ *   the window, which `windowfocus`'s bare `XSetInputFocus` never does; it
+ *   is only meaningful now that the scenario display runs one.
+ * - `focus-type-path`: skips `Ctrl+L` entirely. A GTK file chooser opens
+ *   its location entry on its own when typing begins with `/`, so this
+ *   attempt tests whether the accelerator, rather than the keystrokes, is
+ *   what a runner drops.
+ */
+const CHOOSER_INPUT_STRATEGIES = ['focus-ctrl-l', 'activate-ctrl-l', 'focus-type-path'];
 
-  const baselineWindowCount = countWindowIdsInTree(windowTreeSnapshot());
-  xdo(['key', '--clearmodifiers', 'ctrl+l']);
-  waitForWindowCountAtLeast(baselineWindowCount + 1, LOCATION_BAR_SETTLE_TIMEOUT_MS);
+function typePathAndConfirm(path) {
   xdo(['type', '--clearmodifiers', '--delay', String(TYPE_DELAY_MS), path]);
   sleepMs(POST_TYPE_SETTLE_MS);
   xdo(['key', '--clearmodifiers', 'Return']);
+}
+
+function openLocationBar() {
+  const baselineWindowCount = countWindowIdsInTree(windowTreeSnapshot());
+  xdo(['key', '--clearmodifiers', 'ctrl+l']);
+  waitForWindowCountAtLeast(baselineWindowCount + 1, LOCATION_BAR_SETTLE_TIMEOUT_MS);
+}
+
+function sendChooserInput(windowId, path, strategy) {
+  switch (strategy) {
+    case 'activate-ctrl-l':
+      xdo(['windowactivate', '--sync', windowId]);
+      openLocationBar();
+      typePathAndConfirm(path);
+      return;
+    case 'focus-type-path':
+      xdo(['windowfocus', windowId]);
+      // No `Ctrl+L`: the leading `/` is what opens the location entry.
+      typePathAndConfirm(path);
+      return;
+    default:
+      xdo(['windowfocus', windowId]);
+      openLocationBar();
+      typePathAndConfirm(path);
+  }
 }
 
 function defaultEmit(key, value) {
@@ -313,14 +351,25 @@ export function driveChooserWithPath(windowTitle, path, timeoutMs, { emit = defa
     return false;
   }
 
+  // `VP001_CHOOSER_STRATEGY` pins every attempt to one strategy. It exists so
+  // each strategy can be exercised deliberately on a developer machine --
+  // otherwise only the first would ever run locally, and the other two would
+  // reach a runner having never executed anywhere. It is never set in CI.
+  const forced = process.env.VP001_CHOOSER_STRATEGY;
   for (let attempt = 1; attempt <= MAX_DIALOG_ATTEMPTS; attempt += 1) {
-    emit('dialog_attempt', String(attempt));
+    const strategy = forced ?? (CHOOSER_INPUT_STRATEGIES[attempt - 1] ?? CHOOSER_INPUT_STRATEGIES[0]);
+    // The strategy is named in the transcript so a failed run reports which
+    // input paths a runner refused, not merely how many times it refused.
+    emit('dialog_attempt', `${attempt} strategy=${strategy}`);
     try {
-      sendChooserInput(windowId, path);
+      sendChooserInput(windowId, path, strategy);
     } catch (error) {
-      if (process.env.VP001_DEBUG) console.error(error);
+      emit('dialog_attempt_error', `${strategy}: ${redactProvenance(String(error?.message ?? error))}`);
     }
-    if (waitForWindowGone(windowId, DIALOG_CLOSE_TIMEOUT_MS)) return true;
+    if (waitForWindowGone(windowId, DIALOG_CLOSE_TIMEOUT_MS)) {
+      emit('dialog_closed', strategy);
+      return true;
+    }
   }
 
   emitDiagnostics(emit, { windowTitle, windowId, attempts: MAX_DIALOG_ATTEMPTS });
