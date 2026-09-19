@@ -60,7 +60,8 @@ Mandatory fields:
 `result` MUST be exactly one of `pass`, `fail`, `uncertain` (Closed Outcome
 Vocabulary) -- never a compound rendering such as `orphan-risk/uncertain`.
 `observed_state` is a separate field that carries the additional observed
-context (for example `orphan-risk`); it is never folded into `result`.
+context; it is never folded into `result`. Two tokens are in use: `orphan-risk`
+when termination was not proven, and `proven-gone` when every recorded pid was.
 
 Optional fields, present once a packaged CI run produced them:
 `build_channel_digest`, `exercised_artifact_digest`, `evidence_artifact`,

@@ -82,3 +82,51 @@ row honestly records what its own run observed. Both stand.
 | `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-18 |
 | `evidence_artifact` | e9b253854d9fba71fa0ac81bb2d6e43cdb66732b8b84d0aefd78714a89226f17 -- redacted copy of run 35450847942's `vp-001-transcripts` artifact entry `vp-001-vp-s6-transcript.txt`, retained at `docs/evidence/VP-001/artifacts/vp-001-run-35450847942-vp-s6-transcript.txt` |
 | `feasibility_evidence_artifact` | 4b621369c2413ac773cc609156d5fc8cf98a5afcc162bfd091caa7fac69b7775 -- redacted copy of the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt`, retained at `docs/evidence/VP-001/artifacts/vp-001-run-35450847942-feasibility-transcript.txt` |
+
+## VP-001 VP-S6 scenario -- run 35467644986 (2026-09-19)
+
+The same scenario as `VP-001-VP-S6-02`, on the same baseline, against a build
+that contains the supervisor fix that row drove. The fixture agent spawned the
+same breakaway descendant, and after Stop every recorded pid was proven gone
+within the bounded wait: `self_after_wait=gone descendant_after_wait=gone`.
+
+The descendant had left the process group via `setsid`, so `killpg` could not
+have reached it, and the fixture's own 120-second self-bound had not elapsed
+within the scenario's bounded wait. What accounted for it is the census and
+pid-targeted sweep added in `crates/omnifrons-supervisor/src/descendants.rs`.
+
+`observed_state: proven-gone` names the state the passing branch of `derive`
+returns (`ObservedState::Verify`). The design left that public token unnamed;
+it is chosen here to mirror `orphan-risk` and the `all_pids_proven_gone`
+observation it reports. It does not claim containment in general: a descendant
+born between the census and the signal remains outside both mechanisms, and
+`src-tauri/src/health.rs` still reports containment as `unproven`.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S6-03 |
+| `kind` | scenario |
+| `scenario_id` | VP-S6 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | pass |
+| `observed_state` | proven-gone |
+| `build_channel` | packaged-ci |
+| `build_channel_digest` | d52091e8decb5e488498b72d2bbcfd3a9653311222bb40f40f7b52b94a9ff24f |
+| `exercised_artifact_digest` | d52091e8decb5e488498b72d2bbcfd3a9653311222bb40f40f7b52b94a9ff24f |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s6-linux.sh |
+| `mechanism` | process-group killpg(SIGTERM) plus the pid-targeted sweep of recorded survivors (crates/omnifrons-supervisor/src/descendants.rs) -- exercised this run |
+| `fallback` | killpg(SIGKILL) escalation -- not reached this run: the direct child was reaped, and escalation fires only when it is not |
+| `blocker` | none -- the scenario ran to completion |
+| `identity_gated` | true |
+| `descendant_alive_before_stop` | true |
+| `stop_confirmed` | true |
+| `all_pids_proven_gone` | true |
+| `any_pid_alive_after_wait` | false |
+| `enumeration_unreadable` | false |
+| `run_date` | 2026-09-19 |
+| `observed_pids` | agent pid 13255 and breakaway descendant pid 13257, both proven gone after the bounded wait |
+| `ci_run` | workflow tauri-build.yml, workflow_dispatch (vp001_scenario: true), run 35467644986, head 41a42ef, conclusion success |
+| `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-18 |
+| `evidence_artifact` | fdfc38584a25fe028f3c1a35895bf7bb7f4da38cde65c0b5d628084113aedb3c -- redacted copy of run 35467644986's `vp-001-transcripts` artifact entry `vp-001-vp-s6-transcript.txt`, retained at `docs/evidence/VP-001/artifacts/vp-001-run-35467644986-vp-s6-transcript.txt` |
+| `feasibility_evidence_artifact` | 07c2c440c22779a35b5e2736a417cbe0e4080f4533754f9e35778f8b2634284a -- redacted copy of the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt`, retained at `docs/evidence/VP-001/artifacts/vp-001-run-35467644986-feasibility-transcript.txt` |
