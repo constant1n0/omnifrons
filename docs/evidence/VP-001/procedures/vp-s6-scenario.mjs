@@ -128,7 +128,13 @@ async function approveFixture(baseUrl, sessionId, fixturePath) {
     return { ok: false, blocker: 'pick-executable-button-not-found' };
   }
   await clickElement(baseUrl, sessionId, pickButton);
-  driveChooserWithPath('Open File', fixturePath, CHOOSER_TIMEOUT_MS);
+  // The return value is intentionally not branched on here: a `false` (the
+  // chooser never closed) still falls through to the candidate-panel wait
+  // below, which times out on its own and raises this function's existing
+  // `executable-chooser-timeout` blocker -- driveChooserWithPath only adds
+  // robustness and `dialog_attempt`/`dialog_diagnostic` transcript lines,
+  // it never invents a new outcome.
+  driveChooserWithPath('Open File', fixturePath, CHOOSER_TIMEOUT_MS, { emit });
 
   const candidatePanel = await waitForElement(
     baseUrl,
@@ -182,7 +188,8 @@ async function pickWorkspace(baseUrl, sessionId, workspaceDir) {
     return { ok: false, blocker: 'pick-workspace-button-not-found' };
   }
   await clickElement(baseUrl, sessionId, pickButton);
-  driveChooserWithPath('Select Folder', workspaceDir, CHOOSER_TIMEOUT_MS);
+  // Same non-branching rationale as approveFixture's own call above.
+  driveChooserWithPath('Select Folder', workspaceDir, CHOOSER_TIMEOUT_MS, { emit });
 
   const confirmed = await waitForElement(
     baseUrl,
