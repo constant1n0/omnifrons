@@ -2,6 +2,8 @@
 
 **One context. Every model.**
 
+*Una versión resumida de esta página existe en español: [`README.es.md`](README.es.md). El inglés es la versión canónica.*
+
 Omnifrons is a planned cross-platform desktop facade for user-installed CLI agent harnesses. It gives a person one durable agent identity, one workspace, and one human-facing text/voice control surface while allowing the underlying model or harness to change.
 
 > **Status:** development-mode spike. A Rust workspace plus a Tauri shell exist: a supervised harness runtime with typed IPC, executable approval, line and PTY adapters, and local publication and recovery surfaces. There is no supported release or installer.
