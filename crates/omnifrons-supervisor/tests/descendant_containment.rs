@@ -9,10 +9,12 @@
 //! unproven stopped -> Orphan-risk/uncertain" -- so a clean terminal state
 //! is only honest once every descendant is *proven* gone.
 //!
-//! These tests are about the claim, not about cleanup: a descendant left
-//! running must be *reported* as orphan-risk/uncertain. Each test then
-//! terminates what the product deliberately left alone, because a test owns
-//! what the product did not promise to contain.
+//! These tests are about the claim: whatever `stop` reports must be true
+//! of the descendant it reported it about. A descendant the census
+//! recorded must be swept and proven gone before a definite terminal state
+//! is honest; one the census could never have seen must be reported as
+//! orphan-risk/uncertain, and that one the test terminates itself, because
+//! a test owns what the product did not promise to contain.
 //!
 //! Linux only: the census these tests exercise walks `/proc` by parent
 //! chain, which exists on Linux and not on the other unixes this workspace
@@ -44,6 +46,12 @@ const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The deadline handed to `stop` itself.
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a descendant is given to disappear before it counts as having
+/// outlived the stop that was supposed to sweep it. A process killed by
+/// the sweep is reparented to `init` and reaped within milliseconds; this
+/// bound exists only so the assertion never races that hand-off.
+const SURVIVAL_OBSERVATION: Duration = Duration::from_secs(3);
 
 fn fake_agent(args: &[&str]) -> ProcessSpec {
     ProcessSpec::new(env!("CARGO_BIN_EXE_fake-agent")).with_args(args.to_vec())
@@ -128,6 +136,51 @@ fn still_running(pid: u32) -> bool {
     nix::sys::signal::kill(pid_of(pid), None) != Err(nix::errno::Errno::ESRCH)
 }
 
+/// Whether `pid` is still present after polling for it to disappear for at
+/// most `budget`. `kill(pid, 0)` still succeeds for a zombie, so this
+/// polls until the entry is really gone rather than sampling once.
+fn outlived(pid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if !still_running(pid) {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Assert that a recorded descendant was swept, and that whatever `stop`
+/// reported is true of it: a definite terminal state is only honest once
+/// the descendant is gone, and one still running must be reported as
+/// `orphan-risk/uncertain`.
+fn assert_swept_and_reported_honestly(terminal: ProcessTerminalState, descendant: u32) {
+    let survived = outlived(descendant, SURVIVAL_OBSERVATION);
+    assert!(
+        !(survived
+            && matches!(
+                terminal,
+                ProcessTerminalState::Exited { .. } | ProcessTerminalState::Killed
+            )),
+        "stop reported {terminal:?} while descendant {descendant} was still alive: that is a \
+         clean stop it cannot prove (docs/target-architecture.md § Required failure states)"
+    );
+    assert!(
+        !survived,
+        "descendant {descendant} outlived the stop that was supposed to sweep it"
+    );
+    assert!(
+        matches!(
+            terminal,
+            ProcessTerminalState::Exited { .. } | ProcessTerminalState::Killed
+        ),
+        "with the descendant swept and the group empty, stop must report a definite terminal \
+         state, got {terminal:?}"
+    );
+}
+
 /// Assert that a descendant this stop did not terminate was *reported* as
 /// exactly that, and clean it up.
 ///
@@ -153,10 +206,10 @@ fn assert_reported_as_unproven(terminal: ProcessTerminalState, descendant: u32) 
 /// The `VP-001-VP-S6-02` shape: a descendant that calls `setsid` leaves the
 /// process group `killpg` targets, so signalling the group never reaches
 /// it. It is still in the census taken before the signal, which is the
-/// whole point of taking one -- and being in the census is what makes the
-/// report honest.
+/// whole point of taking one -- and being in the census is what lets the
+/// sweep reach it by pid.
 #[test]
-fn a_setsid_descendant_is_reported_as_orphan_risk_uncertain() {
+fn a_setsid_descendant_is_swept_and_the_reported_state_is_honest() {
     let (mut supervisor, _rx, id, descendant) =
         spawn_with_descendant("--spawn-escaping-descendant");
 
@@ -164,15 +217,15 @@ fn a_setsid_descendant_is_reported_as_orphan_risk_uncertain() {
         .stop(id, STOP_DEADLINE)
         .expect("stop must return a result");
 
-    assert_reported_as_unproven(terminal, descendant);
+    assert_swept_and_reported_honestly(terminal, descendant);
 }
 
 /// A descendant that stays inside the process group but ignores `SIGTERM`
 /// survives the group signal too: the direct child is reaped while it keeps
-/// running, which is exactly the case a reap-only stop mistook for a clean
-/// exit.
+/// running. The sweep must escalate to `SIGKILL` for it specifically,
+/// by pid.
 #[test]
-fn a_sigterm_ignoring_descendant_in_the_group_is_reported_as_orphan_risk_uncertain() {
+fn a_sigterm_ignoring_descendant_in_the_group_is_swept_and_proven_gone() {
     let (mut supervisor, _rx, id, descendant) =
         spawn_with_descendant("--spawn-stubborn-descendant");
 
@@ -180,13 +233,15 @@ fn a_sigterm_ignoring_descendant_in_the_group_is_reported_as_orphan_risk_uncerta
         .stop(id, STOP_DEADLINE)
         .expect("stop must return a result");
 
-    assert_reported_as_unproven(terminal, descendant);
+    assert_swept_and_reported_honestly(terminal, descendant);
 }
 
 /// A descendant that does not exist yet when the census is taken cannot be
 /// in it: that is the residual race this design accepts and does not hide.
 /// What must not follow is a clean stop reported over it -- the process
-/// group check catches the ones that stayed in the group, and the reported
+/// group check catches the ones that stayed in the group -- it reports
+/// them, it does not sweep them, because they are not in the census the
+/// sweep works from. The reported
 /// state, a later `observe`, and the final state frame must then all agree
 /// on `orphan-risk/uncertain`. One of the three disagreeing would be a
 /// caller told two different stories about the same stop.

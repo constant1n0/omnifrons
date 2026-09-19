@@ -16,17 +16,19 @@
 //! 1. **Census** ([`Census::take`]), taken while the child is still alive:
 //!    walk `/proc` by parent chain and record every descendant as
 //!    `(pid, starttime)`.
-//! 2. **Verify** ([`Census::settle`]), after the child is reaped: re-read
-//!    every recorded `(pid, starttime)`, and check the process group
-//!    itself for anything the census never saw.
+//! 2. **Verify and sweep** ([`Census::settle`]), after the child is
+//!    reaped: re-read every recorded `(pid, starttime)`, terminate the
+//!    ones still running (`SIGTERM`, bounded wait, `SIGKILL`), and check
+//!    the process group itself for anything the census never saw.
 //! 3. **Report honestly**: the caller's reap-derived state survives only
 //!    when *every* recorded process is proven gone and the group is empty.
 //!    Anything unproven -- including a recorded descendant still running --
 //!    becomes [`ProcessTerminalState::OrphanRiskUncertain`].
 //!
-//! Reporting is the whole job here: a descendant found still running is
-//! *reported*, not terminated. Proving a claim and acting on it are
-//! separate concerns, and the defect `VP-S6-02` evidenced is the claim.
+//! The sweep only reaches what the census recorded. Anything outside it --
+//! a descendant born after the snapshot -- is reported by the group check
+//! and never swept, because this module will not signal a pid it cannot
+//! identify.
 //!
 //! # What this still cannot prove
 //!
@@ -57,8 +59,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use omnifrons_app::ProcessTerminalState;
@@ -69,15 +73,26 @@ const PROC_ROOT: &str = "/proc";
 
 /// `proc(5)`'s process state for a terminated-but-unreaped process. A
 /// zombie runs no code and holds no resources: it is already terminated,
-/// so it is never counted as a survivor.
+/// so it is never counted as a survivor and never signalled (which would
+/// be a no-op regardless).
 const ZOMBIE_STATE: char = 'Z';
+
+/// How long recorded survivors are given to die after `SIGTERM`, and again
+/// after `SIGKILL`. Bounded and fixed: `stop` already has the caller's own
+/// deadline for the direct child, and this sweep must not turn into a
+/// second, open-ended wait.
+const SWEEP_GRACE: Duration = Duration::from_millis(300);
+
+/// How often the sweep re-reads `/proc` while waiting out a grace period.
+const SWEEP_POLL: Duration = Duration::from_millis(20);
 
 /// One recorded process: its pid paired with the `starttime`
 /// (`proc(5)` field 22) observed for it at census time.
 ///
 /// The pair, never the pid alone: pids are recycled, and a recorded pid
-/// whose `starttime` no longer matches is a *different* process, never a
-/// survivor of the one that was recorded.
+/// whose `starttime` no longer matches is a *different* process: never a
+/// survivor of the one that was recorded, and never something this module
+/// will signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pid: Pid,
@@ -115,9 +130,12 @@ pub(crate) enum Unproven {
     /// `Child`, and even an exited-but-unreaped child is a zombie with a
     /// `/proc` entry of its own.
     ChildEntryMissing,
-    /// A recorded descendant was still running once the direct child had
-    /// been reaped.
+    /// A recorded descendant was still running after both sweep signals
+    /// and both grace periods.
     DescendantStillRunning,
+    /// Signalling a recorded survivor failed for a reason other than "that
+    /// process is already gone", so whether it was terminated is unknown.
+    SignalFailed(Errno),
     /// Something was still in the stopped child's process group once the
     /// census had been accounted for -- a descendant spawned after the
     /// snapshot, which is exactly the residual race this module cannot
@@ -131,7 +149,10 @@ impl std::fmt::Display for Unproven {
             Self::ProcUnreadable => f.write_str("/proc could not be listed"),
             Self::EntryUnreadable => f.write_str("a /proc entry could not be read or parsed"),
             Self::ChildEntryMissing => f.write_str("the child had no /proc entry to census"),
-            Self::DescendantStillRunning => f.write_str("a recorded descendant was still running"),
+            Self::DescendantStillRunning => f.write_str("a recorded descendant outlived the sweep"),
+            Self::SignalFailed(errno) => {
+                write!(f, "signalling a recorded descendant failed: {errno}")
+            }
             Self::GroupNotEmpty => {
                 f.write_str("the child's process group still held a process the census never saw")
             }
@@ -199,14 +220,62 @@ impl Census {
             Self::Snapshot(recorded) => recorded,
             Self::Unavailable(reason) => return Err(*reason),
         };
-        if !survivors_in(proc_root, recorded)?.is_empty() {
-            return Err(Unproven::DescendantStillRunning);
-        }
+        sweep(proc_root, recorded)?;
         if group_survivors_in(proc_root, pgid)?.is_empty() {
             Ok(())
         } else {
             Err(Unproven::GroupNotEmpty)
         }
+    }
+}
+
+/// Terminate every recorded process still running, `SIGTERM` first and
+/// `SIGKILL` second, each round re-verifying `(pid, starttime)` immediately
+/// before it signals anything.
+///
+/// Bounded by construction: exactly two signal rounds, each followed by at
+/// most one [`SWEEP_GRACE`], and one final classification. There is no
+/// "until clean" loop.
+fn sweep(proc_root: &Path, recorded: &[Identity]) -> Result<(), Unproven> {
+    for signal in [Signal::SIGTERM, Signal::SIGKILL] {
+        // Re-read immediately before signalling, every round: this is what
+        // keeps a recycled pid from being signalled, and it is also the
+        // module's irreducible residual -- the pid could in principle be
+        // recycled between this read and the `kill` below.
+        let survivors = survivors_in(proc_root, recorded)?;
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        for identity in &survivors {
+            match kill(identity.pid, signal) {
+                // ESRCH: it died between the read above and this signal.
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(errno) => return Err(Unproven::SignalFailed(errno)),
+            }
+        }
+        wait_out_grace(proc_root, recorded);
+    }
+    if survivors_in(proc_root, recorded)?.is_empty() {
+        Ok(())
+    } else {
+        Err(Unproven::DescendantStillRunning)
+    }
+}
+
+/// Poll until nothing recorded is running any more, or [`SWEEP_GRACE`]
+/// elapses -- whichever comes first. A read failure is not resolved here:
+/// the caller's next [`survivors_in`] reports it.
+fn wait_out_grace(proc_root: &Path, recorded: &[Identity]) {
+    let start = Instant::now();
+    loop {
+        if matches!(survivors_in(proc_root, recorded), Ok(ref survivors) if survivors.is_empty()) {
+            return;
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= SWEEP_GRACE {
+            return;
+        }
+        std::thread::sleep(SWEEP_POLL.min(SWEEP_GRACE.saturating_sub(elapsed)));
     }
 }
 
@@ -663,21 +732,6 @@ mod tests {
                 "an unprovable census must never be reported as a clean stop"
             );
         }
-    }
-
-    /// A recorded descendant that is still running is the defect VP-S6
-    /// evidenced: whatever the direct child's own reap said, this stop
-    /// cannot honestly be reported as clean.
-    #[test]
-    fn a_recorded_descendant_still_running_is_never_a_clean_stop() {
-        let root = ProcRoot::new("recorded-alive");
-        root.entry(4242, 'S', 1, 4242, 111);
-        let census = Census::Snapshot(vec![identity(4242, 111)]);
-
-        assert_eq!(
-            census.prove(root.path(), pid(100)),
-            Err(Unproven::DescendantStillRunning)
-        );
     }
 
     /// A census with nothing recorded still has to prove the process group
