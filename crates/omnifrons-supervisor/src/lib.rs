@@ -15,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use omnifrons_app::harness_adapter::{EnvPlan, LaunchPlan, TransportClass};
 use omnifrons_app::{
@@ -39,6 +39,27 @@ mod output_capture;
 mod pty;
 
 use output_capture::{OutputTable, ReaderHandles};
+
+/// Keeps every `fork` this crate makes (`finish_spawn`) apart from every
+/// moment it holds a descriptor that is not yet close-on-exec
+/// ([`pty::open_pair`], the sealed memfd). A `static`, not an `Inner` field:
+/// two supervisors in one process race like two handles of one. Without
+/// it `openpty`'s non-atomic close-on-exec step leaked a pty, mostly the
+/// master, into 62 of 15600 concurrent spawns (13 of 13 runs); 0 of 3600
+/// single-threaded. On macOS std's `pipe` has the same step (no `pipe2`).
+///
+/// ASSUMPTION: nothing else that runs in this process forks (the other
+/// `Command::new` sites are test code or standalone binaries) -- a future
+/// spawn site that does must take this lock too. COST: a `spawn` that never
+/// returns now blocks every other spawn in the process, not only itself.
+///
+/// Guards no data, so a panic while held must never poison later spawns.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires [`SPAWN_LOCK`]: for one fork, or one not-yet-close-on-exec step.
+pub(crate) fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// How a child's standard streams are wired -- the one choice
 /// [`TokioProcessSupervisor::finish_spawn`] branches on, after the shared
@@ -559,6 +580,10 @@ impl TokioProcessSupervisor {
     /// swallowed or left to hang. Under `Pipes`, `prompt` must be `Some`
     /// only when its stdin is [`StdinPlan::PipePromptThenClose`] --
     /// [`plan_stdio`] upholds that pairing for every caller.
+    ///
+    /// `inheritable_fd`, when `Some` (Linux only), is cleared, spawned, then
+    /// restored -- even on a failed spawn -- all inside [`SPAWN_LOCK`]. Only
+    /// a failing restore, logged as an error, could leave it inheritable.
     fn finish_spawn(
         &mut self,
         mut command: Command,
@@ -566,7 +591,12 @@ impl TokioProcessSupervisor {
         env: &EnvPlan,
         stdio: StdioPlan,
         prompt: Option<Vec<u8>>,
+        inheritable_fd: Option<&std::fs::File>,
     ) -> Result<ProcessId, SupervisorError> {
+        #[cfg(target_os = "linux")]
+        use std::os::fd::AsFd as _;
+        let _ = inheritable_fd; // read below on Linux only, where one exists
+
         apply_env(&mut command, env);
         let wiring = configure_stdio(&mut command, stdio)?;
 
@@ -580,7 +610,36 @@ impl TokioProcessSupervisor {
         // -- see `Drop`'s own doc comment.
         command.kill_on_drop(true);
 
-        let mut child = command.spawn().map_err(|error| {
+        // `SPAWN_LOCK` covers the fork and `inheritable_fd`'s flag.
+        let guard = spawn_lock();
+
+        #[cfg(target_os = "linux")]
+        if let Some(file) = inheritable_fd {
+            nix::fcntl::fcntl(
+                file.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+            )
+            .map_err(|error| {
+                SupervisorError::Spawn(format!(
+                    "close-on-exec clear on sealed memfd failed: {error}"
+                ))
+            })?;
+        }
+
+        let spawned = command.spawn();
+
+        #[cfg(target_os = "linux")]
+        if let Some(file) = inheritable_fd
+            && let Err(error) = nix::fcntl::fcntl(
+                file.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+        {
+            tracing::error!(%error, "close-on-exec restore on sealed memfd failed");
+        }
+        drop(guard);
+
+        let mut child = spawned.map_err(|error| {
             tracing::warn!(program = %program_label, %error, "failed to spawn process");
             SupervisorError::Spawn(error.to_string())
         })?;
@@ -724,12 +783,12 @@ impl TokioProcessSupervisor {
     /// modification impossible in the first place).
     ///
     /// The memfd was created `MFD_CLOEXEC` (`omnifrons-adapters`'
-    /// `fs_prober` doc comment) so it is never inherited by some
-    /// unrelated `exec` before this deliberate moment; immediately before
-    /// spawning, this method clears that flag (`fcntl(F_SETFD,
-    /// FdFlag::empty())`) so it *is* inherited across *this* `exec` --
-    /// with no `unsafe` code, since `nix`'s `fcntl` wrapper is itself
-    /// safe. A direct-binary target only ever needs the kernel's own
+    /// `fs_prober` doc comment) so it is never inherited by some unrelated
+    /// `exec` before this deliberate moment; [`Self::finish_spawn`] clears
+    /// that flag under [`SPAWN_LOCK`] for this `spawn` only and restores it
+    /// right after, so it *is* inherited across *this* `exec` and, unless
+    /// that restore fails, no other -- with no `unsafe`: `nix`'s `fcntl` is
+    /// itself safe. A direct-binary target only ever needs the kernel's own
     /// single internal open of `/proc/self/fd/<n>` (performed before the
     /// calling process's old image is replaced), but a *script* target (a
     /// `#!`-interpreted file) does not: the kernel's shebang handling
@@ -822,19 +881,6 @@ impl TokioProcessSupervisor {
         match handle {
             #[cfg(target_os = "linux")]
             omnifrons_app::ExecHandle::SealedMemory(file) => {
-                use std::os::fd::AsFd as _;
-
-                nix::fcntl::fcntl(
-                    file.as_fd(),
-                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                )
-                .map_err(|error| {
-                    SupervisorError::Spawn(format!(
-                        "failed to clear close-on-exec on the approved executable's sealed \
-                         memfd: {error}"
-                    ))
-                })?;
-
                 let fd = {
                     use std::os::fd::AsRawFd as _;
                     file.as_raw_fd()
@@ -842,9 +888,9 @@ impl TokioProcessSupervisor {
                 let mut command = Command::new(format!("/proc/self/fd/{fd}"));
                 command.args(&plan.argv);
                 command.current_dir(plan.cwd.path());
-                // `file` must stay alive (and therefore its fd open) until
-                // `finish_spawn` has actually called `spawn`.
-                let result = self.finish_spawn(command, &label, &plan.env, stdio, prompt);
+                // `Some(&file)` is what lets it become briefly inheritable.
+                let result =
+                    self.finish_spawn(command, &label, &plan.env, stdio, prompt, Some(&file));
                 drop(file);
                 result
             }
@@ -853,7 +899,7 @@ impl TokioProcessSupervisor {
                 let mut command = Command::new(display_path);
                 command.args(&plan.argv);
                 command.current_dir(plan.cwd.path());
-                self.finish_spawn(command, &label, &plan.env, stdio, prompt)
+                self.finish_spawn(command, &label, &plan.env, stdio, prompt, None)
             }
         }
     }
@@ -874,6 +920,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             &spec.program,
             &spec.env,
             StdioPlan::Pipes(spec.stdin),
+            None,
             None,
         )
     }

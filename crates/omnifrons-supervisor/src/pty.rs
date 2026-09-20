@@ -74,22 +74,24 @@ fn spawn_error(context: &str, error: impl std::fmt::Display) -> SupervisorError 
 }
 
 /// Open a fresh pair at [`WINSIZE`] with default terminal settings. Both
-/// ends are marked close-on-exec: the master must never leak into the
-/// child (or any other exec), and the slave is only ever handed to the
-/// child by `dup2` onto 0/1/2, which clears the flag on those copies. The
-/// master is also switched to non-blocking, which `AsyncFd` requires.
+/// ends are marked close-on-exec before this returns: `openpty` hands them
+/// back without it, so that step through both `fcntl(F_SETFD, FD_CLOEXEC)`
+/// calls runs under [`crate::spawn_lock`] (see its doc for why). The
+/// master is switched to non-blocking afterward, needing no lock.
 ///
 /// # Errors
 ///
 /// Returns [`SupervisorError::Spawn`] if the pair could not be opened or
 /// configured.
 pub(crate) fn open_pair() -> Result<PtyPair, SupervisorError> {
+    let guard = crate::spawn_lock();
     let OpenptyResult { master, slave } =
         openpty(&WINSIZE, None::<&Termios>).map_err(|error| spawn_error("openpty", error))?;
     for fd in [&master, &slave] {
         fcntl(fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|error| spawn_error("fcntl(F_SETFD, FD_CLOEXEC) on the pty", error))?;
     }
+    drop(guard);
     let status = fcntl(master.as_fd(), FcntlArg::F_GETFL)
         .map_err(|error| spawn_error("fcntl(F_GETFL) on the pty master", error))?;
     fcntl(
