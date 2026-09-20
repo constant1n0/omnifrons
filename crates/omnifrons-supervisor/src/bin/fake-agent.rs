@@ -65,6 +65,14 @@
 //! synchronization point a test waits on before calling `stop`), then
 //! sleeps until killed.
 //!
+//! `--report-inherited-fds` (unix; `tests/fixture_reports_inherited_fds.rs`):
+//! scans descriptors 3..255 first thing, classifies each `tty` (refined to
+//! `tty-master`/`tty-slave` on Linux) or `other`, prints `inherited-fds
+//! tty=<n> other=<n> list=<fd>:<kind>,...`, waits for that line to be read
+//! (`tcdrain`), then exits 0. A correctly spawned pty child reaches its
+//! slave only as 0, 1 and 2, so whatever it lists came from its parent:
+//! what the environment left open, or a descriptor a launch leaked.
+//!
 //! Descendant-containment modes (unix; `tests/descendant_containment.rs`),
 //! every one of them self-bounding: each sleeps at most
 //! [`DESCENDANT_LIFETIME_SECS`] and then exits on its own, so a test that
@@ -159,6 +167,7 @@ struct Flags {
     pty_echo: bool,
     pty_corpus: bool,
     pty_ignore_sigterm: bool,
+    report_inherited_fds: bool,
     spawn_escaping_descendant: bool,
     spawn_stubborn_descendant: bool,
     spawn_late_descendant: bool,
@@ -181,6 +190,7 @@ fn parse_flags(args: &[String]) -> Flags {
             "--pty-echo" => flags.pty_echo = true,
             "--pty-corpus" => flags.pty_corpus = true,
             "--pty-ignore-sigterm" => flags.pty_ignore_sigterm = true,
+            "--report-inherited-fds" => flags.report_inherited_fds = true,
             "--spawn-escaping-descendant" => flags.spawn_escaping_descendant = true,
             "--spawn-stubborn-descendant" => flags.spawn_stubborn_descendant = true,
             "--spawn-late-descendant" => flags.spawn_late_descendant = true,
@@ -237,6 +247,19 @@ fn main() -> ExitCode {
 
     if flags.pty_report {
         run_pty_report(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
+    if flags.report_inherited_fds {
+        // Must run first: nothing above this counts as this process's own.
+        #[cfg(unix)]
+        {
+            run_report_inherited_fds(&mut stdout);
+        }
+        #[cfg(not(unix))]
+        {
+            emit(&mut stdout, "inherited-fds tty=0 other=0 list=");
+        }
         return ExitCode::from(exit_code);
     }
 
@@ -537,6 +560,72 @@ fn run_pty_report(stdout: &mut impl Write) {
         .collect();
     keys.sort();
     emit(stdout, &format!("env-keys {}", keys.join(" ")));
+}
+
+/// Exclusive scan bound; 0, 1, 2 never are (this process's own streams).
+#[cfg(unix)]
+const REPORTED_FD_BOUND: std::os::fd::RawFd = 256;
+
+/// Which end of a pty `fd` is (Linux: `readlink` on `/proc/self/fd/<fd>`
+/// tells a master's multiplexer from a slave's `/dev/pts/<n>`; elsewhere,
+/// plain `tty`) -- a leaked master lets its holder type into another
+/// launch's terminal.
+#[cfg(unix)]
+fn pty_end(fd: std::os::fd::RawFd) -> &'static str {
+    #[cfg(target_os = "linux")]
+    if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+        let target = target.to_string_lossy();
+        if target.ends_with("/ptmx") {
+            return "tty-master";
+        }
+        if target.starts_with("/dev/pts/") {
+            return "tty-slave";
+        }
+    }
+    let _ = fd;
+    "tty"
+}
+
+/// See the header doc comment. `fcntl(F_GETFD)` probes each candidate so a
+/// closed slot is never counted by `isatty`.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn run_report_inherited_fds(stdout: &mut impl Write) {
+    use std::os::fd::BorrowedFd;
+
+    let mut tty = 0u32;
+    let mut other = 0u32;
+    let mut entries = Vec::new();
+    for fd in 3..REPORTED_FD_BOUND {
+        // SAFETY: a bare candidate, never one this process owns;
+        // `borrow_raw` does no I/O, the borrow is never stored past this
+        // iteration, and this process is still single-threaded here.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        if nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFD).is_err() {
+            continue;
+        }
+        let kind = if nix::unistd::isatty(borrowed).unwrap_or(false) {
+            tty += 1;
+            pty_end(fd)
+        } else {
+            other += 1;
+            "other"
+        };
+        entries.push(format!("{fd}:{kind}"));
+    }
+    emit(
+        stdout,
+        &format!(
+            "inherited-fds tty={tty} other={other} list={}",
+            entries.join(",")
+        ),
+    );
+    // Wait until the master has read that line before exiting: for a pty
+    // slave `tcdrain` returns once its output queue is empty (off a pty it
+    // fails with `ENOTTY`, ignored). A child that exits the instant it has
+    // written can lose the line on macOS -- a supervisor defect tracked on
+    // its own, and not what this mode is for.
+    let _ = nix::sys::termios::tcdrain(std::io::stdout());
 }
 
 /// The declared run subdirectory, or `None` when the key is unset. The
