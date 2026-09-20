@@ -199,10 +199,20 @@ pub(crate) fn take_receiver(
 /// (never mid-character), `\r\n` treated as a line end with the `\r`
 /// stripped, delivered best-effort via `handles`. Runs until EOF or a read
 /// error -- a final line with no trailing newline is still delivered once
-/// EOF is reached, not dropped for lacking a terminator -- then marks this
-/// stream done and, if it was the last of the two, asks [`try_finalize`] to
-/// send the final state frame (a no-op if the terminal state is not
-/// confirmed yet).
+/// EOF is reached, not dropped for lacking a terminator.
+///
+/// `Ok(0)` ends capture silently: the normal way a stream ends, including
+/// on the pty path where [`crate::pty::MasterReader`] already maps `EIO` to
+/// EOF before it reaches here. An `Err` also ends capture, but flushes any
+/// buffered partial line first, then delivers exactly one synthetic
+/// diagnostic frame on `OutputStream::Stderr` naming the stream, the
+/// error's kind, and its raw OS error number ([`read_error_diagnostic`]) --
+/// never the error's own free-form, OS-supplied (and sometimes localized)
+/// message -- and logs the error via `tracing::warn!`.
+///
+/// Either way, once the loop ends this stream marks itself done and, if it
+/// was the last of the two, asks [`try_finalize`] to send the final state
+/// frame (a no-op if the terminal state is not confirmed yet).
 ///
 /// A split is decided *lazily*: a full buffer is never emitted the moment
 /// it fills, only once the next byte of input proves the line goes on --
@@ -227,11 +237,16 @@ pub(crate) async fn drain_stream<R>(
     // or EOF, makes the CR content -- and then the line continues past the
     // cap (R3-012).
     let mut pending_cr = false;
+    let mut read_error: Option<std::io::Error> = None;
 
     loop {
         let read = match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(read) => read,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
         };
         let mut start = 0;
         while start < read {
@@ -304,9 +319,41 @@ pub(crate) async fn drain_stream<R>(
         emit_text(&handles, stream, &buf, false);
     }
 
+    if let Some(error) = read_error {
+        tracing::warn!(
+            pid = id.0,
+            ?stream,
+            kind = ?error.kind(),
+            os_error = error.raw_os_error(),
+            "output capture ended by a read error"
+        );
+        let diagnostic = read_error_diagnostic(stream, &error);
+        emit_text(&handles, OutputStream::Stderr, diagnostic.as_bytes(), false);
+    }
+
     if handles.active_readers.fetch_sub(1, Ordering::AcqRel) == 1 {
         try_finalize(&outputs, id);
     }
+}
+
+/// Render [`drain_stream`]'s read-error diagnostic text: which stream
+/// ended, the error's `Debug`-formatted [`std::io::ErrorKind`], and its raw
+/// OS error number (or `(no os error)`) -- never `error.to_string()`, whose
+/// OS-supplied message is sometimes localized and does not belong in a
+/// delivered frame.
+fn read_error_diagnostic(stream: OutputStream, error: &std::io::Error) -> String {
+    let stream_name = match stream {
+        OutputStream::Stdout => "stdout",
+        OutputStream::Stderr => "stderr",
+    };
+    let os_error = match error.raw_os_error() {
+        Some(code) => format!("os error {code}"),
+        None => "no os error".to_string(),
+    };
+    format!(
+        "output capture ended by a read error on {stream_name}: {:?} ({os_error})",
+        error.kind()
+    )
 }
 
 /// Split a buffer that reached [`MAX_LINE_BYTES`] whose line goes on: emit
@@ -543,12 +590,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
-    use omnifrons_app::{FramePayload, OutputStream, ProcessId};
+    use omnifrons_app::{FramePayload, OutputStream, ProcessId, ProcessTerminalState};
     use tokio::io::{AsyncRead, ReadBuf};
 
     use super::{
         CHANNEL_CAPACITY, MAX_LINE_BYTES, OutputTable, drain_stream, emit_stdin_write_failed,
-        new_channel, take_receiver, try_send,
+        new_channel, record_confirmed_state, take_receiver, try_send,
     };
 
     /// An `AsyncRead` handing out exactly one predefined chunk per read
@@ -556,12 +603,24 @@ mod tests {
     /// fall relative to read boundaries, which a real pipe never lets it.
     struct ChunkedReader {
         chunks: VecDeque<Vec<u8>>,
+        // `Some` once every chunk is exhausted, to fail the next read
+        // instead of returning EOF -- unused (stays `None`) by every
+        // ordinary, EOF-ending `ChunkedReader`.
+        trailing_error: Option<std::io::Error>,
     }
 
     impl ChunkedReader {
         fn new(chunks: &[&[u8]]) -> Self {
             Self {
                 chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+                trailing_error: None,
+            }
+        }
+
+        fn new_ending_in_error(chunks: &[&[u8]], error: std::io::Error) -> Self {
+            Self {
+                chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+                trailing_error: Some(error),
             }
         }
     }
@@ -572,14 +631,19 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
-            if let Some(chunk) = self.get_mut().chunks.pop_front() {
+            let this = self.get_mut();
+            if let Some(chunk) = this.chunks.pop_front() {
                 assert!(
                     chunk.len() <= buf.remaining(),
                     "a test chunk must fit drain_stream's own read buffer"
                 );
                 buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
             }
-            Poll::Ready(Ok(()))
+            match this.trailing_error.take() {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Ready(Ok(())),
+            }
         }
     }
 
@@ -609,6 +673,161 @@ mod tests {
                 FramePayload::State(_) => None,
             })
             .collect()
+    }
+
+    /// Like [`stdout_frames_for_chunks`], but keeps each frame's own
+    /// `stream` visible: a read-error diagnostic is always `Stderr`,
+    /// regardless of which stream is being drained.
+    fn frames_with_stream_for<R>(
+        reader: R,
+        stream: OutputStream,
+    ) -> Vec<(OutputStream, String, bool)>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let id = ProcessId(7);
+        let (state, handles) = new_channel(2);
+        let outputs: OutputTable = Arc::new(Mutex::new(HashMap::from([(id, state)])));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime must build");
+        runtime.block_on(drain_stream(
+            reader,
+            stream,
+            handles,
+            Arc::clone(&outputs),
+            id,
+        ));
+        let receiver = take_receiver(&outputs, id).expect("subscribing must succeed");
+        receiver
+            .try_iter()
+            .filter_map(|frame| match frame.payload {
+                FramePayload::Text {
+                    stream,
+                    text,
+                    continued,
+                } => Some((stream, text, continued)),
+                FramePayload::State(_) => None,
+            })
+            .collect()
+    }
+
+    /// A fixed, portable OS error for every read-error test here; its
+    /// platform meaning is irrelevant, only that it is stable.
+    fn injected_error() -> std::io::Error {
+        std::io::Error::from_raw_os_error(9)
+    }
+
+    /// A read error flushes a pending partial line first (as EOF would),
+    /// then delivers exactly one diagnostic frame on `Stderr`.
+    #[test]
+    fn a_read_error_delivers_the_pending_partial_line_then_one_diagnostic_stderr_frame() {
+        let expected_kind = injected_error().kind();
+        let frames = frames_with_stream_for(
+            ChunkedReader::new_ending_in_error(&[b"partial"], injected_error()),
+            OutputStream::Stdout,
+        );
+
+        assert_eq!(
+            frames,
+            vec![
+                (OutputStream::Stdout, "partial".to_string(), false),
+                (
+                    OutputStream::Stderr,
+                    format!(
+                        "output capture ended by a read error on stdout: {expected_kind:?} \
+                         (os error 9)"
+                    ),
+                    false,
+                ),
+            ]
+        );
+    }
+
+    /// A clean EOF must never emit the diagnostic, only a real read error.
+    #[test]
+    fn a_clean_eof_emits_no_diagnostic_stderr_frame() {
+        let frames = frames_with_stream_for(ChunkedReader::new(&[b"line\n"]), OutputStream::Stdout);
+        assert_eq!(
+            frames,
+            vec![(OutputStream::Stdout, "line".to_string(), false)]
+        );
+    }
+
+    /// A read error with nothing buffered delivers only the diagnostic.
+    #[test]
+    fn a_read_error_with_no_pending_partial_line_emits_only_the_diagnostic() {
+        let expected_kind = injected_error().kind();
+        let frames = frames_with_stream_for(
+            ChunkedReader::new_ending_in_error(&[], injected_error()),
+            OutputStream::Stderr,
+        );
+
+        assert_eq!(
+            frames,
+            vec![(
+                OutputStream::Stderr,
+                format!(
+                    "output capture ended by a read error on stderr: {expected_kind:?} \
+                     (os error 9)"
+                ),
+                false,
+            )]
+        );
+    }
+
+    /// A read error still decrements `active_readers` like a clean EOF, and
+    /// once the terminal state is confirmed, the finalize tail still sends
+    /// the final `State` frame -- after the diagnostic, never before it.
+    #[test]
+    fn a_read_error_still_lets_the_stream_finish_and_finalize_proceed() {
+        let id = ProcessId(11);
+        let (state, handles) = new_channel(1);
+        let active_readers = Arc::clone(&handles.active_readers);
+        let outputs: OutputTable = Arc::new(Mutex::new(HashMap::from([(id, state)])));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime must build");
+
+        runtime.block_on(drain_stream(
+            ChunkedReader::new_ending_in_error(&[], injected_error()),
+            OutputStream::Stdout,
+            handles,
+            Arc::clone(&outputs),
+            id,
+        ));
+
+        assert_eq!(
+            active_readers.load(Ordering::Acquire),
+            0,
+            "a read error must still decrement active_readers, exactly like a clean EOF"
+        );
+
+        record_confirmed_state(&outputs, id, ProcessTerminalState::Exited { code: Some(0) });
+        let receiver = take_receiver(&outputs, id).expect("subscribing must succeed");
+        // Blocking `iter()`: the state frame is sent from a dedicated
+        // thread (`try_finalize`'s doc comment), so this must wait for it.
+        let frames: Vec<_> = receiver.iter().collect();
+        // Exactly the diagnostic, then the state frame, in that order: the
+        // diagnostic is this stream's last word, never something that
+        // trails the frame every consumer treats as final.
+        let shape: Vec<&str> = frames
+            .iter()
+            .map(|frame| match &frame.payload {
+                FramePayload::Text {
+                    stream: OutputStream::Stderr,
+                    ..
+                } => "diagnostic",
+                FramePayload::Text { .. } => "text",
+                FramePayload::State(ProcessTerminalState::Exited { code: Some(0) }) => "state",
+                FramePayload::State(_) => "unexpected-state",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["diagnostic", "state"],
+            "the diagnostic must precede the final state frame, got {frames:#?}"
+        );
     }
 
     fn x_times(count: usize) -> Vec<u8> {
