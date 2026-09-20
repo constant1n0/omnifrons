@@ -964,6 +964,13 @@ impl ProcessOutput for TokioProcessSupervisor {
     }
 }
 
+/// How long [`Inner`]'s `Drop` gives each killed child to become reapable.
+#[cfg(unix)]
+const DROP_REAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+/// How often it asks in the meantime.
+#[cfg(unix)]
+const DROP_REAP_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 impl Drop for Inner {
     /// Best-effort cleanup, not containment: runs only once the *last*
     /// [`TokioProcessSupervisor`] handle sharing this `Inner` is dropped
@@ -978,9 +985,16 @@ impl Drop for Inner {
     ///
     /// Also makes a short, bounded best-effort attempt to reap each child it
     /// kills, so a killed child does not become a zombie nobody ever
-    /// collects. If the bounded wait gives up, this leaves a zombie rather
-    /// than blocking drop indefinitely -- acceptable, since this is best
-    /// effort, not containment.
+    /// collects. The reap goes through the `Child` itself (`try_wait`), never
+    /// a raw `waitpid` behind its back: Tokio's `Child` disarms its own
+    /// `kill_on_drop` only when it is the one that learns of the exit, and a
+    /// `Child` left believing its process is alive sends `SIGKILL` to that
+    /// pid when it is dropped moments later -- a pid the OS may by then have
+    /// given to something else. If the bounded wait gives up, this logs it
+    /// and leaves a zombie rather than blocking drop indefinitely --
+    /// acceptable, since this is best effort, not containment. That `Child`
+    /// still knows its process is un-reaped, so its own drop signals a pid
+    /// that is still its own.
     ///
     /// This does not attempt Windows containment (the Job Object policy
     /// VP-001 VP-S5 needs is not yet implemented there, matching `stop`'s
@@ -1019,43 +1033,45 @@ impl Drop for Inner {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
-            let children = match self.children.lock() {
+            let mut children = match self.children.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            for (id, tracked) in children.iter() {
-                if matches!(tracked, Tracked::Running(_)) {
-                    let Ok(raw_pid) = i32::try_from(id.0) else {
-                        continue;
-                    };
-                    let pid = nix::unistd::Pid::from_raw(raw_pid);
-                    if let Err(error) =
-                        nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL)
-                    {
-                        tracing::warn!(
-                            pid = id.0,
-                            %error,
-                            "best-effort SIGKILL on supervisor drop failed"
-                        );
-                    }
-                    // Bounded best-effort reap: a killed child normally
-                    // dies within milliseconds, so give it a short window
-                    // rather than blocking drop indefinitely.
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(200);
-                    loop {
-                        match nix::sys::wait::waitpid(
-                            pid,
-                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                        ) {
-                            Ok(nix::sys::wait::WaitStatus::StillAlive)
-                                if std::time::Instant::now() < deadline =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(5));
-                            }
-                            _ => break,
-                        }
-                    }
+            for (id, tracked) in children.iter_mut() {
+                let Tracked::Running(child) = tracked else {
+                    continue;
+                };
+                let Ok(raw_pid) = i32::try_from(id.0) else {
+                    continue;
+                };
+                let pid = nix::unistd::Pid::from_raw(raw_pid);
+                if let Err(error) = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL)
+                {
+                    tracing::warn!(
+                        pid = id.0,
+                        %error,
+                        "best-effort SIGKILL on supervisor drop failed"
+                    );
+                }
+                // Bounded best-effort reap: a killed child normally dies
+                // within milliseconds, so give it a short window rather than
+                // blocking drop indefinitely. Through the `Child` itself,
+                // never a raw `waitpid` behind its back: a `Child` that does
+                // not know it was reaped still sends `SIGKILL` to that pid
+                // when it is dropped (`kill_on_drop`), and by then the OS may
+                // have given the pid to something else.
+                match unix::reap_within(DROP_REAP_BUDGET, DROP_REAP_POLL, || child.try_wait()) {
+                    unix::BoundedReap::Reaped => {}
+                    unix::BoundedReap::GaveUp => tracing::warn!(
+                        pid = id.0,
+                        budget = ?DROP_REAP_BUDGET,
+                        "child not reapable within the drop window; left un-reaped"
+                    ),
+                    unix::BoundedReap::Failed(kind) => tracing::warn!(
+                        pid = id.0,
+                        ?kind,
+                        "reaping a child on supervisor drop failed; left un-reaped"
+                    ),
                 }
             }
         }
@@ -1371,6 +1387,44 @@ mod unix {
         }
     }
 
+    /// What a bounded reap attempt concluded.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum BoundedReap {
+        /// `try_wait` reported an exit status: the child is reaped, and
+        /// whatever handle `try_wait` belongs to knows it.
+        Reaped,
+        /// Still not reapable when the budget ran out.
+        GaveUp,
+        /// `try_wait` itself failed. Retrying an error learns nothing, so
+        /// the attempt ends there.
+        Failed(std::io::ErrorKind),
+    }
+
+    /// Poll `try_wait` every `poll` until it reports an exit status, fails,
+    /// or `budget` is spent. The deadline is checked after each poll, so
+    /// this can outlast `budget` by one `poll` and one `try_wait`, never by
+    /// more.
+    ///
+    /// Takes the poll as a closure so the supervisor's `Drop` can hand it
+    /// its own `Child::try_wait` -- reaping *through* that handle rather
+    /// than behind its back -- and so the bound itself is testable without
+    /// a process that refuses to be reaped.
+    pub(crate) fn reap_within(
+        budget: Duration,
+        poll: Duration,
+        mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> BoundedReap {
+        let deadline = Instant::now() + budget;
+        loop {
+            match try_wait() {
+                Ok(Some(_status)) => return BoundedReap::Reaped,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(poll),
+                Ok(None) => return BoundedReap::GaveUp,
+                Err(error) => return BoundedReap::Failed(error.kind()),
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::SignalOutcome;
@@ -1407,6 +1461,59 @@ mod unix {
                 classify_killpg_result(Err(Errno::EINVAL)),
                 SignalOutcome::Uncertain(Errno::EINVAL)
             ));
+        }
+
+        use std::io;
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::ExitStatus;
+        use std::time::{Duration, Instant};
+
+        use super::{BoundedReap, reap_within};
+
+        const POLL: Duration = Duration::from_millis(1);
+
+        /// A child that is reaped on a later poll is reported reaped, and
+        /// polling stops there.
+        #[test]
+        fn a_child_reaped_on_a_later_poll_is_reaped() {
+            let mut polls = 0;
+            let outcome = reap_within(Duration::from_secs(5), POLL, || {
+                polls += 1;
+                Ok((polls == 3).then(|| ExitStatus::from_raw(0)))
+            });
+            assert_eq!(outcome, BoundedReap::Reaped);
+            assert_eq!(polls, 3, "polling must stop at the reap");
+        }
+
+        /// A child that never becomes reapable is given up on once the
+        /// budget is spent -- bounded, never a hang.
+        #[test]
+        fn a_child_never_reapable_is_given_up_on_within_the_budget() {
+            let budget = Duration::from_millis(40);
+            let started = Instant::now();
+            let outcome = reap_within(budget, POLL, || Ok(None));
+            assert_eq!(outcome, BoundedReap::GaveUp);
+            assert!(started.elapsed() >= budget, "it must use its budget");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "and must not outlive it by much"
+            );
+        }
+
+        /// A failing `try_wait` ends the attempt at once: retrying an error
+        /// learns nothing.
+        #[test]
+        fn a_failing_try_wait_ends_the_attempt_at_once() {
+            // Derived, not named: the kind an errno maps to is the standard
+            // library's business and differs across versions.
+            let failure = || io::Error::from_raw_os_error(nix::libc::ECHILD);
+            let mut polls = 0;
+            let outcome = reap_within(Duration::from_secs(5), POLL, || {
+                polls += 1;
+                Err(failure())
+            });
+            assert_eq!(outcome, BoundedReap::Failed(failure().kind()));
+            assert_eq!(polls, 1);
         }
     }
 }
