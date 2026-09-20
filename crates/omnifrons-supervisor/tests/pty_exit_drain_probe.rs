@@ -13,20 +13,26 @@
 //! way. So that failure is not kernel-side loss. The setup re-creates
 //! `src/pty.rs`'s own, whose pieces are `pub(crate)`.
 //!
-//! Four arms: a control reading promptly while the child lingers; the
+//! Five arms: a control reading promptly while the child lingers; the
 //! product's own shape, read late; the same with the parent holding one
-//! slave open; and the same with no controlling terminal. The first two
-//! assert all 64 bytes -- the product relies on the second -- and the
-//! other two only record: what they show differs by platform.
+//! slave open; the same with no controlling terminal; and the product's
+//! shape never read at all, its master simply closed -- what the
+//! supervisor's teardown does to a child whose output nobody drained, and
+//! not yet measured on macOS: does that close return, and does it release
+//! the child? The first two assert all 64 bytes -- the product relies on
+//! the second -- and the rest only record: what they show differs by
+//! platform.
 //!
 //! Each arm writes raw to fd 2 (`print!`/`eprintln!` are swallowed for a
 //! passing test without `--nocapture`): a `phase=begin` marker, then
 //! `pty-exit-drain-probe arm=<name> os=<os> written=64 received=<n>
-//! end=<eof-zero|eof-eio|idle-timeout|errno-*> reaped=<stage>
-//! released=<stage>`. `reaped` is when the child became reapable,
+//! end=<eof-zero|eof-eio|idle-timeout|skipped|errno-*> reaped=<stage>
+//! released=<stage> master_close=<n>us|blocked`. `master_close` is how
+//! long closing the master took. `reaped` is when the child became reapable,
 //! `released` when the parent's close of its own slave copies returned:
-//! `prompt` (before the master was read), `after-drain`,
-//! `after-master-close`, or `never`; neither is asserted. Linux shows
+//! `prompt` (before the master was read), `after-drain` (`while-unread`
+//! in the arm that never reads), `after-master-close`, or `never`; neither
+//! is asserted. Linux shows
 //! `reaped=prompt` for the late arms, macOS `reaped=after-drain` with a
 //! controlling terminal. `grep 'pty-exit-drain-probe' <log>`.
 //!
@@ -74,17 +80,29 @@ const LATE_READ_DELAY: Duration = Duration::from_millis(300);
 /// How long each stage gives the child to become reapable and the release
 /// to return. Always polled, never a blocking `wait` or `join`, not even
 /// after `kill`: on macOS that can wait forever.
-const STAGE_WAIT: Duration = Duration::from_secs(5);
+const STAGE_WAIT: Duration = Duration::from_secs(3);
 /// An arm still running after this long is named and the process exits.
-/// Above the worst case of every stage timing out (about 30 s).
+/// Above the worst case of every stage timing out (about 22 s).
 const WATCHDOG: Duration = Duration::from_secs(40);
 
-/// One arm: controlling terminal or not (`setsid` + `TIOCSCTTY`), exit
-/// right after writing or linger, and whether the parent holds a slave.
+/// When the parent reads the master, which also decides the child's
+/// script: it lingers 2 s only when it is going to be read promptly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// While the child is still alive.
+    Prompt,
+    /// Only after the child has been given [`STAGE_WAIT`] to be reaped.
+    Late,
+    /// Never: the master is closed with whatever the child wrote unread.
+    Never,
+}
+
+/// One arm: controlling terminal or not (`setsid` + `TIOCSCTTY`), when the
+/// master is read, and whether the parent holds a slave open.
 struct ArmConfig {
     name: &'static str,
     controlling_terminal: bool,
-    exit_immediately: bool,
+    read: Read,
     hold_extra_slave: bool,
 }
 
@@ -192,11 +210,14 @@ fn happens_within_stage(mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// The stage at which something first happened.
-fn stage(before_drain: bool, after_drain: bool, after_master_close: bool) -> &'static str {
-    match (before_drain, after_drain, after_master_close) {
+/// The stage at which something first happened. `middle` names the window
+/// between the first stage and the master's close: `after-drain` when the
+/// master was drained there, `while-unread` when the arm never reads -- a
+/// label must not credit a drain that did not happen.
+fn stage(first: bool, middle: (bool, &'static str), after_master_close: bool) -> &'static str {
+    match (first, middle.0, after_master_close) {
         (true, ..) => "prompt",
-        (_, true, _) => "after-drain",
+        (_, true, _) => middle.1,
         (.., true) => "after-master-close",
         _ => "never",
     }
@@ -239,10 +260,10 @@ fn start_watchdog(name: &'static str) -> Arc<AtomicBool> {
 /// plus the extra slave copy the mitigation arm holds outside `Command`.
 fn build_command(config: &ArmConfig, slave: OwnedFd) -> (Command, Option<OwnedFd>) {
     let payload = std::str::from_utf8(PAYLOAD).expect("the payload is plain ASCII");
-    let linger = if config.exit_immediately {
-        ""
-    } else {
+    let linger = if config.read == Read::Prompt {
         "; sleep 2"
+    } else {
+        ""
     };
     let mut command = Command::new("/bin/sh");
     command
@@ -292,20 +313,41 @@ fn run_arm(config: &ArmConfig) -> Observation {
     let mut is_reaped = || matches!(child.try_wait(), Ok(Some(_)));
 
     set_phase("before-drain");
-    let reaped_unread = config.exit_immediately && happens_within_stage(&mut is_reaped);
+    let reaped_unread = config.read != Read::Prompt && happens_within_stage(&mut is_reaped);
     std::thread::sleep(LATE_READ_DELAY);
     let released_unread = releaser.is_finished();
 
     set_phase("draining");
-    let (received, end) = drain_master(&master);
+    let (received, end) = if config.read == Read::Never {
+        (Vec::new(), "skipped".to_string())
+    } else {
+        drain_master(&master)
+    };
     set_phase("after-drain");
     let reaped_drained = reaped_unread || happens_within_stage(&mut is_reaped);
     let released_drained = released_unread || happens_within_stage(|| releaser.is_finished());
 
     // The master goes before the held slave: with no master left, closing
-    // the last slave has nothing to wait for.
+    // the last slave has nothing to wait for. On a thread of its own and
+    // timed: with output still unread, whether this close returns at all is
+    // itself a measurement.
+    set_phase("closing-master");
+    let closer = std::thread::spawn(move || {
+        // Timed here, around the close alone: the parent only polls.
+        let started = Instant::now();
+        drop(master);
+        started.elapsed()
+    });
+    let master_close = if happens_within_stage(|| closer.is_finished()) {
+        // Finished, so this `join` returns at once.
+        closer.join().map_or_else(
+            |_| "panicked".to_string(),
+            |took| format!("{}us", took.as_micros()),
+        )
+    } else {
+        "blocked".to_string()
+    };
     set_phase("after-master-close");
-    drop(master);
     let reaped_closed = reaped_drained || happens_within_stage(&mut is_reaped);
     let released_closed = released_drained || happens_within_stage(|| releaser.is_finished());
     set_phase("closing-held-slave");
@@ -315,12 +357,20 @@ fn run_arm(config: &ArmConfig) -> Observation {
     }
     finished.store(true, Ordering::SeqCst);
 
-    let reap = stage(reaped_unread, reaped_drained, reaped_closed);
-    let release = stage(released_unread, released_drained, released_closed);
+    let middle = if config.read == Read::Never {
+        "while-unread"
+    } else {
+        "after-drain"
+    };
+    let reap = stage(reaped_unread, (reaped_drained, middle), reaped_closed);
+    let release = stage(released_unread, (released_drained, middle), released_closed);
     let (written, got) = (PAYLOAD.len(), received.len());
     emit(
         config.name,
-        &format!("written={written} received={got} end={end} reaped={reap} released={release}"),
+        &format!(
+            "written={written} received={got} end={end} reaped={reap} released={release} \
+             master_close={master_close}"
+        ),
     );
     Observation { pid, received, end }
 }
@@ -348,7 +398,7 @@ fn control_lingering_child() {
     let observation = run_arm(&ArmConfig {
         name: "control_lingering_child",
         controlling_terminal: true,
-        exit_immediately: false,
+        read: Read::Prompt,
         hold_extra_slave: false,
     });
     assert_eq!(
@@ -364,7 +414,7 @@ fn measure_late_read(name: &'static str, ctty: bool, hold_slave: bool) -> Observ
     let observation = run_arm(&ArmConfig {
         name,
         controlling_terminal: ctty,
-        exit_immediately: true,
+        read: Read::Late,
         hold_extra_slave: hold_slave,
     });
     assert_platform_independent_invariants(&observation);
@@ -395,4 +445,18 @@ fn mitigation_slave_held_late_read() {
 #[test]
 fn hazard_without_controlling_terminal() {
     measure_late_read("hazard_without_controlling_terminal", false, false);
+}
+
+/// The product's own shape, never read: the master is closed with the
+/// child's output still in it, as the supervisor's teardown does. Records
+/// whether that close returns and whether it is what releases the child.
+#[test]
+fn undrained_master_close() {
+    let observation = run_arm(&ArmConfig {
+        name: "undrained_master_close",
+        controlling_terminal: true,
+        read: Read::Never,
+        hold_extra_slave: false,
+    });
+    assert_platform_independent_invariants(&observation);
 }
