@@ -168,6 +168,9 @@ struct Flags {
     pty_corpus: bool,
     pty_ignore_sigterm: bool,
     report_inherited_fds: bool,
+    /// HUNT BRANCH ONLY: skip `--report-inherited-fds`'s `tcdrain`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    no_drain: bool,
     spawn_escaping_descendant: bool,
     spawn_stubborn_descendant: bool,
     spawn_late_descendant: bool,
@@ -191,6 +194,7 @@ fn parse_flags(args: &[String]) -> Flags {
             "--pty-corpus" => flags.pty_corpus = true,
             "--pty-ignore-sigterm" => flags.pty_ignore_sigterm = true,
             "--report-inherited-fds" => flags.report_inherited_fds = true,
+            "--no-drain" => flags.no_drain = true,
             "--spawn-escaping-descendant" => flags.spawn_escaping_descendant = true,
             "--spawn-stubborn-descendant" => flags.spawn_stubborn_descendant = true,
             "--spawn-late-descendant" => flags.spawn_late_descendant = true,
@@ -254,7 +258,7 @@ fn main() -> ExitCode {
         // Must run first: nothing above this counts as this process's own.
         #[cfg(unix)]
         {
-            run_report_inherited_fds(&mut stdout);
+            run_report_inherited_fds(&mut stdout, !flags.no_drain);
         }
         #[cfg(not(unix))]
         {
@@ -590,7 +594,7 @@ fn pty_end(fd: std::os::fd::RawFd) -> &'static str {
 /// closed slot is never counted by `isatty`.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn run_report_inherited_fds(stdout: &mut impl Write) {
+fn run_report_inherited_fds(stdout: &mut impl Write, drain: bool) {
     use std::os::fd::BorrowedFd;
 
     let mut tty = 0u32;
@@ -625,7 +629,9 @@ fn run_report_inherited_fds(stdout: &mut impl Write) {
     // fails with `ENOTTY`, ignored). A child that exits the instant it has
     // written can lose the line on macOS -- a supervisor defect tracked on
     // its own, and not what this mode is for.
-    let _ = nix::sys::termios::tcdrain(std::io::stdout());
+    if drain {
+        let _ = nix::sys::termios::tcdrain(std::io::stdout());
+    }
 }
 
 /// The declared run subdirectory, or `None` when the key is unset. The

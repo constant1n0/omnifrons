@@ -1,0 +1,72 @@
+# NOT FOR MERGING. This file exists on the `hunt/macos-pty-tail-loss` branch
+# only, and must never reach `main`.
+#
+# It runs crates/omnifrons-supervisor/tests/pty_tail_loss_repro.rs many times
+# on macOS, in parallel shards, to catch a rare burst in which the supervisor
+# loses a pty child's final output. One run of that test is 1920 launches and
+# has so far lost none; the defect shows up about once in ten ordinary CI
+# runs, so catching it needs volume. See that test's header for how to read
+# its output.
+name: tail-loss hunt
+
+on:
+  pull_request:
+
+permissions: read-all
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hunt:
+    name: hunt (${{ matrix.os }} shard ${{ matrix.shard }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+        shard: [1, 2, 3, 4, 5]
+        include:
+          # One Linux shard as the control: it is expected to lose nothing.
+          - os: ubuntu-latest
+            shard: 1
+    env:
+      ROUNDS: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7
+
+      - name: Setup toolchain
+        uses: ./.github/actions/setup-toolchain
+
+      - name: Build the hunt once
+        run: cargo test -p omnifrons-supervisor --test pty_tail_loss_repro --no-run
+
+      - name: Hunt
+        run: |
+          set +e
+          failed=0
+          for round in $(seq 1 "$ROUNDS"); do
+            echo "=== round $round of $ROUNDS ==="
+            cargo test -p omnifrons-supervisor --test pty_tail_loss_repro 2>&1 \
+              | grep -E "pty-tail-loss|panicked|test result" \
+              | sed "s/^/round=$round /" | tee -a hunt.log
+            if [ "${PIPESTATUS[0]}" -ne 0 ]; then failed=$((failed + 1)); fi
+          done
+          echo "=================== SUMMARY ==================="
+          echo "hunt-summary os=${{ matrix.os }} shard=${{ matrix.shard }} rounds=$ROUNDS rounds_failed=$failed \
+          lost_launches=$(grep -c 'verdict=lost' hunt.log) \
+          slow_launches=$(grep -c 'verdict=slow' hunt.log) \
+          cells_with_loss=$(grep -E 'pty-tail-loss cell=' hunt.log | grep -vc ' lost=0 ')"
+          echo "--- every lost or slow launch ---"
+          grep -E "verdict=(lost|slow)" hunt.log || echo "(none)"
+          echo "--- every cell that lost anything ---"
+          grep -E "pty-tail-loss cell=" hunt.log | grep -v " lost=0 " || echo "(none)"
+          # Always green: the information is in the log, not in the conclusion.
+          exit 0
