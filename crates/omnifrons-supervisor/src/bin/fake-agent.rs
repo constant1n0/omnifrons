@@ -67,7 +67,9 @@
 //!
 //! `--report-inherited-fds` (unix; `tests/fixture_reports_inherited_fds.rs`):
 //! scans descriptors 3..255 first thing, classifies each `tty` (refined to
-//! `tty-master`/`tty-slave` on Linux) or `other`, prints `inherited-fds
+//! `tty-master`/`tty-slave` on Linux) or `other` (refined to `memfd` on
+//! Linux when it is a `memfd_create`d file -- see
+//! `tests/concurrent_sealed_spawn_fd_inheritance.rs`), prints `inherited-fds
 //! tty=<n> other=<n> list=<fd>:<kind>,...`, waits for that line to be read
 //! (`tcdrain`), then exits 0. A correctly spawned pty child reaches its
 //! slave only as 0, 1 and 2, so whatever it lists came from its parent:
@@ -586,6 +588,24 @@ fn pty_end(fd: std::os::fd::RawFd) -> &'static str {
     "tty"
 }
 
+/// Which kind a non-tty `fd` is: `memfd` on Linux when `readlink` on
+/// `/proc/self/fd/<fd>` names a `memfd_create`d file (`/memfd:<name>
+/// (deleted)`, observed by probing one, from the moment it is created);
+/// `other` for anything else, and everywhere off Linux. It still counts
+/// under `other=`. A sealed launch (`ExecHandle::SealedMemory`) keeps its own
+/// memfd open in the child, so one beyond that came from somewhere else.
+#[cfg(unix)]
+fn other_kind(fd: std::os::fd::RawFd) -> &'static str {
+    #[cfg(target_os = "linux")]
+    if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        && target.to_string_lossy().starts_with("/memfd:")
+    {
+        return "memfd";
+    }
+    let _ = fd;
+    "other"
+}
+
 /// See the header doc comment. `fcntl(F_GETFD)` probes each candidate so a
 /// closed slot is never counted by `isatty`.
 #[cfg(unix)]
@@ -609,7 +629,7 @@ fn run_report_inherited_fds(stdout: &mut impl Write) {
             pty_end(fd)
         } else {
             other += 1;
-            "other"
+            other_kind(fd)
         };
         entries.push(format!("{fd}:{kind}"));
     }

@@ -27,7 +27,7 @@ use omnifrons_supervisor::TokioProcessSupervisor;
 /// Generous headroom; a passing run never approaches it.
 const DEADLINE: Duration = Duration::from_secs(20);
 /// Every kind the fixture may report for a descriptor.
-const KINDS: [&str; 4] = ["tty", "tty-master", "tty-slave", "other"];
+const KINDS: [&str; 5] = ["tty", "tty-master", "tty-slave", "memfd", "other"];
 
 fn fake_agent() -> PathBuf {
     std::fs::canonicalize(env!("CARGO_BIN_EXE_fake-agent"))
@@ -99,7 +99,8 @@ fn assert_self_consistent(lines: &[String]) {
     }
     let ttys = entries.iter().filter(|(_, kind)| kind.starts_with("tty"));
     assert_eq!(count("tty="), ttys.count(), "`tty=` must match: {line:?}");
-    let others = entries.iter().filter(|(_, kind)| *kind == "other");
+    // `other=` counts every descriptor that is not a terminal, `memfd` too.
+    let others = entries.iter().filter(|(_, kind)| !kind.starts_with("tty"));
     assert_eq!(
         count("other="),
         others.count(),
