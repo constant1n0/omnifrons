@@ -13,23 +13,33 @@
 //! way. So that failure is not kernel-side loss. The setup re-creates
 //! `src/pty.rs`'s own, whose pieces are `pub(crate)`.
 //!
-//! Five arms: a control reading promptly while the child lingers; the
-//! product's own shape, read late; the same with the parent holding one
+//! Six arms. Five establish the platform: a control reading promptly
+//! while the child lingers; the product's own shape, read late; the same
+//! with the parent holding one
 //! slave open; the same with no controlling terminal; and the product's
 //! shape never read at all, its master simply closed -- what the
 //! supervisor's teardown does to a child whose output nobody drained.
 //! Measured on macOS CI: that close returns in about 150 us, and it is
 //! what releases the child, which stayed un-reapable for 6 s until then.
-//! The first two arms assert all 64 bytes and the last asserts that the
+//! The first two arms assert all 64 bytes and the fifth asserts that the
 //! close returns and leaves the child reapable -- the product relies on
-//! each of those. The other two only record: they differ by platform.
+//! each of those. The rest only record: they differ by platform.
+//!
+//! A sixth arm tests a hypothesis for the product's own loss of a pty
+//! child's final output on macOS, which the arms above do not reproduce:
+//! that it is the PARENT's release of its slave copies that discards the
+//! queue, whenever the child has already written and tried to exit by then
+//! -- the release being, at that moment, the last close of the slave. It is
+//! the product's shape with that release delayed past the child's exit.
 //!
 //! Each arm writes raw to fd 2 (`print!`/`eprintln!` are swallowed for a
 //! passing test without `--nocapture`): a `phase=begin` marker, then
 //! `pty-exit-drain-probe arm=<name> os=<os> written=64 received=<n>
 //! end=<eof-zero|eof-eio|idle-timeout|skipped|errno-*> reaped=<stage>
-//! released=<stage> master_close=<n>us|blocked`. `master_close` is how
-//! long closing the master took. `reaped` is when the child became reapable,
+//! reaped_ms=<n|-> released=<stage> master_close=<n>us|blocked`.
+//! `master_close` is how long closing the master took, `reaped_ms` how long
+//! after `spawn` the child became reapable. `reaped` is the stage at which
+//! it did,
 //! `released` when the parent's close of its own slave copies returned:
 //! `prompt` (before the master was read), `after-drain` (`while-unread`
 //! in the arm that never reads), `after-master-close`, or `never`; neither
@@ -82,6 +92,10 @@ const LATE_READ_DELAY: Duration = Duration::from_millis(300);
 /// to return. Always polled, never a blocking `wait` or `join`, not even
 /// after `kill`: on macOS that can wait forever.
 const STAGE_WAIT: Duration = Duration::from_secs(3);
+/// How long a late-release arm keeps the parent's slave copies open: long
+/// enough for the child to have written and tried to exit, inside the
+/// first stage.
+const LATE_RELEASE_DELAY: Duration = Duration::from_secs(1);
 /// An arm still running after this long is named and the process exits.
 /// Above the worst case of every stage timing out (about 22 s).
 const WATCHDOG: Duration = Duration::from_secs(40);
@@ -105,6 +119,9 @@ struct ArmConfig {
     controlling_terminal: bool,
     read: Read,
     hold_extra_slave: bool,
+    /// Release the parent's slave copies only after [`LATE_RELEASE_DELAY`],
+    /// by when the child has written and tried to exit, instead of at once.
+    late_release: bool,
 }
 
 /// What one arm observed: the spawned pid (proof a child ran), the bytes
@@ -291,6 +308,26 @@ fn build_command(config: &ArmConfig, slave: OwnedFd) -> (Command, Option<OwnedFd
     (command, extra_slave)
 }
 
+/// Closes the master on a thread of its own, timed around the close alone
+/// while the caller only polls: with output still unread, whether this
+/// close returns at all is itself a measurement. `<n>us`, or `blocked`.
+fn close_master_timed(master: OwnedFd) -> String {
+    let closer = std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(master);
+        started.elapsed()
+    });
+    if happens_within_stage(|| closer.is_finished()) {
+        // Finished, so this `join` returns at once.
+        closer.join().map_or_else(
+            |_| "panicked".to_string(),
+            |took| format!("{}us", took.as_micros()),
+        )
+    } else {
+        "blocked".to_string()
+    }
+}
+
 /// Runs one arm under the serial lock and the watchdog, and emits its line.
 fn run_arm(config: &ArmConfig) -> Observation {
     // Held from before `openpty` to after the last descriptor closes. A
@@ -308,17 +345,39 @@ fn run_arm(config: &ArmConfig) -> Observation {
     let (mut command, extra_slave) = build_command(config, slave);
     let mut child = command.spawn().expect("spawning the probe child");
     let pid = child.id();
-    // Release the parent's own slave copies right after `spawn`, as the
-    // product does -- on a thread of its own, because this may be the last
-    // close of a slave with unread output, and whether that blocks is part
-    // of what is being measured.
-    let releaser = std::thread::spawn(move || drop(command));
-    let mut is_reaped = || matches!(child.try_wait(), Ok(Some(_)));
+    let spawned_at = Instant::now();
+    // Release the parent's own slave copies after `spawn`, as the product
+    // does -- on a thread of its own, because this may be the last close of
+    // a slave with unread output, and what that close does is part of what
+    // is being measured. A late-release arm makes it that last close on
+    // purpose: by then the child has already written and tried to exit.
+    let late_release = config.late_release;
+    let releaser = std::thread::spawn(move || {
+        if late_release {
+            std::thread::sleep(LATE_RELEASE_DELAY);
+        }
+        drop(command);
+    });
+    let mut reaped_after = None;
+    let mut is_reaped = || {
+        let reaped = matches!(child.try_wait(), Ok(Some(_)));
+        if reaped && reaped_after.is_none() {
+            reaped_after = Some(spawned_at.elapsed());
+        }
+        reaped
+    };
 
     set_phase("before-drain");
     let reaped_unread = config.read != Read::Prompt && happens_within_stage(&mut is_reaped);
     std::thread::sleep(LATE_READ_DELAY);
-    let released_unread = releaser.is_finished();
+    // A late-release arm reads only once the release has happened, so the
+    // order -- child exits, parent releases, parent reads -- is the same on
+    // every platform however quickly the child became reapable.
+    let released_unread = if config.late_release {
+        happens_within_stage(|| releaser.is_finished())
+    } else {
+        releaser.is_finished()
+    };
 
     set_phase("draining");
     let (received, end) = if config.read == Read::Never {
@@ -331,25 +390,9 @@ fn run_arm(config: &ArmConfig) -> Observation {
     let released_drained = released_unread || happens_within_stage(|| releaser.is_finished());
 
     // The master goes before the held slave: with no master left, closing
-    // the last slave has nothing to wait for. On a thread of its own and
-    // timed: with output still unread, whether this close returns at all is
-    // itself a measurement.
+    // the last slave has nothing to wait for.
     set_phase("closing-master");
-    let closer = std::thread::spawn(move || {
-        // Timed here, around the close alone: the parent only polls.
-        let started = Instant::now();
-        drop(master);
-        started.elapsed()
-    });
-    let master_close = if happens_within_stage(|| closer.is_finished()) {
-        // Finished, so this `join` returns at once.
-        closer.join().map_or_else(
-            |_| "panicked".to_string(),
-            |took| format!("{}us", took.as_micros()),
-        )
-    } else {
-        "blocked".to_string()
-    };
+    let master_close = close_master_timed(master);
     set_phase("after-master-close");
     let reaped_closed = reaped_drained || happens_within_stage(&mut is_reaped);
     let released_closed = released_drained || happens_within_stage(|| releaser.is_finished());
@@ -368,11 +411,12 @@ fn run_arm(config: &ArmConfig) -> Observation {
     let reap = stage(reaped_unread, (reaped_drained, middle), reaped_closed);
     let release = stage(released_unread, (released_drained, middle), released_closed);
     let (written, got) = (PAYLOAD.len(), received.len());
+    let reaped_ms = reaped_after.map_or_else(|| "-".to_string(), |d| d.as_millis().to_string());
     emit(
         config.name,
         &format!(
-            "written={written} received={got} end={end} reaped={reap} released={release} \
-             master_close={master_close}"
+            "written={written} received={got} end={end} reaped={reap} reaped_ms={reaped_ms} \
+             released={release} master_close={master_close}"
         ),
     );
     Observation {
@@ -409,6 +453,7 @@ fn control_lingering_child() {
         controlling_terminal: true,
         read: Read::Prompt,
         hold_extra_slave: false,
+        late_release: false,
     });
     assert_eq!(
         observation.received.len(),
@@ -425,6 +470,7 @@ fn measure_late_read(name: &'static str, ctty: bool, hold_slave: bool) -> Observ
         controlling_terminal: ctty,
         read: Read::Late,
         hold_extra_slave: hold_slave,
+        late_release: false,
     });
     assert_platform_independent_invariants(&observation);
     observation
@@ -468,6 +514,7 @@ fn undrained_master_close() {
         controlling_terminal: true,
         read: Read::Never,
         hold_extra_slave: false,
+        late_release: false,
     });
     assert_platform_independent_invariants(&observation);
     assert_ne!(
@@ -478,4 +525,24 @@ fn undrained_master_close() {
         observation.reaped, "never",
         "once its master is closed, a child with undrained output must become reapable"
     );
+}
+
+/// The product's own shape, except that the parent releases its slave copies
+/// only once the child has already written and tried to exit -- which is
+/// what `finish_spawn`'s `drop(command)` does whenever the child is quicker
+/// than the parent. HYPOTHESIS under test, stated before the run: on macOS
+/// that release is then the last close of the slave and discards the queue,
+/// so this arm reads `received=0` with `reaped_ms` near
+/// [`LATE_RELEASE_DELAY`], where the arm that releases at once reads 64.
+/// Linux is expected to read 64 either way. Asserts nothing about it.
+#[test]
+fn hazard_slave_released_after_child_exit() {
+    let observation = run_arm(&ArmConfig {
+        name: "hazard_slave_released_after_child_exit",
+        controlling_terminal: true,
+        read: Read::Late,
+        hold_extra_slave: false,
+        late_release: true,
+    });
+    assert_platform_independent_invariants(&observation);
 }
