@@ -25,12 +25,15 @@
 //! close returns and leaves the child reapable -- the product relies on
 //! each of those. The rest only record: they differ by platform.
 //!
-//! A sixth arm tests a hypothesis for the product's own loss of a pty
+//! A sixth arm tested a hypothesis for the product's own loss of a pty
 //! child's final output on macOS, which the arms above do not reproduce:
 //! that it is the PARENT's release of its slave copies that discards the
 //! queue, whenever the child has already written and tried to exit by then
 //! -- the release being, at that moment, the last close of the slave. It is
 //! the product's shape with that release delayed past the child's exit.
+//! REFUTED on macOS CI: it loses nothing either, and the child stays
+//! blocked until the drain exactly as when the release comes at once. That
+//! release is not the cause; the loss is still unexplained.
 //!
 //! Each arm writes raw to fd 2 (`print!`/`eprintln!` are swallowed for a
 //! passing test without `--nocapture`): a `phase=begin` marker, then
@@ -530,11 +533,13 @@ fn undrained_master_close() {
 /// The product's own shape, except that the parent releases its slave copies
 /// only once the child has already written and tried to exit -- which is
 /// what `finish_spawn`'s `drop(command)` does whenever the child is quicker
-/// than the parent. HYPOTHESIS under test, stated before the run: on macOS
-/// that release is then the last close of the slave and discards the queue,
-/// so this arm reads `received=0` with `reaped_ms` near
-/// [`LATE_RELEASE_DELAY`], where the arm that releases at once reads 64.
-/// Linux is expected to read 64 either way. Asserts nothing about it.
+/// than the parent. It tested a hypothesis, stated before the run: that on
+/// macOS this release is then the last close of the slave and discards the
+/// queue, so the arm would read `received=0` with `reaped_ms` near
+/// [`LATE_RELEASE_DELAY`]. REFUTED: macOS CI read all 64 bytes, with the
+/// child blocked until the drain (`reaped_ms` 3342, against 3499 for the
+/// arm that releases at once). Linux reads 64 too. Kept because it pins down
+/// what is NOT the cause; asserts nothing about the outcome.
 #[test]
 fn hazard_slave_released_after_child_exit() {
     let observation = run_arm(&ArmConfig {
