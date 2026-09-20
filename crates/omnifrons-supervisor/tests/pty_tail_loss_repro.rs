@@ -30,11 +30,18 @@
 //! lost_everything=<n> lost_tail_only=<n> read_errors=<n> slow=<n>
 //! max_total_ms=<n>`. And one line for every launch that LOST its last line
 //! or was SLOW (over [`SLOW`]): `pty-tail-loss launch cell=<name>
-//! label=<t-n> verdict=<lost|slow> at_ms=<since the cell began>
+//! label=<t-n> pid=<n> verdict=<lost|slow> at_ms=<since the cell began>
 //! spawn_ms=<in spawn_approved> terminal_ms=<spawn to terminal state>
 //! collect_ms=<terminal state to end of frames> stdout_lines=<n>
 //! read_errors=<n>`. `at_ms` is what shows whether losses are simultaneous;
 //! a slow launch that lost nothing shows a stall is not enough by itself.
+//!
+//! The first run of this hunt lost 744 of 384 000 launches on macOS, every
+//! one of them after 603 to 718 ms inside `spawn_approved`. So the supervisor
+//! itself (this branch only) now prints, for any spawn over 300 ms, the time
+//! each step of `finish_spawn` took: `pty-tail-loss spawn-stall pid=<n>
+//! lock_us= fork_us= to_release_us= release_us= to_attach_us= attach_us=
+//! rest_us= total_us=`. `pid` ties it to the launch line above.
 //!
 //! It asserts nothing about loss -- only that every child reached
 //! `Exited(0)`, so a broken harness cannot pass for a clean result.
@@ -92,6 +99,7 @@ const SH: Child = Child {
 /// What one launch delivered, and how long each part of it took.
 struct Delivered {
     label: String,
+    pid: u32,
     at: Duration,
     spawn: Duration,
     terminal: Duration,
@@ -175,6 +183,7 @@ fn launch(
     let _ = std::fs::remove_dir_all(&dir);
     Delivered {
         label,
+        pid: id.0,
         at,
         spawn,
         terminal,
@@ -216,9 +225,10 @@ fn run_cell(name: &'static str, child: Child, threads: usize) {
             slow += usize::from(total > SLOW);
             if is_lost || total > SLOW {
                 emit_line(&format!(
-                    "pty-tail-loss launch cell={name} label={} verdict={} at_ms={} spawn_ms={} \
+                    "pty-tail-loss launch cell={name} label={} pid={} verdict={} at_ms={} spawn_ms={} \
                      terminal_ms={} collect_ms={} stdout_lines={} read_errors={}",
                     delivered.label,
+                    delivered.pid,
                     if is_lost { "lost" } else { "slow" },
                     delivered.at.as_millis(),
                     delivered.spawn.as_millis(),
