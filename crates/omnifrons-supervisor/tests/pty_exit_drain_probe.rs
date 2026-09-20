@@ -17,11 +17,12 @@
 //! product's own shape, read late; the same with the parent holding one
 //! slave open; the same with no controlling terminal; and the product's
 //! shape never read at all, its master simply closed -- what the
-//! supervisor's teardown does to a child whose output nobody drained, and
-//! not yet measured on macOS: does that close return, and does it release
-//! the child? The first two assert all 64 bytes -- the product relies on
-//! the second -- and the rest only record: what they show differs by
-//! platform.
+//! supervisor's teardown does to a child whose output nobody drained.
+//! Measured on macOS CI: that close returns in about 150 us, and it is
+//! what releases the child, which stayed un-reapable for 6 s until then.
+//! The first two arms assert all 64 bytes and the last asserts that the
+//! close returns and leaves the child reapable -- the product relies on
+//! each of those. The other two only record: they differ by platform.
 //!
 //! Each arm writes raw to fd 2 (`print!`/`eprintln!` are swallowed for a
 //! passing test without `--nocapture`): a `phase=begin` marker, then
@@ -112,6 +113,8 @@ struct Observation {
     pid: u32,
     received: Vec<u8>,
     end: String,
+    reaped: &'static str,
+    master_close: String,
 }
 
 /// `TIOCSCTTY`'s request argument in the exact type this platform's
@@ -372,7 +375,13 @@ fn run_arm(config: &ArmConfig) -> Observation {
              master_close={master_close}"
         ),
     );
-    Observation { pid, received, end }
+    Observation {
+        pid,
+        received,
+        end,
+        reaped: reap,
+        master_close,
+    }
 }
 
 /// What every late-read arm holds on any platform: a child ran, and
@@ -448,8 +457,10 @@ fn hazard_without_controlling_terminal() {
 }
 
 /// The product's own shape, never read: the master is closed with the
-/// child's output still in it, as the supervisor's teardown does. Records
-/// whether that close returns and whether it is what releases the child.
+/// child's output still in it, as the supervisor's teardown does. Pinned on
+/// what that teardown relies on, on any platform: the close returns, and
+/// once the master is gone the child can be reaped. *When* it became
+/// reapable differs by platform and is only recorded.
 #[test]
 fn undrained_master_close() {
     let observation = run_arm(&ArmConfig {
@@ -459,4 +470,12 @@ fn undrained_master_close() {
         hold_extra_slave: false,
     });
     assert_platform_independent_invariants(&observation);
+    assert_ne!(
+        observation.master_close, "blocked",
+        "closing a master whose output was never read must return"
+    );
+    assert_ne!(
+        observation.reaped, "never",
+        "once its master is closed, a child with undrained output must become reapable"
+    );
 }
