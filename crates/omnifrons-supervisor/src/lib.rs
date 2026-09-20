@@ -977,47 +977,46 @@ impl Drop for Inner {
     /// would abort the process.
     ///
     /// Also makes a short, bounded best-effort attempt to reap each child it
-    /// kills: `stop`'s normal reap relies on this supervisor's own Tokio
-    /// runtime, but that runtime is torn down around the same time as this
-    /// cleanup runs (it is a sibling field, dropped in declaration order),
-    /// so it cannot be relied on here. Without this, a killed child would
-    /// become a zombie nobody ever collects. If the bounded wait gives up,
-    /// this leaves a zombie rather than blocking drop indefinitely --
-    /// acceptable, since this is best effort, not containment.
+    /// kills, so a killed child does not become a zombie nobody ever
+    /// collects. If the bounded wait gives up, this leaves a zombie rather
+    /// than blocking drop indefinitely -- acceptable, since this is best
+    /// effort, not containment.
     ///
     /// This does not attempt Windows containment (the Job Object policy
     /// VP-001 VP-S5 needs is not yet implemented there, matching `stop`'s
     /// own honesty about that gap).
     ///
-    /// Before any of that, this signals the driver thread to stop and joins
-    /// it, so its `Arc<Runtime>` clone is guaranteed dropped -- and the
-    /// runtime therefore guaranteed to actually shut down, not merely lose
-    /// one of two owners -- before this function returns.
+    /// ## Order: kill and reap *before* stopping the driver thread
+    ///
+    /// The kill-and-reap loop below runs first, while the driver thread (and
+    /// therefore every output-capture reader task) is still alive and still
+    /// draining every child's master/pipes; only afterward does this signal
+    /// the driver thread to stop and join it. This order is required, not
+    /// incidental: on macOS, a child that is a session leader with a
+    /// controlling terminal -- which is how this crate spawns every PTY
+    /// child -- cannot finish exiting while its pty output is unread, and is
+    /// therefore not reapable, not even after SIGKILL, until its master is
+    /// drained or closed (measured in `tests/pty_exit_drain_probe.rs`; on
+    /// Linux the same child reaps in milliseconds regardless, so this is
+    /// invisible there). Stopping the reader tasks before killing -- the
+    /// previous order -- stops that draining exactly when the kill needs it
+    /// most, so the bounded reap below gave up on macOS for any child that
+    /// still had unread output at the moment of the kill
+    /// (`tests/drop_reaps_flooding_pty_child.rs` pins this). With the
+    /// readers still running, a killed PTY child's pending output keeps
+    /// draining, its exit completes, and the bounded reap below collects it
+    /// exactly as it already does on Linux.
+    ///
+    /// Joining the driver thread still happens before this function
+    /// returns, matching [`Inner`]'s own doc comment that the runtime is
+    /// guaranteed shut down by then -- it is simply the last thing this does
+    /// rather than the first.
+    ///
+    /// One case stays unfixed even with this order: if a child's reader has
+    /// already ended while something else still holds its master open,
+    /// nothing drains it, and the bounded reap below can still give up on
+    /// macOS. Best effort, not containment.
     fn drop(&mut self) {
-        if let Some(shutdown) = self.driver_shutdown.take() {
-            // The driver thread's receiver can only already be gone if the
-            // driver thread itself already exited (e.g. it panicked); a
-            // send error here is not actionable beyond skipping the join.
-            let _ = shutdown.send(());
-        }
-        if let Some(driver_thread) = self.driver_thread.take()
-            && let Err(panic_payload) = driver_thread.join()
-        {
-            // `Box<dyn Any + Send>` has no `Debug` impl; a panic payload is
-            // almost always the `&str`/`String` message `panic!` itself
-            // constructs, so recover that where possible rather than
-            // logging an opaque payload description.
-            let message = panic_payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<non-string panic payload>");
-            tracing::error!(
-                message,
-                "the process supervisor's runtime driver thread panicked"
-            );
-        }
-
         #[cfg(unix)]
         {
             let children = match self.children.lock() {
@@ -1059,6 +1058,30 @@ impl Drop for Inner {
                     }
                 }
             }
+        }
+
+        if let Some(shutdown) = self.driver_shutdown.take() {
+            // The driver thread's receiver can only already be gone if the
+            // driver thread itself already exited (e.g. it panicked); a
+            // send error here is not actionable beyond skipping the join.
+            let _ = shutdown.send(());
+        }
+        if let Some(driver_thread) = self.driver_thread.take()
+            && let Err(panic_payload) = driver_thread.join()
+        {
+            // `Box<dyn Any + Send>` has no `Debug` impl; a panic payload is
+            // almost always the `&str`/`String` message `panic!` itself
+            // constructs, so recover that where possible rather than
+            // logging an opaque payload description.
+            let message = panic_payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            tracing::error!(
+                message,
+                "the process supervisor's runtime driver thread panicked"
+            );
         }
     }
 }
