@@ -252,6 +252,54 @@ fn rerun_env_test_with_a_planted_key() {
     );
 }
 
+/// Diagnostic for
+/// [`observed_env_is_exactly_the_base_allowlist_plus_term_columns_lines`]'s
+/// missing-`env-keys` panic: every received frame in order (stream,
+/// `continued`), the final `State` frame's terminal state (or a note that
+/// none arrived), and the total `dropped_before`. Never prints the process
+/// environment -- only what the channel actually received, and the fixture
+/// itself only ever prints `isatty ...`, `TERM=`, `COLUMNS=`, `LINES=`, and
+/// env *key names*, so echoing texts leaks no secret values.
+#[cfg(unix)]
+fn missing_env_keys_line_report(frames: &[omnifrons_app::OutputFrame]) -> String {
+    use std::fmt::Write as _;
+
+    let mut report = String::from("the report must carry an env-keys line\n");
+    let _ = writeln!(report, "received {} frame(s):", frames.len());
+    for frame in frames {
+        match &frame.payload {
+            FramePayload::Text {
+                stream,
+                text,
+                continued,
+            } => {
+                let stream_name = match stream {
+                    omnifrons_app::OutputStream::Stdout => "stdout",
+                    omnifrons_app::OutputStream::Stderr => "stderr",
+                };
+                let _ = writeln!(report, "  [{stream_name} continued={continued}] {text:?}");
+            }
+            FramePayload::State(state) => {
+                let _ = writeln!(report, "  [state] {state:?}");
+            }
+        }
+    }
+    let state_line = frames
+        .iter()
+        .find_map(|frame| match &frame.payload {
+            FramePayload::State(state) => Some(format!("{state:?}")),
+            FramePayload::Text { .. } => None,
+        })
+        .unwrap_or_else(|| "no state frame received".to_string());
+    let _ = writeln!(report, "terminal state: {state_line}");
+    let dropped_total: u64 = frames.iter().map(|frame| frame.dropped_before).sum();
+    let _ = writeln!(
+        report,
+        "dropped_before total across all frames: {dropped_total}"
+    );
+    report
+}
+
 /// The PTY child's environment is the base allowlist (resolved from the
 /// supervisor's own environment, so only keys actually set there appear)
 /// plus exactly `TERM`, `COLUMNS`, and `LINES`; a planted secret-shaped
@@ -285,10 +333,9 @@ fn observed_env_is_exactly_the_base_allowlist_plus_term_columns_lines() {
         .map(|(text, _)| text)
         .collect();
 
-    let keys_line = texts
-        .iter()
-        .find(|line| line.starts_with("env-keys"))
-        .expect("the report must carry an env-keys line");
+    let Some(keys_line) = texts.iter().find(|line| line.starts_with("env-keys")) else {
+        panic!("{}", missing_env_keys_line_report(&frames));
+    };
     let observed: std::collections::BTreeSet<&str> = keys_line.split_whitespace().skip(1).collect();
 
     assert!(
