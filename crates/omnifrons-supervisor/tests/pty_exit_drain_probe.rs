@@ -1,23 +1,23 @@
-//! A deterministic OS-level *measurement probe*, not a correctness test.
+//! A deterministic OS-level *measurement probe* that also pins one result.
 //!
 //! `tests/pty_launch.rs`'s
 //! `observed_env_is_exactly_the_base_allowlist_plus_term_columns_lines`
 //! ("the report must carry an env-keys line") fails intermittently on
-//! macOS CI, never on Linux. This measures, without asserting, what macOS
-//! does with bytes a child wrote to a pty slave just before exiting when
-//! the master is read only afterwards. Two unproven candidates: the bytes
-//! are discarded, or something blocks until the master drains them. The
-//! probe's first CI run points at the second -- a late-read arm hung on
-//! macOS until the job timed out -- without saying which arm or where. It
-//! re-creates `src/pty.rs`'s `pub(crate)` setup directly: `openpty`, three
-//! slave dups as stdio, `setsid` + `TIOCSCTTY` in `pre_exec`, the parent
-//! releasing its slave right after `spawn`.
+//! macOS CI, never on Linux. This measures what each platform does with
+//! bytes a child wrote to a pty slave just before exiting when the master
+//! is read only afterwards. Measured on macOS CI: with a controlling
+//! terminal nothing is lost -- the child's exit waits until the master has
+//! drained the output, and the child cannot be reaped before that (a
+//! blocking `wait` there hung this probe's first run until the job timed
+//! out); without one, all 64 bytes were lost. Linux loses nothing either
+//! way. So that failure is not kernel-side loss. The setup re-creates
+//! `src/pty.rs`'s own, whose pieces are `pub(crate)`.
 //!
-//! Four arms: a control reading promptly while the child lingers (the only
-//! arm asserting a byte count); the product's own shape, read late; the
-//! same with the parent holding one slave open (a candidate mitigation);
-//! and the same with no controlling terminal, separating "last close of
-//! the slave" from "session-leader exit".
+//! Four arms: a control reading promptly while the child lingers; the
+//! product's own shape, read late; the same with the parent holding one
+//! slave open; and the same with no controlling terminal. The first two
+//! assert all 64 bytes -- the product relies on the second -- and the
+//! other two only record: what they show differs by platform.
 //!
 //! Each arm writes raw to fd 2 (`print!`/`eprintln!` are swallowed for a
 //! passing test without `--nocapture`): a `phase=begin` marker, then
@@ -26,10 +26,9 @@
 //! released=<stage>`. `reaped` is when the child became reapable,
 //! `released` when the parent's close of its own slave copies returned:
 //! `prompt` (before the master was read), `after-drain`,
-//! `after-master-close`, or `never`. Arms 2-4 assert nothing about any of
-//! it: that *is* the measurement. Linux is expected to show `received=64
-//! reaped=prompt released=prompt`, and `reaped=after-drain` for the
-//! control, whose child lingers. `grep 'pty-exit-drain-probe' <log>`.
+//! `after-master-close`, or `never`; neither is asserted. Linux shows
+//! `reaped=prompt` for the late arms, macOS `reaped=after-drain` with a
+//! controlling terminal. `grep 'pty-exit-drain-probe' <log>`.
 //!
 //! The arms run one at a time (see [`ARM_SERIAL`]), nothing here blocks
 //! without a bound, and a watchdog names the arm and phase if one does.
@@ -59,17 +58,14 @@ const PAYLOAD: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno
 /// atomically, and `libtest` runs the four arms on parallel threads of one
 /// process: an arm forking in the window before another arm's
 /// `set_cloexec` would hand its child that arm's slave, silently turning a
-/// hazard arm into the mitigation arm. Measured on Linux before this lock
-/// existed: the hazard arm ended without `EIO` in 2 of 30 parallel runs
-/// and 0 of 30 serial ones.
+/// hazard arm into the mitigation arm (seen on Linux, 2 of 30 runs).
 static ARM_SERIAL: Mutex<()> = Mutex::new(());
 /// Where the running arm is, for the watchdog's report.
 static PHASE: Mutex<&'static str> = Mutex::new("idle");
 
 /// How long the master may yield nothing before the drain loop calls it
 /// idle (`end=idle-timeout`, normal while a slave is held open). Above the
-/// control child's 2 s linger, and generous: a slow runner must not turn a
-/// late byte into an apparent loss.
+/// control child's 2 s linger; a slow runner must not fake a loss.
 const IDLE_LIMIT: Duration = Duration::from_secs(3);
 /// Pause between polls that found nothing.
 const RETRY: Duration = Duration::from_millis(10);
@@ -77,8 +73,7 @@ const RETRY: Duration = Duration::from_millis(10);
 const LATE_READ_DELAY: Duration = Duration::from_millis(300);
 /// How long each stage gives the child to become reapable and the release
 /// to return. Always polled, never a blocking `wait` or `join`, not even
-/// after `kill`: the first CI run of this probe blocked without a bound
-/// on macOS and hung until the job timed out.
+/// after `kill`: on macOS that can wait forever.
 const STAGE_WAIT: Duration = Duration::from_secs(5);
 /// An arm still running after this long is named and the process exits.
 /// Above the worst case of every stage timing out (about 30 s).
@@ -330,9 +325,8 @@ fn run_arm(config: &ArmConfig) -> Observation {
     Observation { pid, received, end }
 }
 
-/// Invariants every hazard/mitigation arm holds regardless of platform: a
-/// child ran, it never handed back more than it was given, and whatever
-/// arrived is a prefix of the payload.
+/// What every late-read arm holds on any platform: a child ran, and
+/// whatever arrived is a prefix of the payload, never more than it.
 fn assert_platform_independent_invariants(observation: &Observation) {
     assert!(observation.pid > 0, "a child must have been spawned");
     assert!(
@@ -348,7 +342,7 @@ fn assert_platform_independent_invariants(observation: &Observation) {
 }
 
 /// Harness sanity: controlling terminal, slave released, prompt read
-/// while the child lingers. The only arm asserting a byte count.
+/// while the child lingers.
 #[test]
 fn control_lingering_child() {
     let observation = run_arm(&ArmConfig {
@@ -366,20 +360,29 @@ fn control_lingering_child() {
 }
 
 /// A late-read arm: the child exits the instant it has written.
-fn measure_late_read(name: &'static str, controlling_terminal: bool, hold_extra_slave: bool) {
+fn measure_late_read(name: &'static str, ctty: bool, hold_slave: bool) -> Observation {
     let observation = run_arm(&ArmConfig {
         name,
-        controlling_terminal,
+        controlling_terminal: ctty,
         exit_immediately: true,
-        hold_extra_slave,
+        hold_extra_slave: hold_slave,
     });
     assert_platform_independent_invariants(&observation);
+    observation
 }
 
-/// The product's own shape: controlling terminal, slave released.
+/// The product's own shape: controlling terminal, slave released. Pinned,
+/// not just recorded: the product relies on losing nothing here.
 #[test]
 fn hazard_slave_released_late_read() {
-    measure_late_read("hazard_slave_released_late_read", true, false);
+    let observation = measure_late_read("hazard_slave_released_late_read", true, false);
+    assert_eq!(
+        observation.received.len(),
+        PAYLOAD.len(),
+        "with a controlling terminal, output written just before exit must survive a late \
+         read (end={})",
+        observation.end
+    );
 }
 
 /// The hazard arm, with the parent holding one extra slave open.
