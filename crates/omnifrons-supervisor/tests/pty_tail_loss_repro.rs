@@ -38,10 +38,15 @@
 //!
 //! The first run of this hunt lost 744 of 384 000 launches on macOS, every
 //! one of them after 603 to 718 ms inside `spawn_approved`. So the supervisor
-//! itself (this branch only) now prints, for any spawn over 300 ms, the time
-//! each step of `finish_spawn` took: `pty-tail-loss spawn-stall pid=<n>
-//! lock_us= fork_us= to_release_us= release_us= to_attach_us= attach_us=
-//! rest_us= total_us=`. `pid` ties it to the launch line above.
+//! itself (this branch only) prints, for any spawn over 300 ms, the time
+//! each step of `finish_spawn` took; `pid` ties it to the launch line above.
+//! The second run tied every one of its 1063 lost launches to a `release`
+//! (`drop(command)`, the parent's close of its slave copies) of about
+//! 600 ms, and no other stall lost anything. This third run carries the
+//! fix -- that release moved after `attach_output` -- and the line's fields
+//! follow the new order: `pty-tail-loss spawn-stall pid=<n> lock_us=
+//! fork_us= to_attach_us= attach_us= to_release_us= release_us= rest_us=
+//! total_us=`. Expected: no loss in any cell.
 //!
 //! It asserts nothing about loss -- only that every child reached
 //! `Exited(0)`, so a broken harness cannot pass for a clean result.

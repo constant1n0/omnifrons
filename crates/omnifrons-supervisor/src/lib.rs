@@ -648,13 +648,6 @@ impl TokioProcessSupervisor {
             tracing::warn!(program = %program_label, %error, "failed to spawn process");
             SupervisorError::Spawn(error.to_string())
         })?;
-        // Released now, deliberately: on the PTY path `command` still
-        // holds this process's copies of the slave end, and the master
-        // only reports EOF once every slave descriptor outside the child
-        // is closed. On the pipe path this is a no-op.
-        let hunt_before_release = hunt_began.elapsed();
-        drop(command);
-        let hunt_released = hunt_began.elapsed();
         let pid = child
             .id()
             .ok_or_else(|| SupervisorError::Spawn("spawned child reported no pid".to_string()))?;
@@ -675,6 +668,14 @@ impl TokioProcessSupervisor {
         self.attach_output(&mut child, wiring, handles, id, prompt);
         let hunt_attached = hunt_began.elapsed();
 
+        // THE FIX UNDER TEST (fix/pty-release-slave-after-reader): the
+        // parent's slave copies are released only now, with the reader
+        // attached. Its timing keeps the `release_us` slot below, so a
+        // stall here would still show as such.
+        let hunt_before_release = hunt_began.elapsed();
+        drop(command);
+        let hunt_released = hunt_began.elapsed();
+
         self.inner
             .children
             .lock()
@@ -682,22 +683,25 @@ impl TokioProcessSupervisor {
             .insert(id, Tracked::Running(Box::new(child)));
 
         // HUNT ONLY: raw on fd 2, so libtest's capture cannot swallow it. Each
-        // figure is the time spent in that one step, in microseconds.
+        // figure is the time spent in that one step, in microseconds, in the
+        // order the steps now run: lock, fork, attach, release.
         if hunt_began.elapsed() > Duration::from_millis(300) {
             let line = format!(
-                "\npty-tail-loss spawn-stall pid={pid} lock_us={} fork_us={} to_release_us={} \
-                 release_us={} to_attach_us={} attach_us={} rest_us={} total_us={}\n",
+                "\npty-tail-loss spawn-stall pid={pid} lock_us={} fork_us={} to_attach_us={} \
+                 attach_us={} to_release_us={} release_us={} rest_us={} total_us={}\n",
                 hunt_locked.as_micros(),
                 hunt_forked.saturating_sub(hunt_locked).as_micros(),
-                hunt_before_release.saturating_sub(hunt_forked).as_micros(),
+                hunt_before_attach.saturating_sub(hunt_forked).as_micros(),
+                hunt_attached.saturating_sub(hunt_before_attach).as_micros(),
+                hunt_before_release
+                    .saturating_sub(hunt_attached)
+                    .as_micros(),
                 hunt_released
                     .saturating_sub(hunt_before_release)
                     .as_micros(),
-                hunt_before_attach.saturating_sub(hunt_released).as_micros(),
-                hunt_attached.saturating_sub(hunt_before_attach).as_micros(),
                 hunt_began
                     .elapsed()
-                    .saturating_sub(hunt_attached)
+                    .saturating_sub(hunt_released)
                     .as_micros(),
                 hunt_began.elapsed().as_micros(),
             );
