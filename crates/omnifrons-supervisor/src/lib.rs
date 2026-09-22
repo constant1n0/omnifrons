@@ -643,11 +643,6 @@ impl TokioProcessSupervisor {
             tracing::warn!(program = %program_label, %error, "failed to spawn process");
             SupervisorError::Spawn(error.to_string())
         })?;
-        // Released now, deliberately: on the PTY path `command` still
-        // holds this process's copies of the slave end, and the master
-        // only reports EOF once every slave descriptor outside the child
-        // is closed. On the pipe path this is a no-op.
-        drop(command);
         let pid = child
             .id()
             .ok_or_else(|| SupervisorError::Spawn("spawned child reported no pid".to_string()))?;
@@ -665,6 +660,17 @@ impl TokioProcessSupervisor {
         // a `Tracked::Running` whose streams have already been taken out
         // from under it.
         self.attach_output(&mut child, wiring, handles, id, prompt);
+
+        // On the PTY path `command` still holds this process's copies of
+        // the slave end, and the master only reports EOF once every slave
+        // descriptor outside the child is closed, so they are released
+        // here -- but only now, with the reader attached. Released before
+        // it, on macOS this close blocked for about 600 ms whenever the
+        // child had already written and exited, and the child's whole
+        // output was gone when it returned
+        // (`tests/pty_fast_exit_keeps_output.rs`). On the pipe path this is
+        // a no-op.
+        drop(command);
 
         self.inner
             .children

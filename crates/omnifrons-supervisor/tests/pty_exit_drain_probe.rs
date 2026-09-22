@@ -31,9 +31,14 @@
 //! queue, whenever the child has already written and tried to exit by then
 //! -- the release being, at that moment, the last close of the slave. It is
 //! the product's shape with that release delayed past the child's exit.
-//! REFUTED on macOS CI: it loses nothing either, and the child stays
-//! blocked until the drain exactly as when the release comes at once. That
-//! release is not the cause; the loss is still unexplained.
+//! On macOS CI it loses nothing either, and the child stays blocked until
+//! the drain exactly as when the release comes at once -- but that holds for
+//! this probe's child, `/bin/sh -c printf`, and no further. The product's
+//! loss was later located in that very release, which blocked for about
+//! 600 ms in every one of 1063 lost launches
+//! (`tests/pty_fast_exit_keeps_output.rs`): all of them children that exit
+//! the instant they have written, while `sh` lost none of 256 000 there
+//! either. Why `sh` differs is not known.
 //!
 //! Each arm writes raw to fd 2 (`print!`/`eprintln!` are swallowed for a
 //! passing test without `--nocapture`): a `phase=begin` marker, then
@@ -536,10 +541,11 @@ fn undrained_master_close() {
 /// than the parent. It tested a hypothesis, stated before the run: that on
 /// macOS this release is then the last close of the slave and discards the
 /// queue, so the arm would read `received=0` with `reaped_ms` near
-/// [`LATE_RELEASE_DELAY`]. REFUTED: macOS CI read all 64 bytes, with the
-/// child blocked until the drain (`reaped_ms` 3342, against 3499 for the
-/// arm that releases at once). Linux reads 64 too. Kept because it pins down
-/// what is NOT the cause; asserts nothing about the outcome.
+/// [`LATE_RELEASE_DELAY`]. Not what happened: macOS CI read all 64 bytes,
+/// with the child blocked until the drain (`reaped_ms` 3342, against 3499
+/// for the arm that releases at once). Linux reads 64 too. That refutes it
+/// for an `sh` child only -- see the module doc for where the product's loss
+/// turned out to be. Asserts nothing about the outcome.
 #[test]
 fn hazard_slave_released_after_child_exit() {
     let observation = run_arm(&ArmConfig {
