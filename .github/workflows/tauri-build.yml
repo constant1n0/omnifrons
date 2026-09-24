@@ -285,6 +285,43 @@ jobs:
             "${GITHUB_WORKSPACE}/target/release/vp-s6-agent" "${workspace_dir}" \
             | tee "${RUNNER_TEMP}/vp-001-vp-s6-transcript.txt"
 
+      - name: VP-001 VP-S1 scenario (evidence run)
+        # desktop-stack-verification-plan.md:122. Mirrors the feasibility
+        # gate step's xvfb-run/tauri-driver shape (no window manager needed;
+        # vp-s1-linux.sh drives no GTK dialog). derive_csp
+        # (tools/evidence-validator) is the only place a result is decided.
+        # Bounded: a wedged driver keeps the app alive holding this step's
+        # stdout, so tee would otherwise wait until the job's own timeout.
+        if: runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.vp001_scenario && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
+        timeout-minutes: 15
+        env:
+          VP001_DIGEST_PATHS: ${{ steps.digest.outputs.paths }}
+          VP001_DIGEST_FILE: ${{ runner.temp }}/vp-001-artifact-digest.txt
+        run: |
+          set -euo pipefail
+          artifact_path="$(printf '%s\n' "${VP001_DIGEST_PATHS}" | grep -m1 '\.AppImage$')"
+          build_channel_digest="$(
+            awk -v name="$(basename "${artifact_path}")" '$2 == name { print $1 }' "${VP001_DIGEST_FILE}"
+          )"
+          # awk prints nothing for an unmatched name and still exits 0; an
+          # empty digest must fail here, never reach the identity gate.
+          if [[ -z "${build_channel_digest}" ]]; then
+            echo "gate=digest-lookup-failed artifact=$(basename "${artifact_path}")"
+            exit 1
+          fi
+          xvfb-run --auto-servernum -- bash -c '
+            set -euo pipefail
+            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
+            driver_pid=$!
+            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
+            for _ in $(seq 1 10); do
+              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
+              sleep 1
+            done
+            docs/evidence/VP-001/procedures/vp-s1-linux.sh "$1" "$2"
+          ' vp-s1-scenario "${artifact_path}" "${build_channel_digest}" \
+            | tee "${RUNNER_TEMP}/vp-001-vp-s1-transcript.txt"
+
       - name: Upload VP-001 transcripts
         # Kept even when a gate fails: a blocked run is evidence of the
         # blocker, not something to discard. The .xwd screenshot only exists
@@ -299,4 +336,5 @@ jobs:
             ${{ runner.temp }}/vp-001-feasibility-transcript.txt
             ${{ runner.temp }}/vp-001-vp-s6-transcript.txt
             ${{ runner.temp }}/vp-001-vp-s6-chooser-failure.xwd
+            ${{ runner.temp }}/vp-001-vp-s1-transcript.txt
           if-no-files-found: warn
