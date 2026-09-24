@@ -1,0 +1,32 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+gate=av1-digest-match digest=03c56b3462a6c6343d16c52c77dcc45fa5e36d59ba91f52bb9119454660fa45f
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:24932): dbind-WARNING **: 23:08:56.806: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=cf777108-485c-4715-b0e9-fca5a4bb68c9
+gate=session-closed session_id=cf777108-485c-4715-b0e9-fca5a4bb68c9
+
+(omnifrons-shell:25107): dbind-WARNING **: 23:09:28.693: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=session-created session_id=8d1c4cd6-f7c9-45f5-92d5-3922abd09cc8
+gate=armed
+gate=location-scheme value=tauri:
+observation=location_scheme value=tauri:
+observation=meta_csp_present value=false
+observation=policy_dump value=form-action 'none'; img-src 'self' artifact:; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='; media-src 'self' artifact:; worker-src 'self'; style-src 'self'; base-uri 'none'; connect-src ipc: http://ipc.localhost; font-src 'self'; frame-src 'none'; default-src 'none'; manifest-src 'self'; object-src 'none'
+observation=inline_script_violation value=true
+observation=inline_script_ran value=false
+observation=external_fetch_violation value=true
+observation=external_fetch_settled value=rejected:TypeError
+observation=framed_context_violation value=true
+observation=iframe_document_url value=about:blank
+observation=violation_count value=3
+observation=third_party_surface_exercised value=false
+gate=session-closed session_id=8d1c4cd6-f7c9-45f5-92d5-3922abd09cc8

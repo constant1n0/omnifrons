@@ -130,3 +130,103 @@ born between the census and the signal remains outside both mechanisms, and
 | `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-18 |
 | `evidence_artifact` | fdfc38584a25fe028f3c1a35895bf7bb7f4da38cde65c0b5d628084113aedb3c -- redacted copy of run 35467644986's `vp-001-transcripts` artifact entry `vp-001-vp-s6-transcript.txt`, retained at `docs/evidence/VP-001/artifacts/vp-001-run-35467644986-vp-s6-transcript.txt` |
 | `feasibility_evidence_artifact` | 07c2c440c22779a35b5e2736a417cbe0e4080f4533754f9e35778f8b2634284a -- redacted copy of the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt`, retained at `docs/evidence/VP-001/artifacts/vp-001-run-35467644986-feasibility-transcript.txt` |
+
+## VP-001 VP-S1 scenario -- run 36070751147 (2026-09-24)
+
+The first execution of VP-S1, against the packaged AppImage on the pinned
+Linux baseline, with the probe `docs/evidence/VP-001/procedures/vp-s1-probe.mjs`
+run inside the renderer through WebDriver. Every fact the probe was built to
+observe was observed, and the outcome is `uncertain` by construction: the
+scenario's claim covers "every renderer surface, including a third-party app
+surface", and no third-party app surface exists in this renderer (ADR-0004
+defers app packaging and any SDK; the renderer is one window, one document,
+three panels). `derive_csp` returns `uncertain` whenever
+`third_party_surface_exercised` is false, by the maintainer's decision; the
+row does not discharge RCS-001-R13 or VP-001-R11.
+
+What the retained transcript shows, on the surface that exists: the
+document's scheme was `tauri:`, never a development URL; no CSP `<meta>`
+element was present, so on this baseline the policy reached the webview by
+another path (the vendored Tauri source names an HTTP header on the
+custom-protocol response; this run did not observe the header itself, only
+the absence of the element); the policy dump read back from the first
+violation event matches `src-tauri/tauri.conf.json`'s `app.security.csp`
+directive for directive, except `script-src`, which reads
+`'self' 'self' '<hash>'`: the configured `'self'` once more, and one hash
+Tauri injects for its own initialization script; a repeated source
+expression changes nothing the policy permits; three
+`securitypolicyviolation` events were recorded for the three attempts, the
+inline script did not run, the fetch settled rejected, and the frame was
+left holding `about:blank`.
+
+What it does not show: which directive each event named. The three
+`*_violation` facts are `summarize`'s prefix matches over the events'
+`effectiveDirective` (`script-src*`, `connect-src*`, `frame-src*`), and the
+transcript carries those booleans and the count, not the events themselves
+-- the probe captures each event's directive and blocked URI but does not
+yet emit them. So the transcript alone cannot re-attribute an event to an
+attempt, and cannot by itself separate "the fetch was rejected because
+`connect-src` blocked it" from "a `connect-src` event fired and the fetch
+also failed to resolve": the reserved `.invalid` host never resolves, and a
+plain network failure settles with the same `TypeError`. That the
+`connect-src` event fired at all is what the row rests on. Emitting the
+events verbatim is recorded follow-up work for the probe.
+
+Both retained transcripts open with a connection-refused line from
+`tauri-driver`: the workflow polls `http://127.0.0.1:4444/status` until the
+driver answers, and the first poll lands before it listens. The same line
+opens every retained VP-S6 transcript; it precedes the first gate and is
+not part of the scenario.
+
+`identity_gated` is not an observation line: it is derived from the two
+gates the transcript does carry, `gate=av1-digest-match` and
+`gate=av2-variant-scan-absent`, both before `gate=session-created`, exactly
+as the VP-S6 rows derive it. Those gates appear in the VP-S1 transcript
+because `vp-s1-linux.sh` runs `vp-s6-linux.sh --mode=feasibility-check`
+itself, which also opens and closes one feasibility session of its own
+(`gate=f1-session-created`); the separately retained feasibility transcript
+is the workflow's earlier feasibility step, a distinct session. The run
+therefore gated identity twice, once per step, against the same artifact
+digest.
+
+`observed_state: unverified` names the state `derive_csp`'s `uncertain`
+branch returns (`CspObservedState::Unverified`), chosen there as VP-S6-03
+chose `proven-gone`: RCS-001's signal mapping has no entry for this. It
+means nothing was demonstrated either way *about the claim as written*; the
+surface that exists showed no bypass.
+
+Each `evidence_artifact` digest below is the SHA-256 of the retained,
+redacted file at the path it names -- the file in this repository, not the
+CI artifact entry it was copied from, whose runner paths were rewritten to
+`<extract-dir>` before retention.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S1-01 |
+| `kind` | scenario |
+| `scenario_id` | VP-S1 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | uncertain |
+| `observed_state` | unverified |
+| `build_channel` | packaged-ci |
+| `build_channel_digest` | 03c56b3462a6c6343d16c52c77dcc45fa5e36d59ba91f52bb9119454660fa45f |
+| `exercised_artifact_digest` | 03c56b3462a6c6343d16c52c77dcc45fa5e36d59ba91f52bb9119454660fa45f |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s1-linux.sh |
+| `blocker` | none -- the scenario ran to completion; the claim's third-party surface does not exist to exercise |
+| `identity_gated` | true -- derived from `gate=av1-digest-match` and `gate=av2-variant-scan-absent`, both before the scenario session |
+| `location_scheme_is_app_protocol` | true (`tauri:`) |
+| `inline_script_violation` | true |
+| `inline_script_ran` | false |
+| `external_fetch_violation` | true |
+| `external_fetch_resolved` | false (settled `rejected:TypeError`; a `connect-src` violation was recorded in the same run) |
+| `framed_context_violation` | true |
+| `policy_dump_captured` | true |
+| `third_party_surface_exercised` | false -- no such surface exists (ADR-0004) |
+| `meta_csp_present` | false -- recorded, not part of the outcome |
+| `violation_count` | 3 |
+| `run_date` | 2026-09-24 |
+| `ci_run` | workflow tauri-build.yml, workflow_dispatch (vp001_scenario: true), run 36070751147, head d6d0813, conclusion success |
+| `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-23 |
+| `evidence_artifact` | a859527a03d2ab8b69a66cbda9260f742bec2dc1f10b7d4c74acff2ef34568cb -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36070751147-vp-s1-transcript.txt`, copied from run 36070751147's `vp-001-transcripts` artifact entry `vp-001-vp-s1-transcript.txt` |
+| `feasibility_evidence_artifact` | ffec85b83a20f971aec899996bda9b376d810cc611ef0d6d656d914dac4e77bf -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36070751147-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
