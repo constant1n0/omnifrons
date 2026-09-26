@@ -314,10 +314,18 @@ jobs:
             tauri-driver --native-driver /usr/bin/WebKitWebDriver &
             driver_pid=$!
             trap "kill \${driver_pid} 2>/dev/null || true" EXIT
+            driver_ready=""
             for _ in $(seq 1 10); do
-              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
+              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && driver_ready=1 && break
               sleep 1
             done
+            # A driver that never answers /status must fail here, loudly,
+            # never fall through into vp-s1-linux.sh against a driver that
+            # is not actually listening.
+            if [[ -z "${driver_ready}" ]]; then
+              echo "gate=driver-not-ready"
+              exit 1
+            fi
             docs/evidence/VP-001/procedures/vp-s1-linux.sh "$1" "$2"
           ' vp-s1-scenario "${artifact_path}" "${build_channel_digest}" \
             | tee "${RUNNER_TEMP}/vp-001-vp-s1-transcript.txt"
