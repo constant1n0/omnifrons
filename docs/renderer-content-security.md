@@ -165,7 +165,7 @@ Each allowlist is maintained in this document and re-evaluated whenever the unde
 
 ## Images and remote resources
 
-The renderer never fetches a remote resource of any kind. The CSP baseline's `img-src` is limited to the app origin and a local artifact scheme; `connect-src` is `'none'`, and `font-src` admits only bundled, self-hosted fonts — no external font service load, which would itself be a remote fetch with the same presence-leak shape as a tracking image. A remote image referenced from rich content renders as a placeholder showing the URL as text, with an explicit "fetch through the core into the artifact tier" action rather than an automatic load (open decision D1 states the default for that action). This is the mitigation for a Markdown note whose embedded image tag points at a remote server: rendering it directly would leak the reader's presence and could carry a tracking token in the URL, so nothing fetches until the user asks. Product-generated SVG (Orb projections) is either sanitized — no scripts, no external references — or rasterized before it reaches the renderer (open decision D7).
+The renderer never fetches a remote resource of any kind. The CSP baseline's `img-src` is limited to the app origin and a local artifact scheme; `connect-src` admits no remote origin, only the typed-IPC bridge sources the CSP baseline documents below, and `font-src` admits only bundled, self-hosted fonts — no external font service load, which would itself be a remote fetch with the same presence-leak shape as a tracking image. A remote image referenced from rich content renders as a placeholder showing the URL as text, with an explicit "fetch through the core into the artifact tier" action rather than an automatic load (open decision D1 states the default for that action). This is the mitigation for a Markdown note whose embedded image tag points at a remote server: rendering it directly would leak the reader's presence and could carry a tracking token in the URL, so nothing fetches until the user asks. Product-generated SVG (Orb projections) is either sanitized — no scripts, no external references — or rasterized before it reaches the renderer (open decision D7).
 
 The same no-renderer-fetch rule applies to any embedded media reference, not only images: the Markdown allowlist in Content classes and rendering modes never includes a `<video>`, `<audio>`, `<iframe>`, or `<object>` element, and the CSP baseline's `object-src 'none'` and `frame-src 'none'` back that allowlist decision structurally rather than leaving it to sanitizer diligence alone.
 
@@ -192,7 +192,7 @@ Every mechanism above depends on the renderer actually being unable to do what i
 | `media-src` | `'self' artifact:` (local artifact scheme) |
 | `font-src` | `'self'` |
 | `manifest-src` | `'self'` |
-| `connect-src` | `'none'` (typed IPC only) |
+| `connect-src` | Only the typed-IPC bridge sources documented below (`ipc:`, `http://ipc.localhost`); no remote origin |
 | `frame-src` | `'none'` |
 | `object-src` | `'none'` |
 | `base-uri` | `'none'` |
@@ -201,7 +201,16 @@ Every mechanism above depends on the renderer actually being unable to do what i
 
 `script-src 'self'` with bundled, hashed scripts excludes both an external CDN load and runtime `eval`-style execution; a script the renderer runs must have shipped inside the application bundle and matched its hash, never have been fetched, generated, or evaluated at runtime from any content source. No embedded browsing context is permitted. The `style-src` nonce covers only product-defined theme-variable values — the curated accent palette [context-orb.md](context-orb.md) defines — never a style computed from or influenced by rendered content; no content source can inject a value that reaches the nonce'd style block.
 
-`connect-src 'none'` governs network-shaped requests a browsing context could otherwise issue — `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource` — and does not govern the typed IPC channel itself: typed IPC rides the desktop framework's own bridge API (ADR-0002), not any of those primitives, and is not a network request this directive was designed to gate. Where a platform's bridge implementation requires a custom protocol handler to carry that traffic, the protocol is added to `connect-src` explicitly, documented in this section, and verified under [VP-001](desktop-stack-verification-plan.md) — never left as an implicit, undocumented exception to the baseline above.
+`connect-src` governs network-shaped requests a browsing context can issue — `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`. On the desktop stack ADR-0002 selects, the typed IPC bridge itself rides one of those primitives: the framework sends each renderer→core call as a `fetch` POST to its own custom protocol, `ipc://localhost/<command>` on Linux and macOS and `http://ipc.localhost/<command>` on Windows, where WebView2 needs an `http` origin in place of a custom scheme (verified against the Tauri version the workspace pins, 2.11.5). Those two are the only sources `connect-src` admits, documented here as this section requires of any bridge protocol:
+
+| Platform | Bridge transport | `connect-src` source |
+| --- | --- | --- |
+| Linux, macOS | `fetch` POST to `ipc://localhost/<command>` | `ipc:` |
+| Windows | `fetch` POST to `http://ipc.localhost/<command>` | `http://ipc.localhost` |
+
+The shipped policy carries both sources on every platform; each platform's bridge uses only its own. Neither source names a remote origin, so the remote-fetch protections above are unchanged. On Linux and macOS, `http://ipc.localhost` is not the bridge, and what a request to that loopback name reaches there is not established by this document; VP-S3 records it per OS.
+
+`connect-src` selects the bridge's transport; it does not gate typed IPC. When the custom-protocol `fetch` fails for any reason, including this policy blocking it, the framework falls back to its `postMessage` bridge, which `connect-src` does not govern. Typed IPC is constrained by core's request validation (Typed IPC constraints), not by this directive. A bridge protocol not listed here is an undocumented exception, never an implicit one; [VP-001](desktop-stack-verification-plan.md) (VP-S3) verifies this list per OS.
 
 The baseline is enforced as the renderer's actual CSP policy — a header or an equivalent webview policy under the desktop stack ADR-0002 selects — not as guidance a component may opt out of, and RCS-001-R13 makes it a conformance-tested acceptance gate rather than an aspiration. A third-party app inherits this baseline exactly, with no relaxation (ADR-0004): a custom app's content class rules, CSP, and navigation constraints are the same ones this document states for the core renderer, and no app manifest field can widen a directive.
 

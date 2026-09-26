@@ -1,9 +1,8 @@
 //! Verifies `tauri.conf.json` transcribes
-//! docs/renderer-content-security.md § CSP baseline (the one documented
-//! exception being `connect-src`, which the baseline sets to `'none'` but
-//! Tauri's IPC bridge needs -- see docs/repository-layout.md § Crate map),
-//! and that `capabilities/default.json` grants nothing beyond
-//! `core:default`.
+//! docs/renderer-content-security.md § CSP baseline (including its
+//! `connect-src`: exactly the two typed-IPC bridge sources that section
+//! documents -- see docs/repository-layout.md § Crate map), and that
+//! `capabilities/default.json` grants nothing beyond `core:default`.
 
 use std::collections::BTreeSet;
 use std::fs;
