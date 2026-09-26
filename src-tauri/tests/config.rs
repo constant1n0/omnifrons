@@ -1,8 +1,10 @@
 //! Verifies `tauri.conf.json` transcribes
 //! docs/renderer-content-security.md § CSP baseline (including its
-//! `connect-src`: exactly the two typed-IPC bridge sources that section
-//! documents -- see docs/repository-layout.md § Crate map), and that
-//! `capabilities/default.json` grants nothing beyond `core:default`.
+//! `connect-src`: `ipc:`, the Linux/macOS typed-IPC bridge source, with
+//! `src-tauri/tauri.windows.conf.json` replacing it with the Windows bridge
+//! source, `http://ipc.localhost` -- see docs/repository-layout.md § Crate
+//! map), and that `capabilities/default.json` grants nothing beyond
+//! `core:default`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -17,8 +19,11 @@ fn read_json(relative_path: &str) -> Value {
 
 /// The CSP baseline directives transcribed unchanged from
 /// renderer-content-security.md § CSP baseline -- every directive except
-/// `connect-src`, which carries the documented platform-bridge exception
-/// (see [`connect_src_is_exactly_the_documented_ipc_bridge_exception`]).
+/// `connect-src`, which carries the documented per-OS typed-IPC bridge
+/// source: `ipc:` at the base (Linux, macOS), replaced on Windows by
+/// `tauri.windows.conf.json`'s `http://ipc.localhost` (see
+/// [`base_connect_src_is_exactly_the_linux_macos_bridge_source`] and
+/// [`windows_overlay_replaces_connect_src_with_exactly_the_windows_bridge_source`]).
 const BASELINE_DIRECTIVES: &[&str] = &[
     "default-src",
     "object-src",
@@ -53,8 +58,8 @@ fn csp_baseline_directives_are_transcribed() {
     assert_eq!(csp["worker-src"], "'self'");
 
     // Exhaustiveness: the CSP object must carry exactly the baseline
-    // directives asserted above plus the documented connect-src exception --
-    // no directive silently added or dropped.
+    // directives asserted above plus the per-OS connect-src -- no directive
+    // silently added or dropped.
     let mut expected: BTreeSet<&str> = BASELINE_DIRECTIVES.iter().copied().collect();
     expected.insert("connect-src");
     let actual: BTreeSet<&str> = csp
@@ -65,18 +70,165 @@ fn csp_baseline_directives_are_transcribed() {
         .collect();
     assert_eq!(
         actual, expected,
-        "csp directive set must match exactly the baseline plus the documented connect-src exception"
+        "csp directive set must match exactly the baseline plus the per-OS connect-src"
     );
 }
 
 #[test]
-fn connect_src_is_exactly_the_documented_ipc_bridge_exception() {
+fn base_connect_src_is_exactly_the_linux_macos_bridge_source() {
     let config = read_json("tauri.conf.json");
 
     assert_eq!(
-        config["app"]["security"]["csp"]["connect-src"], "ipc: http://ipc.localhost",
-        "connect-src must be exactly the documented platform-bridge exception, no wider"
+        config["app"]["security"]["csp"]["connect-src"], "ipc:",
+        "connect-src must be exactly the Linux/macOS typed-IPC bridge source; \
+         Windows replaces it via tauri.windows.conf.json"
     );
+}
+
+/// Tauri's platform-config merge (JSON Merge Patch) means
+/// `tauri.windows.conf.json` overrides `connect-src` on Windows only; every
+/// other directive is inherited unchanged from `tauri.conf.json`. This
+/// overlay must carry exactly that one override -- nothing else, or it
+/// could silently widen the Windows CSP beyond what RCS-001 documents.
+#[test]
+fn windows_overlay_replaces_connect_src_with_exactly_the_windows_bridge_source() {
+    let overlay = read_json("tauri.windows.conf.json");
+
+    assert_eq!(
+        overlay,
+        serde_json::json!({
+            "app": {
+                "security": {
+                    "csp": {
+                        "connect-src": "http://ipc.localhost"
+                    }
+                }
+            }
+        }),
+        "tauri.windows.conf.json must contain exactly the Windows bridge source override, found: {overlay:?}"
+    );
+}
+
+/// The config each OS actually builds with, read by Tauri's own reader
+/// (`tauri::utils::config::parse::read_from`, the one `tauri-build` and
+/// `generate_context!` use). The file-level tests above pin each file; these
+/// pin the merged result, so a change in how Tauri merges a platform overlay
+/// cannot silently drop or add a directive on any OS.
+fn merged_config(target: tauri::utils::platform::Target) -> (Value, usize) {
+    let (config, paths) = tauri::utils::config::parse::read_from(
+        target,
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .unwrap_or_else(|e| panic!("tauri must read the config for {target:?}: {e}"));
+    (config, paths.len())
+}
+
+#[test]
+fn merged_windows_config_is_the_base_with_only_the_windows_bridge_source() {
+    let (merged, files_read) = merged_config(tauri::utils::platform::Target::Windows);
+    assert_eq!(
+        files_read, 2,
+        "Windows must read the base config plus exactly its one overlay"
+    );
+
+    let mut expected = read_json("tauri.conf.json");
+    expected["app"]["security"]["csp"]["connect-src"] =
+        Value::String("http://ipc.localhost".to_string());
+    assert_eq!(
+        merged, expected,
+        "on Windows the merged config must differ from the base only in connect-src"
+    );
+}
+
+#[test]
+fn merged_linux_and_macos_configs_are_the_base_config() {
+    for target in [
+        tauri::utils::platform::Target::Linux,
+        tauri::utils::platform::Target::MacOS,
+    ] {
+        let (merged, files_read) = merged_config(target);
+        assert_eq!(files_read, 1, "{target:?} must read only the base config");
+        assert_eq!(
+            merged,
+            read_json("tauri.conf.json"),
+            "{target:?} must build with the base config unchanged, connect-src `ipc:` included"
+        );
+    }
+}
+
+/// Tauri reads its base config from `tauri.conf.json[5]` or `Tauri.toml` and
+/// merges a `tauri.<platform>.conf.json[5]` or `Tauri.<platform>.toml`
+/// overlay over it via JSON Merge Patch, for macOS, Windows, Linux, Android
+/// and iOS alike (tauri-utils `config::parse`). Any config file beyond the
+/// two reviewed ones -- another platform's overlay, or a second spelling of
+/// the Windows one -- could silently patch `connect-src` somewhere, so this
+/// is an allowlist of every file Tauri would read, not a list of known-bad
+/// names.
+#[test]
+fn only_the_reviewed_tauri_config_files_exist() {
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let config_files: BTreeSet<String> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("failed to list {dir}: {e}"))
+        .map(|entry| {
+            entry
+                .expect("directory entry must be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| {
+            // Case-insensitive: on a case-insensitive filesystem Tauri's
+            // exact-name lookup would find a differently-cased file too.
+            let name = name.to_ascii_lowercase();
+            let extension = std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str());
+            name.starts_with("tauri.")
+                && match extension {
+                    Some("json" | "json5") => name.contains(".conf."),
+                    Some("toml") => true,
+                    _ => false,
+                }
+        })
+        .collect();
+
+    let expected: BTreeSet<String> = ["tauri.conf.json", "tauri.windows.conf.json"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        config_files, expected,
+        "only tauri.conf.json and tauri.windows.conf.json may exist; any other Tauri config file could patch connect-src"
+    );
+}
+
+/// Tauri derives the Windows bridge origin from each window's
+/// `useHttpsScheme` (`http://ipc.localhost` when false, the default;
+/// `https://ipc.localhost` when true). `tauri.windows.conf.json` pins the
+/// `http` form, so a window switching to the `https` scheme would push every
+/// Windows bridge call outside `connect-src` -- and the framework would fall
+/// back to `postMessage` silently rather than fail. Only the base config's
+/// windows need checking because
+/// [`windows_overlay_replaces_connect_src_with_exactly_the_windows_bridge_source`]
+/// keeps the overlay to its single `connect-src` key, so it cannot add or
+/// patch a window. A window built at runtime is outside this test; VP-S3's
+/// per-call transport record covers it.
+#[test]
+fn no_window_switches_the_bridge_to_the_https_scheme() {
+    let config = read_json("tauri.conf.json");
+    let windows = config["app"]["windows"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+
+    for window in windows {
+        assert!(
+            window
+                .get("useHttpsScheme")
+                .is_none_or(|v| v == &Value::Bool(false)),
+            "a window enables useHttpsScheme, which moves the Windows bridge to https://ipc.localhost \
+             outside the documented connect-src source: {window:?}"
+        );
+    }
 }
 
 #[test]

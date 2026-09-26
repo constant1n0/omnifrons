@@ -22,7 +22,7 @@
         "media-src": "'self' artifact:",
         "font-src": "'self'",
         "manifest-src": "'self'",
-        "connect-src": "ipc: http://ipc.localhost",
+        "connect-src": "ipc:",
         "frame-src": "'none'",
         "object-src": "'none'",
         "base-uri": "'none'",

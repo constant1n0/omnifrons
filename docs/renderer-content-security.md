@@ -192,7 +192,7 @@ Every mechanism above depends on the renderer actually being unable to do what i
 | `media-src` | `'self' artifact:` (local artifact scheme) |
 | `font-src` | `'self'` |
 | `manifest-src` | `'self'` |
-| `connect-src` | Only the typed-IPC bridge sources documented below (`ipc:`, `http://ipc.localhost`); no remote origin |
+| `connect-src` | `ipc:` on Linux and macOS; `http://ipc.localhost` on Windows (the typed-IPC bridge sources below) |
 | `frame-src` | `'none'` |
 | `object-src` | `'none'` |
 | `base-uri` | `'none'` |
@@ -201,14 +201,14 @@ Every mechanism above depends on the renderer actually being unable to do what i
 
 `script-src 'self'` with bundled, hashed scripts excludes both an external CDN load and runtime `eval`-style execution; a script the renderer runs must have shipped inside the application bundle and matched its hash, never have been fetched, generated, or evaluated at runtime from any content source. No embedded browsing context is permitted. The `style-src` nonce covers only product-defined theme-variable values — the curated accent palette [context-orb.md](context-orb.md) defines — never a style computed from or influenced by rendered content; no content source can inject a value that reaches the nonce'd style block.
 
-`connect-src` governs network-shaped requests a browsing context can issue — `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`. On the desktop stack ADR-0002 selects, the typed IPC bridge itself rides one of those primitives: the framework sends each renderer→core call as a `fetch` POST to its own custom protocol, `ipc://localhost/<command>` on Linux and macOS and `http://ipc.localhost/<command>` on Windows, where WebView2 needs an `http` origin in place of a custom scheme (verified against the Tauri version the workspace pins, 2.11.5). Those two are the only sources `connect-src` admits, documented here as this section requires of any bridge protocol:
+`connect-src` governs network-shaped requests a browsing context can issue — `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`. On the desktop stack ADR-0002 selects, the typed IPC bridge itself rides one of those primitives: the framework sends each renderer→core call as a `fetch` POST to its own custom protocol, `ipc://localhost/<command>` on Linux and macOS and `http://ipc.localhost/<command>` on Windows, where WebView2 needs an `http` origin in place of a custom scheme (verified against the Tauri version `Cargo.lock` pinned when this was written, 2.11.5; VP-S3 re-verifies it whenever that pin changes). Each OS's policy admits only its own source, documented here as this section requires of any bridge protocol:
 
 | Platform | Bridge transport | `connect-src` source |
 | --- | --- | --- |
 | Linux, macOS | `fetch` POST to `ipc://localhost/<command>` | `ipc:` |
 | Windows | `fetch` POST to `http://ipc.localhost/<command>` | `http://ipc.localhost` |
 
-The shipped policy carries both sources on every platform; each platform's bridge uses only its own. Neither source names a remote origin, so the remote-fetch protections above are unchanged. On Linux and macOS, `http://ipc.localhost` is not the bridge, and what a request to that loopback name reaches there is not established by this document; VP-S3 records it per OS.
+Each OS's shipped policy carries only its own bridge source, and neither source names a remote origin.
 
 `connect-src` selects the bridge's transport; it does not gate typed IPC. When the custom-protocol `fetch` fails for any reason, including this policy blocking it, the framework falls back to its `postMessage` bridge, which `connect-src` does not govern. Typed IPC is constrained by core's request validation (Typed IPC constraints), not by this directive. A bridge protocol not listed here is an undocumented exception, never an implicit one; [VP-001](desktop-stack-verification-plan.md) (VP-S3) verifies this list per OS.
 
