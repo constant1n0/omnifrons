@@ -339,3 +339,47 @@ CI artifact entry it was copied from, whose runner paths were rewritten to
 | `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-25 |
 | `evidence_artifact` | 6b113eeae5c95c6c9ffc366246c179d8bd3c893c0ab77ba75d63330c16760402 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36244318043-vp-s1-transcript.txt`, copied from run 36244318043's `vp-001-transcripts` artifact entry `vp-001-vp-s1-transcript.txt` |
 | `feasibility_evidence_artifact` | 445267473c2a7d6851b0fd119a7e2a431f5c5d72d9b993fe24093f2adc27d81f -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36244318043-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
+
+## VP-001 VP-S1 correction -- VP-001-VP-S1-01 (run 36070751147)
+
+Corrects VP-001-VP-S1-01, filed from run 36070751147 (2026-09-24), in two
+statements about the connection-refused line that opens both of that row's
+retained transcripts. No new run was made. Everything else in
+VP-001-VP-S1-01 stands as filed, including its `result`, its
+`observed_state`, its digests and its retained artifacts. This row repeats
+none of those digests or artifacts: they belong to that row, and the
+store's V5 check refuses the same `evidence_artifact` twice for one
+scenario and baseline.
+
+The cause. VP-001-VP-S1-01 attributes the line to the workflow's first
+readiness poll landing before `tauri-driver` listens. The line itself,
+`Error serving connection: hyper::Error(User(Service), client error
+(Connect))` with a `Connection refused` cause, is `tauri-driver` serving a
+request and failing to connect to the upstream it proxies to (the workflow
+at that row's CI head starts it with `--native-driver
+/usr/bin/WebKitWebDriver`); it does not show `tauri-driver` refusing. The
+only requests the workflow sends before the first gate are its readiness
+polls of `http://127.0.0.1:4444/status`, so the line is still not part of
+the scenario; only its stated mechanism was wrong. VP-001-VP-S1-02 already
+records this reading.
+
+The scope. VP-001-VP-S1-01 says the same line opens every retained VP-S6
+transcript. It opens two of the three: those of runs 35252892166 and
+35467644986. Run 35450847942's retained VP-S6 transcript does not contain
+it; its first line is `gate=av1-digest-match`.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S1-03 |
+| `kind` | scenario |
+| `scenario_id` | VP-S1 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | uncertain |
+| `observed_state` | unverified |
+| `build_channel` | packaged-ci |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s1-linux.sh |
+| `corrects` | VP-001-VP-S1-01 |
+| `blocker` | none -- a correction of VP-001-VP-S1-01's prose; its outcome and fields stand as filed |
+| `run_date` | 2026-09-24 -- the date of the corrected run; no new run was made |
+| `ci_run` | workflow tauri-build.yml, run 36070751147, the run VP-001-VP-S1-01 was filed from |
