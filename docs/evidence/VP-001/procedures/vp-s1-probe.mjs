@@ -10,6 +10,21 @@
 // (`tools/evidence-validator/src/derive.rs`) returns `Uncertain` whenever
 // that is the case: the maintainer's decision on how to file the row until
 // that surface exists.
+//
+// Transcript line formats: `formatObservations` emits the derived summary
+// as `observation=<key> value=<v>` (one line per fact). `formatViolationLines`
+// emits every captured `securitypolicyviolation` event verbatim, one
+// `observation=violation index=<i> ...` line per event in event order, so
+// event-to-attempt attribution can be re-derived from the transcript alone
+// without re-running the probe. Each field on a violation line is
+// individually JSON-encoded (`key=`-prefixed `JSON.stringify` output) --
+// `originalPolicy` routinely carries spaces and semicolons, and JSON's own
+// escaping (quotes, newlines, backslashes) is already what `buildReadScript`
+// depends on for its snapshot, so no new encoding is introduced. A field a
+// given event never carried reads back as a literal `null`, never dropped
+// or blank. The empty case (no events at all) emits no `observation=violation`
+// lines; it is still visible in the transcript via the existing
+// `observation=violation_count value=0` line `formatObservations` always emits.
 
 /**
  * Installs a `securitypolicyviolation` listener, then makes exactly three
@@ -31,6 +46,8 @@ export function buildArmScript() {
         disposition: e.disposition,
         originalPolicy: e.originalPolicy,
         sourceFile: e.sourceFile,
+        lineNumber: e.lineNumber,
+        sample: e.sample,
       });
     });
 
@@ -151,5 +168,35 @@ export function formatObservations(summary) {
   return OBSERVATION_ORDER.map((key) => {
     const value = key === 'policy_dump' ? toSingleLine(summary[key]) : summary[key];
     return `observation=${key} value=${value}`;
+  });
+}
+
+/** Every field a captured `securitypolicyviolation` event line carries, in emission order. */
+const VIOLATION_FIELD_ORDER = [
+  'effectiveDirective',
+  'violatedDirective',
+  'blockedURI',
+  'disposition',
+  'originalPolicy',
+  'sourceFile',
+  'lineNumber',
+  'sample',
+];
+
+/**
+ * Every captured `securitypolicyviolation` event as its own
+ * `observation=violation index=<i> <field>=<json> ...` line, in event
+ * order, verbatim -- see the module header for the encoding. Returns no
+ * lines at all for the empty case; `formatObservations`'s own
+ * `violation_count` line already makes that case visible.
+ */
+export function formatViolationLines(violations) {
+  const list = Array.isArray(violations) ? violations : [];
+  return list.map((violationEvent, index) => {
+    const source = violationEvent ?? {};
+    const fields = VIOLATION_FIELD_ORDER.map(
+      (key) => `${key}=${JSON.stringify(source[key] ?? null)}`,
+    ).join(' ');
+    return `observation=violation index=${index} ${fields}`;
   });
 }

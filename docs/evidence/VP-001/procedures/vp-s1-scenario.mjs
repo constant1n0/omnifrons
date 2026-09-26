@@ -8,13 +8,26 @@
 // this exits non-zero on any failure -- a deliberate, differently-shaped
 // signal from VP-S6's own exit-0 discipline.
 //
+// Between the location-scheme gate and the summary observations, this also
+// emits one `observation=violation ...` line per captured
+// `securitypolicyviolation` event, verbatim and in event order
+// (`vp-s1-probe.mjs`'s `formatViolationLines` -- see that file's header for
+// the line format and its encoding).
+//
 // Invoked as `node vp-s1-scenario.mjs <baseUrl> <applicationPath>`.
 
 import { resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 import { createSession, deleteSession, executeScript } from './webdriver-session.mjs';
-import { buildArmScript, buildReadScript, formatObservations, summarize } from './vp-s1-probe.mjs';
+import {
+  buildArmScript,
+  buildReadScript,
+  formatObservations,
+  formatViolationLines,
+  summarize,
+} from './vp-s1-probe.mjs';
 
 function emit(key, value) {
   process.stdout.write(`${key}=${value}\n`);
@@ -28,10 +41,21 @@ const SETTLE_MS = 2_000;
 // a blocker naming the call, never an open-ended wait.
 const CALL_DEADLINE_MS = 30_000;
 
-function withDeadline(promise, label) {
+// Exported for `node --test` (`vp-s1-scenario.test.mjs`): the optional `ms`
+// lets tests bound a real deadline in milliseconds instead of waiting on
+// `CALL_DEADLINE_MS`'s full 30s; every production call site omits it and
+// gets that default unchanged. Whichever of `promise`/`deadline` settles
+// first decides the race; `.finally` then always clears the deadline timer
+// -- including when `promise` wins -- so a wedged WebDriver call never
+// outlives its own deadline as a dangling timer. When the deadline wins
+// instead, the underlying WebDriver request itself is left running:
+// `webdriver-session.mjs`'s `fetch` call takes no `AbortSignal`, and wiring
+// one through would change its exported functions' signatures, so this
+// stays a documented gap rather than a redesign of that module.
+export function withDeadline(promise, label, ms = CALL_DEADLINE_MS) {
   let timer;
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} exceeded ${CALL_DEADLINE_MS} ms`)), CALL_DEADLINE_MS);
+    timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms} ms`)), ms);
   });
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
@@ -59,12 +83,15 @@ async function main() {
     await withDeadline(executeScript(baseUrl, sessionId, buildArmScript(), []), 'arm');
     emit('gate', 'armed');
 
-    await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+    await delay(SETTLE_MS);
 
     const read = await withDeadline(executeScript(baseUrl, sessionId, buildReadScript(), []), 'read');
     const summary = summarize(read);
 
     emit('gate', `location-scheme value=${summary.location_scheme}`);
+    for (const line of formatViolationLines(read.violations)) {
+      process.stdout.write(`${line}\n`);
+    }
     for (const line of formatObservations(summary)) {
       process.stdout.write(`${line}\n`);
     }

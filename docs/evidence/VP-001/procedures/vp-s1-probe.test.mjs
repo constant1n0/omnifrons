@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { buildArmScript, formatObservations, summarize } from './vp-s1-probe.mjs';
+import { buildArmScript, formatObservations, formatViolationLines, summarize } from './vp-s1-probe.mjs';
 
 test('buildArmScript', async (t) => {
   const script = buildArmScript();
@@ -15,6 +15,24 @@ test('buildArmScript', async (t) => {
     assert.match(script, /attempt\('inline-script'/);
     assert.match(script, /attempt\('external-fetch'/);
     assert.match(script, /attempt\('framed-context'/);
+  });
+
+  await t.test('records every field a securitypolicyviolation event carries, for the per-event transcript lines', () => {
+    assert.match(script, /effectiveDirective: e\.effectiveDirective/);
+    assert.match(script, /violatedDirective: e\.violatedDirective/);
+    assert.match(script, /blockedURI: e\.blockedURI/);
+    assert.match(script, /disposition: e\.disposition/);
+    assert.match(script, /originalPolicy: e\.originalPolicy/);
+    assert.match(script, /sourceFile: e\.sourceFile/);
+    assert.match(script, /lineNumber: e\.lineNumber/);
+    assert.match(script, /sample: e\.sample/);
+  });
+
+  await t.test('captures exactly the fields formatViolationLines emits, no more and no fewer', () => {
+    const captured = [...script.matchAll(/(\w+): e\.\1\b/g)].map((m) => m[1]).sort();
+    const [line] = formatViolationLines([{}]);
+    const emitted = [...line.matchAll(/ (\w+)=/g)].map((m) => m[1]).filter((key) => key !== 'index').sort();
+    assert.deepEqual(captured, emitted);
   });
 
   await t.test('targets the reserved .invalid host for both network-shaped attempts, never a real origin', () => {
@@ -105,5 +123,50 @@ test('formatObservations', async (t) => {
     );
     const policyLine = formatObservations(summary).find((line) => line.startsWith('observation=policy_dump'));
     assert.equal(policyLine, "observation=policy_dump value=default-src 'none'; script-src 'self'; frame-src 'none'");
+  });
+});
+
+test('formatViolationLines', async (t) => {
+  await t.test('emits one line per event, in event order, each carrying its own 0-based index', () => {
+    const violations = [
+      violation('script-src-elem', "default-src 'none'; script-src 'self'"),
+      violation('connect-src', "default-src 'none'; script-src 'self'"),
+    ];
+    const lines = formatViolationLines(violations);
+    assert.equal(lines.length, 2);
+    assert.match(lines[0], /^observation=violation index=0 /);
+    assert.match(lines[1], /^observation=violation index=1 /);
+  });
+
+  await t.test('JSON-encodes every field value, so spaces and semicolons in originalPolicy stay unambiguous', () => {
+    const policy = "default-src 'none'; script-src 'self'; connect-src 'none'";
+    const [line] = formatViolationLines([{ effectiveDirective: 'connect-src', originalPolicy: policy }]);
+    assert.ok(line.includes(`originalPolicy=${JSON.stringify(policy)}`));
+    assert.ok(line.includes(`effectiveDirective=${JSON.stringify('connect-src')}`));
+  });
+
+  await t.test('never truncates or normalizes a value -- newlines and quotes survive the JSON encoding verbatim', () => {
+    const policy = "default-src 'none';\n  script-src 'self'";
+    const [line] = formatViolationLines([{ effectiveDirective: 'script-src', originalPolicy: policy }]);
+    assert.ok(line.includes(`originalPolicy=${JSON.stringify(policy)}`));
+  });
+
+  await t.test('carries a missing field through as a literal JSON null, never dropped', () => {
+    const [line] = formatViolationLines([{ effectiveDirective: 'script-src' }]);
+    assert.ok(line.includes('blockedURI=null'));
+    assert.ok(line.includes('sourceFile=null'));
+    assert.ok(line.includes('lineNumber=null'));
+    assert.ok(line.includes('sample=null'));
+  });
+
+  await t.test('emits no lines at all for the empty case -- visible instead via the existing observation=violation_count line', () => {
+    assert.deepEqual(formatViolationLines([]), []);
+    assert.deepEqual(formatViolationLines(undefined), []);
+  });
+
+  await t.test('a null entry still yields its line of nulls, never a throw', () => {
+    const [line] = formatViolationLines([null]);
+    assert.match(line, /^observation=violation index=0 effectiveDirective=null /);
+    assert.ok(line.endsWith('sample=null'));
   });
 });
