@@ -1,0 +1,35 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+gate=av1-digest-match digest=437204786229aa0a35b69a56ecca4d71d02820a5fe92867aeaa579cb28141501
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:25014): dbind-WARNING **: 13:16:47.831: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=58641145-36c7-4471-8f51-5133b7029c19
+gate=session-closed session_id=58641145-36c7-4471-8f51-5133b7029c19
+
+(omnifrons-shell:25129): dbind-WARNING **: 13:17:19.700: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=session-created session_id=ba887581-e38c-473d-b1b8-3ffc79e8c40d
+gate=armed
+gate=location-scheme value=tauri:
+observation=violation index=0 effectiveDirective="script-src-elem" violatedDirective="script-src-elem" blockedURI="inline" disposition="enforce" originalPolicy="style-src 'self'; base-uri 'none'; frame-src 'none'; connect-src ipc: http://ipc.localhost; form-action 'none'; manifest-src 'self'; object-src 'none'; default-src 'none'; media-src 'self' artifact:; worker-src 'self'; font-src 'self'; img-src 'self' artifact:; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='" sourceFile="" lineNumber=0 sample=""
+observation=violation index=1 effectiveDirective="connect-src" violatedDirective="connect-src" blockedURI="https://vp-s1.invalid/" disposition="enforce" originalPolicy="style-src 'self'; base-uri 'none'; frame-src 'none'; connect-src ipc: http://ipc.localhost; form-action 'none'; manifest-src 'self'; object-src 'none'; default-src 'none'; media-src 'self' artifact:; worker-src 'self'; font-src 'self'; img-src 'self' artifact:; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='" sourceFile="" lineNumber=0 sample=""
+observation=violation index=2 effectiveDirective="frame-src" violatedDirective="frame-src" blockedURI="https://vp-s1.invalid" disposition="enforce" originalPolicy="style-src 'self'; base-uri 'none'; frame-src 'none'; connect-src ipc: http://ipc.localhost; form-action 'none'; manifest-src 'self'; object-src 'none'; default-src 'none'; media-src 'self' artifact:; worker-src 'self'; font-src 'self'; img-src 'self' artifact:; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='" sourceFile="" lineNumber=0 sample=""
+observation=location_scheme value=tauri:
+observation=meta_csp_present value=false
+observation=policy_dump value=style-src 'self'; base-uri 'none'; frame-src 'none'; connect-src ipc: http://ipc.localhost; form-action 'none'; manifest-src 'self'; object-src 'none'; default-src 'none'; media-src 'self' artifact:; worker-src 'self'; font-src 'self'; img-src 'self' artifact:; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='
+observation=inline_script_violation value=true
+observation=inline_script_ran value=false
+observation=external_fetch_violation value=true
+observation=external_fetch_settled value=rejected:TypeError
+observation=framed_context_violation value=true
+observation=iframe_document_url value=about:blank
+observation=violation_count value=3
+observation=third_party_surface_exercised value=false
+gate=session-closed session_id=ba887581-e38c-473d-b1b8-3ffc79e8c40d
