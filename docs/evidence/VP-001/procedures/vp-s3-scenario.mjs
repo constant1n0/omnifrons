@@ -18,7 +18,7 @@ import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-import { withDeadline } from './vp-s1-scenario.mjs';
+import { SESSION_CREATE_DEADLINE_MS, withDeadline } from './vp-s1-scenario.mjs';
 import { createSession, deleteSession, executeScript } from './webdriver-session.mjs';
 import {
   buildArmScript,
@@ -61,7 +61,7 @@ async function main() {
 
   let sessionId;
   try {
-    sessionId = await withDeadline(createSession(baseUrl, applicationPath), 'session-create');
+    sessionId = await withDeadline(createSession(baseUrl, applicationPath), 'session-create', SESSION_CREATE_DEADLINE_MS);
   } catch (error) {
     emit('blocker', `session-create-failed: ${error.message}`);
     process.exitCode = 1;

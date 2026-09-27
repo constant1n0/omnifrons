@@ -9,7 +9,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { withDeadline } from './vp-s1-scenario.mjs';
+import { SESSION_CREATE_DEADLINE_MS, withDeadline } from './vp-s1-scenario.mjs';
+
+test('SESSION_CREATE_DEADLINE_MS leaves at least twice the slowest session creation measured on CI (32.6 s)', () => {
+  assert.ok(SESSION_CREATE_DEADLINE_MS >= 2 * 32_600, String(SESSION_CREATE_DEADLINE_MS));
+});
 
 test('withDeadline', async (t) => {
   await t.test('resolves with the wrapped promise\'s own value when it settles well before the deadline', async () => {

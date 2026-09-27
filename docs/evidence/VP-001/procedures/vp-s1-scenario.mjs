@@ -40,6 +40,12 @@ const SETTLE_MS = 2_000;
 // Every WebDriver call is given this long; an unresponsive driver becomes
 // a blocker naming the call, never an open-ended wait.
 const CALL_DEADLINE_MS = 30_000;
+// Creating the session launches the packaged app, which CALL_DEADLINE_MS
+// cannot cover: CI job logs measured it at 30.2-32.6 s for the first session
+// of a step and 11.4-13.6 s for VP-S1's own, and VP-S3's first run (36352840629)
+// was blocked by this 30 s bound. Its cause is not established; the bound
+// leaves headroom and still fits vp-s1/vp-s3-linux.sh's 300 s scenario limit.
+export const SESSION_CREATE_DEADLINE_MS = 90_000;
 
 // Exported for `node --test` (`vp-s1-scenario.test.mjs`): the optional `ms`
 // lets tests bound a real deadline in milliseconds instead of waiting on
@@ -70,7 +76,7 @@ async function main() {
 
   let sessionId;
   try {
-    sessionId = await withDeadline(createSession(baseUrl, applicationPath), 'session-create');
+    sessionId = await withDeadline(createSession(baseUrl, applicationPath), 'session-create', SESSION_CREATE_DEADLINE_MS);
   } catch (error) {
     emit('blocker', `session-create-failed: ${error.message}`);
     process.exitCode = 1;
