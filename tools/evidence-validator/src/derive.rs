@@ -141,3 +141,128 @@ pub fn derive_csp(observations: CspObservations) -> (Outcome, CspObservedState) 
     }
     (Outcome::Uncertain, CspObservedState::Unverified)
 }
+
+/// The public `observed_state` a VP-S3 (typed-IPC bridge confinement) row
+/// may additionally carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcObservedState {
+    /// The public state token for a baseline whose typed-IPC bridge stayed
+    /// inside its documented `connect-src` source, with every proof held.
+    Confined,
+    /// The captured `connect-src` is not exactly the bridge source RCS-001
+    /// documents for the baseline's OS -- the plan's own `undocumented-bridge`
+    /// token (VP-001 § Signal mapping).
+    UndocumentedBridge,
+    /// A bridge call fell back to `postMessage`, or a `connect-src`
+    /// violation fired for the bridge origin itself.
+    FellBack,
+    /// An `artifact:` load succeeded although RCS-001 documents no handler
+    /// for it yet (renderer-content-security.md § CSP baseline).
+    ArtifactServed,
+    /// A call to a command the app never registered resolved instead of
+    /// being rejected.
+    UnregisteredCommandServed,
+    /// Any fact absent, unreadable, or short of full proof; nothing was
+    /// demonstrated either way.
+    Unverified,
+}
+
+/// Every fact a VP-S3 probe can observe, before any outcome is decided.
+/// Mirrors [`CspObservations`]'s own shape: independent booleans, not a
+/// state machine, one baseline (OS) at a time.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IpcObservations {
+    /// AV1/AV2 both gated before the session was created.
+    pub identity_gated: bool,
+    /// The packaged custom-protocol scheme was observed, never `http:`.
+    pub location_scheme_is_app_protocol: bool,
+    /// A `connect-src` policy dump (a violation's `originalPolicy`, or
+    /// `<meta>`) was captured for this baseline's OS.
+    pub connect_src_policy_captured: bool,
+    /// The captured `connect-src` is exactly the bridge source RCS-001
+    /// documents for this baseline's OS (`ipc:` on Linux/macOS,
+    /// `http://ipc.localhost` on Windows).
+    pub connect_src_is_documented_source_for_os: bool,
+    /// A renderer->core call to a command the app registered resolved.
+    pub registered_call_completed: bool,
+    /// The registered call's `fetch` to the bridge origin was observed
+    /// (`ipc://localhost/<cmd>` or `http://ipc.localhost/<cmd>`), not
+    /// `postMessage`.
+    pub registered_call_used_custom_protocol: bool,
+    /// The typed-IPC bridge fell back to `postMessage` for any call -- the
+    /// framework's own fallback when the custom-protocol `fetch` fails
+    /// (renderer-content-security.md § CSP baseline).
+    pub postmessage_fallback_observed: bool,
+    /// A `securitypolicyviolation` matched `connect-src*` for the bridge
+    /// origin itself.
+    pub bridge_connect_src_violation: bool,
+    /// A call to a command the app never registered was rejected.
+    pub unregistered_call_rejected: bool,
+    /// A call to a command the app never registered resolved anyway.
+    pub unregistered_call_resolved: bool,
+    /// An `artifact:` load (`img-src`/`media-src`) was attempted against
+    /// the reserved scheme.
+    pub artifact_load_attempted: bool,
+    /// The `artifact:` load actually succeeded, although RCS-001 documents
+    /// no handler for it yet.
+    pub artifact_load_succeeded: bool,
+    /// `src-tauri/tests/protocol_inventory.rs` passed on the run's head
+    /// commit -- the static half of this evidence.
+    pub static_inventory_pinned: bool,
+}
+
+/// Maps VP-S3 observations to `(result, observed_state)`.
+///
+/// Demonstrated failures override every other observation, checked in this
+/// fixed order (first match wins):
+///
+/// 1. `connect_src_policy_captured && !connect_src_is_documented_source_for_os`
+///    yields `(Fail, UndocumentedBridge)` -- the plan's own
+///    `undocumented-bridge` token.
+/// 2. `postmessage_fallback_observed || bridge_connect_src_violation` yields
+///    `(Fail, FellBack)`.
+/// 3. `artifact_load_succeeded` yields `(Fail, ArtifactServed)`.
+/// 4. `unregistered_call_resolved` yields `(Fail, UnregisteredCommandServed)`.
+///
+/// `Pass` requires every positive proof: `identity_gated`,
+/// `location_scheme_is_app_protocol`, `connect_src_policy_captured`,
+/// `connect_src_is_documented_source_for_os`, `registered_call_completed`,
+/// `registered_call_used_custom_protocol`, `unregistered_call_rejected`,
+/// `artifact_load_attempted` (with `artifact_load_succeeded` false, already
+/// excluded above), and `static_inventory_pinned`. Anything else is
+/// `Uncertain`.
+///
+/// Unlike [`derive_csp`], `Pass` is reachable here -- per baseline: this
+/// function derives one OS's result at a time, and a `Pass` on one baseline
+/// never transfers to another OS's row (VP-001-R15).
+#[must_use]
+pub fn derive_ipc(observations: IpcObservations) -> (Outcome, IpcObservedState) {
+    if observations.connect_src_policy_captured
+        && !observations.connect_src_is_documented_source_for_os
+    {
+        return (Outcome::Fail, IpcObservedState::UndocumentedBridge);
+    }
+    if observations.postmessage_fallback_observed || observations.bridge_connect_src_violation {
+        return (Outcome::Fail, IpcObservedState::FellBack);
+    }
+    if observations.artifact_load_succeeded {
+        return (Outcome::Fail, IpcObservedState::ArtifactServed);
+    }
+    if observations.unregistered_call_resolved {
+        return (Outcome::Fail, IpcObservedState::UnregisteredCommandServed);
+    }
+    if observations.identity_gated
+        && observations.location_scheme_is_app_protocol
+        && observations.connect_src_policy_captured
+        && observations.connect_src_is_documented_source_for_os
+        && observations.registered_call_completed
+        && observations.registered_call_used_custom_protocol
+        && observations.unregistered_call_rejected
+        && observations.artifact_load_attempted
+        && observations.static_inventory_pinned
+    {
+        return (Outcome::Pass, IpcObservedState::Confined);
+    }
+    (Outcome::Uncertain, IpcObservedState::Unverified)
+}
