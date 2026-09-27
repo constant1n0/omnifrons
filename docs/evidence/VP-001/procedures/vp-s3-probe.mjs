@@ -111,10 +111,14 @@ export function buildArmScript() {
   `;
 }
 
-/** Reads back `window.__vpS3`, deep-cloned, plus `location.protocol` as `location_protocol`. */
+/**
+ * Reads back `window.__vpS3`, deep-cloned, plus `location.protocol` as
+ * `location_protocol`; an empty snapshot (which `summarize` reads as all
+ * `false`) when the probe was never armed, never a throw.
+ */
 export function buildReadScript() {
   return `
-    var snapshot = JSON.parse(JSON.stringify(window.__vpS3));
+    var snapshot = window.__vpS3 ? JSON.parse(JSON.stringify(window.__vpS3)) : {};
     snapshot.location_protocol = location.protocol;
     return snapshot;
   `;
@@ -181,10 +185,14 @@ export function summarize(read, os) {
   const postmessageFallbackObserved = source.consoleWarnFallbackSeen === true
     || (typeof source.postMessageCallCount === 'number' && source.postMessageCallCount >= 1);
 
+  // The bridge origin always counts, with or without its trailing slash. Only a custom scheme (`ipc:`)
+  // may also match by scheme -- CSP3 reports a non-HTTP(S) blocked URL as the bare scheme (`ipc`) --
+  // never `http:`, which on Windows would count every blocked http URL as the bridge.
+  const schemeMayMatch = bridgeScheme !== null && !/^https?:$/.test(bridgeScheme);
+  const isBridgeUri = (uri) => uri === bridgeOrigin.slice(0, -1) || uri.startsWith(bridgeOrigin)
+    || (schemeMayMatch && (uri.startsWith(bridgeScheme) || uri === bridgeScheme.slice(0, -1)));
   const isBridgeViolation = (v) => v && typeof v.effectiveDirective === 'string' && v.effectiveDirective.startsWith('connect-src')
-    && typeof v.blockedURI === 'string' && bridgeOrigin
-    // CSP3 reports a non-HTTP(S) blocked URL as its bare scheme (`ipc`), so that form counts too.
-    && (v.blockedURI.startsWith(bridgeOrigin) || v.blockedURI.startsWith(bridgeScheme) || v.blockedURI === bridgeScheme.slice(0, -1));
+    && typeof v.blockedURI === 'string' && bridgeOrigin && isBridgeUri(v.blockedURI);
 
   const unregisteredAttempt = findAttempt('unregistered-call');
   const artifactAttempt = findAttempt('artifact-load');

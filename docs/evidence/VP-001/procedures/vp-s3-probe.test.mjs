@@ -4,9 +4,45 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  bridgeOriginFor, buildArmScript, connectSrcSources, documentedConnectSrcFor,
+  bridgeOriginFor, buildArmScript, buildReadScript, connectSrcSources, documentedConnectSrcFor,
   formatFetchLines, formatObservations, formatViolationLines, summarize,
 } from './vp-s3-probe.mjs';
+
+test('buildReadScript returns an empty snapshot, never throws, when the probe was never armed', () => {
+  const script = buildReadScript();
+  assert.match(script, /window\.__vpS3 \? JSON\.parse\(JSON\.stringify\(window\.__vpS3\)\) : \{\}/);
+  // Run the page script the way executeScript does, in a scope with no armed probe.
+  const snapshot = new Function('window', 'location', script)({}, { protocol: 'tauri:' });
+  assert.deepEqual(snapshot, { location_protocol: 'tauri:' });
+});
+
+test('summarize on Windows', async (t) => {
+  const connect = (blockedURI, originalPolicy = 'connect-src http://ipc.localhost') => ({
+    effectiveDirective: 'connect-src', originalPolicy, blockedURI,
+  });
+  await t.test('the http bridge origin backs the custom-protocol and documented-source facts', () => {
+    const summary = summarize({
+      violations: [connect('https://vp-s3.invalid/')],
+      fetches: [{ url: 'http://ipc.localhost/shell_health', outcome: 'resolved:200' }],
+      attempts: [{ name: 'registered-call', outcome: 'resolved' }],
+    }, 'windows');
+    assert.equal(summary.connect_src_is_documented_source_for_os, true);
+    assert.equal(summary.registered_call_used_custom_protocol, true);
+    assert.equal(summary.bridge_connect_src_violation, false);
+  });
+  await t.test('only the bridge origin counts as a bridge violation, never any other http URL', () => {
+    for (const uri of ['http://ipc.localhost/shell_health', 'http://ipc.localhost']) {
+      assert.equal(summarize({ violations: [connect(uri)] }, 'windows').bridge_connect_src_violation, true, uri);
+    }
+    for (const uri of ['http://example.invalid/', 'http://ipc.localhost.example.invalid/', 'http']) {
+      assert.equal(summarize({ violations: [connect(uri)] }, 'windows').bridge_connect_src_violation, false, uri);
+    }
+  });
+  await t.test("Linux's source is not Windows' documented one", () => {
+    const summary = summarize({ violations: [connect('https://vp-s3.invalid/', 'connect-src ipc:')] }, 'windows');
+    assert.equal(summary.connect_src_is_documented_source_for_os, false);
+  });
+});
 
 test('buildArmScript', async (t) => {
   const script = buildArmScript();
