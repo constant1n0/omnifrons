@@ -212,6 +212,8 @@ Each OS's shipped policy carries only its own bridge source, and neither source 
 
 `connect-src` selects the bridge's transport; it does not gate typed IPC. When the custom-protocol `fetch` fails for any reason, including this policy blocking it, the framework falls back to its `postMessage` bridge, which `connect-src` does not govern. Typed IPC is constrained by core's request validation (Typed IPC constraints), not by this directive. A bridge protocol not listed here is an undocumented exception, never an implicit one; [VP-001](desktop-stack-verification-plan.md) (VP-S3) verifies this list per OS.
 
+`artifact:` in `img-src` and `media-src` is reserved for the artifact tier (Images and remote resources): no handler serves it yet, so a load through it fails. It gains a handler only together with that tier, documented in this section and verified under [VP-001](desktop-stack-verification-plan.md) (VP-S3); until then VP-S3 expects every `artifact:` load to fail.
+
 The baseline is enforced as the renderer's actual CSP policy — a header or an equivalent webview policy under the desktop stack ADR-0002 selects — not as guidance a component may opt out of, and RCS-001-R13 makes it a conformance-tested acceptance gate rather than an aspiration. A third-party app inherits this baseline exactly, with no relaxation (ADR-0004): a custom app's content class rules, CSP, and navigation constraints are the same ones this document states for the core renderer, and no app manifest field can widen a directive.
 
 ## Typed IPC constraints

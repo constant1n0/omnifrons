@@ -25,8 +25,8 @@
 //! [`csp_scheme_sources_are_the_inventoried_ones`]), which is `ipc:` /
 //! `http://ipc.localhost` in `connect-src` (the typed-IPC bridge, per OS) and
 //! `artifact:` in `img-src`/`media-src`. `artifact:` has **no registered
-//! handler today** -- that mismatch is pinned here as the current fact,
-//! pending a maintainer decision to document it as reserved or remove it.
+//! handler**: RCS-001 § CSP baseline reserves it for the artifact tier, and
+//! it gains a handler only together with that tier.
 //!
 //! A Tauri version bump must re-check `src/manager/webview.rs`'s scheme
 //! registration logic: this inventory is derived from that source, not from
@@ -335,9 +335,9 @@ fn scheme_sources_collects_every_scheme_and_url_token() {
 /// (`src-tauri/tests/config.rs` already pins the exact directive values and
 /// the merged per-OS config -- this only pins which sources are scheme
 /// sources). `artifact:` in `img-src`/`media-src` is a policy scheme with
-/// **no registered handler today** (see this file's module doc comment and
-/// [`app_registers_no_uri_scheme`]) -- pinned here as the current fact
-/// pending a maintainer decision, not "fixed" by adding or removing it.
+/// **no registered handler** (see this file's module doc comment and
+/// [`app_registers_no_uri_scheme`]): RCS-001 reserves it for the artifact
+/// tier, so it stays in the policy with no handler until that tier lands.
 #[test]
 fn csp_scheme_sources_are_the_inventoried_ones() {
     let base = read_json("tauri.conf.json");
