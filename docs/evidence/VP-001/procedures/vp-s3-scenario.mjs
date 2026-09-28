@@ -18,7 +18,7 @@ import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-import { SESSION_CREATE_DEADLINE_MS, withDeadline } from './vp-s1-scenario.mjs';
+import { SESSION_CREATE_DEADLINE_MS, withDeadline } from './scenario-session.mjs';
 import { createSession, deleteSession, executeScript } from './webdriver-session.mjs';
 import {
   buildArmScript,
