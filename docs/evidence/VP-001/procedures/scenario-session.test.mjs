@@ -1,10 +1,13 @@
 // `node --test` unit tests for `scenario-session.mjs`: the shared
 // `withDeadline` helper (moved here from `vp-s1-scenario.mjs`, tests moved
-// with it) and `runScenarioSession`'s normal-path lifecycle. Everything
-// here runs in-process against a fake `webdriver` -- no WebDriver session,
-// subprocess, or display, mirroring every other `*-scenario.test.mjs` file.
+// with it) and `runScenarioSession`. Everything runs in-process against a
+// fake `webdriver`, a real `node:events` `EventEmitter` standing in for
+// `process` as the SIGTERM source, and a fake `exit` that records its code
+// instead of ending the test process -- no WebDriver session, subprocess,
+// or display, mirroring every other `*-scenario.test.mjs` file.
 
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 
 import {
@@ -51,6 +54,31 @@ test('withDeadline', async (t) => {
 
 // -- runScenarioSession --
 
+// Small, real (unmocked) deadlines for every test that deliberately expires
+// one: tens of milliseconds keep the suite fast while still exercising the
+// real withDeadline race. The one exception is the default-deadline test
+// below, which pins the scenarios' own real 90 s default via mock.timers.
+const FAST_DEADLINES = { sessionCreate: 300, call: 300, terminationTeardown: 50 };
+
+/** One test's shared emit sink and SIGTERM source, plus a `run` shorthand
+ * that supplies `runScenarioSession`'s common fields so each test states
+ * only what it overrides (`webdriver`, `body`, `exit`, `deadlines`). */
+function context() {
+  const lines = [];
+  const emit = (key, value) => lines.push(`${key}=${value}`);
+  const signals = new EventEmitter();
+  const run = (overrides) =>
+    runScenarioSession({
+      baseUrl: 'http://example.invalid',
+      applicationPath: '/app',
+      emit,
+      signals,
+      exit: () => assert.fail('exit must not be called'),
+      ...overrides,
+    });
+  return { lines, emit, signals, run };
+}
+
 /** A `deleteSession` fake that counts its own calls, for tests asserting
  * "deleted at most once" without a bespoke counter each time. */
 function countingDelete() {
@@ -61,24 +89,32 @@ function countingDelete() {
   return state;
 }
 
-/** One test's shared emit sink, plus a `run` shorthand that supplies
- * `runScenarioSession`'s common fields so each test states only what it
- * overrides (`webdriver`, `body`, `deadlines`). */
-function context() {
-  const lines = [];
-  const emit = (key, value) => lines.push(`${key}=${value}`);
-  const run = (overrides) =>
-    runScenarioSession({
-      baseUrl: 'http://example.invalid',
-      applicationPath: '/app',
-      emit,
-      ...overrides,
-    });
-  return { lines, emit, run };
+/** A promise plus its own resolve/reject, for tests that must control
+ * exactly when a fake WebDriver call settles relative to a SIGTERM. */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
-test('runScenarioSession: happy path emits session-created, the body\'s own lines, and session-closed; deletes once; resolves 0', async () => {
-  const { lines, emit, run } = context();
+/** Polls `conditionFn` until true, for tests waiting on an in-flight async
+ * call or a real `FAST_DEADLINES` timer. Polls on a real 1 ms tick, not a
+ * bare microtask turn: `termination-teardown` is a real `setTimeout` and
+ * needs actual wall-clock time regardless of how many turns are taken. */
+async function waitFor(conditionFn) {
+  for (let i = 0; i < 2_000; i++) {
+    if (conditionFn()) return;
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  throw new Error('waitFor: condition never became true');
+}
+
+test('runScenarioSession: happy path emits session-created, the body\'s own lines, and session-closed; deletes once; resolves 0; leaves no SIGTERM listener', async () => {
+  const { lines, emit, signals, run } = context();
   const del = countingDelete();
 
   const code = await run({
@@ -93,6 +129,7 @@ test('runScenarioSession: happy path emits session-created, the body\'s own line
     'gate=session-closed session_id=sess-1',
   ]);
   assert.equal(del.count, 1);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
 });
 
 test('runScenarioSession: create rejects -- session-create-failed, no delete, resolves 1', async () => {
@@ -166,6 +203,26 @@ test('runScenarioSession: body throws -- unexpected-error, then one delete and s
   assert.equal(del.count, 1);
 });
 
+test('runScenarioSession: body throws a non-Error (null) -- unexpected-error: null, still one delete and session-closed; resolves 1', async () => {
+  const { lines, run } = context();
+  const del = countingDelete();
+
+  const code = await run({
+    webdriver: { createSession: async () => 'sess-1', deleteSession: del.deleteSession },
+    body: async () => {
+      throw null; // eslint-disable-line no-throw-literal -- deliberately non-Error
+    },
+  });
+
+  assert.equal(code, 1);
+  assert.deepEqual(lines, [
+    'gate=session-created session_id=sess-1',
+    'blocker=unexpected-error: null',
+    'gate=session-closed session_id=sess-1',
+  ]);
+  assert.equal(del.count, 1);
+});
+
 test('runScenarioSession: delete rejects -- session-close-failed; resolves 1', async () => {
   const { lines, run } = context();
 
@@ -184,4 +241,143 @@ test('runScenarioSession: delete rejects -- session-close-failed; resolves 1', a
     'gate=session-created session_id=sess-1',
     'blocker=session-close-failed: DELETE failed with HTTP 500',
   ]);
+});
+
+test('runScenarioSession: delete never settles -- session-close-failed carrying the call deadline message; resolves 1', async () => {
+  const { lines, run } = context();
+  const deadlines = { ...FAST_DEADLINES, call: 30 };
+  const never = new Promise(() => {});
+
+  const code = await run({
+    webdriver: { createSession: async () => 'sess-1', deleteSession: () => never },
+    body: async () => {},
+    deadlines,
+  });
+
+  assert.equal(code, 1);
+  assert.deepEqual(lines, [
+    'gate=session-created session_id=sess-1',
+    `blocker=session-close-failed: session-delete exceeded ${deadlines.call} ms`,
+  ]);
+});
+
+test('runScenarioSession: SIGTERM during body -- terminated blocker, exactly one delete, session-closed, exit(143); a late body rejection emits no unexpected-error', async () => {
+  const { lines, signals, run } = context();
+  const del = countingDelete();
+  const exitCodes = [];
+  const body = deferred();
+
+  const resultPromise = run({
+    webdriver: { createSession: async () => 'sess-1', deleteSession: del.deleteSession },
+    body: () => body.promise,
+    exit: (code) => exitCodes.push(code),
+    deadlines: FAST_DEADLINES,
+  });
+
+  await waitFor(() => lines.includes('gate=session-created session_id=sess-1'));
+  signals.emit('SIGTERM');
+  await waitFor(() => exitCodes.length === 1);
+
+  // The body's own promise rejects only after the signal was already
+  // handled -- this must produce no `unexpected-error` line. Awaiting the
+  // result lets the normal path's catch (and its re-entrant, memoized
+  // `close()` call) run to completion before asserting.
+  body.reject(new Error('late-rejection-after-signal'));
+  await resultPromise;
+
+  assert.deepEqual(exitCodes, [143]);
+  assert.deepEqual(lines, [
+    'gate=session-created session_id=sess-1',
+    'blocker=terminated: SIGTERM',
+    'gate=session-closed session_id=sess-1',
+  ]);
+  assert.equal(del.count, 1);
+});
+
+test('runScenarioSession: SIGTERM during create, create resolving inside the window -- one delete for that id, no session-created gate, body never called, exit(143)', async () => {
+  const { lines, signals, run } = context();
+  const del = countingDelete();
+  const create = deferred();
+  const exitCodes = [];
+
+  const resultPromise = run({
+    webdriver: { createSession: () => create.promise, deleteSession: del.deleteSession },
+    body: async () => assert.fail('body must never run once terminated'),
+    exit: (code) => exitCodes.push(code),
+    deadlines: FAST_DEADLINES,
+  });
+
+  // Fire the signal before create ever settles, then let the still-pending
+  // creation resolve inside the termination-teardown window.
+  signals.emit('SIGTERM');
+  await waitFor(() => lines.includes('blocker=terminated: SIGTERM'));
+  create.resolve('sess-late');
+  await waitFor(() => exitCodes.length === 1);
+
+  assert.deepEqual(exitCodes, [143]);
+  assert.deepEqual(lines, ['blocker=terminated: SIGTERM', 'gate=session-closed session_id=sess-late']);
+  assert.equal(del.count, 1);
+  await resultPromise;
+});
+
+test('runScenarioSession: SIGTERM during create, create never settling -- session-close-failed carrying the termination-teardown deadline message, exit(143)', async () => {
+  const { lines, signals, run } = context();
+  const never = new Promise(() => {});
+  const exitCodes = [];
+
+  const resultPromise = run({
+    webdriver: {
+      createSession: () => never,
+      deleteSession: async () => assert.fail('delete must never be attempted with no session id'),
+    },
+    body: async () => assert.fail('body must never run once terminated'),
+    exit: (code) => exitCodes.push(code),
+    deadlines: FAST_DEADLINES,
+  });
+
+  signals.emit('SIGTERM');
+  await waitFor(() => exitCodes.length === 1);
+
+  assert.deepEqual(exitCodes, [143]);
+  assert.deepEqual(lines, [
+    'blocker=terminated: SIGTERM',
+    `blocker=session-close-failed: termination-teardown exceeded ${FAST_DEADLINES.terminationTeardown} ms`,
+  ]);
+  await resultPromise;
+});
+
+test('runScenarioSession: SIGTERM while the normal path\'s close() is already in flight -- still exactly one delete call and one session-closed line', async () => {
+  const { lines, signals, run } = context();
+  let deleteCalls = 0;
+  const deleteCall = deferred();
+  const exitCodes = [];
+
+  const resultPromise = run({
+    webdriver: {
+      createSession: async () => 'sess-1',
+      deleteSession: () => {
+        deleteCalls += 1;
+        return deleteCall.promise;
+      },
+    },
+    body: async () => {},
+    exit: (code) => exitCodes.push(code),
+    deadlines: FAST_DEADLINES,
+  });
+
+  // Wait until the normal path's own close() has already issued the
+  // DELETE and is waiting on it, then fire the signal.
+  await waitFor(() => deleteCalls === 1);
+  signals.emit('SIGTERM');
+  await waitFor(() => lines.includes('blocker=terminated: SIGTERM'));
+  deleteCall.resolve();
+  await waitFor(() => exitCodes.length === 1);
+
+  assert.equal(deleteCalls, 1);
+  assert.deepEqual(lines, [
+    'gate=session-created session_id=sess-1',
+    'blocker=terminated: SIGTERM',
+    'gate=session-closed session_id=sess-1',
+  ]);
+  await resultPromise;
 });
