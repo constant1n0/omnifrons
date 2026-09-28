@@ -11,8 +11,10 @@ import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 
 import {
+  DEFAULT_DEADLINES,
   runScenarioSession,
   SESSION_CREATE_DEADLINE_MS,
+  TERMINATION_TEARDOWN_DEADLINE_MS,
   withDeadline,
 } from './scenario-session.mjs';
 
@@ -177,10 +179,23 @@ test('runScenarioSession: default deadlines -- a never-settling create is still 
   assert.equal(settled, false, 'must still be waiting 1 ms before the deadline');
 
   t.mock.timers.tick(1);
+  // The raw `createSession()` call behind `never` truly never settles, so
+  // once the sessionCreate deadline wins, close() still
+  // has to wait, bounded by `deadlines.call` (`DEFAULT_DEADLINES.call`
+  // here), to find out whether it eventually succeeds and orphans a
+  // session -- through several more `await`s than the simpler chain above.
+  // A real `setImmediate` (unaffected by the `setTimeout`-only mock) fully
+  // drains the microtask queue, so that wait's own timer is reliably
+  // registered before it is ticked forward, however many hops it takes.
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(DEFAULT_DEADLINES.call);
   const code = await resultPromise;
 
   assert.equal(code, 1);
-  assert.deepEqual(lines, [`blocker=session-create-failed: session-create exceeded ${SESSION_CREATE_DEADLINE_MS} ms`]);
+  assert.deepEqual(lines, [
+    `blocker=session-create-failed: session-create exceeded ${SESSION_CREATE_DEADLINE_MS} ms`,
+    `blocker=session-close-failed: late-session-create exceeded ${DEFAULT_DEADLINES.call} ms`,
+  ]);
 });
 
 test('runScenarioSession: body throws -- unexpected-error, then one delete and session-closed; resolves 1', async () => {
@@ -259,6 +274,198 @@ test('runScenarioSession: delete never settles -- session-close-failed carrying 
     'gate=session-created session_id=sess-1',
     `blocker=session-close-failed: session-delete exceeded ${deadlines.call} ms`,
   ]);
+});
+
+test('runScenarioSession: the sessionCreate deadline loses the race, then the raw create resolves late -- session-create-failed, then session-closed for the orphaned session; one delete; resolves 1', async () => {
+  const { lines, run } = context();
+  const del = countingDelete();
+  const create = deferred();
+
+  const resultPromise = run({
+    webdriver: { createSession: () => create.promise, deleteSession: del.deleteSession },
+    body: async () => assert.fail('body must not run once create-failed is reported'),
+    deadlines: FAST_DEADLINES,
+  });
+
+  await waitFor(() => lines.includes(`blocker=session-create-failed: session-create exceeded ${FAST_DEADLINES.sessionCreate} ms`));
+  create.resolve('sess-late');
+  const code = await resultPromise;
+
+  assert.equal(code, 1);
+  assert.deepEqual(lines, [
+    `blocker=session-create-failed: session-create exceeded ${FAST_DEADLINES.sessionCreate} ms`,
+    'gate=session-closed session_id=sess-late',
+  ]);
+  assert.equal(del.count, 1);
+});
+
+test('runScenarioSession: the sessionCreate deadline loses the race and the raw create never settles -- session-close-failed carrying the call deadline message; resolves 1', async () => {
+  const { lines, run } = context();
+  const never = new Promise(() => {});
+
+  const code = await run({
+    webdriver: {
+      createSession: () => never,
+      deleteSession: async () => assert.fail('delete must never be attempted with no session id'),
+    },
+    body: async () => assert.fail('body must not run once create-failed is reported'),
+    deadlines: FAST_DEADLINES,
+  });
+
+  assert.equal(code, 1);
+  assert.deepEqual(lines, [
+    `blocker=session-create-failed: session-create exceeded ${FAST_DEADLINES.sessionCreate} ms`,
+    `blocker=session-close-failed: late-session-create exceeded ${FAST_DEADLINES.call} ms`,
+  ]);
+});
+
+test('runScenarioSession: the sessionCreate deadline loses the race, then the raw create rejects on its own -- only session-create-failed; no delete; resolves 1', async () => {
+  const { lines, run } = context();
+  const del = countingDelete();
+  const create = deferred();
+
+  const resultPromise = run({
+    webdriver: { createSession: () => create.promise, deleteSession: del.deleteSession },
+    body: async () => assert.fail('body must not run once create-failed is reported'),
+    deadlines: FAST_DEADLINES,
+  });
+
+  await waitFor(() => lines.includes(`blocker=session-create-failed: session-create exceeded ${FAST_DEADLINES.sessionCreate} ms`));
+  create.reject(new Error('ECONNRESET'));
+  const code = await resultPromise;
+
+  assert.equal(code, 1);
+  assert.deepEqual(lines, [`blocker=session-create-failed: session-create exceeded ${FAST_DEADLINES.sessionCreate} ms`]);
+  assert.equal(del.count, 0);
+});
+
+test('runScenarioSession: a deadlines override without a terminationTeardown value still gets the real default, not the 30 s withDeadline fallback', async (t) => {
+  // Real sessionCreate/call magnitudes (free under mock.timers): small ones
+  // would let close() give up on its own long before any teardown bound.
+  const { sessionCreate, call } = DEFAULT_DEADLINES;
+  const overrides = {
+    omitted: { sessionCreate, call },
+    'explicitly undefined': { sessionCreate, call, terminationTeardown: undefined },
+  };
+  for (const [name, deadlines] of Object.entries(overrides)) {
+    await t.test(name, async (st) => {
+      st.mock.timers.enable({ apis: ['setTimeout'] });
+      const { lines, signals, run } = context();
+      const exitCodes = [];
+
+      // Never awaited: the normal path legitimately stays pending on the
+      // 90 s create, as in production, where exit() ends the process first.
+      run({
+        webdriver: {
+          createSession: () => new Promise(() => {}),
+          deleteSession: async () => assert.fail('delete must never be attempted with no session id'),
+        },
+        body: async () => assert.fail('body must never run once terminated'),
+        exit: (code) => exitCodes.push(code),
+        deadlines,
+      });
+
+      // A real setImmediate (not mocked) drains every microtask hop between steps.
+      signals.emit('SIGTERM');
+      await new Promise((resolve) => setImmediate(resolve));
+      st.mock.timers.tick(TERMINATION_TEARDOWN_DEADLINE_MS - 1);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(exitCodes.length, 0, 'must still be waiting 1 ms before the default termination-teardown deadline');
+
+      st.mock.timers.tick(1);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(exitCodes, [143]);
+      assert.deepEqual(lines, [
+        'blocker=terminated: SIGTERM',
+        `blocker=session-close-failed: termination-teardown exceeded ${TERMINATION_TEARDOWN_DEADLINE_MS} ms`,
+      ]);
+    });
+  }
+});
+
+test('runScenarioSession: a raw create resolving in the same turn its sessionCreate deadline fires is still deleted', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { lines, run } = context();
+  const del = countingDelete();
+  const create = deferred();
+
+  const resultPromise = run({
+    webdriver: { createSession: () => create.promise, deleteSession: del.deleteSession },
+    body: async () => assert.fail('body must not run once create-failed is reported'),
+  });
+
+  // The deadline fires and the raw create resolves before any microtask
+  // runs, so the session exists before close() looks for it.
+  t.mock.timers.tick(DEFAULT_DEADLINES.sessionCreate);
+  create.resolve('sess-late');
+  const code = await resultPromise;
+
+  assert.equal(code, 1);
+  assert.deepEqual(lines, [
+    `blocker=session-create-failed: session-create exceeded ${DEFAULT_DEADLINES.sessionCreate} ms`,
+    'gate=session-closed session_id=sess-late',
+  ]);
+  assert.equal(del.count, 1);
+});
+
+test('runScenarioSession: a createSession that returns a plain value or throws synchronously is handled like a promise', async (t) => {
+  await t.test('plain value', async () => {
+    const { lines, signals, run } = context();
+    const code = await run({
+      webdriver: { createSession: () => 'sess-sync', deleteSession: async () => {} },
+      body: async () => {},
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(lines, ['gate=session-created session_id=sess-sync', 'gate=session-closed session_id=sess-sync']);
+    assert.equal(signals.listenerCount('SIGTERM'), 0);
+  });
+
+  await t.test('synchronous throw', async () => {
+    const { lines, signals, run } = context();
+    const code = await run({
+      webdriver: {
+        createSession: () => {
+          throw new Error('bad-arguments');
+        },
+        deleteSession: async () => assert.fail('delete must never be attempted with no session id'),
+      },
+      body: async () => assert.fail('body must not run when create fails'),
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(lines, ['blocker=session-create-failed: bad-arguments']);
+    assert.equal(signals.listenerCount('SIGTERM'), 0);
+  });
+});
+
+test('runScenarioSession: an emit that throws on the terminated line still deletes the session and reaches exit(143), with no unhandled rejection', async () => {
+  const { signals, run } = context();
+  const del = countingDelete();
+  const exitCodes = [];
+  const emittedKeys = [];
+
+  const throwingEmit = (key, value) => {
+    emittedKeys.push(`${key}=${value}`);
+    if (value === 'terminated: SIGTERM') {
+      throw new Error('EPIPE');
+    }
+  };
+
+  run({
+    emit: throwingEmit,
+    webdriver: { createSession: async () => 'sess-1', deleteSession: del.deleteSession },
+    body: () => new Promise(() => {}), // never resolves; the signal is what ends this run
+    exit: (code) => exitCodes.push(code),
+    deadlines: FAST_DEADLINES,
+  });
+
+  await waitFor(() => emittedKeys.includes('gate=session-created session_id=sess-1'));
+  signals.emit('SIGTERM');
+  await waitFor(() => exitCodes.length === 1);
+
+  assert.deepEqual(exitCodes, [143]);
+  // A broken transcript must not also leave the packaged app running.
+  assert.equal(del.count, 1);
 });
 
 test('runScenarioSession: SIGTERM during body -- terminated blocker, exactly one delete, session-closed, exit(143); a late body rejection emits no unexpected-error', async () => {

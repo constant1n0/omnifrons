@@ -21,6 +21,16 @@ export const SESSION_CREATE_DEADLINE_MS = 90_000;
 // must finish inside that, or SIGKILL lands with the packaged app still up.
 export const TERMINATION_TEARDOWN_DEADLINE_MS = 8_000;
 
+/** The three deadlines `runScenarioSession` uses for any field a caller's
+ * `deadlines` override omits or leaves `undefined`. An `undefined` bound
+ * would make `withDeadline` silently fall back to `CALL_DEADLINE_MS` (30 s),
+ * past the scripts' `--kill-after=10s` window. */
+export const DEFAULT_DEADLINES = {
+  sessionCreate: SESSION_CREATE_DEADLINE_MS,
+  call: CALL_DEADLINE_MS,
+  terminationTeardown: TERMINATION_TEARDOWN_DEADLINE_MS,
+};
+
 // Exported for both scenarios and for `node --test`
 // (`scenario-session.test.mjs`). The optional `ms` defaults to
 // `CALL_DEADLINE_MS`; session creation passes `SESSION_CREATE_DEADLINE_MS`,
@@ -54,9 +64,9 @@ function messageOf(error) {
  * terminated run instead calls `exit` (default `process.exit(143)`), which
  * never returns in production, but tests inject a fake that records the
  * code so this can still settle and be asserted. `signals`/`webdriver`/
- * `deadlines` are likewise overridable for in-process testing; `deadlines`
- * is taken whole, not merged with the defaults, since every call site
- * already supplies all three fields.
+ * `deadlines` are likewise overridable for in-process testing; a field a
+ * `deadlines` override omits or leaves `undefined` keeps its
+ * `DEFAULT_DEADLINES` value.
  */
 export async function runScenarioSession({
   baseUrl,
@@ -66,12 +76,14 @@ export async function runScenarioSession({
   signals = process,
   exit = (code) => process.exit(code),
   webdriver = { createSession, deleteSession },
-  deadlines = {
-    sessionCreate: SESSION_CREATE_DEADLINE_MS,
-    call: CALL_DEADLINE_MS,
-    terminationTeardown: TERMINATION_TEARDOWN_DEADLINE_MS,
-  },
+  deadlines: deadlineOverrides = {},
 }) {
+  // An override entry left `undefined` keeps its default, like an omitted one.
+  const deadlines = { ...DEFAULT_DEADLINES };
+  for (const [name, ms] of Object.entries(deadlineOverrides)) {
+    if (ms !== undefined) deadlines[name] = ms;
+  }
+
   // Re-checked after every later await, since a termination can land at any one.
   let terminated = false;
   // Memoized: the normal path and the SIGTERM handler can both reach this,
@@ -83,6 +95,13 @@ export async function runScenarioSession({
   // first, and close() has not emitted anything yet".
   let closeEmittedFailure = false;
   let sessionPromise; // declared before the listener below reads it
+  // The raw createSession() call's own outcome, `{ id }` or `{ error }`,
+  // as a promise that never rejects. `withDeadline` cannot abort the
+  // request (its own comment above), so losing the `sessionCreate` race
+  // does not mean no session exists: close() reads this outcome to delete
+  // one that arrives late instead of orphaning it and the packaged app it
+  // launched.
+  let createOutcome;
 
   function close() {
     if (closePromise === null) {
@@ -91,7 +110,20 @@ export async function runScenarioSession({
         try {
           id = await sessionPromise;
         } catch {
-          return; // create failed, or never finished: nothing to delete
+          let outcome;
+          try {
+            outcome = await withDeadline(createOutcome, 'late-session-create', deadlines.call);
+          } catch (error) {
+            // `createOutcome` never rejects: only this bound can, with the
+            // raw request still pending.
+            closeEmittedFailure = true;
+            emit('blocker', `session-close-failed: ${messageOf(error)}`);
+            throw error;
+          }
+          if (!('id' in outcome)) {
+            return; // the raw request itself failed: nothing was created
+          }
+          id = outcome.id;
         }
         try {
           await withDeadline(webdriver.deleteSession(baseUrl, id), 'session-delete', deadlines.call);
@@ -108,18 +140,31 @@ export async function runScenarioSession({
 
   async function onSigterm() {
     terminated = true;
-    emit('blocker', 'terminated: SIGTERM');
     try {
-      // Bounds the whole close() attempt, including a session still mid-creation.
-      await withDeadline(close(), 'termination-teardown', deadlines.terminationTeardown);
-    } catch (error) {
-      // Report here only when close() itself never got to fail on its own
-      // (the deadline elapsed first); otherwise it already emitted its line.
-      if (!closeEmittedFailure) {
-        emit('blocker', `session-close-failed: ${messageOf(error)}`);
+      // Its own try: a broken `emit` loses the transcript line, but must not
+      // also skip the teardown below and leave the packaged app running.
+      try {
+        emit('blocker', 'terminated: SIGTERM');
+      } catch {
+        // Nothing to report it to; the teardown still runs.
       }
+      try {
+        // Bounds the whole close() attempt, including a session still mid-creation.
+        await withDeadline(close(), 'termination-teardown', deadlines.terminationTeardown);
+      } catch (error) {
+        // Report here only when close() itself never got to fail on its own
+        // (the deadline elapsed first); otherwise it already emitted its line.
+        if (!closeEmittedFailure) {
+          emit('blocker', `session-close-failed: ${messageOf(error)}`);
+        }
+      }
+    } catch {
+      // Whatever escaped above (most likely a broken `emit`, e.g. EPIPE on
+      // a closed stdout) must not surface as an unhandled rejection from
+      // this async listener, nor skip the exit below.
+    } finally {
+      exit(143);
     }
-    exit(143);
   }
 
   // Installed before `createSession` is called: a first attempt registered
@@ -128,11 +173,16 @@ export async function runScenarioSession({
   // that -- and `once` removes itself after firing, with no removal needed here.
   signals.once('SIGTERM', onSigterm);
 
-  sessionPromise = withDeadline(
-    webdriver.createSession(baseUrl, applicationPath),
-    'session-create',
-    deadlines.sessionCreate,
+  // The executor turns a synchronous throw or a plain returned value into
+  // this promise's own rejection or value, like an async createSession's.
+  const createPromise = new Promise((resolve) => {
+    resolve(webdriver.createSession(baseUrl, applicationPath));
+  });
+  createOutcome = createPromise.then(
+    (id) => ({ id }),
+    (error) => ({ error }),
   );
+  sessionPromise = withDeadline(createPromise, 'session-create', deadlines.sessionCreate);
 
   let failed = false;
   try {
