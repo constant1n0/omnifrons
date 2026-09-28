@@ -78,8 +78,9 @@ fi
 # 124 is SCENARIO_TIMEOUT firing, 137 a SIGKILL, from --kill-after or
 # outside. Both exit 1 with a named gate line, never a raw status outside
 # this script's documented contract; the scenario's own exit passes through.
-# Known gap, shared with vp-s1-linux.sh: the SIGTERM that ends a timed-out
-# scenario skips its session delete, so the packaged app can outlive it.
+# On the SIGTERM this `timeout` sends when SCENARIO_TIMEOUT fires, the
+# scenario deletes its own session within the --kill-after=10s window
+# (scenario-session.mjs's `runScenarioSession`), as vp-s1-linux.sh's does.
 status=0
 timeout --kill-after=10s "${SCENARIO_TIMEOUT}" \
   node "${procedures_dir}/vp-s3-scenario.mjs" "${webdriver_base_url}" "${artifact_path}" linux \

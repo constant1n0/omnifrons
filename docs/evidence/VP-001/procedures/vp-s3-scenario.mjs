@@ -1,16 +1,21 @@
 #!/usr/bin/env node
 // VP-S3 scenario orchestrator (desktop-stack-verification-plan.md:124):
-// opens one WebDriver session, arms the typed-IPC bridge probe's four
-// attempts (`vp-s3-probe.mjs`), waits, reads the result, and emits a
-// `key=value` transcript of OBSERVATIONS ONLY. Never names an outcome
-// (mirrors `vp-s1-scenario.mjs`): `derive_ipc` (`tools/evidence-validator`,
-// pure, unit-tested) is the sole place a result exists. Exits non-zero on
-// any failure, like `vp-s1-scenario.mjs`.
+// arms the typed-IPC bridge probe's four attempts (`vp-s3-probe.mjs`),
+// waits, reads the result, and emits a `key=value` transcript of
+// OBSERVATIONS ONLY. Never names an outcome (mirrors `vp-s1-scenario.mjs`):
+// `derive_ipc` (`tools/evidence-validator`, pure, unit-tested) is the sole
+// place a result exists. Exits non-zero on any failure, like
+// `vp-s1-scenario.mjs`.
 //
 // Unlike VP-S1, a third `<os>` argument selects the probe's per-OS bridge
 // origin and documented source; it is validated before any session opens.
-// Between the location-scheme gate and the summary, every violation and then
-// every recorded fetch is emitted verbatim (formats: `vp-s3-probe.mjs`).
+// The WebDriver session itself (create, this scenario's own work below,
+// and delete -- including on the SIGTERM `vp-s3-linux.sh`'s
+// `timeout --kill-after=10s` sends when the scenario bound fires) is owned
+// by `scenario-session.mjs`'s `runScenarioSession`, shared with
+// `vp-s1-scenario.mjs`; this file supplies only the `body` callback below.
+// Between the location-scheme gate and the summary, every violation and
+// then every recorded fetch is emitted verbatim (formats: `vp-s3-probe.mjs`).
 //
 // Invoked as `node vp-s3-scenario.mjs <baseUrl> <applicationPath> <os>`.
 
@@ -18,8 +23,8 @@ import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-import { SESSION_CREATE_DEADLINE_MS, withDeadline } from './scenario-session.mjs';
-import { createSession, deleteSession, executeScript } from './webdriver-session.mjs';
+import { runScenarioSession, withDeadline } from './scenario-session.mjs';
+import { executeScript } from './webdriver-session.mjs';
 import {
   buildArmScript,
   buildReadScript,
@@ -59,58 +64,31 @@ async function main() {
     return;
   }
 
-  let sessionId;
-  try {
-    sessionId = await withDeadline(createSession(baseUrl, applicationPath), 'session-create', SESSION_CREATE_DEADLINE_MS);
-  } catch (error) {
-    emit('blocker', `session-create-failed: ${error.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  emit('gate', `session-created session_id=${sessionId}`);
+  process.exitCode = await runScenarioSession({
+    baseUrl,
+    applicationPath,
+    emit,
+    body: async (sessionId) => {
+      await withDeadline(executeScript(baseUrl, sessionId, buildArmScript(), []), 'arm');
+      emit('gate', 'armed');
 
-  let blocker = null;
-  try {
-    await withDeadline(executeScript(baseUrl, sessionId, buildArmScript(), []), 'arm');
-    emit('gate', 'armed');
+      await delay(SETTLE_MS);
 
-    await delay(SETTLE_MS);
+      const read = await withDeadline(executeScript(baseUrl, sessionId, buildReadScript(), []), 'read');
+      const summary = summarize(read, os);
 
-    const read = await withDeadline(executeScript(baseUrl, sessionId, buildReadScript(), []), 'read');
-    const summary = summarize(read, os);
-
-    emit('gate', `location-scheme value=${summary.location_scheme}`);
-    for (const line of formatViolationLines(read.violations)) {
-      process.stdout.write(`${line}\n`);
-    }
-    for (const line of formatFetchLines(read.fetches)) {
-      process.stdout.write(`${line}\n`);
-    }
-    for (const line of formatObservations(summary)) {
-      process.stdout.write(`${line}\n`);
-    }
-  } catch (error) {
-    blocker = `unexpected-error: ${error.message}`;
-    if (process.env.VP001_DEBUG) console.error(error);
-  } finally {
-    if (blocker !== null) {
-      emit('blocker', blocker);
-    }
-    // A failed teardown is the one failure that leaves the packaged app
-    // alive, so it is reported as its own blocker, never as a close.
-    try {
-      await withDeadline(deleteSession(baseUrl, sessionId), 'session-delete');
-      emit('gate', `session-closed session_id=${sessionId}`);
-    } catch (error) {
-      blocker ??= `session-close-failed: ${error.message}`;
-      emit('blocker', `session-close-failed: ${error.message}`);
-      if (process.env.VP001_DEBUG) console.error(error);
-    }
-  }
-
-  if (blocker !== null) {
-    process.exitCode = 1;
-  }
+      emit('gate', `location-scheme value=${summary.location_scheme}`);
+      for (const line of formatViolationLines(read.violations)) {
+        process.stdout.write(`${line}\n`);
+      }
+      for (const line of formatFetchLines(read.fetches)) {
+        process.stdout.write(`${line}\n`);
+      }
+      for (const line of formatObservations(summary)) {
+        process.stdout.write(`${line}\n`);
+      }
+    },
+  });
 }
 
 // Only run when executed directly, never when imported. Both sides are

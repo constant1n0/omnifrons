@@ -2,9 +2,8 @@
 // `vp-s3-scenario.mjs`: create one session, run the scenario's own `body`,
 // and delete the session -- on the normal path, and also on the SIGTERM
 // that both scripts' `timeout --kill-after=10s` sends when the scenario's
-// bound fires. Both scenarios still manage their own session inline, so
-// that SIGTERM still skips their session delete (`vp-s3-linux.sh`'s "Known
-// gap") until they switch to `runScenarioSession`.
+// bound fires. Without a handler, that SIGTERM skipped the session delete
+// and the packaged app outlived the scenario.
 
 import { createSession, deleteSession } from './webdriver-session.mjs';
 
