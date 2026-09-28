@@ -1,0 +1,50 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+gate=av1-digest-match digest=fd783e18ded3a1d6f6b3ccc6e60f13f96039cf55e01fcde9fed53c65b12f13b3
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:25570): dbind-WARNING **: 17:05:30.911: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=a72d1c8c-99c7-4ade-972b-3900b1759fa3
+gate=session-closed session_id=a72d1c8c-99c7-4ade-972b-3900b1759fa3
+
+(omnifrons-shell:25679): dbind-WARNING **: 17:06:03.028: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=session-created session_id=0815193d-92ae-4822-a64f-c39ff24dadec
+gate=armed
+gate=location-scheme value=tauri:
+observation=violation index=0 effectiveDirective="connect-src" violatedDirective="connect-src" blockedURI="https://vp-s3.invalid/" disposition="enforce" originalPolicy="manifest-src 'self'; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='; font-src 'self'; default-src 'none'; img-src 'self' artifact:; media-src 'self' artifact:; form-action 'none'; frame-src 'none'; object-src 'none'; connect-src ipc:; base-uri 'none'; worker-src 'self'; style-src 'self'" sourceFile="" lineNumber=0 sample=""
+observation=fetch index=0 url="ipc://localhost/shell_health" outcome="resolved:200"
+observation=fetch index=1 url="ipc://localhost/vp_s3_unregistered_command" outcome="resolved:200"
+observation=fetch index=2 url="https://vp-s3.invalid/" outcome="rejected:TypeError"
+observation=fetch index=3 url="ipc://localhost/approvals_list" outcome="resolved:200"
+observation=fetch index=4 url="ipc://localhost/workspace_current" outcome="resolved:200"
+observation=fetch index=5 url="ipc://localhost/outbox_status" outcome="resolved:200"
+observation=fetch index=6 url="ipc://localhost/publications_list" outcome="resolved:200"
+observation=fetch index=7 url="ipc://localhost/guidance_status" outcome="resolved:200"
+observation=fetch index=8 url="ipc://localhost/guidance_status" outcome="resolved:200"
+observation=fetch index=9 url="ipc://localhost/guidance_snapshots" outcome="resolved:200"
+observation=fetch index=10 url="ipc://localhost/guidance_snapshots" outcome="resolved:200"
+observation=fetch index=11 url="ipc://localhost/wrongroot_status" outcome="resolved:200"
+observation=fetch index=12 url="ipc://localhost/misplaced_list" outcome="resolved:200"
+observation=fetch index=13 url="ipc://localhost/recovery_list" outcome="resolved:200"
+observation=fetch index=14 url="ipc://localhost/adapters_list" outcome="resolved:200"
+observation=fetch index=15 url="ipc://localhost/approvals_list" outcome="resolved:200"
+observation=location_scheme value=tauri:
+observation=location_scheme_is_app_protocol value=true
+observation=connect_src_policy_captured value=true
+observation=connect_src_is_documented_source_for_os value=true
+observation=registered_call_completed value=true
+observation=registered_call_used_custom_protocol value=true
+observation=postmessage_fallback_observed value=false
+observation=bridge_connect_src_violation value=false
+observation=unregistered_call_rejected value=true
+observation=unregistered_call_resolved value=false
+observation=artifact_load_attempted value=true
+observation=artifact_load_succeeded value=false
+gate=session-closed session_id=0815193d-92ae-4822-a64f-c39ff24dadec
