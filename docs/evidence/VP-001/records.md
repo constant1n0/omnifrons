@@ -383,3 +383,132 @@ it; its first line is `gate=av1-digest-match`.
 | `blocker` | none -- a correction of VP-001-VP-S1-01's prose; its outcome and fields stand as filed |
 | `run_date` | 2026-09-24 -- the date of the corrected run; no new run was made |
 | `ci_run` | workflow tauri-build.yml, run 36070751147, the run VP-001-VP-S1-01 was filed from |
+
+## VP-001 VP-S3 scenario -- run 36352840629 (2026-09-27)
+
+The first execution of VP-S3 (typed-IPC bridge confinement), against the
+packaged AppImage on the pinned Linux baseline, run through
+`vp-s3-linux.sh`, which reuses `vp-s6-linux.sh --mode=feasibility-check`
+for AV1/AV2 exactly as `vp-s1-linux.sh` does. Unlike either VP-S1 row, the
+scenario's own `WebDriver` session was never created: session creation
+exceeded the scenario's 30-second bound (`vp-s3-scenario.mjs`), so the
+probe never armed and no VP-S3-specific fact was ever
+observed. The outcome is `uncertain` by `derive_ipc`'s own construction on
+an all-absent observation set: none of its four fixed-order failure checks
+can fire with no positive observation to fire on, and `Pass` requires every
+positive proof, so the row falls to `(Uncertain, Unverified)`.
+
+What the retained VP-S3 transcript shows. It opens with the same
+connection-refused preamble VP-001-VP-S1-01's and -02's transcripts do;
+VP-001-VP-S1-02/-03 already established the reading used here --
+`tauri-driver` serving a request and failing to reach the upstream it
+proxies to, not `tauri-driver` itself refusing -- and this row does not
+re-derive it. Then
+`gate=av1-digest-match digest=027628e46beb188d30fd36dab0ad02a35d3928b39e0764b66e866d726f737bde`
+and
+`gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell`,
+both before any session is attempted. `vp-s3-linux.sh`'s own reused
+`vp-s6-linux.sh --mode=feasibility-check` subprocess then opens and closes
+one feasibility session of its own, `gate=f1-session-created` /
+`gate=session-closed`, at a session id distinct from the one in the
+separately retained feasibility transcript -- the workflow's own, earlier
+feasibility step -- exactly the two-sessions-per-run structure the VP-S1
+rows describe. After that feasibility session closed, a fresh
+`omnifrons-shell` process started for the scenario's own session attempt,
+and the transcript records only `blocker=session-create-failed:
+session-create exceeded 30000 ms`: no `gate=session-created` line ever
+appears, so the scenario session itself was never created.
+
+`identity_gated` is derived the same way the VP-S1 rows derive it: both
+`gate=av1-digest-match` and `gate=av2-variant-scan-absent` appear before
+the (attempted) scenario session.
+
+What this run cannot show: every other `IpcObservations` field the probe
+itself would populate is false because none of it was ever observed, not
+because it was observed absent --
+`location_scheme_is_app_protocol`, `connect_src_policy_captured`,
+`connect_src_is_documented_source_for_os`, `registered_call_completed`,
+`registered_call_used_custom_protocol`, `postmessage_fallback_observed`,
+`bridge_connect_src_violation`, `unregistered_call_rejected`,
+`unregistered_call_resolved`, `artifact_load_attempted`, and
+`artifact_load_succeeded`. No connect-src policy dump was captured, no
+registered call transport was recorded, no `postMessage` fallback or
+bridge `connect-src` violation was recorded, no unregistered-command
+handling was recorded, and no `artifact:` load was attempted or observed
+-- the scenario's claim about transport, policy, fallback, `artifact:`
+handling, and unregistered-command rejection is not addressed by this run
+in either direction.
+
+`static_inventory_pinned` is the one `IpcObservations` field this row can
+still state, since it is not the probe's own observation:
+`src-tauri/tests/protocol_inventory.rs` is exercised by the `build-test
+(ubuntu-latest)` CI check, confirmed (read-only, via the GitHub API's
+check-runs endpoint for this run's head commit) to have succeeded on
+64649de. True.
+
+Timing context, measured from the job log of run 36352840629, not from a
+retained artifact, each interval running from the app process's first
+output line to `gate=session-created`: in this run every F1 session took
+30.3-30.4 s and the VP-S1 scenario session 12.2 s. The VP-S3 scenario
+session never reached `gate=session-created`; its `blocker=` line, emitted
+when the scenario's own 30 s bound (started at its session request, before
+the app printed anything) ran out, came 28.8 s after that app process's
+first output line. Earlier runs 36070751147 and 36244318043 show F1
+30.2-32.6 s and VP-S1 scenario sessions of 13.6 s and 11.4 s respectively. This row states no cause for the roughly 30-second
+session-create duration; nothing observed here demonstrates one.
+
+Per the evidence-store spec's Blocked or Non-Reproducible Verification
+Attempt requirement, this row is not retried, renamed, or replaced. A
+separate, follow-up change is expected to raise the session-create
+deadline; a later run made against that longer deadline is to be filed as
+its own row, never as a replacement for this one.
+
+This run's CI job conclusion is `failure`, unlike either VP-S1 row's
+`success`: `vp-s3-linux.sh` passes through `vp-s3-scenario.mjs`'s own exit
+status for the scenario leg unchanged, and this row's blocker is not one
+of the two statuses (124, 137) the shell renames to its own `gate=`
+lines -- so the scenario script's own nonzero exit on `session-create-failed`
+propagates as the job's own conclusion, independent of the `uncertain`
+result the evidence-store spec requires this row to record.
+
+The row does not discharge RCS-001-R14 or VP-001-R12: no bridge call,
+`connect-src` capture, or handler-inventory fact was demonstrated on this
+run, in either direction.
+
+Each `evidence_artifact` digest below is the SHA-256 of the retained,
+redacted file at the path it names -- the file in this repository, not the
+CI artifact entry it was copied from, whose runner paths were rewritten to
+`<extract-dir>` before retention.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S3-01 |
+| `kind` | scenario |
+| `scenario_id` | VP-S3 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | uncertain |
+| `observed_state` | unverified |
+| `build_channel` | packaged-ci |
+| `build_channel_digest` | 027628e46beb188d30fd36dab0ad02a35d3928b39e0764b66e866d726f737bde |
+| `exercised_artifact_digest` | 027628e46beb188d30fd36dab0ad02a35d3928b39e0764b66e866d726f737bde |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s3-linux.sh |
+| `blocker` | session-create-failed -- the scenario's `WebDriver` session was never created: session-create exceeded 30000 ms |
+| `identity_gated` | true -- derived from `gate=av1-digest-match` and `gate=av2-variant-scan-absent`, both before the scenario session was attempted |
+| `location_scheme_is_app_protocol` | false -- never observed; the scenario session was never created |
+| `connect_src_policy_captured` | false -- never observed, same reason |
+| `connect_src_is_documented_source_for_os` | false -- never observed, same reason |
+| `registered_call_completed` | false -- never observed, same reason |
+| `registered_call_used_custom_protocol` | false -- never observed, same reason |
+| `postmessage_fallback_observed` | false -- never observed, same reason |
+| `bridge_connect_src_violation` | false -- never observed, same reason |
+| `unregistered_call_rejected` | false -- never observed, same reason |
+| `unregistered_call_resolved` | false -- never observed, same reason |
+| `artifact_load_attempted` | false -- never observed, same reason |
+| `artifact_load_succeeded` | false -- never observed, same reason |
+| `static_inventory_pinned` | true -- `build-test (ubuntu-latest)` succeeded on this run's head commit 64649de, confirmed read-only via the GitHub API check-runs endpoint |
+| `run_date` | 2026-09-27 |
+| `ci_run` | workflow tauri-build.yml, workflow_dispatch (vp001_scenario: true), run 36352840629, head 64649de, conclusion failure |
+| `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-26 |
+| `evidence_artifact` | e70aa97508d1b5070da7b17eaab243ac9fbb70943fe194be18ca54068b35f5e6 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36352840629-vp-s3-transcript.txt`, copied from run 36352840629's `vp-001-transcripts` artifact entry `vp-001-vp-s3-transcript.txt` |
+| `feasibility_evidence_artifact` | be58a3c7cec62a9f51854dac7174f88dec10ab6f23ed3a2ef3f2fa2fc80cc1c2 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36352840629-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
