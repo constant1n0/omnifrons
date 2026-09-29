@@ -10,13 +10,18 @@
 # (this file only), at the cost of one extra, harmless session create/close.
 #
 # Usage: vp-s1-linux.sh <artifact-path> <build-channel-digest>
-# Env: VP001_WEBDRIVER_BASE_URL (default: http://127.0.0.1:4444)
-# Exit: 0 on completion; 1 on an AV1/AV2 rejection, an AV1/AV2 leg that wedged
-# past AV_TIMEOUT or was SIGKILLed, or a scenario blocker; 2 on a usage error,
+# Env: VP001_WEBDRIVER_BASE_URL (default: http://127.0.0.1:4444),
+# VP001_AV_TIMEOUT (default: 120s), VP001_SCENARIO_TIMEOUT (default: 300s)
+# Exit: this script only ever exits 0 (completion), 1, or 2 (a usage error,
 # including a digest that is not 64 hex digits -- the caller's lookup can
-# yield an empty string, which must never reach AV1. Both the AV1/AV2 leg and
-# the scenario are wall-clock bounded (AV_TIMEOUT, SCENARIO_TIMEOUT); neither
-# can run to the job's own timeout.
+# yield an empty string, which must never reach AV1). Both the AV1/AV2 leg
+# and the scenario are wall-clock bounded (AV_TIMEOUT, SCENARIO_TIMEOUT) via
+# `timeout`, so neither can run to the job's own timeout; each leg's status
+# is mapped through leg-status.sh's `map_leg_status` (see that file's
+# header) before this script exits 1 or passes the child's own 1/2 through:
+# gate=<leg>-timeout / -killed / -terminated / -unexpected-exit, for
+# leg=av-feasibility-check and leg=scenario. An AV1/AV2 rejection or a
+# scenario blocker (the child's own exit 1) already prints its own gate line.
 
 set -euo pipefail
 
@@ -47,35 +52,34 @@ AV_TIMEOUT="${VP001_AV_TIMEOUT:-120s}"
 
 webdriver_base_url="${VP001_WEBDRIVER_BASE_URL:-http://127.0.0.1:4444}"
 procedures_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/leg-status.sh
+source "${procedures_dir}/leg-status.sh"
 
 # vp-s6-linux.sh's own transcript lines (its AV1/AV2 gates, plus its own F1
 # gate=f1-session-created / gate=session-closed pair) pass through to this
 # script's stdout unchanged -- a superset, never a rewrite, of this file's own.
 # The status is captured with `|| status=$?`, never inside `if ! ...; then`:
 # there `$?` is the negation's own 0, which would turn a rejection into exit 0.
+# A nonzero status is mapped through leg-status.sh's `map_leg_status`,
+# shared with the scenario leg below and with vp-s3-linux.sh so the four
+# legs cannot drift; an AV1/AV2 rejection already printed its own
+# `gate=<token>` line, so 1 and 2 pass through unchanged.
 status=0
 timeout --kill-after=10s "${AV_TIMEOUT}" \
   "${procedures_dir}/vp-s6-linux.sh" --mode=feasibility-check "${artifact_path}" "${build_channel_digest}" \
   || status=$?
 if [[ "${status}" -ne 0 ]]; then
-  # vp-s6-linux.sh exits only 0/1/2 and runs no `timeout` of its own, so
-  # 124 is this bound firing: a wedge, named as one. 137 (128+SIGKILL) is
-  # either --kill-after forcing the issue or a SIGKILL from outside (the
-  # OOM killer, say) -- the status cannot tell which, so it is named a kill,
-  # never a timeout. Both exit 1, the status this script documents for
-  # them; an AV1/AV2 rejection already printed its own `gate=<token>` line.
-  # Any other status passes through unchanged, preserving vp-s6-linux.sh's
-  # own exit contract.
-  if [[ "${status}" -eq 124 ]]; then
-    echo "gate=av-feasibility-check-timeout"
-    exit 1
-  fi
-  if [[ "${status}" -eq 137 ]]; then
-    echo "gate=av-feasibility-check-killed"
-    exit 1
-  fi
-  exit "${status}"
+  map_leg_status av-feasibility-check "${status}" || exit $?
 fi
 
+# The scenario leg is mapped through the same function; the scenario's own
+# exit 1 or 2 passes through unchanged. On the SIGTERM this `timeout` sends when
+# SCENARIO_TIMEOUT fires, the scenario deletes its own session within the
+# --kill-after=10s window (scenario-session.mjs's `runScenarioSession`).
+status=0
 timeout --kill-after=10s "${SCENARIO_TIMEOUT}" \
-  node "${procedures_dir}/vp-s1-scenario.mjs" "${webdriver_base_url}" "${artifact_path}"
+  node "${procedures_dir}/vp-s1-scenario.mjs" "${webdriver_base_url}" "${artifact_path}" \
+  || status=$?
+if [[ "${status}" -ne 0 ]]; then
+  map_leg_status scenario "${status}" || exit $?
+fi

@@ -14,7 +14,10 @@ const CALL_DEADLINE_MS = 30_000;
 // cannot cover: CI job logs measured it at 30.2-32.6 s for the first session
 // of a step and 11.4-13.6 s for VP-S1's own, and VP-S3's first run (36352840629)
 // was blocked by this 30 s bound. Its cause is not established; the bound
-// leaves headroom and still fits vp-s1/vp-s3-linux.sh's 300 s scenario limit.
+// leaves headroom. Since the late-created-session cleanup, a create that
+// never settles holds the scenario for SESSION_CREATE_DEADLINE_MS plus
+// CALL_DEADLINE_MS (120 s worst case) before giving up, which still fits
+// vp-s1/vp-s3-linux.sh's 300 s scenario limit.
 export const SESSION_CREATE_DEADLINE_MS = 90_000;
 // Both scripts' `timeout --kill-after=10s` leaves 10 s between SIGTERM and
 // SIGKILL; teardown -- deleting the session and printing its own line --

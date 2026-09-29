@@ -29,6 +29,7 @@ function runWithAvStub(stubBody, scenarioBody = ECHO_ARGV, scenarioTimeout = '30
   const dir = mkdtempSync(join(tmpdir(), 'vp-s3-linux-'));
   try {
     copyFileSync(join(HERE, 'vp-s3-linux.sh'), join(dir, 'vp-s3-linux.sh'));
+    copyFileSync(join(HERE, 'leg-status.sh'), join(dir, 'leg-status.sh'));
     writeFileSync(join(dir, 'vp-s6-linux.sh'), `#!/usr/bin/env bash\n${stubBody}\n`, { mode: 0o755 });
     writeFileSync(join(dir, 'vp-s3-scenario.mjs'), `${scenarioBody}\n`);
     writeFileSync(join(dir, 'artifact.AppImage'), '');
@@ -103,5 +104,22 @@ test('vp-s3-linux.sh scenario leg exit contract', LINUX_ONLY, async (t) => {
     assert.equal(status, 1);
     assert.ok(stdout.includes('gate=scenario-killed'));
     assert.ok(!stdout.includes('gate=scenario-timeout'));
+  });
+
+  await t.test('a SIGTERM from outside the bound is named terminated, never a timeout or a kill', () => {
+    // A Node process with no SIGTERM handler dies by signal (status 143),
+    // unlike the scripts' own `timeout --kill-after` SIGTERM, which
+    // scenario-session.mjs's handler catches to delete the session first.
+    const { status, stdout } = runWithAvStub(AV_PASS, "process.kill(process.pid, 'SIGTERM');");
+    assert.equal(status, 1);
+    assert.ok(stdout.includes('gate=scenario-terminated'));
+    assert.ok(!stdout.includes('gate=scenario-timeout'));
+    assert.ok(!stdout.includes('gate=scenario-killed'));
+  });
+
+  await t.test('a status outside 0/1/2/124/137/143 is named unexpected, with its raw status', () => {
+    const { status, stdout } = runWithAvStub(AV_PASS, 'process.exitCode = 127;');
+    assert.equal(status, 1);
+    assert.ok(stdout.includes('gate=scenario-unexpected-exit status=127'));
   });
 });
