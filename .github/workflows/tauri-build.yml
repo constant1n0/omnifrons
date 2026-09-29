@@ -208,16 +208,11 @@ jobs:
           build_channel_digest="$(
             awk -v name="$(basename "${artifact_path}")" '$2 == name { print $1 }' "${VP001_DIGEST_FILE}"
           )"
+          # with-webdriver.sh owns tauri-driver (start, /status wait, stop);
+          # a driver that never answers or exits early fails this step.
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
-            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
-            driver_pid=$!
-            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
-            for _ in $(seq 1 10); do
-              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
-              sleep 1
-            done
-            docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=feasibility-check "$1" "$2"
+            docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=feasibility-check "$1" "$2"
           ' vp-s6-feasibility-check "${artifact_path}" "${build_channel_digest}" \
             | tee "${RUNNER_TEMP}/vp-001-feasibility-transcript.txt"
 
@@ -273,14 +268,10 @@ jobs:
               xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
               sleep 1
             done
-            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
-            driver_pid=$!
-            trap "kill \${driver_pid} \${wm_pid} 2>/dev/null || true" EXIT
-            for _ in $(seq 1 10); do
-              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && break
-              sleep 1
-            done
-            docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=scenario "$1" "$2" "$3" "$4"
+            # with-webdriver.sh owns tauri-driver (start, /status wait, stop);
+            # a driver that never answers or exits early fails this step. The
+            # EXIT trap above still stops openbox.
+            docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=scenario "$1" "$2" "$3" "$4"
           ' vp-s6-scenario "${artifact_path}" "${build_channel_digest}" \
             "${GITHUB_WORKSPACE}/target/release/vp-s6-agent" "${workspace_dir}" \
             | tee "${RUNNER_TEMP}/vp-001-vp-s6-transcript.txt"
@@ -309,24 +300,11 @@ jobs:
             echo "gate=digest-lookup-failed artifact=$(basename "${artifact_path}")"
             exit 1
           fi
+          # with-webdriver.sh owns tauri-driver (start, /status wait, stop);
+          # a driver that never answers or exits early fails this step.
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
-            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
-            driver_pid=$!
-            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
-            driver_ready=""
-            for _ in $(seq 1 10); do
-              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && driver_ready=1 && break
-              sleep 1
-            done
-            # A driver that never answers /status must fail here, loudly,
-            # never fall through into vp-s1-linux.sh against a driver that
-            # is not actually listening.
-            if [[ -z "${driver_ready}" ]]; then
-              echo "gate=driver-not-ready"
-              exit 1
-            fi
-            docs/evidence/VP-001/procedures/vp-s1-linux.sh "$1" "$2"
+            docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s1-linux.sh "$1" "$2"
           ' vp-s1-scenario "${artifact_path}" "${build_channel_digest}" \
             | tee "${RUNNER_TEMP}/vp-001-vp-s1-transcript.txt"
 
@@ -356,21 +334,11 @@ jobs:
             echo "gate=digest-lookup-failed artifact=$(basename "${artifact_path}")" | tee "${transcript}"
             exit 1
           fi
+          # with-webdriver.sh owns tauri-driver (start, /status wait, stop);
+          # a driver that never answers or exits early fails this step.
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
-            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
-            driver_pid=$!
-            trap "kill \${driver_pid} 2>/dev/null || true" EXIT
-            driver_ready=""
-            for _ in $(seq 1 10); do
-              curl -sf http://127.0.0.1:4444/status >/dev/null 2>&1 && driver_ready=1 && break
-              sleep 1
-            done
-            if [[ -z "${driver_ready}" ]]; then
-              echo "gate=driver-not-ready"
-              exit 1
-            fi
-            docs/evidence/VP-001/procedures/vp-s3-linux.sh "$1" "$2"
+            docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s3-linux.sh "$1" "$2"
           ' vp-s3-scenario "${artifact_path}" "${build_channel_digest}" \
             | tee "${transcript}"
 
