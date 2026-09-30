@@ -14,13 +14,24 @@
 // (`img-src`/`media-src`) has no handler yet, so every load fails (RCS-001).
 // The deliberate `fetch('https://vp-s3.invalid/')` (`policy-probe`) forces a
 // `connect-src` violation so `originalPolicy` yields a dump even when the
-// bridge raises none. `identity_gated`/`static_inventory_pinned` are supplied
-// elsewhere (the shell driver's gates; CI's protocol_inventory.rs run).
+// bridge raises none. `identity_gated` is supplied elsewhere (the shell
+// driver's gates). `static_inventory_pinned` is supplied by the retained
+// `vp-001-vp-s3-static-inventory.txt` run artifact: tauri-build.yml's "VP-001
+// VP-S3 static protocol inventory (evidence run)" step runs
+// `src-tauri/tests/protocol_inventory.rs` on this run's own head commit and
+// tees its output there, so the fact is retained evidence, not a GitHub API
+// check-run lookup performed after the fact.
 //
 // Transcript: `formatObservations` emits `observation=<key> value=<v>` lines;
 // `formatFetchLines` emits JSON-encoded `observation=fetch index=<i>
-// url=<json> outcome=<json>` lines, one per recorded fetch; `formatViolationLines` is reused from
-// `vp-s1-probe.mjs` (re-exported below), never duplicated.
+// url=<json> outcome=<json>` lines, one per recorded fetch; `formatAttemptLines`
+// emits JSON-encoded `observation=attempt index=<i> name=<json>
+// outcome=<json>` lines, one per recorded attempt -- this is the only place
+// the unregistered-call attempt's own outcome (e.g. `rejected:...`) reaches
+// the transcript; `unregistered_call_rejected` alone is a summary boolean,
+// and that call's `fetch` line reads `resolved:200` (the bridge's own POST
+// succeeded) even when the command itself was rejected. `formatViolationLines`
+// is reused from `vp-s1-probe.mjs` (re-exported below), never duplicated.
 
 export { formatViolationLines } from './vp-s1-probe.mjs';
 
@@ -231,5 +242,14 @@ export function formatFetchLines(fetches) {
   return list.map((entry, index) => {
     const source = entry ?? {};
     return `observation=fetch index=${index} url=${JSON.stringify(source.url ?? null)} outcome=${JSON.stringify(source.outcome ?? null)}`;
+  });
+}
+
+/** Every recorded attempt (registered-call, unregistered-call, artifact-load, policy-probe) as one `observation=attempt index=<i> name=<json> outcome=<json>` line. */
+export function formatAttemptLines(attempts) {
+  const list = Array.isArray(attempts) ? attempts : [];
+  return list.map((entry, index) => {
+    const source = entry ?? {};
+    return `observation=attempt index=${index} name=${JSON.stringify(source.name ?? null)} outcome=${JSON.stringify(source.outcome ?? null)}`;
   });
 }

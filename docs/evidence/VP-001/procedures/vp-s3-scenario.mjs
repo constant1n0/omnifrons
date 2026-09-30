@@ -14,8 +14,9 @@
 // `timeout --kill-after=10s` sends when the scenario bound fires) is owned
 // by `scenario-session.mjs`'s `runScenarioSession`, shared with
 // `vp-s1-scenario.mjs`; this file supplies only the `body` callback below.
-// Between the location-scheme gate and the summary, every violation and
-// then every recorded fetch is emitted verbatim (formats: `vp-s3-probe.mjs`).
+// Between the location-scheme gate and the summary, every violation, then
+// every recorded fetch, then every recorded attempt is emitted verbatim
+// (formats: `vp-s3-probe.mjs`).
 //
 // Invoked as `node vp-s3-scenario.mjs <baseUrl> <applicationPath> <os>`.
 
@@ -28,6 +29,7 @@ import { executeScript } from './webdriver-session.mjs';
 import {
   buildArmScript,
   buildReadScript,
+  formatAttemptLines,
   formatFetchLines,
   formatObservations,
   formatViolationLines,
@@ -82,6 +84,9 @@ async function main() {
         process.stdout.write(`${line}\n`);
       }
       for (const line of formatFetchLines(read.fetches)) {
+        process.stdout.write(`${line}\n`);
+      }
+      for (const line of formatAttemptLines(read.attempts)) {
         process.stdout.write(`${line}\n`);
       }
       for (const line of formatObservations(summary)) {

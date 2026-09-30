@@ -342,6 +342,30 @@ jobs:
           ' vp-s3-scenario "${artifact_path}" "${build_channel_digest}" \
             | tee "${transcript}"
 
+      - name: VP-001 VP-S3 static protocol inventory (evidence run)
+        # The static half of VP-S3's evidence (static_inventory_pinned):
+        # src-tauri/tests/protocol_inventory.rs on this job's own head commit,
+        # its output retained with the transcripts rather than looked up later
+        # as a check-run. `!cancelled()`, unlike the scenario steps: a failed
+        # scenario must not skip it, and it starts no WebDriver session, so
+        # the stale-driver concern that keeps `!cancelled()` off those steps
+        # does not apply.
+        if: "!cancelled() && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.vp001_scenario && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''"
+        run: |
+          set -euo pipefail
+          {
+            echo "gate=static-inventory head=$(git rev-parse HEAD)"
+            # --release: the "Build Tauri app (no publish)" step above already
+            # built omnifrons-shell and its dependency graph in release
+            # profile (tauri-action's own default, matching the packaged
+            # artifact this evidence run exercises), so running this test the
+            # same way reuses that compilation instead of paying for a
+            # separate debug build. The test only pins source/build-config
+            # facts (scheme registration, CSP values, the resolved dependency
+            # graph); release-vs-debug codegen itself is not measured here.
+            cargo test -p omnifrons-shell --test protocol_inventory --release
+          } | tee "${RUNNER_TEMP}/vp-001-vp-s3-static-inventory.txt"
+
       - name: Upload VP-001 transcripts
         # Kept even when a gate fails: a blocked run is evidence of the
         # blocker, not something to discard. The .xwd screenshot only exists
@@ -358,4 +382,5 @@ jobs:
             ${{ runner.temp }}/vp-001-vp-s6-chooser-failure.xwd
             ${{ runner.temp }}/vp-001-vp-s1-transcript.txt
             ${{ runner.temp }}/vp-001-vp-s3-transcript.txt
+            ${{ runner.temp }}/vp-001-vp-s3-static-inventory.txt
           if-no-files-found: warn

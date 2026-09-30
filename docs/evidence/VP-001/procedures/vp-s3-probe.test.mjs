@@ -5,7 +5,7 @@ import { test } from 'node:test';
 
 import {
   bridgeOriginFor, buildArmScript, buildReadScript, connectSrcSources, documentedConnectSrcFor,
-  formatFetchLines, formatObservations, formatViolationLines, summarize,
+  formatAttemptLines, formatFetchLines, formatObservations, formatViolationLines, summarize,
 } from './vp-s3-probe.mjs';
 
 test('buildReadScript returns an empty snapshot, never throws, when the probe was never armed', () => {
@@ -181,7 +181,7 @@ test('summarize', async (t) => {
   });
 });
 
-test('formatObservations / formatFetchLines', async (t) => {
+test('formatObservations / formatFetchLines / formatAttemptLines', async (t) => {
   await t.test('formatObservations emits every key in the stable declared order, carrying location_scheme unjudged', () => {
     const lines = formatObservations(summarize(readFixture(), 'linux'));
     const keys = lines.map((line) => line.slice('observation='.length).split(' value=')[0]);
@@ -204,5 +204,19 @@ test('formatObservations / formatFetchLines', async (t) => {
     assert.equal(lines[1], 'observation=fetch index=1 url="https://vp-s3.invalid/" outcome="rejected:TypeError"');
     assert.deepEqual(formatFetchLines([]), []);
     assert.equal(formatFetchLines([null])[0], 'observation=fetch index=0 url=null outcome=null');
+  });
+  await t.test('formatAttemptLines emits one JSON-encoded line per attempt, in order, and tolerates the empty/null cases', () => {
+    const attempts = [
+      { name: 'registered-call', outcome: 'resolved' },
+      { name: 'unregistered-call', outcome: 'rejected:command vp_s3_unregistered_command not found' },
+    ];
+    const lines = formatAttemptLines(attempts);
+    assert.equal(lines[0], 'observation=attempt index=0 name="registered-call" outcome="resolved"');
+    assert.equal(
+      lines[1],
+      'observation=attempt index=1 name="unregistered-call" outcome="rejected:command vp_s3_unregistered_command not found"',
+    );
+    assert.deepEqual(formatAttemptLines([]), []);
+    assert.equal(formatAttemptLines([null])[0], 'observation=attempt index=0 name=null outcome=null');
   });
 });
