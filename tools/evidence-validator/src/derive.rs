@@ -266,3 +266,147 @@ pub fn derive_ipc(observations: IpcObservations) -> (Outcome, IpcObservedState) 
     }
     (Outcome::Uncertain, IpcObservedState::Unverified)
 }
+
+/// The public `observed_state` a VP-S13 (typed IPC boundary; path attacks
+/// rejected) row may additionally carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcBoundaryObservedState {
+    /// The filesystem outside the trap workspace changed between the
+    /// before/after snapshot -- the escape this scenario exists to catch.
+    Escaped,
+    /// The outside canary file's content appeared in any response.
+    Leaked,
+    /// An attack invoke resolved instead of being rejected: best-effort
+    /// interpretation of a malformed or path-attack payload, not the typed
+    /// rejection RCS-001-R14 requires.
+    BestEffort,
+    /// The static capability test showed a generic shell or filesystem
+    /// capability still reachable from the renderer.
+    GenericCapability,
+    /// The public state token for a baseline where every sent attack was
+    /// rejected with a typed error and nothing outside the workspace was
+    /// touched.
+    Rejected,
+    /// Any fact absent, unreadable, or short of full proof; nothing was
+    /// demonstrated either way.
+    Unverified,
+}
+
+/// Every fact a VP-S13 probe can observe, before any outcome is decided.
+/// Mirrors [`IpcObservations`]'s own shape: independent booleans, not a
+/// state machine, one baseline (OS) at a time. The static half (the
+/// capability and validator Rust tests, run on the run's own head) and the
+/// runtime half (the packaged-build `WebDriver` probe against a prepared
+/// trap workspace) each contribute their own facts below.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IpcBoundaryObservations {
+    /// AV1/AV2 both gated before the session was created.
+    pub identity_gated: bool,
+    /// The packaged custom-protocol scheme was observed, never `http:`.
+    pub location_scheme_is_app_protocol: bool,
+    /// The probe confirmed the trap workspace the shell driver prepared is
+    /// the current workspace, selected through the native picker -- so a
+    /// rejection below is not merely "no workspace selected".
+    pub workspace_selected: bool,
+    /// The static capability test (no generic shell or filesystem
+    /// capability reachable from the renderer) passed on this run's head
+    /// commit.
+    pub generic_capability_absent_pinned: bool,
+    /// The static validator Rust tests passed on this run's head commit.
+    pub validators_pinned: bool,
+    /// At least one payload of each malformed class (wrong types, missing
+    /// fields, unknown fields, oversized or out-of-range ids including
+    /// above 2^53) was sent to a side-effect-free path-bearing command.
+    pub malformed_payloads_sent: bool,
+    /// At least one payload of each path-attack class (symlinks escaping
+    /// the workspace, traversal and absolute names, NUL and control
+    /// characters) was sent to a side-effect-free path-bearing command.
+    pub path_attacks_sent: bool,
+    /// Every sent attack's invoke rejected.
+    pub every_attack_rejected: bool,
+    /// Each rejection carried a typed error code or message, not a generic
+    /// crash or timeout.
+    pub every_rejection_typed: bool,
+    /// The before/after filesystem snapshot outside the workspace was
+    /// captured.
+    pub outside_snapshot_taken: bool,
+    /// The outside snapshot changed between before and after.
+    pub outside_target_modified: bool,
+    /// The outside canary file's content appeared in any response.
+    pub canary_leaked: bool,
+    /// Any sent attack's invoke resolved instead of being rejected.
+    pub attack_accepted: bool,
+    /// The static capability test showed a generic shell or filesystem
+    /// capability.
+    pub generic_capability_observed: bool,
+}
+
+/// Maps VP-S13 observations to `(result, observed_state)`.
+///
+/// Demonstrated failures override every other observation, checked in this
+/// fixed order (first match wins). `Escaped` and `Leaked` come first
+/// because an observed escape -- the trap workspace boundary itself giving
+/// way -- outweighs every other fact this probe could have recorded,
+/// including a clean rejection log for every other attack:
+///
+/// 1. `outside_target_modified` yields `(Fail, Escaped)`.
+/// 2. `canary_leaked` yields `(Fail, Leaked)`.
+/// 3. `attack_accepted` yields `(Fail, BestEffort)` -- an attack invoke
+///    resolved instead of being rejected.
+/// 4. `generic_capability_observed` yields `(Fail, GenericCapability)`.
+///
+/// `attack_accepted` and `every_attack_rejected` are deliberately separate
+/// facts, mirroring [`derive_ipc`]'s `artifact_load_attempted` /
+/// `artifact_load_succeeded` split: an attack that was never sent is
+/// neither accepted nor rejected. Without `malformed_payloads_sent` and
+/// `path_attacks_sent` as their own required proofs, `every_attack_rejected`
+/// would hold vacuously on an empty attack set and `attack_accepted` would
+/// stay unset, which must not read as `Pass`.
+///
+/// `Pass` requires every positive proof: `identity_gated`,
+/// `location_scheme_is_app_protocol`, `workspace_selected`,
+/// `generic_capability_absent_pinned`, `validators_pinned`,
+/// `malformed_payloads_sent`, `path_attacks_sent`, `every_attack_rejected`,
+/// `every_rejection_typed`, and `outside_snapshot_taken`. An unproved fact
+/// never counts as a failure on its own: absent proof falls through to
+/// `Uncertain`, never to one of the `Fail` states above, which are reserved
+/// for an actually demonstrated failure.
+///
+/// An untyped rejection (a crash or timeout instead of a typed error) is
+/// deliberately not a `Fail` state: it is still a rejection, so it is not
+/// best-effort interpretation, but it does not show why the payload was
+/// refused, and a timeout can come from the harness itself. It leaves
+/// `every_rejection_typed` unproved, so the row falls to `Uncertain`, and the
+/// probe's own per-attack outcome lines record what actually happened.
+#[must_use]
+pub fn derive_ipc_boundary(
+    observations: IpcBoundaryObservations,
+) -> (Outcome, IpcBoundaryObservedState) {
+    if observations.outside_target_modified {
+        return (Outcome::Fail, IpcBoundaryObservedState::Escaped);
+    }
+    if observations.canary_leaked {
+        return (Outcome::Fail, IpcBoundaryObservedState::Leaked);
+    }
+    if observations.attack_accepted {
+        return (Outcome::Fail, IpcBoundaryObservedState::BestEffort);
+    }
+    if observations.generic_capability_observed {
+        return (Outcome::Fail, IpcBoundaryObservedState::GenericCapability);
+    }
+    if observations.identity_gated
+        && observations.location_scheme_is_app_protocol
+        && observations.workspace_selected
+        && observations.generic_capability_absent_pinned
+        && observations.validators_pinned
+        && observations.malformed_payloads_sent
+        && observations.path_attacks_sent
+        && observations.every_attack_rejected
+        && observations.every_rejection_typed
+        && observations.outside_snapshot_taken
+    {
+        return (Outcome::Pass, IpcBoundaryObservedState::Rejected);
+    }
+    (Outcome::Uncertain, IpcBoundaryObservedState::Unverified)
+}
