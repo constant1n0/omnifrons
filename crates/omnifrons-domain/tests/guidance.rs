@@ -123,6 +123,20 @@ fn a_guidance_file_is_one_markdown_component_at_the_workspace_root() {
     assert!(ManagedFileName::guidance(&exact).is_ok(), "255 bytes pass");
 }
 
+/// Isolates the NUL byte from the control-character cases in the table
+/// above (VP-S13's static half, desktop-stack-verification-plan.md:134):
+/// embedded `\0` is its own well-known attack shape against a lower layer
+/// that treats a name as a C string, so it earns a standalone proof rather
+/// than staying one case among many.
+#[test]
+fn a_guidance_file_name_rejects_a_nul_byte() {
+    assert_eq!(
+        ManagedFileName::guidance("AGENTS\u{0}.md"),
+        Err(ManagedFileNameError::Control),
+        "a NUL byte must be refused as a control character"
+    );
+}
+
 #[test]
 fn a_target_names_the_file_its_kind_manages() {
     let guidance = ManagedTarget::guidance(ManagedFileName::guidance("CLAUDE.md").expect("valid"));

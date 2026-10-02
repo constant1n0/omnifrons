@@ -129,6 +129,20 @@ fn outbox_path_rejects_control_characters_and_line_separators() {
     assert!(OutboxPath::new("<!-- omnifrons:end guidance -->").is_ok());
 }
 
+/// Isolates the NUL byte from the parameterized class above (VP-S13's
+/// static half, desktop-stack-verification-plan.md:134): embedded `\0` is
+/// its own well-known attack shape against a lower layer that treats a
+/// path as a C string, so it earns a standalone proof rather than staying
+/// one case among many.
+#[test]
+fn outbox_path_rejects_a_nul_byte() {
+    assert_eq!(
+        OutboxPath::new("out\u{0}x").unwrap_err(),
+        OutboxPathError::Control,
+        "a NUL byte must be refused as a control character"
+    );
+}
+
 /// R1-004 (slice 5c risk re-review): `char::is_control` covers only the
 /// Cc category, so the bidirectional override, embedding and isolate
 /// range (U+202A..=U+202E, U+2066..=U+2069) passed the refusal above and

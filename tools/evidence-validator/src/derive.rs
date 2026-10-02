@@ -311,9 +311,15 @@ pub struct IpcBoundaryObservations {
     pub workspace_selected: bool,
     /// The static capability test (no generic shell or filesystem
     /// capability reachable from the renderer) passed on this run's head
-    /// commit.
+    /// commit -- the retained `vp-001-vp-s13-static-boundary.txt`
+    /// artifact's `gate=static-boundary-section name=capabilities` section,
+    /// which ends `status=0` only when every test it names ran and passed
+    /// (a renamed test fails it rather than silently matching nothing).
     pub generic_capability_absent_pinned: bool,
-    /// The static validator Rust tests passed on this run's head commit.
+    /// The static validator Rust tests (path and reference validation)
+    /// passed on this run's head commit -- the same artifact's
+    /// `gate=static-boundary-section name=validators` section, under the
+    /// same proof.
     pub validators_pinned: bool,
     /// At least one payload of each malformed class (wrong types, missing
     /// fields, unknown fields, oversized or out-of-range ids including
