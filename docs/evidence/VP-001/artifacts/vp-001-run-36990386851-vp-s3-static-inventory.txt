@@ -1,0 +1,12 @@
+gate=static-inventory head=49f330402c61e6c30a8e74efbe645e2fde880cf8
+
+running 6 tests
+test csp_scheme_sources_are_the_inventoried_ones ... ok
+test dependency_graph_violations_flags_each_way_a_scheme_could_slip_in ... ok
+test scheme_sources_collects_every_scheme_and_url_token ... ok
+test app_registers_no_uri_scheme ... ok
+test tauri_is_resolved_without_scheme_adding_features ... ok
+test no_other_crate_can_register_a_scheme ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+

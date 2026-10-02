@@ -733,3 +733,203 @@ CI artifact entry it was copied from, whose runner paths were rewritten to
 | `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-27 |
 | `evidence_artifact` | b2c20e7df17cd1b989dd8261766d514800b318fa0a0c4a91d22c0ff16ac1d1f5 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36454804051-vp-s3-transcript.txt`, copied from run 36454804051's `vp-001-transcripts` artifact entry `vp-001-vp-s3-transcript.txt` |
 | `feasibility_evidence_artifact` | 11972446d0497fcaa64be620cc584649cde88457521ae91a49491ee35bca01d6 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36454804051-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
+
+## VP-001 VP-S3 scenario -- run 36990386851 (2026-10-02)
+
+The third execution of VP-S3 (typed-IPC bridge confinement), against the
+packaged AppImage on the pinned Linux baseline, run through
+`vp-s3-linux.sh`, exactly as VP-001-VP-S3-01 and VP-001-VP-S3-02. Between
+VP-001-VP-S3-02's head (e06a4a5) and this row's (49f3304), `git log
+--oneline e06a4a5..49f3304` shows the scenario session lifecycle hardened against SIGTERM and a
+late-created session, a fake-WebDriver end-to-end test suite added for the
+VP-S1/VP-S3 drivers, those drivers tightened to a 0/1/2 exit-status
+contract, one liveness-checked `with-webdriver.sh` bootstrap shared across
+the VP-001 steps, and -- on 49f3304, the commit this row's run was
+dispatched against -- the `observation=attempt` transcript lines and the
+static protocol-inventory CI step this row now cites. `git diff --stat
+e06a4a5 49f3304` touches only `.github/workflows/tauri-build.yml`, files
+under `docs/evidence/VP-001/procedures/`, and `records.md` itself; no file
+under `src-tauri/` or the renderer frontend changed. This row states no
+cause for anything in that history; it only reports what changed.
+
+The retained VP-S3 transcript opens with the same connection-refused
+preamble VP-001-VP-S3-02's does; VP-001-VP-S1-02/-03 already established
+the reading used here, and this row does not re-derive it. The retained
+feasibility transcript does not open with it: its first line is
+`gate=av1-digest-match`, as VP-001-VP-S1-03 recorded for run 35450847942's
+VP-S6 transcript. In the VP-S3 transcript, the preamble is followed by `gate=av1-digest-match
+digest=e06ed9f0b6897a8f152fd655d64bb1df2031a8c0c7cb0561b090049e5db6eada`
+and `gate=av2-variant-scan-absent
+binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell`, both before
+any session is attempted. `vp-s3-linux.sh`'s own reused
+`vp-s6-linux.sh --mode=feasibility-check` subprocess then opens and closes
+one feasibility session of its own, `gate=f1-session-created` /
+`gate=session-closed` (session `ddb6112a-8358-4ac7-9172-894670ca7154`), at
+a session id distinct from the one in the separately retained feasibility
+transcript (`c167f55d-4916-4ce2-8c83-7759f21dc185`) -- the workflow's own,
+earlier feasibility step -- exactly the two-sessions-per-run structure the
+VP-S1 rows, VP-001-VP-S3-01, and VP-001-VP-S3-02 describe. After that
+feasibility session closed, a fresh `omnifrons-shell` process started for
+the scenario's own session attempt, and it succeeded:
+`gate=session-created session_id=e4b72fb2-2a3b-4234-a8a6-e4fc20e87958`,
+then `gate=armed`, then `gate=location-scheme value=tauri:`.
+
+`identity_gated` is derived the same way the VP-S1 rows, VP-001-VP-S3-01,
+and VP-001-VP-S3-02 derive it: both `gate=av1-digest-match` and
+`gate=av2-variant-scan-absent` appear before the scenario session was
+created.
+
+The AV1 digest gated in this run
+(`e06ed9f0b6897a8f152fd655d64bb1df2031a8c0c7cb0561b090049e5db6eada`, equal
+to both `build_channel_digest` and `exercised_artifact_digest`; AV2's
+`variant_scan` is `absent`) is new relative to both prior VP-S3 rows. A
+separate validation dispatch against the same commit 49f3304 (run
+36787727082, branch `feat/vp-s3-probe-evidence`, not filed as a row and
+its artifacts not retained in this repository) gated a different AV1
+digest for a packaged build of that same commit,
+`875b4249d9255322a4558f6e8d4ef9e473f65a2dc00d8f10a22982cce35cf708`. Two
+packaged builds of the same commit therefore produced two different
+AppImage digests. This row states no cause for the difference; nothing
+observed here demonstrates one.
+
+Exactly one `securitypolicyviolation` was recorded, at index 0:
+`effectiveDirective`/`violatedDirective` `connect-src`, `blockedURI`
+`"https://vp-s3.invalid/"` -- the probe's own deliberate policy-probe
+fetch, not a bridge call -- `disposition` `"enforce"`, and `originalPolicy`
+whose `connect-src` directive is exactly `ipc:`, the Linux/macOS bridge
+source RCS-001 documents (renderer-content-security.md § CSP baseline).
+The policy dump's directive order differs from VP-001-VP-S3-02's while
+carrying the identical thirteen-directive set, the same kind of difference
+VP-001-VP-S1-02 recorded for its own policy dump. `sourceFile`,
+`lineNumber`, and `sample` are empty, as on all three of VP-001-VP-S1-02's
+violation events and VP-001-VP-S3-02's one event.
+
+Sixteen `fetch` lines were recorded, in the same shape VP-001-VP-S3-02's
+were: index 0, `ipc://localhost/shell_health`, `resolved:200`, the probe's
+registered call; index 1, `ipc://localhost/vp_s3_unregistered_command`,
+`resolved:200`, the probe's unregistered call; index 2,
+`https://vp-s3.invalid/`, `rejected:TypeError`, the policy probe. Indexes
+3-15 are the same thirteen calls the app's own renderer made during the
+probe's observation window that VP-001-VP-S3-02 recorded --
+`approvals_list`, `workspace_current`, `outbox_status`,
+`publications_list`, `guidance_status` (twice), `guidance_snapshots`
+(twice), `wrongroot_status`, `misplaced_list`, `recovery_list`,
+`adapters_list`, `approvals_list` again -- every one to `ipc://localhost`,
+every one `resolved:200`.
+
+New in this run: four `observation=attempt index=<i> name=<json>
+outcome=<json>` lines, one per attempt `vp-s3-probe.mjs`'s `buildArmScript`
+makes, in the format `formatAttemptLines` adds (commit 49f3304): index 0
+`registered-call` `resolved`; index 1 `unregistered-call`
+`rejected:Command vp_s3_unregistered_command not found`; index 2
+`artifact-load` `error`; index 3 `policy-probe` `rejected:TypeError`. The
+unregistered invoke's own rejection, carrying Tauri's own error message,
+is now in the retained transcript itself, not only in the summary boolean.
+VP-001-VP-S3-02 could rest `unregistered_call_rejected` only on
+`unregisteredAttempt?.outcome` inside `vp-s3-probe.mjs`'s `summarize`,
+stating: "The rejection recorded here rests entirely on
+`unregisteredAttempt?.outcome` in `vp-s3-probe.mjs`'s `summarize` -- the
+`invoke('vp_s3_unregistered_command')` promise's own settled outcome,
+distinct from the `fetch` line above it -- never on the fetch's status."
+That sentence still describes how the fact is derived, but the attempt's
+own outcome text is now part of the retained evidence this row cites,
+closing the gap that sentence described.
+
+The summary observations were emitted exactly as VP-001-VP-S3-02's were:
+`location_scheme_is_app_protocol=true`,
+`connect_src_policy_captured=true`,
+`connect_src_is_documented_source_for_os=true`,
+`registered_call_completed=true`,
+`registered_call_used_custom_protocol=true`,
+`postmessage_fallback_observed=false`,
+`bridge_connect_src_violation=false`,
+`unregistered_call_rejected=true`, `unregistered_call_resolved=false`,
+`artifact_load_attempted=true`, `artifact_load_succeeded=false`.
+
+`static_inventory_pinned` no longer rests on a GitHub API check-run
+lookup, unlike VP-001-VP-S3-01's and VP-001-VP-S3-02's. The retained file
+`docs/evidence/VP-001/artifacts/vp-001-run-36990386851-vp-s3-static-inventory.txt`
+(CI step "VP-001 VP-S3 static protocol inventory (evidence run)", added in
+commit 49f3304) opens `gate=static-inventory
+head=49f330402c61e6c30a8e74efbe645e2fde880cf8`, matching this run's own
+head commit, and shows `src-tauri/tests/protocol_inventory.rs`'s own
+output: "test result: ok. 6 passed; 0 failed". No GitHub API lookup is
+needed for this row; `static_inventory_evidence_artifact` below
+cites the retained file directly.
+
+`derive_ipc` (`tools/evidence-validator/src/derive.rs`) checks its four
+demonstrated-failure conditions in fixed order before admitting `Pass`, as
+in VP-001-VP-S3-02: `connect_src_policy_captured &&
+!connect_src_is_documented_source_for_os` is false, since the captured
+source is exactly the documented one; `postmessage_fallback_observed ||
+bridge_connect_src_violation` is false; `artifact_load_succeeded` is
+false; `unregistered_call_resolved` is false. Every fact `Pass` requires is
+true -- `identity_gated`, `location_scheme_is_app_protocol`,
+`connect_src_policy_captured`, `connect_src_is_documented_source_for_os`,
+`registered_call_completed`, `registered_call_used_custom_protocol`,
+`unregistered_call_rejected`, `artifact_load_attempted`, and
+`static_inventory_pinned` -- so `derive_ipc` yields `(Pass, Confined)`.
+
+`postmessage_fallback_observed` is `false` for the same reason
+VP-001-VP-S3-02 gives: the registered call's own fetch (index 0) resolved
+before any rejection could set Tauri's `customProtocolIpcFailed` flag, and
+this run's transcript records no bridge fetch rejecting and no fallback
+console warning either. This row does not re-derive that reading at
+length.
+
+Timing context, measured from the job log of run 36990386851, not from a
+retained artifact, each interval running from the app process's first
+output line to its session's `gate=session-created` (or
+`gate=f1-session-created`): every one of the four F1 sessions in this run's
+job log took 30.2-31.4 s, the VP-S1 scenario
+session took 11.8 s, and the VP-S3 scenario session took 30.2 s. This row
+states no cause for the session-create durations; nothing observed here
+demonstrates one.
+
+This is the Linux baseline VP-001-BASE-01 only. Per VP-001-R15, a passing
+result does not transfer between baselines, for the reasons
+VP-001-VP-S3-02 gives; this row does not repeat them. It does not by
+itself discharge VP-001-R12, which requires every bridge protocol
+enumerated per OS, or RCS-001-R14, whose payload-shape clause this probe's
+registered call (`invoke('shell_health')`, no payload argument) does not
+address -- the same reasoning VP-001-VP-S3-02 gives for its own Linux-only
+pass.
+
+Each `evidence_artifact` digest below is the SHA-256 of the retained,
+redacted file at the path it names -- the file in this repository, not the
+CI artifact entry it was copied from, whose runner paths were rewritten to
+`<extract-dir>` before retention.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S3-03 |
+| `kind` | scenario |
+| `scenario_id` | VP-S3 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | pass |
+| `observed_state` | confined |
+| `build_channel` | packaged-ci |
+| `build_channel_digest` | e06ed9f0b6897a8f152fd655d64bb1df2031a8c0c7cb0561b090049e5db6eada |
+| `exercised_artifact_digest` | e06ed9f0b6897a8f152fd655d64bb1df2031a8c0c7cb0561b090049e5db6eada |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s3-linux.sh |
+| `blocker` | none -- the scenario ran to completion and every `derive_ipc` `Pass` proof was observed |
+| `identity_gated` | true -- derived from `gate=av1-digest-match` and `gate=av2-variant-scan-absent`, both before the scenario session was created |
+| `location_scheme_is_app_protocol` | true (`tauri:`) |
+| `connect_src_policy_captured` | true |
+| `connect_src_is_documented_source_for_os` | true -- captured `connect-src ipc:`, exactly the Linux source RCS-001 documents |
+| `registered_call_completed` | true |
+| `registered_call_used_custom_protocol` | true -- the registered call's fetch went to `ipc://localhost/shell_health`, resolved:200 |
+| `postmessage_fallback_observed` | false |
+| `bridge_connect_src_violation` | false |
+| `unregistered_call_rejected` | true -- the invoke's own promise rejected, recorded verbatim as `observation=attempt index=1 name="unregistered-call" outcome="rejected:Command vp_s3_unregistered_command not found"` |
+| `unregistered_call_resolved` | false -- the underlying fetch (index 1) nonetheless resolved:200; see prose |
+| `artifact_load_attempted` | true |
+| `artifact_load_succeeded` | false |
+| `static_inventory_pinned` | true -- the retained `vp-001-run-36990386851-vp-s3-static-inventory.txt` shows `test result: ok. 6 passed; 0 failed` on this run's own head commit 49f330402c61e6c30a8e74efbe645e2fde880cf8 |
+| `run_date` | 2026-10-02 |
+| `ci_run` | workflow tauri-build.yml, workflow_dispatch (vp001_scenario: true), run 36990386851, head 49f3304, conclusion success |
+| `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2026-12-31 |
+| `evidence_artifact` | a9bb393c4e6e52e5613e4b7298afbca0490031e04b53518b95a12bb900f09cd8 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36990386851-vp-s3-transcript.txt`, copied from run 36990386851's `vp-001-transcripts` artifact entry `vp-001-vp-s3-transcript.txt` |
+| `feasibility_evidence_artifact` | 2984acc0ea9cbc0ba7ca2fa2a91f6fb3548cb90f86541d66d626fe8067ae5cb1 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36990386851-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
+| `static_inventory_evidence_artifact` | cd4daabd91ecff524e2d76be1f4bbf0f6396d4a681eaa7979e3093e83435ef12 -- SHA-256 of the retained file, byte-identical to its CI artifact entry (it holds no runner path to redact), `docs/evidence/VP-001/artifacts/vp-001-run-36990386851-vp-s3-static-inventory.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-vp-s3-static-inventory.txt` |

@@ -1,0 +1,54 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+gate=av1-digest-match digest=e06ed9f0b6897a8f152fd655d64bb1df2031a8c0c7cb0561b090049e5db6eada
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:25552): dbind-WARNING **: 09:40:30.823: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=ddb6112a-8358-4ac7-9172-894670ca7154
+gate=session-closed session_id=ddb6112a-8358-4ac7-9172-894670ca7154
+
+(omnifrons-shell:25664): dbind-WARNING **: 09:41:02.806: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=session-created session_id=e4b72fb2-2a3b-4234-a8a6-e4fc20e87958
+gate=armed
+gate=location-scheme value=tauri:
+observation=violation index=0 effectiveDirective="connect-src" violatedDirective="connect-src" blockedURI="https://vp-s3.invalid/" disposition="enforce" originalPolicy="connect-src ipc:; form-action 'none'; base-uri 'none'; manifest-src 'self'; media-src 'self' artifact:; script-src 'self' 'self' 'sha256-WSC0Zwqh5kGjYVEhkSn92QCCvyNfPlTTDLOpOU/P+2s='; default-src 'none'; img-src 'self' artifact:; object-src 'none'; style-src 'self'; worker-src 'self'; frame-src 'none'; font-src 'self'" sourceFile="" lineNumber=0 sample=""
+observation=fetch index=0 url="ipc://localhost/shell_health" outcome="resolved:200"
+observation=fetch index=1 url="ipc://localhost/vp_s3_unregistered_command" outcome="resolved:200"
+observation=fetch index=2 url="https://vp-s3.invalid/" outcome="rejected:TypeError"
+observation=fetch index=3 url="ipc://localhost/approvals_list" outcome="resolved:200"
+observation=fetch index=4 url="ipc://localhost/workspace_current" outcome="resolved:200"
+observation=fetch index=5 url="ipc://localhost/outbox_status" outcome="resolved:200"
+observation=fetch index=6 url="ipc://localhost/publications_list" outcome="resolved:200"
+observation=fetch index=7 url="ipc://localhost/guidance_status" outcome="resolved:200"
+observation=fetch index=8 url="ipc://localhost/guidance_status" outcome="resolved:200"
+observation=fetch index=9 url="ipc://localhost/guidance_snapshots" outcome="resolved:200"
+observation=fetch index=10 url="ipc://localhost/guidance_snapshots" outcome="resolved:200"
+observation=fetch index=11 url="ipc://localhost/wrongroot_status" outcome="resolved:200"
+observation=fetch index=12 url="ipc://localhost/misplaced_list" outcome="resolved:200"
+observation=fetch index=13 url="ipc://localhost/recovery_list" outcome="resolved:200"
+observation=fetch index=14 url="ipc://localhost/adapters_list" outcome="resolved:200"
+observation=fetch index=15 url="ipc://localhost/approvals_list" outcome="resolved:200"
+observation=attempt index=0 name="registered-call" outcome="resolved"
+observation=attempt index=1 name="unregistered-call" outcome="rejected:Command vp_s3_unregistered_command not found"
+observation=attempt index=2 name="artifact-load" outcome="error"
+observation=attempt index=3 name="policy-probe" outcome="rejected:TypeError"
+observation=location_scheme value=tauri:
+observation=location_scheme_is_app_protocol value=true
+observation=connect_src_policy_captured value=true
+observation=connect_src_is_documented_source_for_os value=true
+observation=registered_call_completed value=true
+observation=registered_call_used_custom_protocol value=true
+observation=postmessage_fallback_observed value=false
+observation=bridge_connect_src_violation value=false
+observation=unregistered_call_rejected value=true
+observation=unregistered_call_resolved value=false
+observation=artifact_load_attempted value=true
+observation=artifact_load_succeeded value=false
+gate=session-closed session_id=e4b72fb2-2a3b-4234-a8a6-e4fc20e87958
