@@ -27,12 +27,39 @@ export const TERMINATION_TEARDOWN_DEADLINE_MS = 8_000;
 /** The three deadlines `runScenarioSession` uses for any field a caller's
  * `deadlines` override omits or leaves `undefined`. An `undefined` bound
  * would make `withDeadline` silently fall back to `CALL_DEADLINE_MS` (30 s),
- * past the scripts' `--kill-after=10s` window. */
+ * past the scripts' `--kill-after=10s` window. Also the exhaustive set of
+ * keys a `deadlines` override may name -- see `validateDeadlines` below. */
 export const DEFAULT_DEADLINES = {
   sessionCreate: SESSION_CREATE_DEADLINE_MS,
   call: CALL_DEADLINE_MS,
   terminationTeardown: TERMINATION_TEARDOWN_DEADLINE_MS,
 };
+
+/**
+ * Validates a test-only `deadlines` override before `runScenarioSession`
+ * makes any WebDriver call. `undefined` (an omitted key or the whole
+ * argument) keeps every default. Anything else must be a plain object whose
+ * keys are a subset of `DEFAULT_DEADLINES`'s, each value either `undefined`
+ * (keeps that field's own default) or a positive finite number, so a
+ * misspelled key (e.g. `terminationTeardwn`) fails loudly instead of the
+ * real field silently keeping its default.
+ */
+function validateDeadlines(overrides) {
+  if (overrides === undefined) return;
+  if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) {
+    throw new TypeError('deadlines must be an object');
+  }
+  const validKeys = Object.keys(DEFAULT_DEADLINES);
+  for (const [name, value] of Object.entries(overrides)) {
+    if (!validKeys.includes(name)) {
+      throw new TypeError(`deadlines.${name} is not a recognized key (expected one of: ${validKeys.join(', ')})`);
+    }
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new TypeError(`deadlines.${name} must be a positive finite number (got: ${String(value)})`);
+    }
+  }
+}
 
 // Exported for both scenarios and for `node --test`
 // (`scenario-session.test.mjs`). The optional `ms` defaults to
@@ -69,7 +96,10 @@ function messageOf(error) {
  * code so this can still settle and be asserted. `signals`/`webdriver`/
  * `deadlines` are likewise overridable for in-process testing; a field a
  * `deadlines` override omits or leaves `undefined` keeps its
- * `DEFAULT_DEADLINES` value.
+ * `DEFAULT_DEADLINES` value. `deadlines` is validated (`validateDeadlines`)
+ * before any WebDriver call: an invalid override throws a `TypeError`
+ * instead of being silently ignored or reaching `Object.entries`'s own
+ * unhelpful error.
  */
 export async function runScenarioSession({
   baseUrl,
@@ -81,6 +111,8 @@ export async function runScenarioSession({
   webdriver = { createSession, deleteSession },
   deadlines: deadlineOverrides = {},
 }) {
+  validateDeadlines(deadlineOverrides);
+
   // An override entry left `undefined` keeps its default, like an omitted one.
   const deadlines = { ...DEFAULT_DEADLINES };
   for (const [name, ms] of Object.entries(deadlineOverrides)) {

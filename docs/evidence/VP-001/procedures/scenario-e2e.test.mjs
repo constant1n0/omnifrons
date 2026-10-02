@@ -39,11 +39,13 @@ const CHILD_TIMEOUT_MS = 15_000;
  * Answers `POST /session`, `POST /session/<id>/execute/sync` (arm, then
  * read), and `DELETE /session/<id>`, and records every request as
  * `<METHOD> <path>` so a test can assert the DELETE count. `behavior`
- * selects one misbehavior ('create-500', 'exec-500', 'delete-500', 'hang');
- * anything else is the happy path. `readResult` is returned verbatim from
- * the second `execute/sync` call (the probe's read); the first always
- * answers `null` -- the arm script's own return value is never used by the
- * scenario scripts.
+ * selects one misbehavior ('create-500', 'exec-500', 'delete-500', 'hang',
+ * 'hang-read'); anything else is the happy path. `readResult` is returned
+ * verbatim from the second `execute/sync` call (the probe's read); the
+ * first always answers `null` -- the arm script's own return value is
+ * never used by the scenario scripts. 'hang' never answers the first
+ * (arm) call, the SIGTERM-during-arm case; 'hang-read' answers the first
+ * normally but never answers the second (read), the SIGTERM-after-armed case.
  */
 function startFakeWebDriver({ behavior = 'ok', readResult = {} } = {}) {
   const requests = [];
@@ -66,7 +68,8 @@ function startFakeWebDriver({ behavior = 'ok', readResult = {} } = {}) {
 
       if (req.method === 'POST' && req.url.endsWith('/execute/sync')) {
         execCount += 1;
-        if (behavior === 'hang') return; // never respond -- the SIGTERM case
+        if (behavior === 'hang') return; // never respond -- the SIGTERM-during-arm case
+        if (behavior === 'hang-read' && execCount === 2) return; // never respond -- the SIGTERM-after-armed case
         if (behavior === 'exec-500' && execCount === 2) {
           return send(500, { error: 'javascript error', message: 'read failed' });
         }
@@ -125,24 +128,65 @@ function spawnScript(script, args) {
   return { child, lines, closed };
 }
 
-/** Runs `script` to completion against the fake endpoint, bounded by `CHILD_TIMEOUT_MS`. */
+/**
+ * Runs `script` to completion against the fake endpoint, bounded by
+ * `CHILD_TIMEOUT_MS`. `timedOut` is `true` iff that bound fired and the
+ * child had to be SIGKILLed; a child killed this way exits with `code: null`
+ * like any other signal death, so callers must check `timedOut` before
+ * `code`/`lines` -- otherwise a hang reads as a transcript mismatch rather
+ * than as the hang it is.
+ */
 async function run(script, args) {
   const { child, lines, closed } = spawnScript(script, args);
-  const timer = setTimeout(() => child.kill('SIGKILL'), CHILD_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+  }, CHILD_TIMEOUT_MS);
   try {
     const { code } = await closed;
-    return { lines, code };
+    return { lines, code, timedOut };
   } finally {
     clearTimeout(timer);
   }
 }
 
-/** Polls `lines` until it contains `line`, for the SIGTERM case, which must
- * act at a precise point in the transcript rather than after exit. */
-async function waitForLine(lines, line) {
+/** Asserts `run()`'s result did not hit `CHILD_TIMEOUT_MS`, before any
+ * assertion against its transcript or exit code: a SIGKILLed-for-timeout
+ * child must be diagnosed as a hang, not as whatever `code`/`lines`
+ * happened to be at the moment it was killed. */
+function assertNotTimedOut({ timedOut, lines }) {
+  assert.equal(
+    timedOut,
+    false,
+    `child hit the ${CHILD_TIMEOUT_MS} ms test bound and was killed; lines seen so far: ${JSON.stringify(lines)}`,
+  );
+}
+
+/**
+ * Polls `lines` until it contains `line`, racing the poll against `closed`
+ * so a child that has already exited -- or exits while this is waiting --
+ * fails at once, naming its exit code/signal and the lines seen so far,
+ * instead of polling uselessly until CHILD_TIMEOUT_MS. For the SIGTERM
+ * cases, which must act at a precise point in the transcript rather than
+ * after exit.
+ */
+async function waitForLine(lines, line, closed) {
   const deadline = Date.now() + CHILD_TIMEOUT_MS;
+  let exitResult = null;
+  closed.then((result) => {
+    exitResult = result;
+  });
   while (!lines.includes(line)) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for line: ${line}`);
+    if (exitResult !== null) {
+      throw new Error(
+        `child exited (code=${exitResult.code}, signal=${exitResult.signal}) before line: ${line}; ` +
+          `lines seen so far: ${JSON.stringify(lines)}`,
+      );
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for line: ${line}; lines seen so far: ${JSON.stringify(lines)}`);
+    }
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -295,7 +339,8 @@ for (const scenario of SCENARIOS) {
     await t.test('ok: exact transcript in order, exit 0, one DELETE', async () => {
       const fake = await startFakeWebDriver({ behavior: 'ok', readResult: scenario.readResult });
       try {
-        const { lines, code } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        const { lines, code, timedOut } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        assertNotTimedOut({ timedOut, lines });
         assert.deepEqual(lines, scenario.okLines);
         assert.equal(code, 0);
         // Arm, then read, then delete -- all addressed to the session created.
@@ -313,7 +358,8 @@ for (const scenario of SCENARIOS) {
     await t.test('read fails (execute 500): unexpected-error blocker, exit 1, one DELETE', async () => {
       const fake = await startFakeWebDriver({ behavior: 'exec-500' });
       try {
-        const { lines, code } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        const { lines, code, timedOut } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        assertNotTimedOut({ timedOut, lines });
         assert.deepEqual(lines, scenario.execFailLines);
         assert.equal(code, 1);
         assert.equal(fake.deleteCount(), 1);
@@ -325,7 +371,8 @@ for (const scenario of SCENARIOS) {
     await t.test('delete fails: session-close-failed replaces session-closed, exit 1, one DELETE attempt', async () => {
       const fake = await startFakeWebDriver({ behavior: 'delete-500', readResult: scenario.readResult });
       try {
-        const { lines, code } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        const { lines, code, timedOut } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        assertNotTimedOut({ timedOut, lines });
         assert.deepEqual(lines, scenario.deleteFailLines);
         assert.equal(code, 1);
         assert.equal(fake.deleteCount(), 1);
@@ -337,7 +384,8 @@ for (const scenario of SCENARIOS) {
     await t.test('create fails: exactly one session-create-failed blocker, exit 1, no DELETE', async () => {
       const fake = await startFakeWebDriver({ behavior: 'create-500' });
       try {
-        const { lines, code } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        const { lines, code, timedOut } = await run(scenario.script, scenario.argsFor(fake.baseUrl));
+        assertNotTimedOut({ timedOut, lines });
         assert.deepEqual(lines, scenario.createFailLines);
         assert.equal(code, 1);
         assert.equal(fake.deleteCount(), 0);
@@ -349,7 +397,8 @@ for (const scenario of SCENARIOS) {
     await t.test('usage error: missing arguments, exit 2, no request reaches the fake', async () => {
       const fake = await startFakeWebDriver();
       try {
-        const { lines, code } = await run(scenario.script, []);
+        const { lines, code, timedOut } = await run(scenario.script, []);
+        assertNotTimedOut({ timedOut, lines });
         assert.deepEqual(lines, [scenario.usageLine]);
         assert.equal(code, 2);
         assert.equal(fake.requests.length, 0);
@@ -366,7 +415,7 @@ for (const scenario of SCENARIOS) {
         const { child, lines, closed } = spawnScript(scenario.script, scenario.argsFor(fake.baseUrl));
         const timer = setTimeout(() => child.kill('SIGKILL'), CHILD_TIMEOUT_MS);
         try {
-          await waitForLine(lines, 'gate=session-created session_id=sess-1');
+          await waitForLine(lines, 'gate=session-created session_id=sess-1', closed);
           child.kill('SIGTERM');
           const { code, signal } = await closed;
           assert.deepEqual(lines, [
@@ -385,13 +434,53 @@ for (const scenario of SCENARIOS) {
         }
       },
     );
+
+    // Two deterministic points after 'gate=armed': during the 2 s settle
+    // delay (signalled at once), and during the hung read (signalled once
+    // the fake has received the read, the second execute/sync call).
+    for (const phase of ['settle delay', 'hung read']) {
+      await t.test(
+        `SIGTERM during the ${phase}: terminated blocker, one DELETE, exit code 143`,
+        { skip: process.platform === 'win32' && 'Node cannot deliver a catchable SIGTERM to a child on Windows' },
+        async () => {
+          // 'hang-read' answers the arm call normally, then never answers the read.
+          const fake = await startFakeWebDriver({ behavior: 'hang-read' });
+          const { child, lines, closed } = spawnScript(scenario.script, scenario.argsFor(fake.baseUrl));
+          const timer = setTimeout(() => child.kill('SIGKILL'), CHILD_TIMEOUT_MS);
+          try {
+            await waitForLine(lines, 'gate=armed', closed);
+            while (phase === 'hung read' && fake.requests.filter((r) => r.endsWith('/execute/sync')).length < 2) {
+              if (child.exitCode !== null || child.signalCode !== null) throw new Error(`child exited before its read: ${JSON.stringify(lines)}`);
+              await new Promise((r) => setTimeout(r, 20));
+            }
+            child.kill('SIGTERM');
+            const { code, signal } = await closed;
+            assert.deepEqual(lines, [
+              'gate=session-created session_id=sess-1',
+              'gate=armed',
+              'blocker=terminated: SIGTERM',
+              'gate=session-closed session_id=sess-1',
+            ]);
+            assert.equal(code, 143);
+            assert.equal(signal, null);
+            assert.equal(fake.deleteCount(), 1);
+          } finally {
+            clearTimeout(timer);
+            if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); // a failed wait left it running
+            await closed;
+            await fake.close();
+          }
+        },
+      );
+    }
   });
 }
 
 test('vp-s3-scenario.mjs: unsupported <os> value is a usage error, exit 2, no request reaches the fake', async () => {
   const fake = await startFakeWebDriver();
   try {
-    const { lines, code } = await run(VP_S3_SCRIPT, [fake.baseUrl, '/app', 'plan9']);
+    const { lines, code, timedOut } = await run(VP_S3_SCRIPT, [fake.baseUrl, '/app', 'plan9']);
+    assertNotTimedOut({ timedOut, lines });
     assert.deepEqual(lines, [VP_S3_USAGE_LINE]);
     assert.equal(code, 2);
     assert.equal(fake.requests.length, 0);

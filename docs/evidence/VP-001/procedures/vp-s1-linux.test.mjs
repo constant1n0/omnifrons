@@ -116,6 +116,23 @@ test('vp-s1-linux.sh scenario leg exit contract', LINUX_ONLY, async (t) => {
     assert.ok(stdout.includes('gate=scenario-killed'));
     assert.ok(!stdout.includes('gate=scenario-timeout'));
   });
+
+  await t.test('a SIGTERM from outside the bound is named terminated, never a timeout or a kill', () => {
+    // A Node process with no SIGTERM handler dies by signal (status 143),
+    // unlike the scripts' own `timeout --kill-after` SIGTERM, which
+    // scenario-session.mjs's handler catches to delete the session first.
+    const { status, stdout } = runWithAvStub(AV_PASS, { scenarioBody: "process.kill(process.pid, 'SIGTERM');" });
+    assert.equal(status, 1);
+    assert.ok(stdout.includes('gate=scenario-terminated'));
+    assert.ok(!stdout.includes('gate=scenario-timeout'));
+    assert.ok(!stdout.includes('gate=scenario-killed'));
+  });
+
+  await t.test('a status outside 0/1/2/124/137/143 is named unexpected, with its raw status', () => {
+    const { status, stdout } = runWithAvStub(AV_PASS, { scenarioBody: 'process.exitCode = 127;' });
+    assert.equal(status, 1);
+    assert.ok(stdout.includes('gate=scenario-unexpected-exit status=127'));
+  });
 });
 
 test('map_leg_status maps an unmapped status directly, without spawning a driver', LINUX_ONLY, () => {

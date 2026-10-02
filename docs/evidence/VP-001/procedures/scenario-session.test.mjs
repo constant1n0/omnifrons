@@ -588,3 +588,68 @@ test('runScenarioSession: SIGTERM while the normal path\'s close() is already in
   ]);
   await resultPromise;
 });
+
+// -- deadlines override validation --
+
+/** A `createSession` fake for the validation tests below: the override must
+ * be rejected before any WebDriver call, never after a session exists. */
+function createSessionMustNotBeCalled() {
+  return async () => assert.fail('createSession must not be called when deadlines is invalid');
+}
+
+test('runScenarioSession: an invalid deadlines override throws before any WebDriver call', async (t) => {
+  await t.test('null is rejected, instead of reaching Object.entries\' own unhelpful TypeError', async () => {
+    const { run } = context();
+    await assert.rejects(
+      run({
+        webdriver: { createSession: createSessionMustNotBeCalled(), deleteSession: async () => {} },
+        body: async () => assert.fail('body must not run'),
+        deadlines: null,
+      }),
+      /^TypeError: deadlines must be an object$/,
+    );
+  });
+
+  await t.test('a misspelled key is rejected, naming it and the allowed keys, instead of being silently dropped', async () => {
+    const { run } = context();
+    await assert.rejects(
+      run({
+        webdriver: { createSession: createSessionMustNotBeCalled(), deleteSession: async () => {} },
+        body: async () => assert.fail('body must not run'),
+        deadlines: { terminationTeardwn: 100 },
+      }),
+      (error) => {
+        assert.ok(error instanceof TypeError, String(error));
+        assert.match(error.message, /terminationTeardwn/);
+        for (const key of Object.keys(DEFAULT_DEADLINES)) assert.match(error.message, new RegExp(key));
+        return true;
+      },
+    );
+  });
+
+  await t.test('a zero or negative value is rejected', async () => {
+    const { run } = context();
+    for (const value of [0, -5]) {
+      await assert.rejects(
+        run({
+          webdriver: { createSession: createSessionMustNotBeCalled(), deleteSession: async () => {} },
+          body: async () => assert.fail('body must not run'),
+          deadlines: { call: value },
+        }),
+        /deadlines\.call/,
+      );
+    }
+  });
+
+  await t.test('a non-number value is rejected', async () => {
+    const { run } = context();
+    await assert.rejects(
+      run({
+        webdriver: { createSession: createSessionMustNotBeCalled(), deleteSession: async () => {} },
+        body: async () => assert.fail('body must not run'),
+        deadlines: { call: '30' },
+      }),
+      /deadlines\.call/,
+    );
+  });
+});
