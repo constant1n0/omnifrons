@@ -25,8 +25,20 @@
 // proof, not a rejection); a differing baseline is `attack_accepted`
 // (`BestEffort`). `canary_leaked` is any in-page `canaryHit`, computed on
 // the full, uncapped text before `capText` runs.
+//
+// Two facts the retained transcript cannot otherwise show: which bytes an attack actually sent, and that the unknown-field
+// pair's two response bodies were truly identical rather than two matching
+// 512-char prefixes. `payloadDigest` and the paired `*ResponseFull` bodies
+// close both gaps; the transcript line itself still carries only digests
+// and lengths, never the args or the bodies.
+
+import { createHash } from 'node:crypto';
 
 const MAX_TEXT_LENGTH = 512;
+// The paired full-body retention bound, in UTF-16 code units (JS string length), not bytes: both
+// sides of a pair are measured alike, though a non-ASCII body under it may exceed 64 KiB in UTF-8.
+// Large enough for any real guidance file content, small enough to keep the snapshot bounded.
+const MAX_FULL_RESPONSE_LENGTH = 64 * 1024;
 /** `guidanceFile`: the driver's planted symlink to the outside canary. `absentGuidanceFile`: a valid, never-created, never-trapped name. Shared so driver and probe name the same files. */
 export const TRAP_NAMES = Object.freeze({ guidanceFile: 'AGENTS.md', absentGuidanceFile: 'VP-S13-ABSENT.md' });
 
@@ -57,12 +69,13 @@ export const ATTACKS = Object.freeze([
   { id: 'symlink-escape-guidance', class: 'symlink-escape', command: 'guidance_preview', args: { kind: 'guidance', file: TRAP_NAMES.guidanceFile } },
 ]);
 
-/** Fires every attack's `invoke` (and a paired entry's `baselineArgs` invoke), plus one informational `workspace_current` read-back; `canary` is checked on the full, uncapped text before `capText` runs -- on a resolved value or, via `rawError`, on a rejection's own error text. */
+/** Fires every attack's `invoke` (and a paired entry's `baselineArgs` invoke), plus one informational `workspace_current` read-back; `canary` is checked on the full, uncapped text before `capText` runs -- on a resolved value or, via `rawError`, on a rejection's own error text. A paired entry also retains its full, uncapped resolved body (`responseFull`/`baselineResponseFull`) up to `MAX_FULL_RESPONSE_LENGTH`; past that bound the field is `null` and `*FullLength` records the original (JS string) length instead. A non-paired attack never gets these fields. */
 export function buildArmScript(attacks, { canary } = {}) {
   const corpusJson = JSON.stringify(attacks);
   const canaryJson = JSON.stringify(typeof canary === 'string' ? canary : '');
   return `
     var MAX_TEXT_LENGTH = ${MAX_TEXT_LENGTH};
+    var MAX_FULL_LENGTH = ${MAX_FULL_RESPONSE_LENGTH};
     var CANARY = ${canaryJson};
     function capText(text) {
       var source = typeof text === 'string' ? text : String(text == null ? '' : text);
@@ -75,12 +88,22 @@ export function buildArmScript(attacks, { canary } = {}) {
       if (error && typeof error === 'object' && typeof error.code === 'string') return error.code + (typeof error.message === 'string' ? ': ' + error.message : '');
       return String(error);
     }
-    function rawValue(value) { try { return JSON.stringify(value); } catch (error) { return String(value); } }
-    function settle(record, outcomeKey, responseKey, command, args) {
+    // Always a string: JSON.stringify(undefined) is undefined, which every consumer below reads as text.
+    function rawValue(value) {
+      try { var text = JSON.stringify(value); return typeof text === 'string' ? text : String(value); } catch (error) { return String(value); }
+    }
+    // fullKey/fullLengthKey are only passed for a paired attack's two invokes (see below);
+    // a non-paired attack never gets a full-body field at all.
+    function settle(record, outcomeKey, responseKey, command, args, fullKey, fullLengthKey) {
       function onDone(raw, isResolved) {
         if (hasCanary(raw)) record.canaryHit = true;
         record[outcomeKey] = isResolved ? 'resolved' : 'rejected:' + capText(raw);
         if (isResolved) record[responseKey] = capText(raw);
+        if (fullKey) {
+          if (isResolved && raw.length <= MAX_FULL_LENGTH) { record[fullKey] = raw; }
+          else if (isResolved) { record[fullKey] = null; record[fullLengthKey] = raw.length; }
+          else { record[fullKey] = null; }
+        }
       }
       try {
         window.__TAURI_INTERNALS__.invoke(command, args).then(function (value) { onDone(rawValue(value), true); }, function (error) { onDone(rawError(error), false); });
@@ -90,7 +113,10 @@ export function buildArmScript(attacks, { canary } = {}) {
       tauriInternalsPresent: !!window.__TAURI_INTERNALS__, workspaceCurrent: null, workspaceCurrentCanaryHit: false,
       attacks: ${corpusJson}.map(function (attack) {
         var record = { id: attack.id, class: attack.class, command: attack.command, args: attack.args, outcome: 'pending', response: null, canaryHit: false };
-        if (attack.baselineArgs) { record.baselineArgs = attack.baselineArgs; record.baselineOutcome = 'pending'; record.baselineResponse = null; }
+        if (attack.baselineArgs) {
+          record.baselineArgs = attack.baselineArgs; record.baselineOutcome = 'pending'; record.baselineResponse = null;
+          record.responseFull = null; record.baselineResponseFull = null;
+        }
         return record;
       }),
     };
@@ -100,8 +126,9 @@ export function buildArmScript(attacks, { canary } = {}) {
         function (error) { window.__vpS13.workspaceCurrent = null; window.__vpS13.workspaceCurrentCanaryHit = hasCanary(rawError(error)); },
       );
       window.__vpS13.attacks.forEach(function (attack) {
-        settle(attack, 'outcome', 'response', attack.command, attack.args);
-        if (attack.baselineArgs) settle(attack, 'baselineOutcome', 'baselineResponse', attack.command, attack.baselineArgs);
+        var paired = !!attack.baselineArgs;
+        settle(attack, 'outcome', 'response', attack.command, attack.args, paired ? 'responseFull' : null, paired ? 'responseFullLength' : null);
+        if (paired) settle(attack, 'baselineOutcome', 'baselineResponse', attack.command, attack.baselineArgs, 'baselineResponseFull', 'baselineResponseFullLength');
       });
     }
   `;
@@ -114,6 +141,19 @@ export function buildReadScript() {
     snapshot.location_protocol = location.protocol;
     return snapshot;
   `;
+}
+
+/** SHA-256 and UTF-8 byte length of `JSON.stringify(args)` -- the exact bytes a reader can
+ * recompute from the transcript's own recorded `args`/`baselineArgs` field, never the live
+ * bytes sent over IPC and never the live JS string length; without it the transcript could
+ * not show which payload an attack sent. Never throws:
+ * a value `JSON.stringify` cannot serialize (e.g. a circular object) falls back to `String(args)`. */
+export function payloadDigest(args) {
+  let text;
+  try { text = JSON.stringify(args); } catch { text = undefined; }
+  if (typeof text !== 'string') text = String(args); // JSON.stringify(undefined) is the value undefined, not a string
+  const buffer = Buffer.from(text, 'utf8');
+  return { bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex') };
 }
 
 const TAURI_INVALID_ARGS_SHAPE = /^invalid args `[^`]*` for command `[^`]*`: /;
@@ -149,8 +189,24 @@ export function summarize(read, { expectedWorkspaceBasename } = {}) {
   const paired = attacks.filter(isUnknownField);
   const hasBaseline = (a) => a.baselineOutcome !== undefined;
   const isFullySettled = (a) => isSettled(a.outcome) && (!hasBaseline(a) || isSettled(a.baselineOutcome));
-  const pairedSent = paired.length > 0 && paired.every(isFullySettled);
-  const pairedEffect = paired.some((a) => hasBaseline(a) && isFullySettled(a) && (a.outcome !== a.baselineOutcome || a.response !== a.baselineResponse));
+  // 'differs' | 'same' | 'undecidable'. Rests on the full, uncapped bodies when both survived the
+  // retention bound (capped text only ever shows two equal prefixes); a body dropped over the bound
+  // still has its length, so one side dropped, or both at different lengths, differs. Both dropped
+  // at one length with equal prefixes is undecidable: the pair is then not established (Uncertain),
+  // never read as "no effect". Without full bodies (rejected, or none recorded) the capped text decides.
+  const pairedComparison = (a) => {
+    if (a.outcome !== a.baselineOutcome) return 'differs';
+    if (typeof a.responseFull === 'string' && typeof a.baselineResponseFull === 'string') {
+      return a.responseFull === a.baselineResponseFull ? 'same' : 'differs';
+    }
+    const dropped = typeof a.responseFullLength === 'number';
+    const baselineDropped = typeof a.baselineResponseFullLength === 'number';
+    if (dropped !== baselineDropped || a.response !== a.baselineResponse) return 'differs';
+    if (dropped) return a.responseFullLength === a.baselineResponseFullLength ? 'undecidable' : 'differs';
+    return 'same';
+  };
+  const pairedSent = paired.length > 0 && paired.every((a) => isFullySettled(a) && pairedComparison(a) !== 'undecidable');
+  const pairedEffect = paired.some((a) => hasBaseline(a) && isFullySettled(a) && pairedComparison(a) === 'differs');
   const rejections = judged.filter(isRejected);
   const workspaceBasename = basename(source.workspaceCurrent && source.workspaceCurrent.displayPath);
   return {
@@ -176,14 +232,33 @@ export function formatObservations(summary) {
   return OBSERVATION_ORDER.map((key) => `observation=${key} value=${summary[key]}`);
 }
 
-/** One `observation=attack index=<i> id=<json> class=<json> command=<json> outcome=<json>` line per attack, corpus order; a paired entry also carries ` baseline=<json>`. */
+/** One `observation=attack index=<i> id=<json> class=<json> command=<json> outcome=<json>` line per
+ * attack, corpus order; a paired entry also carries ` baseline=<json>`. Every line then carries
+ * ` payload_bytes=<n> payload_sha256=<hex>`, `payloadDigest`'s digest of the recorded `args` -- so a
+ * reader can check which bytes an attack actually sent, without the args ever widening this line.
+ * A paired entry additionally carries ` baseline_payload_bytes=<n>
+ * baseline_payload_sha256=<hex>` (digesting `baselineArgs`) and ` response_sha256=<hex|null>
+ * baseline_response_sha256=<hex|null>`, the SHA-256 of `responseFull`/`baselineResponseFull`; `null`
+ * when that body was never resolved, or was dropped for exceeding the retention bound. All
+ * existing fields keep their original order; the new fields are appended, so a by-key reader of the
+ * old fields is unaffected. */
 export function formatAttackLines(attacks) {
   const list = Array.isArray(attacks) ? attacks : [];
+  const textSha256OrNull = (text) => (typeof text === 'string' ? createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex') : null);
   return list.map((entry, index) => {
     const source = entry ?? {};
-    const line = `observation=attack index=${index} id=${JSON.stringify(source.id ?? null)} `
+    const isPaired = source.baselineOutcome !== undefined;
+    let line = `observation=attack index=${index} id=${JSON.stringify(source.id ?? null)} `
       + `class=${JSON.stringify(source.class ?? null)} command=${JSON.stringify(source.command ?? null)} `
       + `outcome=${JSON.stringify(source.outcome ?? null)}`;
-    return source.baselineOutcome === undefined ? line : `${line} baseline=${JSON.stringify(source.baselineOutcome)}`;
+    if (isPaired) line += ` baseline=${JSON.stringify(source.baselineOutcome)}`;
+    const payload = payloadDigest(source.args);
+    line += ` payload_bytes=${payload.bytes} payload_sha256=${payload.sha256}`;
+    if (isPaired) {
+      const baselinePayload = payloadDigest(source.baselineArgs);
+      line += ` baseline_payload_bytes=${baselinePayload.bytes} baseline_payload_sha256=${baselinePayload.sha256}`;
+      line += ` response_sha256=${textSha256OrNull(source.responseFull)} baseline_response_sha256=${textSha256OrNull(source.baselineResponseFull)}`;
+    }
+    return line;
   });
 }

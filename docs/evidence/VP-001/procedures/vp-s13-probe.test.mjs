@@ -2,12 +2,15 @@
 // (mirrors vp-s3-probe.test.mjs).
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 
 import {
   ATTACKS, TRAP_NAMES, buildArmScript, buildReadScript, classifyRejection,
-  formatAttackLines, formatObservations, summarize,
+  formatAttackLines, formatObservations, payloadDigest, summarize,
 } from './vp-s13-probe.mjs';
+
+const sha256Of = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 
 const MALFORMED_CLASSES = ['wrong-type', 'missing-field', 'unknown-field', 'oversized', 'id-out-of-range'];
 const PATH_ATTACK_CLASSES = ['traversal', 'absolute', 'nul-or-control', 'symlink-escape'];
@@ -35,6 +38,19 @@ test('ATTACKS: every class present once, unique ids, allowed camelCase commands,
   assert.equal(unknownField.args.file, TRAP_NAMES.absentGuidanceFile);
   assert.equal(unknownField.baselineArgs.file, TRAP_NAMES.absentGuidanceFile);
   assert.ok('vpS13Unknown' in unknownField.args && !('vpS13Unknown' in unknownField.baselineArgs));
+});
+
+test('payloadDigest: SHA-256 and UTF-8 byte length of JSON.stringify(args), never the live JS string length', () => {
+  const known = payloadDigest({});
+  assert.equal(known.bytes, 2); // JSON.stringify({}) === '{}'
+  // sha256sum of the literal 2-byte string "{}", computed independently of this module.
+  assert.equal(known.sha256, '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a');
+  assert.deepEqual(payloadDigest({}), known, 'deterministic for the same input');
+
+  // JSON.stringify('é') === '"é"': 3 JS chars, but 4 UTF-8 bytes since é encodes as 2 bytes.
+  const nonAscii = payloadDigest('é');
+  assert.equal(nonAscii.bytes, 4);
+  assert.notEqual(nonAscii.bytes, '"é"'.length, 'byte length must differ from the JS string length for a non-ASCII payload');
 });
 
 test('classifyRejection: typed (ShellError kebab-case shape, or Tauri arg-deserialization shape) vs. untyped, never throws', () => {
@@ -101,6 +117,42 @@ test('summarize', () => {
   const differingResponse = fullyRejectedAttacks();
   differingResponse[unknownFieldIndex] = { ...pairedCase('resolved', 'resolved'), response: '{"a":1}', baselineResponse: '{"a":2}' };
   assert.equal(summarize(readFixture({ attacks: differingResponse }), {}).attack_accepted, true, 'both resolved, different bodies');
+  // When both full bodies survive the retention bound, the comparison rests on them, not
+  // on the capped response -- so equal capped prefixes with differing full bodies still flip the fact.
+  const differingFull = fullyRejectedAttacks();
+  differingFull[unknownFieldIndex] = {
+    ...pairedCase('resolved', 'resolved'), response: 'same', baselineResponse: 'same',
+    responseFull: 'full-a', baselineResponseFull: 'full-b',
+  };
+  assert.equal(summarize(readFixture({ attacks: differingFull }), {}).attack_accepted, true, 'equal capped prefixes, differing full bodies');
+  const sameFull = fullyRejectedAttacks();
+  sameFull[unknownFieldIndex] = {
+    ...pairedCase('resolved', 'resolved'), response: 'same', baselineResponse: 'same',
+    responseFull: 'full-a', baselineResponseFull: 'full-a',
+  };
+  const sameFullSummary = summarize(readFixture({ attacks: sameFull }), {});
+  assert.equal(sameFullSummary.attack_accepted, false, 'both full bodies retained and equal: no effect');
+  assert.equal(sameFullSummary.malformed_payloads_sent, true, 'and the pair is established');
+  // A body dropped for exceeding the bound still carries its length: one side dropped and the other
+  // retained, or both dropped at different lengths, means the bodies differ despite equal prefixes.
+  const sameCapped = { ...pairedCase('resolved', 'resolved'), response: 'same', baselineResponse: 'same' };
+  const oneDropped = fullyRejectedAttacks();
+  oneDropped[unknownFieldIndex] = { ...sameCapped, responseFull: null, responseFullLength: 70_000, baselineResponseFull: 'same' };
+  assert.equal(summarize(readFixture({ attacks: oneDropped }), {}).attack_accepted, true, 'one side over the bound, the other within it');
+  const bothDroppedApart = fullyRejectedAttacks();
+  bothDroppedApart[unknownFieldIndex] = {
+    ...sameCapped, responseFull: null, responseFullLength: 70_000, baselineResponseFull: null, baselineResponseFullLength: 70_001,
+  };
+  assert.equal(summarize(readFixture({ attacks: bothDroppedApart }), {}).attack_accepted, true, 'both over the bound, different lengths');
+  // Both dropped at the same length with equal prefixes cannot be compared: the pair is not
+  // established (malformed_payloads_sent=false, so Uncertain), never read as "no effect".
+  const bothDroppedEqual = fullyRejectedAttacks();
+  bothDroppedEqual[unknownFieldIndex] = {
+    ...sameCapped, responseFull: null, responseFullLength: 70_000, baselineResponseFull: null, baselineResponseFullLength: 70_000,
+  };
+  const undecidable = summarize(readFixture({ attacks: bothDroppedEqual }), {});
+  assert.equal(undecidable.malformed_payloads_sent, false, 'an undecidable pair is not an established check');
+  assert.equal(undecidable.attack_accepted, false, 'nor a demonstrated effect');
   const pendingBaseline = fullyRejectedAttacks();
   pendingBaseline[unknownFieldIndex] = pairedCase('resolved', 'pending');
   assert.equal(summarize(readFixture({ attacks: pendingBaseline }), {}).malformed_payloads_sent, false);
@@ -141,15 +193,46 @@ test('formatObservations / formatAttackLines', () => {
     'path_attacks_sent', 'every_attack_rejected', 'every_rejection_typed', 'attack_accepted', 'canary_leaked',
   ]);
 
+  const judgedArgs = { kind: 'guidance', file: '/etc/passwd' };
+  const pairedArgs = { kind: 'guidance', file: 'x', vpS13Unknown: true };
+  const pairedBaselineArgs = { kind: 'guidance', file: 'x' };
   const attacks = [
-    { id: 'a-1', class: 'traversal', command: 'guidance_status', outcome: 'rejected:guidance-file-invalid: nope' },
-    { id: 'a-2', class: 'unknown-field', command: 'guidance_preview', outcome: 'resolved', baselineOutcome: 'resolved' },
+    { id: 'a-1', class: 'traversal', command: 'guidance_status', args: judgedArgs, outcome: 'rejected:guidance-file-invalid: nope' },
+    {
+      id: 'a-2', class: 'unknown-field', command: 'guidance_preview', args: pairedArgs, baselineArgs: pairedBaselineArgs,
+      outcome: 'resolved', baselineOutcome: 'resolved', responseFull: '{"ok":true}', baselineResponseFull: '{"ok":true}',
+    },
+    {
+      id: 'a-3', class: 'unknown-field', command: 'guidance_preview', args: pairedArgs, baselineArgs: pairedBaselineArgs,
+      outcome: 'resolved', baselineOutcome: 'resolved', responseFull: null, baselineResponseFull: 'short-baseline-body',
+    },
   ];
   const attackLines = formatAttackLines(attacks);
-  assert.equal(attackLines[0], 'observation=attack index=0 id="a-1" class="traversal" command="guidance_status" outcome="rejected:guidance-file-invalid: nope"');
-  assert.equal(attackLines[1], 'observation=attack index=1 id="a-2" class="unknown-field" command="guidance_preview" outcome="resolved" baseline="resolved"');
+  const judgedPayload = payloadDigest(judgedArgs);
+  assert.equal(attackLines[0],
+    'observation=attack index=0 id="a-1" class="traversal" command="guidance_status" outcome="rejected:guidance-file-invalid: nope"'
+    + ` payload_bytes=${judgedPayload.bytes} payload_sha256=${judgedPayload.sha256}`);
+
+  const pairedPayload = payloadDigest(pairedArgs);
+  const pairedBaselinePayload = payloadDigest(pairedBaselineArgs);
+  assert.equal(attackLines[1],
+    'observation=attack index=1 id="a-2" class="unknown-field" command="guidance_preview" outcome="resolved" baseline="resolved"'
+    + ` payload_bytes=${pairedPayload.bytes} payload_sha256=${pairedPayload.sha256}`
+    + ` baseline_payload_bytes=${pairedBaselinePayload.bytes} baseline_payload_sha256=${pairedBaselinePayload.sha256}`
+    + ` response_sha256=${sha256Of('{"ok":true}')} baseline_response_sha256=${sha256Of('{"ok":true}')}`);
+
+  // A full body dropped for exceeding the retention bound (responseFull: null) gives response_sha256=null;
+  // its paired counterpart that survived still gets a real digest.
+  assert.equal(attackLines[2],
+    'observation=attack index=2 id="a-3" class="unknown-field" command="guidance_preview" outcome="resolved" baseline="resolved"'
+    + ` payload_bytes=${pairedPayload.bytes} payload_sha256=${pairedPayload.sha256}`
+    + ` baseline_payload_bytes=${pairedBaselinePayload.bytes} baseline_payload_sha256=${pairedBaselinePayload.sha256}`
+    + ` response_sha256=null baseline_response_sha256=${sha256Of('short-baseline-body')}`);
+
   assert.deepEqual(formatAttackLines([]), []);
-  assert.equal(formatAttackLines([null])[0], 'observation=attack index=0 id=null class=null command=null outcome=null');
+  const nullPayload = payloadDigest(undefined);
+  assert.equal(formatAttackLines([null])[0],
+    `observation=attack index=0 id=null class=null command=null outcome=null payload_bytes=${nullPayload.bytes} payload_sha256=${nullPayload.sha256}`);
 });
 
 function runArmed(script, invoke, workspaceValue = null) {
@@ -203,6 +286,54 @@ test('buildArmScript', async (t) => {
     assert.equal(seen.length, 2);
     assert.equal(fakeWindow.__vpS13.attacks[0].outcome, 'resolved');
     assert.equal(fakeWindow.__vpS13.attacks[0].baselineOutcome, 'resolved');
+  });
+  await t.test('a paired attack retains the full uncapped response body within the retention bound (65,536 UTF-16 units), and null plus the original length above it', async () => {
+    const paired = [{
+      id: 'u-2', class: 'unknown-field', command: 'guidance_preview',
+      args: { kind: 'guidance', file: 'x', extra: true }, baselineArgs: { kind: 'guidance', file: 'x' },
+    }];
+    // Resolved values are JSON-stringified before capping/retention (rawValue), same as `response`.
+    const small = 'y'.repeat(600); // over the 512-char cap, well under the full-body bound
+    const smallRaw = JSON.stringify(small);
+    const fakeWindow = await settleMicrotasks(runArmed(buildArmScript(paired, {}), () => Promise.resolve(small)));
+    assert.equal(fakeWindow.__vpS13.attacks[0].responseFull, smallRaw);
+    assert.equal(fakeWindow.__vpS13.attacks[0].baselineResponseFull, smallRaw);
+    assert.equal(fakeWindow.__vpS13.attacks[0].response.length, 512, 'the capped field stays bounded even though the full body is retained separately');
+    assert.equal(fakeWindow.__vpS13.attacks[0].responseFullLength, undefined, 'length is only recorded once the full body is dropped');
+
+    const big = 'z'.repeat(64 * 1024 + 1);
+    const bigRaw = JSON.stringify(big);
+    const fakeWindowBig = await settleMicrotasks(runArmed(buildArmScript(paired, {}), () => Promise.resolve(big)));
+    assert.equal(fakeWindowBig.__vpS13.attacks[0].responseFull, null);
+    assert.equal(fakeWindowBig.__vpS13.attacks[0].responseFullLength, bigRaw.length);
+    assert.equal(fakeWindowBig.__vpS13.attacks[0].baselineResponseFull, null);
+    assert.equal(fakeWindowBig.__vpS13.attacks[0].baselineResponseFullLength, bigRaw.length);
+  });
+  await t.test('a paired invoke resolving to undefined still retains a string body, never throwing in the page', async () => {
+    const paired = [{
+      id: 'u-3', class: 'unknown-field', command: 'guidance_preview',
+      args: { kind: 'guidance', file: 'x', extra: true }, baselineArgs: { kind: 'guidance', file: 'x' },
+    }];
+    const fakeWindow = await settleMicrotasks(runArmed(buildArmScript(paired, {}), () => Promise.resolve(undefined)));
+    assert.equal(fakeWindow.__vpS13.attacks[0].responseFull, 'undefined');
+    assert.equal(fakeWindow.__vpS13.attacks[0].baselineResponseFull, 'undefined');
+    assert.equal(fakeWindow.__vpS13.attacks[0].response, 'undefined');
+  });
+  await t.test('a rejected paired side keeps a null full body and no length; the resolved side keeps its body', async () => {
+    const paired = [{
+      id: 'u-4', class: 'unknown-field', command: 'guidance_preview',
+      args: { kind: 'guidance', file: 'x', extra: true }, baselineArgs: { kind: 'guidance', file: 'x' },
+    }];
+    const invoke = (args) => ('extra' in args ? Promise.reject('invalid-request: no') : Promise.resolve('ok'));
+    const record = (await settleMicrotasks(runArmed(buildArmScript(paired, {}), invoke))).__vpS13.attacks[0];
+    assert.equal(record.outcome, 'rejected:invalid-request: no');
+    assert.equal(record.responseFull, null);
+    assert.equal('responseFullLength' in record, false, 'a length means dropped for size, never rejected');
+    assert.equal(record.baselineResponseFull, '"ok"');
+  });
+  await t.test('a non-paired attack never retains a full response body', async () => {
+    const fakeWindow = await settleMicrotasks(runArmed(buildArmScript(tiny, {}), () => Promise.resolve('ok')));
+    assert.equal('responseFull' in fakeWindow.__vpS13.attacks[0], false);
   });
   await t.test("a synchronous throw from invoke settles as 'rejected:...', never an uncaught exception", async () => {
     const throwSync = () => { throw new Error('boom-sync'); };
