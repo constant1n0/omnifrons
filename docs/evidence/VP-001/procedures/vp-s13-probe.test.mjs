@@ -29,7 +29,7 @@ test('ATTACKS: every class present once, unique ids, allowed camelCase commands,
   const idRange = ATTACKS.filter((a) => a.class === 'id-out-of-range');
   assert.equal(idRange.length, 2);
   for (const entry of idRange) assert.equal(entry.command, 'harness_observe');
-  assert.ok(idRange.some((e) => e.args.id > Number.MAX_SAFE_INTEGER));
+  assert.ok(idRange.some((e) => e.args.id > 2 ** 53), 'above-2^53 id must exceed 2^53 itself, not merely MAX_SAFE_INTEGER (2^53 - 1)');
   assert.ok(idRange.some((e) => e.args.id < 0));
   const unknownField = ATTACKS.find((a) => a.class === 'unknown-field'); // spike-log.md:94-96
   assert.equal(unknownField.args.file, TRAP_NAMES.absentGuidanceFile);
@@ -203,6 +203,32 @@ test('buildArmScript', async (t) => {
     assert.equal(seen.length, 2);
     assert.equal(fakeWindow.__vpS13.attacks[0].outcome, 'resolved');
     assert.equal(fakeWindow.__vpS13.attacks[0].baselineOutcome, 'resolved');
+  });
+  await t.test("a synchronous throw from invoke settles as 'rejected:...', never an uncaught exception", async () => {
+    const throwSync = () => { throw new Error('boom-sync'); };
+    const fakeWindow = await settleMicrotasks(runArmed(buildArmScript(tiny, {}), throwSync));
+    assert.equal(fakeWindow.__vpS13.attacks[0].outcome, 'rejected:Error: boom-sync');
+  });
+  await t.test('no __TAURI_INTERNALS__: attacks stay pending, tauriInternalsPresent is false, workspace_current is never invoked', async () => {
+    const fakeWindow = {};
+    new Function('window', buildArmScript(tiny, {}))(fakeWindow);
+    await settleMicrotasks(fakeWindow);
+    assert.equal(fakeWindow.__vpS13.tauriInternalsPresent, false);
+    assert.equal(fakeWindow.__vpS13.attacks[0].outcome, 'pending');
+    assert.equal(fakeWindow.__vpS13.workspaceCurrent, null);
+  });
+  await t.test('a rejected workspace_current carrying the canary in its error text sets workspaceCurrentCanaryHit', async () => {
+    const fakeWindow = {
+      __TAURI_INTERNALS__: {
+        invoke: (cmd) => (cmd === 'workspace_current'
+          ? Promise.reject({ code: 'invalid-request', message: 'path contains leak-me' })
+          : Promise.resolve('ok')),
+      },
+    };
+    new Function('window', buildArmScript(tiny, { canary: 'leak-me' }))(fakeWindow);
+    await settleMicrotasks(fakeWindow);
+    assert.equal(fakeWindow.__vpS13.workspaceCurrent, null);
+    assert.equal(fakeWindow.__vpS13.workspaceCurrentCanaryHit, true);
   });
 });
 

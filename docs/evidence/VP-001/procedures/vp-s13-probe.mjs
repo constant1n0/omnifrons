@@ -46,7 +46,9 @@ export const ATTACKS = Object.freeze([
   },
   // Malformed: oversized (~1 MiB) and id-out-of-range (above 2^53, plus a negative one).
   { id: 'oversized-file', class: 'oversized', command: 'guidance_status', args: { kind: 'guidance', file: 'A'.repeat(OVERSIZED_LENGTH) } },
-  { id: 'id-out-of-range-above-2-53', class: 'id-out-of-range', command: 'harness_observe', args: { id: 9_007_199_254_740_993 } },
+  // 9_007_199_254_740_993 (2^53 + 1) is not representable and rounds to
+  // exactly 2^53; 2^53 + 2 is the next representable double above it.
+  { id: 'id-out-of-range-above-2-53', class: 'id-out-of-range', command: 'harness_observe', args: { id: 2 ** 53 + 2 } },
   { id: 'id-out-of-range-negative', class: 'id-out-of-range', command: 'harness_observe', args: { id: -1 } },
   // Path attack: one class, one command each -- spread across both path-bearing fields (run_id, file); symlink-escape only fits the guidance file (run_id never resolves a path).
   { id: 'traversal-run-id', class: 'traversal', command: 'candidates_list', args: { runId: 'a/../../b' } },
@@ -55,7 +57,7 @@ export const ATTACKS = Object.freeze([
   { id: 'symlink-escape-guidance', class: 'symlink-escape', command: 'guidance_preview', args: { kind: 'guidance', file: TRAP_NAMES.guidanceFile } },
 ]);
 
-/** Fires every attack's `invoke` (and a paired entry's `baselineArgs` invoke), plus one informational `workspace_current` read-back; `canary` is checked on the full, uncapped text before `capText` runs. */
+/** Fires every attack's `invoke` (and a paired entry's `baselineArgs` invoke), plus one informational `workspace_current` read-back; `canary` is checked on the full, uncapped text before `capText` runs -- on a resolved value or, via `rawError`, on a rejection's own error text. */
 export function buildArmScript(attacks, { canary } = {}) {
   const corpusJson = JSON.stringify(attacks);
   const canaryJson = JSON.stringify(typeof canary === 'string' ? canary : '');
@@ -95,7 +97,7 @@ export function buildArmScript(attacks, { canary } = {}) {
     if (window.__TAURI_INTERNALS__) {
       window.__TAURI_INTERNALS__.invoke('workspace_current').then(
         function (value) { window.__vpS13.workspaceCurrent = value || null; window.__vpS13.workspaceCurrentCanaryHit = hasCanary(rawValue(value)); },
-        function () { window.__vpS13.workspaceCurrent = null; },
+        function (error) { window.__vpS13.workspaceCurrent = null; window.__vpS13.workspaceCurrentCanaryHit = hasCanary(rawError(error)); },
       );
       window.__vpS13.attacks.forEach(function (attack) {
         settle(attack, 'outcome', 'response', attack.command, attack.args);

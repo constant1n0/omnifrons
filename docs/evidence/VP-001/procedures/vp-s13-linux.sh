@@ -9,16 +9,33 @@
 # snapshot is deliberately narrow: changes under the outside directory only
 # (type, size, mtime, mode, content), never reads -- a read surfaces as the
 # canary in a response -- nor other locations. It is taken after the
-# scenario exits, i.e. after its session delete has ended the app.
+# scenario exits, i.e. after its session delete has ended the app -- except
+# on a timeout or a kill (raw status 124 or 137 -- leg-status.sh's own
+# `<leg>-timeout`/`<leg>-killed` statuses): a SIGKILL there may race the
+# app's own teardown, so the session delete is not proven to have ended it,
+# and an unchanged snapshot is then reported as
+# gate=outside-snapshot-indeterminate with NO observation line at all --
+# that absence, not a false value, is what tells derive_ipc_boundary
+# (tools/evidence-validator) outside_snapshot_taken is false, i.e. "not
+# observed" rather than "observed as unmodified". A snapshot that still
+# differs is reported as a demonstrated change regardless of exit status
+# (gate=outside-snapshot-taken, value=true): the difference itself stands. A
+# vanished outside directory is itself a modification
+# (gate=outside-snapshot-taken, value=true); any other after-snapshot
+# failure stays gate=outside-snapshot-failed, exit 1. A workspace GTK
+# bookmark is seeded and restored the same way as vp-s6-linux.sh's own
+# (--mode=scenario), so the chooser's bookmark-jump strategy can reach it; a
+# symlinked bookmarks path, or one this script fails to back up, is left
+# untouched (gate=bookmark-seed-skipped), the chooser then falling back to
+# typing the path.
 # Usage: vp-s13-linux.sh <artifact-path> <build-channel-digest>
 # Env: VP001_WEBDRIVER_BASE_URL (default: http://127.0.0.1:4444),
 # VP001_AV_TIMEOUT (default: 120s), VP001_SCENARIO_TIMEOUT (default: 300s)
 # Exit: 0, 1, or 2 (a usage error, including a non-64-hex digest). Each
 # `timeout`-wrapped leg's status is mapped through leg-status.sh's
 # `map_leg_status`, for leg=av-feasibility-check/scenario (vp-s3-linux.sh's
-# own contract). The outside snapshot runs around the scenario
-# leg whatever its exit status; its failure is gate=outside-snapshot-failed,
-# exit 1, and a missing or non-plain TRAP_NAMES entry gate=trap-names-invalid.
+# own contract). A missing, non-plain, or dot-segment (`.`/`..`) TRAP_NAMES
+# entry is gate=trap-names-invalid, exit 1, before any trap or scenario.
 
 set -euo pipefail
 
@@ -55,13 +72,53 @@ if [[ "${status}" -ne 0 ]]; then
   map_leg_status av-feasibility-check "${status}" || exit $?
 fi
 
-# One scratch root holds canary and trap workspace as siblings; one trap removes both.
+# One scratch root holds canary and trap workspace as siblings. The same
+# EXIT trap also restores (or removes) the GTK3 places-sidebar bookmark
+# seeded below, the way vp-s6-linux.sh --mode=scenario restores its own: a
+# caller's own bookmarks are their data and must be left exactly as found.
 scratch_root="$(mktemp -d)"
-trap 'rm -rf "${scratch_root}"' EXIT
+bookmarks_file="${HOME}/.config/gtk-3.0/bookmarks"
+bookmarks_backup=""
+bookmarks_seeded="0"
+cleanup() {
+  rm -rf "${scratch_root}"
+  if [[ -n "${bookmarks_backup}" ]]; then
+    mv -f "${bookmarks_backup}" "${bookmarks_file}"
+  elif [[ "${bookmarks_seeded}" == "1" ]]; then
+    rm -f "${bookmarks_file}"
+  fi
+}
+trap cleanup EXIT
 
 outside_dir="${scratch_root}/outside"
 workspace_dir="${scratch_root}/workspace"
 mkdir -p "${outside_dir}" "${workspace_dir}"
+
+# Seeded for the chooser's bookmark-jump strategy (vp-s6-xdotool.mjs, tried
+# first); typing the path is still the fallback whenever seeding is
+# skipped below. A symlinked bookmarks path is left untouched: seeding
+# through it would write through to wherever it points, not to a file
+# this script owns. `bookmarks_backup` is assigned only once `cp -p` has
+# actually succeeded -- never from the bare `mktemp` result -- so a failed
+# backup can never leave the EXIT trap restoring an empty or partial file
+# over the caller's real one; seeding itself is skipped in that case too.
+mkdir -p "$(dirname "${bookmarks_file}")"
+if [[ -L "${bookmarks_file}" ]]; then
+  echo "gate=bookmark-seed-skipped reason=symlink"
+elif [[ -f "${bookmarks_file}" ]]; then
+  bookmarks_backup_candidate="$(mktemp "${bookmarks_file}.vp-s13-backup.XXXXXX")"
+  if cp -p "${bookmarks_file}" "${bookmarks_backup_candidate}"; then
+    bookmarks_backup="${bookmarks_backup_candidate}"
+    printf 'file://%s\n' "${workspace_dir}" > "${bookmarks_file}"
+    bookmarks_seeded="1"
+  else
+    rm -f "${bookmarks_backup_candidate}"
+    echo "gate=bookmark-seed-skipped reason=backup-failed"
+  fi
+else
+  printf 'file://%s\n' "${workspace_dir}" > "${bookmarks_file}"
+  bookmarks_seeded="1"
+fi
 
 canary_value="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(24).toString("hex"))')"
 canary_file="${outside_dir}/canary.txt"
@@ -79,9 +136,13 @@ mapfile -t trap_names < <(
     })();
   '
 )
-# Two plain names only: an import failure leaves fewer, a separator escapes the workspace.
+# Two plain names only: an import failure leaves fewer, a separator escapes
+# the workspace, and a bare "." or ".." names the directory itself rather
+# than a file inside it.
 if [[ "${#trap_names[@]}" -ne 2 || -z "${trap_names[0]}" || -z "${trap_names[1]}" \
-  || "${trap_names[0]}${trap_names[1]}" == */* ]]; then
+  || "${trap_names[0]}${trap_names[1]}" == */* \
+  || "${trap_names[0]}" == "." || "${trap_names[0]}" == ".." \
+  || "${trap_names[1]}" == "." || "${trap_names[1]}" == ".." ]]; then
   echo "gate=trap-names-invalid"
   exit 1
 fi
@@ -112,12 +173,29 @@ VP001_CANARY="${canary_value}" \
   || status=$?
 
 # Taken unconditionally: a blocked/killed scenario must never skip this.
-after_snapshot="$(snapshot_outside_dir "${outside_dir}")" || { echo "gate=outside-snapshot-failed"; exit 1; }
-echo "gate=outside-snapshot-taken"
-if [[ "${before_snapshot}" == "${after_snapshot}" ]]; then
-  echo "observation=outside_target_modified value=false"
-else
+# status 124/137 are leg-status.sh's own timeout/kill statuses: an
+# unchanged snapshot under either does not prove nothing happened, since
+# the session delete may not have ended the app, so it is indeterminate --
+# and reported with NO observation line, never a false one, so
+# derive_ipc_boundary can never read this as a proven negative. A detected
+# difference always stands as a demonstrated change. A vanished outside
+# directory is itself a modification, not a snapshot failure.
+if after_snapshot="$(snapshot_outside_dir "${outside_dir}")"; then
+  if [[ "${before_snapshot}" != "${after_snapshot}" ]]; then
+    echo "gate=outside-snapshot-taken"
+    echo "observation=outside_target_modified value=true"
+  elif [[ "${status}" -eq 124 || "${status}" -eq 137 ]]; then
+    echo "gate=outside-snapshot-indeterminate"
+  else
+    echo "gate=outside-snapshot-taken"
+    echo "observation=outside_target_modified value=false"
+  fi
+elif [[ ! -d "${outside_dir}" ]]; then
+  echo "gate=outside-snapshot-taken"
   echo "observation=outside_target_modified value=true"
+else
+  echo "gate=outside-snapshot-failed"
+  exit 1
 fi
 
 if [[ "${status}" -ne 0 ]]; then
