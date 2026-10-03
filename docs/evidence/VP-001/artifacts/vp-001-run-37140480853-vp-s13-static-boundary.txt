@@ -1,0 +1,111 @@
+gate=static-boundary head=4e1f8520ab45af7fdf95ffd5ea366a5544e1b038
+gate=static-boundary-section name=capabilities
+   Compiling omnifrons-shell v0.1.0 (/home/runner/work/omnifrons/omnifrons/src-tauri)
+    Finished `release` profile [optimized] target(s) in 40.39s
+     Running tests/config.rs (target/release/deps/config-4905eae14a1e7c62)
+
+running 2 tests
+test build_script_does_not_reference_app_manifest ... ok
+test default_capability_grants_only_core_default ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+gate=static-boundary-section-exit name=capabilities status=0
+gate=static-boundary-section name=validators
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling syn v3.0.5
+   Compiling thiserror-impl v2.0.20
+   Compiling thiserror v2.0.20
+   Compiling omnifrons-domain v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-domain)
+    Finished `release` profile [optimized] target(s) in 3.10s
+     Running tests/outbox.rs (target/release/deps/outbox-489647d6e5a0b390)
+
+running 13 tests
+test a_project_relative_path_is_bounded_in_length ... ok
+test outbox_path_rejects_a_backslash_separator ... ok
+test outbox_path_rejects_a_nul_byte ... ok
+test outbox_path_rejects_a_parent_traversal_component ... ok
+test outbox_path_rejects_a_windows_drive_prefix_on_every_platform ... ok
+test outbox_path_rejects_an_absolute_path ... ok
+test outbox_path_rejects_an_empty_path ... ok
+test outbox_path_rejects_bidirectional_override_characters ... ok
+test outbox_path_rejects_control_characters_and_line_separators ... ok
+test run_id_accepts_a_minted_token_and_round_trips ... ok
+test run_id_rejects_a_token_over_64_characters ... ok
+test run_id_rejects_empty_separators_dots_and_odd_characters ... ok
+test sha256_digest_parses_its_own_hex_and_rejects_bad_input ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+   Compiling omnifrons-domain v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-domain)
+    Finished `release` profile [optimized] target(s) in 0.78s
+     Running tests/guidance.rs (target/release/deps/guidance-dde09cf892125b34)
+
+running 2 tests
+test a_guidance_file_is_one_markdown_component_at_the_workspace_root ... ok
+test a_guidance_file_name_rejects_a_nul_byte ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+   Compiling serde_core v1.0.229
+   Compiling nix v0.31.3
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling serde_derive v1.0.229
+   Compiling bitflags v2.13.1
+   Compiling memchr v2.8.3
+   Compiling omnifrons-app v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-app)
+   Compiling omnifrons-adapters v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-adapters)
+    Finished `release` profile [optimized] target(s) in 8.87s
+     Running tests/json_outbox_policy.rs (target/release/deps/json_outbox_policy-8f4b33d9a27583ea)
+
+running 2 tests
+test a_raw_path_declared_as_the_outbox_is_rejected_at_load ... ok
+test an_outbox_declaration_with_a_line_break_is_rejected_at_load ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+   Compiling omnifrons-shell v0.1.0 (/home/runner/work/omnifrons/omnifrons/src-tauri)
+    Finished `release` profile [optimized] target(s) in 10.82s
+     Running unittests src/lib.rs (target/release/deps/omnifrons_shell-42ed599ba946e30f)
+
+running 5 tests
+test ipc::dto::tests::approval_id_dto_rejects_a_malformed_or_non_string_value ... ok
+test ipc::dto::tests::approval_id_dto_round_trips_through_a_16_hex_character_string_above_2_53 ... ok
+test ipc::guidance::tests::guidance_errors_map_to_their_codes_with_slash_free_messages ... ok
+test ipc::guidance::tests::an_invalid_guidance_file_name_is_guidance_file_invalid ... ok
+test ipc::guidance::tests::a_link_at_the_guidance_name_is_guidance_file_invalid ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 228 filtered out; finished in 0.00s
+   Compiling omnifrons-app v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-app)
+    Finished `release` profile [optimized] target(s) in 1.64s
+     Running tests/launch_plan_cwd.rs (target/release/deps/launch_plan_cwd-6b06d4d847b8832c)
+
+running 1 test
+test a_symlink_targeting_outside_the_workspace_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+   Compiling omnifrons-app v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-app)
+    Finished `release` profile [optimized] target(s) in 0.54s
+     Running tests/wrong_root_contracts.rs (target/release/deps/wrong_root_contracts-1a7702665e4dab73)
+
+running 2 tests
+test a_link_planted_at_the_new_entrys_name_is_refused_not_replaced ... ok
+test a_link_planted_at_the_copy_ins_staging_name_is_never_written_through ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+   Compiling omnifrons-app v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-app)
+    Finished `release` profile [optimized] target(s) in 0.41s
+     Running tests/work_area.rs (target/release/deps/work_area-1ecddf42491a5850)
+
+running 1 test
+test a_device_asset_path_linked_into_a_workspace_is_destination_invalid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+   Compiling omnifrons-app v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-app)
+    Finished `release` profile [optimized] target(s) in 0.29s
+     Running tests/outbox_declaration.rs (target/release/deps/outbox_declaration-9550f8963b62ab4d)
+
+running 2 tests
+test a_declared_path_that_is_a_link_is_invalid_even_when_it_points_inside_the_project ... ok
+test a_declared_path_that_canonicalizes_outside_the_project_is_invalid ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+gate=static-boundary-section-exit name=validators status=0

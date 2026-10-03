@@ -1,0 +1,47 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+Openbox-Message: Unable to find a valid menu file "/var/lib/openbox/debian-menu.xml"
+gate=av1-digest-match digest=0d4f689b3737b436d41e92e373f1cdebe616dcd434944d7bb4d9da27b0618d03
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:26056): dbind-WARNING **: 17:34:11.907: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=7c5cc903-0a89-4a51-8e14-31ac86089fb9
+gate=session-closed session_id=7c5cc903-0a89-4a51-8e14-31ac86089fb9
+gate=canary-created length=48
+
+(omnifrons-shell:26219): dbind-WARNING **: 17:34:44.039: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=session-created session_id=92a769c5-28e6-4b42-afd1-e674d5c82953
+dialog_attempt=1 strategy=bookmark-jump
+dialog_closed=bookmark-jump
+gate=workspace-selected basename=workspace
+gate=armed
+gate=location-scheme value=tauri:
+observation=attack index=0 id="wrong-type-run-id-number" class="wrong-type" command="candidates_list" outcome="rejected:invalid args `runId` for command `candidates_list`: invalid type: integer `12345`, expected a string"
+observation=attack index=1 id="wrong-type-id-string" class="wrong-type" command="harness_observe" outcome="rejected:invalid args `id` for command `harness_observe`: invalid type: string \"not-a-number\", expected u32"
+observation=attack index=2 id="missing-field-kind" class="missing-field" command="guidance_status" outcome="rejected:invalid args `kind` for command `guidance_status`: command guidance_status missing required key kind"
+observation=attack index=3 id="unknown-field-extra" class="unknown-field" command="guidance_preview" outcome="resolved" baseline="resolved"
+observation=attack index=4 id="oversized-file" class="oversized" command="guidance_status" outcome="rejected:guidance-file-invalid: the file name exceeds 255 bytes"
+observation=attack index=5 id="id-out-of-range-above-2-53" class="id-out-of-range" command="harness_observe" outcome="rejected:invalid args `id` for command `harness_observe`: invalid value: integer `9007199254740994`, expected u32"
+observation=attack index=6 id="id-out-of-range-negative" class="id-out-of-range" command="harness_observe" outcome="rejected:invalid args `id` for command `harness_observe`: invalid value: integer `-1`, expected u32"
+observation=attack index=7 id="traversal-run-id" class="traversal" command="candidates_list" outcome="rejected:invalid-request: the run id is not valid"
+observation=attack index=8 id="absolute-file" class="absolute" command="guidance_status" outcome="rejected:guidance-file-invalid: the file name must be one path component with no separator"
+observation=attack index=9 id="control-run-id" class="nul-or-control" command="candidates_list" outcome="rejected:invalid-request: the run id is not valid"
+observation=attack index=10 id="symlink-escape-guidance" class="symlink-escape" command="guidance_preview" outcome="rejected:guidance-file-invalid: the managed file is not a regular file"
+observation=location_scheme_is_app_protocol value=true
+observation=workspace_selected value=true
+observation=malformed_payloads_sent value=true
+observation=path_attacks_sent value=true
+observation=every_attack_rejected value=true
+observation=every_rejection_typed value=true
+observation=attack_accepted value=false
+observation=canary_leaked value=false
+gate=session-closed session_id=92a769c5-28e6-4b42-afd1-e674d5c82953
+gate=outside-snapshot-taken
+observation=outside_target_modified value=false

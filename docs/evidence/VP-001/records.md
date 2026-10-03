@@ -933,3 +933,237 @@ CI artifact entry it was copied from, whose runner paths were rewritten to
 | `evidence_artifact` | a9bb393c4e6e52e5613e4b7298afbca0490031e04b53518b95a12bb900f09cd8 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36990386851-vp-s3-transcript.txt`, copied from run 36990386851's `vp-001-transcripts` artifact entry `vp-001-vp-s3-transcript.txt` |
 | `feasibility_evidence_artifact` | 2984acc0ea9cbc0ba7ca2fa2a91f6fb3548cb90f86541d66d626fe8067ae5cb1 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-36990386851-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
 | `static_inventory_evidence_artifact` | cd4daabd91ecff524e2d76be1f4bbf0f6396d4a681eaa7979e3093e83435ef12 -- SHA-256 of the retained file, byte-identical to its CI artifact entry (it holds no runner path to redact), `docs/evidence/VP-001/artifacts/vp-001-run-36990386851-vp-s3-static-inventory.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-vp-s3-static-inventory.txt` |
+
+## VP-001 VP-S13 scenario -- run 37140480853 (2026-10-03)
+
+The first execution of VP-S13 (IPC boundary: typed commands only; path
+attacks rejected; desktop-stack-verification-plan.md:134), against the
+packaged AppImage on the pinned Linux baseline, run through
+`vp-s13-linux.sh` at head 4e1f852
+(`4e1f8520ab45af7fdf95ffd5ea366a5544e1b038`). `vp-s13-linux.sh` reuses
+`vp-s6-linux.sh --mode=feasibility-check` for AV1/AV2, exactly as
+`vp-s3-linux.sh` does, then prepares the trap workspace `vp-s13-probe.mjs`
+and `vp-s13-scenario.mjs` exercise: a canary file outside the workspace, the
+probe's `TRAP_NAMES.guidanceFile` symlinked to it inside the workspace, and
+a before/after snapshot of the outside directory.
+
+The retained VP-S13 transcript opens with the same tauri-driver
+connection-refused preamble VP-001-VP-S3-03's own carries
+(`Error serving connection: hyper::Error(User(Service), client error
+(Connect)) ... Connection refused (os error 111)`), immediately followed by
+one line of Openbox menu-file noise, then `gate=av1-digest-match` and
+`gate=av2-variant-scan-absent`, both before any session is attempted. The
+retained feasibility transcript does not open with either: its first line
+is `gate=av1-digest-match`, as VP-001-VP-S1-03 and VP-001-VP-S3-03 already
+established for their own feasibility transcripts. `identity_gated` is
+derived the same way every prior VP-S1/VP-S3 row derives it: both
+`gate=av1-digest-match` and `gate=av2-variant-scan-absent` appear, in both
+transcripts, before the scenario session was created.
+
+The AV1 digest gated in both transcripts of this run
+(`0d4f689b3737b436d41e92e373f1cdebe616dcd434944d7bb4d9da27b0618d03`, equal
+to both `build_channel_digest` and `exercised_artifact_digest` below; AV2's
+`variant_scan` is `absent`) is new relative to VP-001-VP-S3-03's own gated
+digest. A separate validation dispatch against the same commit 4e1f852
+(run 37139532753, branch `feat/vp-s13-ci-step`, not filed as a row and its
+artifacts not retained in this repository) gated a different AV1 digest for
+a packaged build of that same commit,
+`c42484bdd00c7e7b0debf8e353cfb38f663e5b40e537f96d099cffaa6fbda426`. This is
+the same non-reproducibility VP-001-VP-S3-03 recorded for its own commit;
+this row states no cause for it either -- nothing observed here
+demonstrates one.
+
+After the AV1/AV2 gates, `vp-s13-linux.sh`'s own reused
+`vp-s6-linux.sh --mode=feasibility-check` subprocess opened and closed one
+feasibility session of its own, `gate=f1-session-created` /
+`gate=session-closed` (session `7c5cc903-0a89-4a51-8e14-31ac86089fb9`) --
+the same two-sessions-per-run structure the VP-S1 and VP-S3 rows describe.
+The canary was then created, `gate=canary-created length=48`: the 48-character
+hex value itself is never printed anywhere in either retained transcript, only
+its length, and it crosses into the scenario process through
+`VP001_CANARY`, never argv. A fresh `omnifrons-shell` process then started
+for the scenario's own session attempt, and it succeeded:
+`gate=session-created session_id=92a769c5-28e6-4b42-afd1-e674d5c82953`.
+
+The native folder picker was driven by the same `bookmark-jump` chooser
+strategy `vp-s6-xdotool.mjs` tries first for the other scenarios:
+`dialog_attempt=1 strategy=bookmark-jump`, `dialog_closed=bookmark-jump`,
+then `gate=workspace-selected basename=workspace`. The basename is
+`workspace` because `vp-s13-linux.sh` names the trap workspace directory
+that; the scenario's own `confirmWorkspaceSelected` poll (`vp-s13-scenario.mjs`)
+confirmed this basename through `workspace_current`'s own `displayPath`
+before emitting this gate, so `workspace_selected` records that the
+*trap* workspace was selected, not merely that some dialog closed. Then
+`gate=armed` and `gate=location-scheme value=tauri:`.
+
+Eleven `observation=attack` lines were recorded, one per entry of
+`vp-s13-probe.mjs`'s fixed corpus (`ATTACKS`), covering every declared
+malformed class (wrong-type, missing-field, unknown-field, oversized,
+id-out-of-range) and path-attack class (traversal, absolute, nul-or-control,
+symlink-escape); the retained transcript carries each outcome verbatim.
+They matched the validation dispatch's (run 37139532753) byte for byte,
+which this repository cannot re-check, since that run is not retained.
+Tauri's own argument binding rejected the malformed payloads before any
+command body ran: indexes 0, 1, 2, 5 and 6, as ``invalid args `<key>` for
+command `<cmd>`: ...`` (`expected a string`, `expected u32`, `missing
+required key kind`, and `invalid value: integer 9007199254740994` / `-1`,
+`expected u32`). The shell's own validators rejected the rest: index 4 (a
+~1 MiB file name) `guidance-file-invalid: the file name exceeds 255 bytes`;
+index 8 (`/etc/passwd`) `guidance-file-invalid: the file name must be one
+path component with no separator`; indexes 7 (`a/../../b`) and 9 (a control
+character) `invalid-request: the run id is not valid`; and index 10, the
+planted symlink, `guidance-file-invalid: the managed file is not a regular
+file`. Index 3 is the unknown-field pair.
+
+The unknown-field pair (index 3) is a no-effect check, not a rejection:
+Tauri ignores a JSON key that matches no command argument
+(`docs/spike-log.md:94-96`). The same `guidance_preview` call went out with
+and without an extra `vpS13Unknown` key, both against the never-created
+`TRAP_NAMES.absentGuidanceFile`; both outcomes were `resolved`. The response
+bodies are not retained: their equality rests on `attack_accepted=false`,
+which the probe sets on any outcome or body difference within the pair,
+compared in-page. The pair is excluded from `every_attack_rejected`.
+
+The eight summary observations were emitted exactly as the probe's
+`OBSERVATION_ORDER` declares them:
+`location_scheme_is_app_protocol=true`, `workspace_selected=true`,
+`malformed_payloads_sent=true`, `path_attacks_sent=true`,
+`every_attack_rejected=true`, `every_rejection_typed=true`,
+`attack_accepted=false`, `canary_leaked=false`. `every_rejection_typed`
+holds because every one of the ten judged rejections above matches either
+Tauri's own `` invalid args `<key>` for command `<cmd>`: `` shape or the
+shell's kebab-case `ShellError` shape (`classifyRejection`,
+`vp-s13-probe.mjs`); none is a bare crash, an empty message, or a timeout.
+`canary_leaked` is `false` because no attack's response and no
+`workspace_current` read-back ever carried the canary's 48-character
+value, checked on the full, uncapped text before `capText` truncates it.
+
+The scenario session closed
+(`gate=session-closed session_id=92a769c5-28e6-4b42-afd1-e674d5c82953`)
+before the after-snapshot was taken: `gate=outside-snapshot-taken` /
+`observation=outside_target_modified value=false`. The run exited 0, so
+`vp-s13-linux.sh`'s indeterminate branch for a raw status 124/137 does not
+apply. The snapshot compares type, size, mtime, mode and regular-file
+SHA-256 under the outside directory only; it never sees reads (a read would
+surface the canary in a response, which `canary_leaked` covers) nor any
+other location.
+
+The retained static-boundary artifact
+(`vp-001-run-37140480853-vp-s13-static-boundary.txt`, CI step "VP-001 VP-S13
+static IPC boundary (evidence run)") opens `gate=static-boundary
+head=4e1f8520ab45af7fdf95ffd5ea366a5544e1b038`, this run's head. Its
+`capabilities` section (2 tests) and `validators` section (eight test
+selections, 28 tests) each end `status=0`. The artifact holds test output,
+not the invocations: that each selection ran its named tests with `--exact`
+and required every one to pass (so a renamed test fails rather than matching
+nothing) is the procedure's, the step's `pinned` helper in
+`.github/workflows/tauri-build.yml` at 4e1f852, the head the artifact names. This gives
+`generic_capability_absent_pinned` and `validators_pinned` true, and
+`generic_capability_observed` false: nothing here shows a generic shell or
+filesystem capability.
+
+`derive_ipc_boundary` (`tools/evidence-validator/src/derive.rs`) checks its
+four demonstrated-failure conditions in fixed order before admitting
+`Pass`: `outside_target_modified` is false; `canary_leaked` is false;
+`attack_accepted` is false; `generic_capability_observed` is false. Every
+fact `Pass` requires is then true -- `identity_gated`,
+`location_scheme_is_app_protocol`, `workspace_selected`,
+`generic_capability_absent_pinned`, `validators_pinned`,
+`malformed_payloads_sent`, `path_attacks_sent`, `every_attack_rejected`,
+`every_rejection_typed`, and `outside_snapshot_taken` -- so
+`derive_ipc_boundary` yields `(Pass, Rejected)`.
+
+This is the Linux baseline VP-001-BASE-01 only. Per VP-001-R15, a passing
+result does not transfer between baselines; Windows junctions and macOS
+were not exercised by this row. The plan's own procedure column reads
+"Fuzz typed IPC with malformed payloads, raw paths, symlink/junction and
+traversal cases" (desktop-stack-verification-plan.md:134); this run
+realizes that as a fixed corpus, not randomized fuzzing, covering every
+declared malformed and path-attack class against exactly four
+side-effect-free, path-bearing commands -- `guidance_status`,
+`guidance_preview`, `candidates_list` (its `runId`), and `harness_observe`
+(its `id`). Per `vp-s13-probe.mjs`'s own header comment, "every dialog or
+success-side-effecting command" among the renderer's registered commands is
+excluded from this corpus; the commands this row does not cover include
+every dialog-presenting command (`executable_pick_and_probe`,
+`workspace_pick`) and every command whose success has a side effect
+(`harness_spawn`, `harness_stop`, `executable_approve`, `executable_revoke`,
+`artifact_approve`, `artifact_publish`, `guidance_apply`, `guidance_remove`,
+`guidance_pin`, `guidance_restore`, `wrongroot_scan`, `misplaced_remedy`,
+`catalog_repair`, `recovery_approve`), plus the read-only commands this
+corpus simply never targeted. Unknown-key tolerance is by design; whether to
+close it stays the spike log's open decision (`docs/spike-log.md:94`). The symlink-escape class was exercised only through the
+guidance file name (`guidance_preview`); `candidates_list`'s `runId` never
+resolves to a filesystem path, so no symlink case fits it.
+
+This row does not by itself discharge RCS-001-R14 ("Every renderer→core
+request MUST be a typed IPC message; a payload MUST carry a logical
+reference and MUST NOT carry a raw filesystem path.") in full: it evidences
+the rejection of raw-path and malformed payloads only for the four probed
+commands, not for every renderer→core request the running application can
+make. It does support target-architecture's invariant 4 ("The renderer has
+no generic shell or unrestricted filesystem capability.") on this head
+commit, through the pinned static capability test:
+`src-tauri/capabilities/default.json` grants the main window exactly
+`["core:default"]`, with no `fs`, `shell`, `http`, or `dialog` permission
+listed. No row in `docs/desktop-stack-verification-plan.md`'s VP-001-R*
+requirements table names VP-S13; only VP-S13's own scenario-catalog row
+does.
+
+Timing context, re-derived here from the job log of run 37140480853 (not a
+retained artifact), each interval running from the app process's first
+output line to its session's `gate=session-created` (or
+`gate=f1-session-created`): the five F1 sessions in this run's job log
+(the standalone feasibility step's, the VP-S6 step's, and each of VP-S1's,
+VP-S3's, and VP-S13's own reused `--mode=feasibility-check` session) took
+30.2-30.4 s;
+the VP-S1 scenario session took 12.4 s; the VP-S3 scenario session took
+30.2 s; the VP-S13 scenario session took 13.8 s. Within the VP-S13
+scenario session, `gate=workspace-selected` followed `gate=session-created`
+by 2.3 s, and `gate=outside-snapshot-taken` followed `gate=armed` by 5.1 s
+-- the `SETTLE_MS` 5 s wait `vp-s13-scenario.mjs` holds before reading the
+armed page back, plus the brief work after. This row states no cause for
+any of these durations; nothing observed here demonstrates one.
+
+Each `evidence_artifact` digest below is the SHA-256 of the retained,
+redacted file at the path it names -- the file in this repository, not the
+CI artifact entry it was copied from, whose runner paths were rewritten to
+`<extract-dir>` before retention. The static-boundary artifact carries no
+such path to redact: its `/home/runner/work/omnifrons/omnifrons/...` lines
+are GitHub runner paths, not personal ones, and are retained byte-identical
+to the CI artifact entry.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S13-01 |
+| `kind` | scenario |
+| `scenario_id` | VP-S13 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | pass |
+| `observed_state` | rejected |
+| `build_channel` | packaged-ci |
+| `build_channel_digest` | 0d4f689b3737b436d41e92e373f1cdebe616dcd434944d7bb4d9da27b0618d03 |
+| `exercised_artifact_digest` | 0d4f689b3737b436d41e92e373f1cdebe616dcd434944d7bb4d9da27b0618d03 |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s13-linux.sh |
+| `blocker` | none -- the scenario ran to completion and every `derive_ipc_boundary` `Pass` proof was observed |
+| `identity_gated` | true -- derived from `gate=av1-digest-match` and `gate=av2-variant-scan-absent`, both before the scenario session was created, in both retained transcripts |
+| `location_scheme_is_app_protocol` | true (`tauri:`) |
+| `workspace_selected` | true -- `gate=workspace-selected basename=workspace`, confirmed through `workspace_current`'s own `displayPath` before this gate was emitted |
+| `generic_capability_absent_pinned` | true -- the retained static-boundary artifact's `capabilities` section (2 tests) ends `status=0` |
+| `validators_pinned` | true -- the same artifact's `validators` section (eight test files, 28 tests) ends `status=0` |
+| `malformed_payloads_sent` | true -- every malformed class (wrong-type x2, missing-field, unknown-field paired, oversized, id-out-of-range x2) appears among the eleven attack lines |
+| `path_attacks_sent` | true -- every path-attack class (traversal, absolute, nul-or-control, symlink-escape) appears among the eleven attack lines |
+| `every_attack_rejected` | true -- every judged (non-paired) attack's own invoke rejected; see prose for the excluded unknown-field pair |
+| `every_rejection_typed` | true -- every rejection matches Tauri's `invalid args` shape or the shell's kebab-case `ShellError` shape, never a bare crash or timeout |
+| `outside_snapshot_taken` | true -- `gate=outside-snapshot-taken`, taken after `gate=session-closed` |
+| `outside_target_modified` | false -- `observation=outside_target_modified value=false` |
+| `canary_leaked` | false -- `observation=canary_leaked value=false`; the canary value itself was never printed, only its length |
+| `attack_accepted` | false -- no judged attack's invoke resolved, and the probe's in-page comparison found no outcome or body difference in the unknown-field pair (bodies not retained) |
+| `generic_capability_observed` | false -- no observation in either transcript or the static artifact shows a generic shell or filesystem capability |
+| `run_date` | 2026-10-03 |
+| `ci_run` | workflow tauri-build.yml, workflow_dispatch (vp001_scenario: true), run 37140480853, head 4e1f852, conclusion success |
+| `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2027-01-01 |
+| `evidence_artifact` | dfe68f8e2ec4ef97b0680f69c03308a9fe1bde8d8528b86a5ed6910659366ed5 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-37140480853-vp-s13-transcript.txt`, copied from run 37140480853's `vp-001-transcripts` artifact entry `vp-001-vp-s13-transcript.txt` |
+| `feasibility_evidence_artifact` | 28ab5bc2556219f39246e9410cd9d3aa14e6912967ae3bc28c5260f06b4e05e9 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-37140480853-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
+| `static_boundary_evidence_artifact` | d06eb156e5d0c20094644f9a77cb7f780d1e548b5b8aa95b1ab2518641651641 -- SHA-256 of the retained file, byte-identical to its CI artifact entry (it holds no runner path to redact), `docs/evidence/VP-001/artifacts/vp-001-run-37140480853-vp-s13-static-boundary.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-vp-s13-static-boundary.txt` |
