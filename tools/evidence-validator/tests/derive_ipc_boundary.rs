@@ -49,14 +49,26 @@ fn removing_any_independent_positive_proof_yields_uncertain() {
         |o| o.every_rejection_typed = false,
         |o| o.outside_snapshot_taken = false,
     ];
-    for mutate in mutators {
+    for (index, mutate) in mutators.into_iter().enumerate() {
         let mut observations = all_proofs();
         mutate(&mut observations);
         assert_eq!(
             derive_ipc_boundary(observations),
-            (Outcome::Uncertain, IpcBoundaryObservedState::Unverified)
+            (Outcome::Uncertain, IpcBoundaryObservedState::Unverified),
+            "proof #{index} removed"
         );
     }
+}
+
+#[test]
+fn a_modification_reported_without_a_snapshot_gate_still_fails_closed_as_escaped() {
+    let mut observations = all_proofs();
+    observations.outside_snapshot_taken = false;
+    observations.outside_target_modified = true;
+    assert_eq!(
+        derive_ipc_boundary(observations),
+        (Outcome::Fail, IpcBoundaryObservedState::Escaped)
+    );
 }
 
 #[test]

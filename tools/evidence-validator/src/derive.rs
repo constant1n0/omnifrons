@@ -311,37 +311,53 @@ pub struct IpcBoundaryObservations {
     pub workspace_selected: bool,
     /// The static capability test (no generic shell or filesystem
     /// capability reachable from the renderer) passed on this run's head
-    /// commit -- the retained `vp-001-vp-s13-static-boundary.txt`
-    /// artifact's `gate=static-boundary-section name=capabilities` section,
-    /// which ends `status=0` only when every test it names ran and passed
-    /// (a renamed test fails it rather than silently matching nothing).
+    /// commit: in the retained `vp-001-vp-s13-static-boundary.txt`, the
+    /// `gate=static-boundary-section name=capabilities` section closed by
+    /// `gate=static-boundary-section-exit name=capabilities status=0`. The
+    /// workflow step's `pinned` helper is what makes that line mean every
+    /// named test ran and passed (a renamed test fails it, never matches
+    /// nothing); the artifact records the outcome, not the invocation.
     pub generic_capability_absent_pinned: bool,
     /// The static validator Rust tests (path and reference validation)
-    /// passed on this run's head commit -- the same artifact's
-    /// `gate=static-boundary-section name=validators` section, under the
-    /// same proof.
+    /// passed on this run's head commit: the same artifact's `validators`
+    /// section, closed by `gate=static-boundary-section-exit name=validators
+    /// status=0`, under the same proof.
     pub validators_pinned: bool,
     /// At least one payload of each malformed class (wrong types, missing
     /// fields, unknown fields, oversized or out-of-range ids including
     /// above 2^53) was sent to a side-effect-free path-bearing command.
+    /// Unknown fields are a paired no-effect check, not an attack expected
+    /// to be rejected: Tauri ignores an extra key by design
+    /// (`docs/spike-log.md:94-96`), so the same call is sent with and
+    /// without it, and both calls must have settled.
     pub malformed_payloads_sent: bool,
     /// At least one payload of each path-attack class (symlinks escaping
     /// the workspace, traversal and absolute names, NUL and control
     /// characters) was sent to a side-effect-free path-bearing command.
     pub path_attacks_sent: bool,
-    /// Every sent attack's invoke rejected.
+    /// Every sent attack's invoke rejected. The unknown-field pair is not an
+    /// attack in this sense (see `malformed_payloads_sent`).
     pub every_attack_rejected: bool,
     /// Each rejection carried a typed error code or message, not a generic
     /// crash or timeout.
     pub every_rejection_typed: bool,
     /// The before/after filesystem snapshot outside the workspace was
-    /// captured.
+    /// captured (`gate=outside-snapshot-taken`). False on
+    /// `gate=outside-snapshot-indeterminate`: a timeout or kill with an
+    /// unchanged snapshot, after which the app is not proven to have
+    /// stopped.
     pub outside_snapshot_taken: bool,
-    /// The outside snapshot changed between before and after.
+    /// The outside snapshot changed between before and after. The driver
+    /// only reports this alongside `outside_snapshot_taken`; should a
+    /// modification ever arrive without it, `derive_ipc_boundary` still
+    /// fails closed on it (`Escaped`), since a reported change outweighs a
+    /// missing gate.
     pub outside_target_modified: bool,
     /// The outside canary file's content appeared in any response.
     pub canary_leaked: bool,
-    /// Any sent attack's invoke resolved instead of being rejected.
+    /// Any sent attack's invoke resolved instead of being rejected, or the
+    /// unknown-field pair's two calls differed in outcome or response (the
+    /// extra key had an effect).
     pub attack_accepted: bool,
     /// The static capability test showed a generic shell or filesystem
     /// capability.

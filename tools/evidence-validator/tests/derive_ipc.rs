@@ -49,12 +49,13 @@ fn removing_any_independent_positive_proof_yields_uncertain() {
         |o| o.artifact_load_attempted = false,
         |o| o.static_inventory_pinned = false,
     ];
-    for mutate in mutators {
+    for (index, mutate) in mutators.into_iter().enumerate() {
         let mut observations = all_proofs();
         mutate(&mut observations);
         assert_eq!(
             derive_ipc(observations),
-            (Outcome::Uncertain, IpcObservedState::Unverified)
+            (Outcome::Uncertain, IpcObservedState::Unverified),
+            "proof #{index} removed"
         );
     }
 }
