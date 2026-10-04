@@ -320,6 +320,7 @@ test('with-openbox.sh', NOT_WINDOWS, async (t) => {
       try {
         const markerPath = join(dir, 'command.ran');
         const counterFile = join(dir, 'xprop.calls');
+        const started = process.hrtime.bigint();
         const run = await runWrapper({
           openboxBody: 'exec sleep 30',
           // Not ready on the first poll, so the loop really sleeps the
@@ -331,8 +332,12 @@ test('with-openbox.sh', NOT_WINDOWS, async (t) => {
           command: markerCommand(markerPath),
           pollInterval: interval,
         });
+        const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
         try {
           assert.equal(run.status, 0, `interval=${interval}: ${run.stdout}${run.stderr}`);
+          // A lower bound only: one sleep of the interval must have happened between the two polls
+          // (10% slack for timer granularity); start-up time can only add to it.
+          assert.ok(elapsedMs >= Number(interval) * 1000 * 0.9, `interval=${interval}: elapsed ${elapsedMs.toFixed(0)} ms`);
           assert.ok(run.stdout.includes('gate=wm-ready'), `interval=${interval}: ${run.stdout}`);
           assert.equal(readFileSync(counterFile, 'utf8').trim(), '2', `interval=${interval}: ready on the second poll, after one sleep`);
           assert.ok(existsSync(markerPath), `interval=${interval}: the command should have run`);
