@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -64,6 +64,15 @@ rmSync(join(dirname(workspaceDir), 'outside'), { recursive: true, force: true })
 process.stdout.write('${SCENARIO_MARKER} removed-outside=true\\n');
 `;
 
+// Ignores SIGTERM and then sleeps well past the driver's own 10 s
+// --kill-after grace period, so `timeout` must escalate to SIGKILL: the
+// process cannot handle that signal, so its own exit status is 128+9=137,
+// the "killed outright" counterpart to the plain 124 timeout.
+const IGNORE_SIGTERM_SCENARIO_BODY = `
+process.on('SIGTERM', () => {});
+setTimeout(() => {}, 30_000);
+`;
+
 // Reads $HOME's own bookmarks file (through any symlink, untouched if one)
 // and reports whether it is exactly the seeded workspace line.
 const BOOKMARK_READ_SCENARIO_BODY = `
@@ -80,9 +89,11 @@ process.stdout.write('${SCENARIO_MARKER} bookmarks_seeded=' + (content === 'file
 // fixture's own scratch dir, never the real one: the script seeds and
 // restores a GTK bookmark under $HOME/.config/gtk-3.0/bookmarks.
 // `homeBookmarks` pre-creates that file before the run: `{ content }` for a
-// plain pre-existing file, or `{ symlink: true, targetContent }` for a
-// symlinked path (its target lives alongside, under `dir`). The returned
-// bookmarks* fields reflect post-run state, read before `dir` is removed.
+// plain pre-existing file, `{ content, unreadable: true }` for a file whose
+// backup copy must fail (see below), or `{ symlink: true, targetContent }`
+// for a symlinked path (its target lives alongside, under `dir`). The
+// returned bookmarks* fields reflect post-run state, read before `dir` is
+// removed.
 function runWithAvStub({
   avBody, scenarioBody = DEFAULT_SCENARIO_BODY, scenarioTimeout = '30s', probeBody = null, homeBookmarks = null,
 }) {
@@ -104,6 +115,12 @@ function runWithAvStub({
         symlinkSync(bookmarksTarget, bookmarksPath);
       } else {
         writeFileSync(bookmarksPath, homeBookmarks.content);
+        // Unreadable, not just unwritable: makes the script's own `cp -p`
+        // fail reading the source, while `mktemp` -- which only needs to
+        // create a new file in the (still writable) directory -- still
+        // succeeds, so the failure lands on the backup copy itself, the way
+        // vp-s13-linux.sh's own reason=backup-failed branch expects.
+        if (homeBookmarks.unreadable) chmodSync(bookmarksPath, 0o000);
       }
     }
     const result = spawnSync('bash', [join(dir, 'vp-s13-linux.sh'), join(dir, 'artifact.AppImage'), DIGEST], {
@@ -111,6 +128,10 @@ function runWithAvStub({
       env: { ...process.env, HOME: dir, VP001_AV_TIMEOUT: '1s', VP001_SCENARIO_TIMEOUT: scenarioTimeout },
       timeout: 30_000,
     });
+    // Restored before this harness inspects it: the fixture made it
+    // unreadable to provoke the script's own failure, but that must not
+    // also block this test's own read of the post-run bookmarks state.
+    if (homeBookmarks && !homeBookmarks.symlink && homeBookmarks.unreadable) chmodSync(bookmarksPath, 0o600);
     const bookmarksIsSymlink = existsSync(bookmarksPath) && lstatSync(bookmarksPath).isSymbolicLink();
     return {
       status: result.status,
@@ -135,6 +156,7 @@ test('vp-s13-linux.sh', LINUX_ONLY, async (t) => {
   const usageErrorRun = runWithAvStub({ avBody: 'exit 2' });
   const scenarioBlockerRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: 'process.exitCode = 1;' });
   const scenarioTimeoutRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: 'setTimeout(() => {}, 30_000);', scenarioTimeout: '1s' });
+  const scenarioKilledRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: IGNORE_SIGTERM_SCENARIO_BODY, scenarioTimeout: '1s' });
   const badNamesRun = runWithAvStub({
     avBody: AV_PASS, probeBody: "export const TRAP_NAMES = { guidanceFile: '../AGENTS.md', absentGuidanceFile: 'x.md' };",
   });
@@ -154,6 +176,15 @@ test('vp-s13-linux.sh', LINUX_ONLY, async (t) => {
   const bookmarkSymlinkRun = runWithAvStub({
     avBody: AV_PASS, scenarioBody: BOOKMARK_READ_SCENARIO_BODY,
     homeBookmarks: { symlink: true, targetContent: bookmarkSymlinkTargetContent },
+  });
+  const bookmarkBackupFailedContent = 'file:///home/someone/Documents\n';
+  // The default scenario (not BOOKMARK_READ_SCENARIO_BODY): the bookmarks
+  // file stays unreadable (by this same test-runner user) for the whole
+  // run, so a scenario that tried to read it through $HOME would itself
+  // fail; this case asserts the untouched byte-for-byte state from the
+  // harness's own post-run read instead, once permissions are restored.
+  const bookmarkBackupFailedRun = runWithAvStub({
+    avBody: AV_PASS, homeBookmarks: { content: bookmarkBackupFailedContent, unreadable: true },
   });
 
   await t.test('TRAP_NAMES that are missing, not one plain name, or a dot segment stop the run with a named gate, before any trap or scenario', () => {
@@ -217,6 +248,25 @@ test('vp-s13-linux.sh', LINUX_ONLY, async (t) => {
     // No observation line at all here: absence, not a false value, is what
     // must tell derive_ipc_boundary this was never observed.
     assert.ok(!scenarioTimeoutRun.stdout.includes('observation=outside_target_modified'), scenarioTimeoutRun.stdout);
+  });
+
+  await t.test('the scenario killed outright (status 137) is indeterminate too: same absence of an observation line, same exit status as a timeout', () => {
+    assert.equal(scenarioKilledRun.status, 1);
+    assert.ok(scenarioKilledRun.stdout.includes('gate=scenario-killed'), scenarioKilledRun.stdout);
+    assert.ok(scenarioKilledRun.stdout.includes('gate=outside-snapshot-indeterminate'), scenarioKilledRun.stdout);
+    assert.ok(!scenarioKilledRun.stdout.includes('gate=outside-snapshot-taken'), scenarioKilledRun.stdout);
+    // No observation line at all here either, for the same reason as the
+    // timeout case above: an unchanged snapshot under a kill does not prove
+    // nothing happened, since the session delete may not have ended the app.
+    assert.ok(!scenarioKilledRun.stdout.includes('observation=outside_target_modified'), scenarioKilledRun.stdout);
+  });
+
+  await t.test('GTK bookmark backup failure: the original file is left byte-for-byte untouched, named gate=bookmark-seed-skipped reason=backup-failed, and never seeded', () => {
+    assert.equal(bookmarkBackupFailedRun.status, 0);
+    assert.ok(bookmarkBackupFailedRun.stdout.includes('gate=bookmark-seed-skipped reason=backup-failed'), bookmarkBackupFailedRun.stdout);
+    assert.ok(!bookmarkBackupFailedRun.stdout.includes('gate=bookmark-seed-skipped reason=symlink'), bookmarkBackupFailedRun.stdout);
+    assert.equal(bookmarkBackupFailedRun.bookmarksIsSymlink, false);
+    assert.equal(bookmarkBackupFailedRun.bookmarksContent, bookmarkBackupFailedContent);
   });
 
   await t.test('GTK bookmark: seeded then removed with no prior file; restored byte-for-byte over a prior file; left untouched (gate=bookmark-seed-skipped) over a symlinked path', () => {
