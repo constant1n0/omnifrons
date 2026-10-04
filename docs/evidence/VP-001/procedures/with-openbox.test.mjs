@@ -93,8 +93,11 @@ const XPROP_READY_OUTPUT = '_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x2000
  * `openbox` and `xprop` executables written into a bin dir prepended to
  * PATH -- `openboxBody` and `xpropBody` stand in for the real binaries.
  * `readyPolls` and `pollInterval` set VP001_WM_READY_POLLS/
- * VP001_WM_POLL_INTERVAL; either may be omitted (`undefined`) to leave the
- * script's own default, or set to a deliberately invalid string. Uses
+ * VP001_WM_POLL_INTERVAL. `readyPolls` defaults to '3' here, never the
+ * script's own 10 -- a short budget keeps the never-ready cases fast, and
+ * omitting it (or passing `undefined`) still sets 3. `pollInterval` may be
+ * omitted to leave the script's own default (1 s). Either may be set to a
+ * deliberately invalid string. Uses
  * async `spawn`, never `spawnSync`, bounded by `CHILD_TIMEOUT_MS`, so a
  * wedged wrapper fails its own test instead of hanging the suite. Returns
  * the temp `dir` too, so a case can inspect files the stub or the command
@@ -311,6 +314,36 @@ test('with-openbox.sh', NOT_WINDOWS, async (t) => {
     }
   });
 
+  await t.test('a valid fractional VP001_WM_POLL_INTERVAL (0.1, .5, 1.) is accepted and slept between polls', async () => {
+    for (const interval of ['0.1', '.5', '1.']) {
+      const dir = mkdtempSync(join(tmpdir(), 'with-openbox-marker-'));
+      try {
+        const markerPath = join(dir, 'command.ran');
+        const counterFile = join(dir, 'xprop.calls');
+        const run = await runWrapper({
+          openboxBody: 'exec sleep 30',
+          // Not ready on the first poll, so the loop really sleeps the
+          // fractional interval once before the second poll finds it ready.
+          xpropBody:
+            `count=0\n[[ -f ${JSON.stringify(counterFile)} ]] && count=$(cat ${JSON.stringify(counterFile)})\n` +
+            `count=$((count + 1))\necho "$count" > ${JSON.stringify(counterFile)}\n` +
+            `if [[ "$count" -ge 2 ]]; then echo ${JSON.stringify(XPROP_READY_OUTPUT)}; else echo ${JSON.stringify(XPROP_NOT_READY_OUTPUT)}; fi`,
+          command: markerCommand(markerPath),
+          pollInterval: interval,
+        });
+        try {
+          assert.equal(run.status, 0, `interval=${interval}: ${run.stdout}${run.stderr}`);
+          assert.ok(run.stdout.includes('gate=wm-ready'), `interval=${interval}: ${run.stdout}`);
+          assert.equal(readFileSync(counterFile, 'utf8').trim(), '2', `interval=${interval}: ready on the second poll, after one sleep`);
+          assert.ok(existsSync(markerPath), `interval=${interval}: the command should have run`);
+        } finally {
+          rmSync(run.dir, { recursive: true, force: true });
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
   await t.test('an invalid VP001_WM_POLL_INTERVAL (0, or non-numeric) is a usage error: exit 2, before openbox ever starts', async () => {
     for (const invalidInterval of ['0', '0.0', 'abc']) {
       const dir = mkdtempSync(join(tmpdir(), 'with-openbox-marker-'));
