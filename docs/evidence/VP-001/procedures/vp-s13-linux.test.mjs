@@ -10,7 +10,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -108,6 +109,7 @@ function runWithAvStub({
     writeFileSync(join(dir, 'artifact.AppImage'), '');
     const bookmarksPath = join(dir, '.config', 'gtk-3.0', 'bookmarks');
     const bookmarksTarget = join(dir, 'bookmarks-target.txt');
+    let unreadableHeld = false;
     if (homeBookmarks) {
       mkdirSync(dirname(bookmarksPath), { recursive: true });
       if (homeBookmarks.symlink) {
@@ -120,7 +122,18 @@ function runWithAvStub({
         // create a new file in the (still writable) directory -- still
         // succeeds, so the failure lands on the backup copy itself, the way
         // vp-s13-linux.sh's own reason=backup-failed branch expects.
-        if (homeBookmarks.unreadable) chmodSync(bookmarksPath, 0o000);
+        if (homeBookmarks.unreadable) {
+          chmodSync(bookmarksPath, 0o000);
+          // Mode 000 does not stop a reader with CAP_DAC_OVERRIDE (root, as
+          // in many CI containers): there the script's own `cp -p` succeeds
+          // and the backup-failed branch cannot be provoked this way, so the
+          // case records whether the fixture actually held.
+          try {
+            accessSync(bookmarksPath, constants.R_OK);
+          } catch {
+            unreadableHeld = true;
+          }
+        }
       }
     }
     const result = spawnSync('bash', [join(dir, 'vp-s13-linux.sh'), join(dir, 'artifact.AppImage'), DIGEST], {
@@ -138,6 +151,7 @@ function runWithAvStub({
       stdout: result.stdout,
       bookmarksExists: existsSync(bookmarksPath),
       bookmarksIsSymlink,
+      unreadableHeld,
       bookmarksContent: existsSync(bookmarksPath) && !bookmarksIsSymlink ? readFileSync(bookmarksPath, 'utf8') : null,
       bookmarksTargetContent: existsSync(bookmarksTarget) ? readFileSync(bookmarksTarget, 'utf8') : null,
     };
@@ -261,7 +275,11 @@ test('vp-s13-linux.sh', LINUX_ONLY, async (t) => {
     assert.ok(!scenarioKilledRun.stdout.includes('observation=outside_target_modified'), scenarioKilledRun.stdout);
   });
 
-  await t.test('GTK bookmark backup failure: the original file is left byte-for-byte untouched, named gate=bookmark-seed-skipped reason=backup-failed, and never seeded', () => {
+  await t.test('GTK bookmark backup failure: the original file is left byte-for-byte untouched, named gate=bookmark-seed-skipped reason=backup-failed, and never seeded', (st) => {
+    if (!bookmarkBackupFailedRun.unreadableHeld) {
+      st.skip('mode 000 does not block reads for this user (e.g. root), so the backup failure cannot be provoked');
+      return;
+    }
     assert.equal(bookmarkBackupFailedRun.status, 0);
     assert.ok(bookmarkBackupFailedRun.stdout.includes('gate=bookmark-seed-skipped reason=backup-failed'), bookmarkBackupFailedRun.stdout);
     assert.ok(!bookmarkBackupFailedRun.stdout.includes('gate=bookmark-seed-skipped reason=symlink'), bookmarkBackupFailedRun.stdout);
