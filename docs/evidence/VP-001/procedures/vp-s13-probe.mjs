@@ -143,15 +143,20 @@ export function buildReadScript() {
   `;
 }
 
+const UNSERIALIZABLE_PAYLOAD = '[unserializable payload]';
+
 /** SHA-256 and UTF-8 byte length of `JSON.stringify(args)` -- the exact bytes a reader can
  * recompute from the transcript's own recorded `args`/`baselineArgs` field, never the live
  * bytes sent over IPC and never the live JS string length; without it the transcript could
- * not show which payload an attack sent. Never throws:
- * a value `JSON.stringify` cannot serialize (e.g. a circular object) falls back to `String(args)`. */
+ * not show which payload an attack sent. Never throws: a value `JSON.stringify` cannot
+ * serialize (e.g. a circular object) falls back to `String(args)`, and one `String()` cannot
+ * convert either (e.g. a circular object with no prototype) to the fixed `UNSERIALIZABLE_PAYLOAD`. */
 export function payloadDigest(args) {
   let text;
   try { text = JSON.stringify(args); } catch { text = undefined; }
-  if (typeof text !== 'string') text = String(args); // JSON.stringify(undefined) is the value undefined, not a string
+  if (typeof text !== 'string') { // JSON.stringify(undefined) is the value undefined, not a string
+    try { text = String(args); } catch { text = UNSERIALIZABLE_PAYLOAD; }
+  }
   const buffer = Buffer.from(text, 'utf8');
   return { bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex') };
 }

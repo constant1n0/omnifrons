@@ -51,6 +51,18 @@ test('payloadDigest: SHA-256 and UTF-8 byte length of JSON.stringify(args), neve
   const nonAscii = payloadDigest('é');
   assert.equal(nonAscii.bytes, 4);
   assert.notEqual(nonAscii.bytes, '"é"'.length, 'byte length must differ from the JS string length for a non-ASCII payload');
+
+  // Never throws, even where both serializations fail: a circular object with no prototype makes
+  // JSON.stringify throw (circular) and String() throw (nothing to convert it with).
+  const hostile = Object.create(null);
+  hostile.self = hostile;
+  assert.throws(() => JSON.stringify(hostile));
+  assert.throws(() => String(hostile));
+  // The fixed marker '[unserializable payload]' (24 bytes); sha256sum of that literal, computed
+  // independently of this module, so a different fallback constant fails here.
+  assert.deepEqual(payloadDigest(hostile), {
+    bytes: 24, sha256: '89ab615c4f1d7fe299bac6a0132b1a0dbc4a67c4d274b5a68c6dfbcd4b33a789',
+  });
 });
 
 test('classifyRejection: typed (ShellError kebab-case shape, or Tauri arg-deserialization shape) vs. untyped, never throws', () => {
@@ -308,6 +320,21 @@ test('buildArmScript', async (t) => {
     assert.equal(fakeWindowBig.__vpS13.attacks[0].responseFullLength, bigRaw.length);
     assert.equal(fakeWindowBig.__vpS13.attacks[0].baselineResponseFull, null);
     assert.equal(fakeWindowBig.__vpS13.attacks[0].baselineResponseFullLength, bigRaw.length);
+  });
+  await t.test('the retention bound is inclusive: a body of exactly 65,536 UTF-16 units is kept, 65,537 is dropped', async () => {
+    const paired = [{
+      id: 'u-5', class: 'unknown-field', command: 'guidance_preview',
+      args: { kind: 'guidance', file: 'x', extra: true }, baselineArgs: { kind: 'guidance', file: 'x' },
+    }];
+    const atBound = 'z'.repeat(64 * 1024 - 2); // JSON.stringify adds two quotes: 65,536 units
+    assert.equal(JSON.stringify(atBound).length, 64 * 1024);
+    const kept = (await settleMicrotasks(runArmed(buildArmScript(paired, {}), () => Promise.resolve(atBound)))).__vpS13.attacks[0];
+    assert.equal(kept.responseFull, JSON.stringify(atBound));
+    assert.equal(kept.responseFullLength, undefined);
+    const overBound = 'z'.repeat(64 * 1024 - 1); // 65,537 units once quoted
+    const dropped = (await settleMicrotasks(runArmed(buildArmScript(paired, {}), () => Promise.resolve(overBound)))).__vpS13.attacks[0];
+    assert.equal(dropped.responseFull, null);
+    assert.equal(dropped.responseFullLength, 64 * 1024 + 1);
   });
   await t.test('a paired invoke resolving to undefined still retains a string body, never throwing in the page', async () => {
     const paired = [{
