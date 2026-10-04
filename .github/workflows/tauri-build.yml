@@ -256,22 +256,13 @@ jobs:
           # independent of that forced cwd -- reliably does.
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
-            # A minimal window manager, not the feasibility-gate step above:
-            # that step never drives a chooser, only this one does. Started
-            # first and given its own readiness wait (xprop, from x11-utils
-            # already installed above) so it has taken the WM_S0 selection
-            # before the app launches into this display.
-            openbox &
-            wm_pid=$!
-            trap "kill \${wm_pid} 2>/dev/null || true" EXIT
-            for _ in $(seq 1 10); do
-              xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
-              sleep 1
-            done
-            # with-webdriver.sh owns tauri-driver (start, /status wait, stop);
-            # a driver that never answers or exits early fails this step. The
-            # EXIT trap above still stops openbox.
-            docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=scenario "$1" "$2" "$3" "$4"
+            # with-openbox.sh owns openbox (start, readiness wait, stop): a
+            # minimal window manager, not needed by the feasibility-gate step
+            # above, since that step never drives a chooser and only this one
+            # does. with-webdriver.sh then owns tauri-driver (start, /status
+            # wait, stop); a driver that never answers or exits early fails
+            # this step.
+            docs/evidence/VP-001/procedures/with-openbox.sh docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s6-linux.sh --mode=scenario "$1" "$2" "$3" "$4"
           ' vp-s6-scenario "${artifact_path}" "${build_channel_digest}" \
             "${GITHUB_WORKSPACE}/target/release/vp-s6-agent" "${workspace_dir}" \
             | tee "${RUNNER_TEMP}/vp-001-vp-s6-transcript.txt"
@@ -348,8 +339,8 @@ jobs:
         # (tools/evidence-validator) is the only place a result is decided. A
         # failed lookup still leaves its gate line in the transcript, same as
         # that step. The trap workspace's own picker needs a window manager,
-        # so this step wraps the VP-S6 scenario step's own openbox/xprop
-        # readiness block around with-webdriver.sh instead of VP-S3's bare
+        # so this step wraps with-webdriver.sh in the with-openbox.sh helper
+        # (shared with the VP-S6 scenario step) instead of VP-S3's bare
         # xvfb-run.
         if: runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.vp001_scenario && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''
         timeout-minutes: 15
@@ -375,18 +366,10 @@ jobs:
           # a driver that never answers or exits early fails this step.
           xvfb-run --auto-servernum -- bash -c '
             set -euo pipefail
-            # A minimal window manager, same reasoning as the VP-S6 scenario
-            # step: the trap workspace picker needs one to realize dialog
-            # focus. Started first and given its own readiness wait (xprop,
-            # from x11-utils already installed above).
-            openbox &
-            wm_pid=$!
-            trap "kill \${wm_pid} 2>/dev/null || true" EXIT
-            for _ in $(seq 1 10); do
-              xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
-              sleep 1
-            done
-            docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s13-linux.sh "$1" "$2"
+            # with-openbox.sh owns openbox (start, readiness wait, stop),
+            # same reasoning as the VP-S6 scenario step: the trap workspace
+            # picker needs a window manager to realize dialog focus.
+            docs/evidence/VP-001/procedures/with-openbox.sh docs/evidence/VP-001/procedures/with-webdriver.sh docs/evidence/VP-001/procedures/vp-s13-linux.sh "$1" "$2"
           ' vp-s13-scenario "${artifact_path}" "${build_channel_digest}" \
             | tee "${transcript}"
 
