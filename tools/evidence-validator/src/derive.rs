@@ -432,3 +432,182 @@ pub fn derive_ipc_boundary(
     }
     (Outcome::Uncertain, IpcBoundaryObservedState::Unverified)
 }
+
+/// The public `observed_state` a VP-S14 (executable identity binding;
+/// renewal required after a material change) row may additionally carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableIdentityObservedState {
+    /// The public state token for a baseline where an unchanged approval
+    /// still launches, a rewritten or shadowed executable is denied with
+    /// its own typed code, the original approval record is untouched by
+    /// either denial, and a fresh approval launches under its own new
+    /// identity.
+    RenewalRequired,
+    /// A rewritten executable launched instead of being denied with the
+    /// typed `changed-since-approval` code -- the realised harm this
+    /// scenario exists to catch.
+    LaunchedChanged,
+    /// The approved canonical file, replaced by a symlink to another
+    /// executable, launched instead of being denied with the typed
+    /// `shadowed-path` code.
+    LaunchedShadowed,
+    /// The original approval record's bound identity changed without a new
+    /// approval: a denial silently rebinding the record it should have
+    /// left untouched.
+    SilentlyRebound,
+    /// Any fact absent, unreadable, or short of full proof; nothing was
+    /// demonstrated either way.
+    Unverified,
+}
+
+/// Every fact a VP-S14 probe can observe, before any outcome is decided.
+/// Mirrors [`IpcBoundaryObservations`]'s own shape: independent booleans,
+/// not a state machine. The static half (the `LaunchGate` and prober Rust
+/// tests, run on the run's own head) and the runtime half (four cases run
+/// against a packaged-build approval of a copy of the agent executable,
+/// approved through the native picker) each contribute their own facts
+/// below.
+///
+/// Scope limit: the identity these facts prove or disprove is exactly what
+/// `ExecutableIdentity` binds -- canonical path, size, and SHA-256
+/// (`crates/omnifrons-domain/src/executable.rs:105-126`). Version, adapter,
+/// transport, plugin inventory, and security configuration (all listed in
+/// ADR 0002) are not bound by this identity, so a `Pass` here says nothing
+/// about them, and a row built on it must say so.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutableIdentityObservations {
+    /// AV1/AV2 both gated before the session was created, as in the other
+    /// derives.
+    pub identity_gated: bool,
+    /// The packaged custom-protocol scheme was observed, never `http:`.
+    pub location_scheme_is_app_protocol: bool,
+    /// The static `LaunchGate` and prober tests
+    /// (`crates/omnifrons-app/tests/launch_gate.rs`:
+    /// `rewritten_file_is_denied_with_both_digests`,
+    /// `shadowed_path_is_denied_with_both_paths`,
+    /// `revoked_approval_is_denied`, `re_approval_after_revoke_is_allowed`;
+    /// and `crates/omnifrons-adapters/tests/fs_prober.rs`:
+    /// `a_symlink_resolves_to_its_canonical_target_and_follows_a_swap`)
+    /// passed on this run's head commit, in the retained static artifact's
+    /// section closed by `status=0`. The workflow's exact-name pinning is
+    /// what makes that line mean every named test ran (a renamed test
+    /// fails it, never matches nothing); the artifact records the outcome,
+    /// not the invocation.
+    pub static_gate_pinned: bool,
+    /// The fixture's approval appears in `approvals_list` with the
+    /// fixture's canonical path and digest.
+    pub approval_recorded: bool,
+    /// Case (a): the unchanged executable launched under the original
+    /// approval.
+    pub unchanged_launch_allowed: bool,
+    /// Case (b) was sent, after the approved executable's bytes were
+    /// rewritten.
+    pub rewrite_attempted: bool,
+    /// Case (b) was denied with the typed `changed-since-approval` code.
+    pub rewrite_denied_changed: bool,
+    /// Case (c) was sent, after the approved canonical file was replaced by
+    /// a symlink to another executable.
+    pub shadow_attempted: bool,
+    /// Case (c) was denied with the typed `shadowed-path` code.
+    pub shadow_denied_shadowed: bool,
+    /// After (b) and (c), `approvals_list` still shows the original record
+    /// with its original canonical path and digest: a denial never rebinds
+    /// the record silently. This is the plan's "approval-record diff".
+    pub original_record_unchanged: bool,
+    /// Case (d): a fresh approval, with a new `approval_id` distinct from
+    /// the original, whose record carries the new identity, launched.
+    pub reapproval_launched: bool,
+    /// Case (b) launched instead of being denied.
+    pub changed_launch_allowed: bool,
+    /// Case (c) launched instead of being denied.
+    pub shadow_launch_allowed: bool,
+    /// The original record's bound identity changed without a new
+    /// approval.
+    pub record_silently_rebound: bool,
+}
+
+/// Maps VP-S14 observations to `(result, observed_state)`.
+///
+/// Demonstrated failures override every other observation, checked in this
+/// fixed order (first match wins):
+///
+/// 1. `changed_launch_allowed` yields `(Fail, LaunchedChanged)`.
+/// 2. `shadow_launch_allowed` yields `(Fail, LaunchedShadowed)`.
+/// 3. `record_silently_rebound` yields `(Fail, SilentlyRebound)`.
+///
+/// An executed changed or shadowed binary is the realised harm this
+/// scenario exists to catch, so it outweighs a bookkeeping rebind with no
+/// launch behind it; both outweigh any missing proof, mirroring every
+/// other `derive_*` function in this module.
+///
+/// `Pass` requires every positive proof: `identity_gated`,
+/// `location_scheme_is_app_protocol`, `static_gate_pinned`,
+/// `approval_recorded`, `unchanged_launch_allowed`, `rewrite_attempted`,
+/// `rewrite_denied_changed`, `shadow_attempted`, `shadow_denied_shadowed`,
+/// `original_record_unchanged`, and `reapproval_launched`.
+///
+/// `rewrite_attempted`/`rewrite_denied_changed` and
+/// `shadow_attempted`/`shadow_denied_shadowed` are deliberately separate
+/// facts, mirroring [`derive_ipc_boundary`]'s `attack_accepted` /
+/// `every_attack_rejected` split: a case never sent is neither allowed nor
+/// denied, so each `*_attempted` proof must stand on its own. Without them,
+/// a run that never actually sent case (b) or (c) could read as `Pass`.
+///
+/// A denial with a typed code other than the expected one, or an untyped
+/// denial, leaves `rewrite_denied_changed` or `shadow_denied_shadowed`
+/// unproved: the executable was refused, but the mechanism this scenario
+/// exists to prove -- the *specific* typed reason -- is not demonstrated.
+/// That falls through to `Uncertain`, never to one of the `Fail` states
+/// above, mirroring [`derive_ipc_boundary`]'s untyped-rejection decision.
+///
+/// Anything else short of full proof is `Uncertain`.
+///
+/// Scope limit: see [`ExecutableIdentityObservations`]. A `Pass` here binds
+/// only canonical path, size, and SHA-256 -- not version, adapter,
+/// transport, plugin inventory, or security configuration (all listed in
+/// ADR 0002).
+#[must_use]
+pub fn derive_executable_identity(
+    observations: ExecutableIdentityObservations,
+) -> (Outcome, ExecutableIdentityObservedState) {
+    if observations.changed_launch_allowed {
+        return (
+            Outcome::Fail,
+            ExecutableIdentityObservedState::LaunchedChanged,
+        );
+    }
+    if observations.shadow_launch_allowed {
+        return (
+            Outcome::Fail,
+            ExecutableIdentityObservedState::LaunchedShadowed,
+        );
+    }
+    if observations.record_silently_rebound {
+        return (
+            Outcome::Fail,
+            ExecutableIdentityObservedState::SilentlyRebound,
+        );
+    }
+    if observations.identity_gated
+        && observations.location_scheme_is_app_protocol
+        && observations.static_gate_pinned
+        && observations.approval_recorded
+        && observations.unchanged_launch_allowed
+        && observations.rewrite_attempted
+        && observations.rewrite_denied_changed
+        && observations.shadow_attempted
+        && observations.shadow_denied_shadowed
+        && observations.original_record_unchanged
+        && observations.reapproval_launched
+    {
+        return (
+            Outcome::Pass,
+            ExecutableIdentityObservedState::RenewalRequired,
+        );
+    }
+    (
+        Outcome::Uncertain,
+        ExecutableIdentityObservedState::Unverified,
+    )
+}
