@@ -411,27 +411,14 @@ jobs:
           boundary="${RUNNER_TEMP}/vp-001-vp-s13-static-boundary.txt"
           echo "gate=static-boundary head=$(git rev-parse HEAD)" > "${boundary}"
 
-          # pinned <cargo args...> -- <test names...>: runs exactly the named
-          # tests (--exact) and requires every one of them to pass, so a renamed
-          # test -- which a name filter would silently match zero times -- fails
-          # the selection. stderr is kept, so a build failure leaves its cause in
-          # the artifact, not only in the job log.
-          pinned() {
-            local args=() names=() out status=0 passed
-            while [[ "$1" != "--" ]]; do
-              args+=("$1")
-              shift
-            done
-            shift
-            names=("$@")
-            out="$(cargo test "${args[@]}" -- --exact "${names[@]}" 2>&1)" || status=$?
-            printf '%s\n' "${out}"
-            passed="$(printf '%s\n' "${out}" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | awk '{n += $1} END {print n + 0}')"
-            if [[ "${status}" -ne 0 || "${passed}" -ne "${#names[@]}" ]]; then
-              echo "gate=static-boundary-selection-failed expected=${#names[@]} passed=${passed} status=${status}"
-              return 1
-            fi
-          }
+          # pinned <gate-prefix> <cargo args...> -- <test names...>: runs
+          # exactly the named tests (--exact) and requires every one of them
+          # to pass, so a renamed test -- which a name filter would silently
+          # match zero times -- fails the selection. stderr is kept, so a
+          # build failure leaves its cause in the artifact, not only in the
+          # job log. Shared with the VP-S14 static step below (and any later
+          # one), so they cannot drift on this logic.
+          source docs/evidence/VP-001/procedures/pinned-tests.sh
 
           # --release reuses the release build of the VP-S3 static inventory step
           # above (see its comment); the `contract-tests` selection below is the
@@ -440,7 +427,7 @@ jobs:
           {
             echo "gate=static-boundary-section name=capabilities"
             section_status=0
-            pinned -p omnifrons-shell --test config --release -- \
+            pinned static-boundary -p omnifrons-shell --test config --release -- \
               default_capability_grants_only_core_default \
               build_script_does_not_reference_app_manifest || section_status=1
             exit "${section_status}"
@@ -451,7 +438,7 @@ jobs:
           {
             echo "gate=static-boundary-section name=validators"
             section_status=0
-            pinned -p omnifrons-domain --test outbox --release -- \
+            pinned static-boundary -p omnifrons-domain --test outbox --release -- \
               outbox_path_rejects_an_empty_path \
               outbox_path_rejects_a_parent_traversal_component \
               outbox_path_rejects_an_absolute_path \
@@ -465,26 +452,26 @@ jobs:
               run_id_rejects_a_token_over_64_characters \
               run_id_rejects_empty_separators_dots_and_odd_characters \
               sha256_digest_parses_its_own_hex_and_rejects_bad_input || section_status=1
-            pinned -p omnifrons-domain --test guidance --release -- \
+            pinned static-boundary -p omnifrons-domain --test guidance --release -- \
               a_guidance_file_is_one_markdown_component_at_the_workspace_root \
               a_guidance_file_name_rejects_a_nul_byte || section_status=1
-            pinned -p omnifrons-adapters --test json_outbox_policy --release -- \
+            pinned static-boundary -p omnifrons-adapters --test json_outbox_policy --release -- \
               a_raw_path_declared_as_the_outbox_is_rejected_at_load \
               an_outbox_declaration_with_a_line_break_is_rejected_at_load || section_status=1
-            pinned -p omnifrons-shell --lib --release -- \
+            pinned static-boundary -p omnifrons-shell --lib --release -- \
               ipc::guidance::tests::an_invalid_guidance_file_name_is_guidance_file_invalid \
               ipc::guidance::tests::a_link_at_the_guidance_name_is_guidance_file_invalid \
               ipc::guidance::tests::guidance_errors_map_to_their_codes_with_slash_free_messages \
               ipc::dto::tests::approval_id_dto_round_trips_through_a_16_hex_character_string_above_2_53 \
               ipc::dto::tests::approval_id_dto_rejects_a_malformed_or_non_string_value || section_status=1
-            pinned -p omnifrons-app --test launch_plan_cwd --release -- \
+            pinned static-boundary -p omnifrons-app --test launch_plan_cwd --release -- \
               a_symlink_targeting_outside_the_workspace_is_rejected || section_status=1
-            pinned -p omnifrons-app --test wrong_root_contracts --features contract-tests --release -- \
+            pinned static-boundary -p omnifrons-app --test wrong_root_contracts --features contract-tests --release -- \
               a_link_planted_at_the_new_entrys_name_is_refused_not_replaced \
               a_link_planted_at_the_copy_ins_staging_name_is_never_written_through || section_status=1
-            pinned -p omnifrons-app --test work_area --release -- \
+            pinned static-boundary -p omnifrons-app --test work_area --release -- \
               a_device_asset_path_linked_into_a_workspace_is_destination_invalid || section_status=1
-            pinned -p omnifrons-app --test outbox_declaration --release -- \
+            pinned static-boundary -p omnifrons-app --test outbox_declaration --release -- \
               a_declared_path_that_is_a_link_is_invalid_even_when_it_points_inside_the_project \
               a_declared_path_that_canonicalizes_outside_the_project_is_invalid || section_status=1
             exit "${section_status}"
@@ -493,6 +480,53 @@ jobs:
 
           status=0
           if [[ "${cap_status}" -ne 0 || "${val_status}" -ne 0 ]]; then
+            status=1
+          fi
+          exit "${status}"
+
+      - name: VP-001 VP-S14 static executable identity (evidence run)
+        # The static half of VP-S14's evidence: `LaunchGate::decide` and
+        # `FsExecutableProber` Rust tests, pinned by exact name, on this
+        # job's own head commit, retained with the transcripts. A row files
+        # `ExecutableIdentityObservations::static_gate_pinned`
+        # (tools/evidence-validator/src/derive.rs) from this artifact's two
+        # `gate=static-identity-section-exit ... status=0` lines. Plan row:
+        # desktop-stack-verification-plan.md:135. `!cancelled()`, same
+        # reasoning as the VP-S13 static step above: a failed scenario must
+        # not skip it, and it starts no WebDriver session.
+        if: "!cancelled() && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.vp001_scenario && hashFiles('rust-toolchain.toml') != '' && hashFiles('src-tauri/tauri.conf.json') != ''"
+        run: |
+          set -euo pipefail
+          identity="${RUNNER_TEMP}/vp-001-vp-s14-static-identity.txt"
+          echo "gate=static-identity head=$(git rev-parse HEAD)" > "${identity}"
+
+          source docs/evidence/VP-001/procedures/pinned-tests.sh
+
+          launch_gate_status=0
+          {
+            echo "gate=static-identity-section name=launch-gate"
+            section_status=0
+            pinned static-identity -p omnifrons-app --test launch_gate --features contract-tests --release -- \
+              rewritten_file_is_denied_with_both_digests \
+              shadowed_path_is_denied_with_both_paths \
+              revoked_approval_is_denied \
+              re_approval_after_revoke_is_allowed || section_status=1
+            exit "${section_status}"
+          } | tee -a "${identity}" || launch_gate_status=1
+          echo "gate=static-identity-section-exit name=launch-gate status=${launch_gate_status}" | tee -a "${identity}"
+
+          prober_status=0
+          {
+            echo "gate=static-identity-section name=prober"
+            section_status=0
+            pinned static-identity -p omnifrons-adapters --test fs_prober --release -- \
+              unix_tests::a_symlink_resolves_to_its_canonical_target_and_follows_a_swap || section_status=1
+            exit "${section_status}"
+          } | tee -a "${identity}" || prober_status=1
+          echo "gate=static-identity-section-exit name=prober status=${prober_status}" | tee -a "${identity}"
+
+          status=0
+          if [[ "${launch_gate_status}" -ne 0 || "${prober_status}" -ne 0 ]]; then
             status=1
           fi
           exit "${status}"
@@ -516,4 +550,5 @@ jobs:
             ${{ runner.temp }}/vp-001-vp-s13-transcript.txt
             ${{ runner.temp }}/vp-001-vp-s3-static-inventory.txt
             ${{ runner.temp }}/vp-001-vp-s13-static-boundary.txt
+            ${{ runner.temp }}/vp-001-vp-s14-static-identity.txt
           if-no-files-found: warn
