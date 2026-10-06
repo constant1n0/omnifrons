@@ -46,11 +46,16 @@ function identitiesEqual(left, right) {
     && left.canonicalPath === right.canonicalPath && left.size === right.size && left.sha256 === right.sha256;
 }
 
-/** The first entry of `list` whose `approvalId` is `approvalId`, or `null`
- * for a non-array list, a non-string id, or no match. */
+/** The one entry of `list` whose `approvalId` is `approvalId`, or `null`
+ * for a non-array list, a non-string id, no match, or -- fail closed --
+ * more than one match. A duplicated id makes "the" record itself
+ * ambiguous (which copy is real?), so it must never stand in as either an
+ * unchanged record or a silent rebind; callers see it the same as a
+ * missing record. */
 function findApproval(list, approvalId) {
   if (!Array.isArray(list) || typeof approvalId !== 'string' || approvalId.length === 0) return null;
-  return list.find((entry) => entry && entry.approvalId === approvalId) ?? null;
+  const matches = list.filter((entry) => entry && entry.approvalId === approvalId);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 /** `cases[label]`, or `{}` for a missing or malformed entry -- every
@@ -60,8 +65,19 @@ function caseOf(cases, label) {
   return entry && typeof entry === 'object' ? entry : {};
 }
 
+const U32_MAX = 4294967295;
+
+/** `true` only for an integer in the `u32` range -- the wire shape of
+ * `ProcessIdDto` (`src-tauri/src/ipc/dto.rs:196`). A bare
+ * `typeof x === 'number'` check also accepts `NaN`, `Infinity`, negative
+ * numbers, fractions, and values past `u32`, none of which a real pid can
+ * ever be. */
+function isValidProcessId(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= U32_MAX;
+}
+
 const isSettled = (entry) => entry.outcome === 'resolved' || entry.outcome === 'rejected';
-const isResolvedWithProcess = (entry) => entry.outcome === 'resolved' && typeof entry.processId === 'number';
+const isResolvedWithProcess = (entry) => entry.outcome === 'resolved' && isValidProcessId(entry.processId);
 const isDeniedWithCode = (entry, code) => entry.outcome === 'rejected' && entry.code === code;
 
 export const CASE_LABELS = Object.freeze(['a', 'b', 'c', 'd']);
@@ -96,22 +112,44 @@ export function summarize(input) {
   const beforeIdentity = identityOf(beforeEntry);
   const afterIdentity = identityOf(afterEntry);
 
+  // A freshly approved record is active; a before entry sitting at any
+  // other status (e.g. already revoked) is not what a fresh approval
+  // would have just written, whatever its identity triple says.
   const approval_recorded = Boolean(beforeEntry) && Boolean(originalIdentity)
+    && beforeEntry.status === 'active'
     && identitiesEqual(beforeIdentity, originalIdentity);
 
-  const original_record_unchanged = Boolean(beforeEntry) && Boolean(afterEntry) && identitiesEqual(beforeIdentity, afterIdentity);
+  // Any status change -- not only an identity change -- is a change to the
+  // record, so both snapshots must be active for "unchanged" to hold.
+  const original_record_unchanged = Boolean(beforeEntry) && Boolean(afterEntry)
+    && beforeEntry.status === 'active' && afterEntry.status === 'active'
+    && identitiesEqual(beforeIdentity, afterIdentity);
   // A rebind needs both identities established: a snapshot missing either
   // is unproven, never the failure fact (the same restraint as a vanished
-  // record or an untyped rejection).
+  // record or an untyped rejection). Identity-only, deliberately: unlike
+  // `original_record_unchanged` above, a revocation changes `status`, not
+  // the bound identity, so it must never read as a silent rebind.
   const record_silently_rebound = Boolean(beforeIdentity) && Boolean(afterIdentity)
     && !identitiesEqual(beforeIdentity, afterIdentity);
 
   const reapprovalId = reapproval && typeof reapproval.approvalId === 'string' ? reapproval.approvalId : null;
   const reapprovalEntry = findApproval(afterList, reapprovalId);
+  const reapprovalEntryIdentity = identityOf(reapprovalEntry);
+  const reapprovalCallIdentity = identityOf(reapproval);
+  // Mirrors approval_recorded: the record must carry what the re-approval
+  // call actually returned, not merely some identity or other. Without this,
+  // a hollow or partial after-list entry (`reapprovalEntryIdentity === null`)
+  // would make `identitiesEqual(null, originalIdentity)` false, and the
+  // negation below would wrongly count that hollow entry as "differing".
+  // Active, like approval_recorded: a re-approval already revoked in the
+  // after list is no renewal that could launch.
+  const reapprovalRecorded = Boolean(reapprovalEntry) && reapprovalEntry.status === 'active'
+    && Boolean(reapprovalCallIdentity) && identitiesEqual(reapprovalEntryIdentity, reapprovalCallIdentity);
   // An original with no established identity leaves nothing to differ from:
   // never read as a distinct renewal.
-  const reapprovalDiffersFromOriginal = Boolean(reapprovalId) && reapprovalId !== originalId && Boolean(reapprovalEntry)
-    && Boolean(originalIdentity) && !identitiesEqual(identityOf(reapprovalEntry), originalIdentity);
+  const reapprovalDiffersFromOriginal = Boolean(reapprovalId) && reapprovalId !== originalId
+    && Boolean(originalIdentity) && reapprovalRecorded
+    && !identitiesEqual(reapprovalEntryIdentity, originalIdentity);
 
   return {
     location_scheme_is_app_protocol: location_protocol === 'tauri:',
@@ -154,7 +192,7 @@ export function formatCaseLines(cases) {
     const entry = caseOf(source, label);
     const outcome = typeof entry.outcome === 'string' ? entry.outcome : 'pending';
     let line = `observation=case label=${JSON.stringify(label)} outcome=${JSON.stringify(outcome)} code=${JSON.stringify(entry.code ?? null)}`;
-    if (outcome === 'resolved' && typeof entry.processId === 'number') line += ` process_id=${entry.processId}`;
+    if (outcome === 'resolved' && isValidProcessId(entry.processId)) line += ` process_id=${entry.processId}`;
     return line;
   });
 }
@@ -175,6 +213,8 @@ function basename(value) {
  * phase's list, for each id in `ids` (typically `[originalId,
  * reapprovalId]`, deduplicated). A line is only emitted when that phase's
  * list actually carries the id -- never a fabricated "missing" line.
+ * A duplicated id in a phase's list is the same as absent, by `findApproval`'s
+ * own fail-closed rule: ambiguous, so no line for that phase.
  *
  * `basename`, never the full `canonicalPath`: the fixture lives under a
  * scratch directory whose name must never appear in retained evidence.

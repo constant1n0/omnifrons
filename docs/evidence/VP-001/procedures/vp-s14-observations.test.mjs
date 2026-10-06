@@ -101,6 +101,35 @@ test('summarize: an empty or partial evidence object is no established identity,
   }
 });
 
+test('summarize: a before entry with status other than active is not approval_recorded, even with a matching identity', () => {
+  const input = allGoodInput();
+  input.beforeList = [approval(ORIGINAL_ID, ORIGINAL.evidence.canonicalPath, ORIGINAL.evidence.size, ORIGINAL.evidence.sha256, 'revoked')];
+  assert.equal(summarize(input).approval_recorded, false);
+});
+
+test('summarize: a before or after entry with status other than active is not original_record_unchanged, even with a matching identity', () => {
+  const { canonicalPath, size, sha256 } = ORIGINAL.evidence;
+  for (const [label, before, after] of [
+    ['before revoked', approval(ORIGINAL_ID, canonicalPath, size, sha256, 'revoked'), approval(ORIGINAL_ID, canonicalPath, size, sha256)],
+    ['after revoked', approval(ORIGINAL_ID, canonicalPath, size, sha256), approval(ORIGINAL_ID, canonicalPath, size, sha256, 'revoked')],
+  ]) {
+    const input = allGoodInput();
+    input.beforeList = [before];
+    input.afterList = [after, approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true')];
+    assert.equal(summarize(input).original_record_unchanged, false, label);
+  }
+});
+
+test('summarize: a revocation (status changes, identity does not) is not record_silently_rebound -- identity-only, by design', () => {
+  const { canonicalPath, size, sha256 } = ORIGINAL.evidence;
+  const input = allGoodInput();
+  input.beforeList = [approval(ORIGINAL_ID, canonicalPath, size, sha256)];
+  input.afterList = [approval(ORIGINAL_ID, canonicalPath, size, sha256, 'revoked'), approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true')];
+  const summary = summarize(input);
+  assert.equal(summary.record_silently_rebound, false);
+  assert.equal(summary.original_record_unchanged, false, 'the status change is still a change, just not a rebind');
+});
+
 test('summarize: an after-list entry without evidence is unproven, never record_silently_rebound', () => {
   const input = allGoodInput();
   input.afterList = [{ approvalId: ORIGINAL_ID, approvedAt: 0, status: 'active', revokedAt: null }, approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true')];
@@ -158,6 +187,29 @@ test('summarize: an untyped (no code) rejection also sets neither *_denied_* nor
   assert.equal(summary.rewrite_attempted, true);
 });
 
+test('summarize: a duplicated original id in beforeList is unproven -- not approval_recorded', () => {
+  const input = allGoodInput();
+  const { canonicalPath, size, sha256 } = ORIGINAL.evidence;
+  input.beforeList = [approval(ORIGINAL_ID, canonicalPath, size, sha256), approval(ORIGINAL_ID, canonicalPath, size, sha256)];
+  assert.equal(summarize(input).approval_recorded, false);
+});
+
+test('summarize: a duplicated original id in afterList is unproven -- neither original_record_unchanged nor record_silently_rebound, even when one copy is rebound', () => {
+  const input = allGoodInput();
+  const { canonicalPath, size, sha256 } = ORIGINAL.evidence;
+  // Two entries share the original id: one unchanged, one rebound to a
+  // different file. Which is "the" record is itself ambiguous, so neither
+  // positive fact (unchanged) nor the failure fact (rebound) may fire.
+  input.afterList = [
+    approval(ORIGINAL_ID, canonicalPath, size, sha256),
+    approval(ORIGINAL_ID, '/scratch/other-file', 999, 'sha-different'),
+    approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true'),
+  ];
+  const summary = summarize(input);
+  assert.equal(summary.original_record_unchanged, false);
+  assert.equal(summary.record_silently_rebound, false);
+});
+
 test('summarize: a missing record in afterList gives neither original_record_unchanged nor record_silently_rebound', () => {
   const input = allGoodInput();
   input.afterList = [approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true')]; // original id absent
@@ -181,10 +233,74 @@ test('summarize: a re-approval with the same identity as the original does not c
   assert.equal(summary.reapproval_launched, false);
 });
 
+test('summarize: a re-approval record that is already revoked in afterList is not reapproval_launched', () => {
+  const input = allGoodInput();
+  input.afterList = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true', 'revoked'),
+  ];
+  assert.equal(summarize(input).reapproval_launched, false);
+});
+
+test('summarize: a process id above u32 (4294967296) is not a launched process', () => {
+  const input = allGoodInput();
+  input.cases = { ...input.cases, a: resolvedCase(4294967296) };
+  assert.equal(summarize(input).unchanged_launch_allowed, false);
+  input.cases = { ...input.cases, a: resolvedCase(4294967295) };
+  assert.equal(summarize(input).unchanged_launch_allowed, true, 'the u32 maximum itself is valid');
+});
+
+test('summarize: a re-approval entry with hollow evidence does not count as reapproval_launched, though a null identity never equals the original', () => {
+  const input = allGoodInput();
+  // The after-list entry for the re-approval id carries no evidence at all:
+  // `identityOf` reads it as no established identity, not as "different".
+  input.afterList = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    { approvalId: REAPPROVAL_ID, approvedAt: 0, status: 'active', revokedAt: null },
+  ];
+  assert.equal(summarize(input).reapproval_launched, false);
+});
+
+test('summarize: a re-approval entry with partial evidence (missing sha256) does not count as reapproval_launched', () => {
+  const input = allGoodInput();
+  input.afterList = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    { approvalId: REAPPROVAL_ID, evidence: { canonicalPath: '/scratch/true-copy2', size: 100 }, approvedAt: 0, status: 'active', revokedAt: null },
+  ];
+  assert.equal(summarize(input).reapproval_launched, false);
+});
+
+test('summarize: a re-approval call whose own identity does not match its after-list record does not count as reapproval_launched', () => {
+  const input = allGoodInput();
+  // `reapproval` (the approve-call result) claims one identity; the record
+  // actually written to the list carries a different one. The record must
+  // carry what was approved, mirroring approval_recorded's own check.
+  input.reapproval = { approvalId: REAPPROVAL_ID, evidence: { canonicalPath: '/scratch/not-what-was-approved', size: 1, sha256: 'sha-mismatch' } };
+  assert.equal(summarize(input).reapproval_launched, false);
+});
+
 test('summarize: unsettled cases (d still pending) do not count as reapproval_launched even with a differing reapproval identity', () => {
   const input = allGoodInput();
   input.cases = { ...input.cases, d: pendingCase() };
   assert.equal(summarize(input).reapproval_launched, false);
+});
+
+test('summarize: a resolved case with a processId that is NaN, Infinity, negative, fractional, a string, or null is not unchanged_launch_allowed', () => {
+  for (const [label, badProcessId] of [
+    ['NaN', NaN], ['Infinity', Infinity], ['negative', -1], ['fractional', 1.5], ['string', '100'], ['null', null],
+  ]) {
+    const input = allGoodInput();
+    input.cases = { ...input.cases, a: { outcome: 'resolved', processId: badProcessId, code: null } };
+    assert.equal(summarize(input).unchanged_launch_allowed, false, label);
+  }
+});
+
+test('summarize: case (d) resolved with a processId that is NaN, negative, or fractional is not reapproval_launched', () => {
+  for (const [label, badProcessId] of [['NaN', NaN], ['negative', -1], ['fractional', 1.5]]) {
+    const input = allGoodInput();
+    input.cases = { ...input.cases, d: { outcome: 'resolved', processId: badProcessId, code: null } };
+    assert.equal(summarize(input).reapproval_launched, false, label);
+  }
 });
 
 test('summarize: location_scheme_is_app_protocol is strictly tauri:, never e.g. https:', () => {
@@ -227,6 +343,13 @@ test('formatCaseLines: fixed label order, exact strings, process_id only on a re
   ]);
 });
 
+test('formatCaseLines: a resolved case with a processId that is NaN, negative, fractional, or a string omits process_id entirely', () => {
+  for (const [label, badProcessId] of [['NaN', NaN], ['negative', -1], ['fractional', 1.5], ['string', '42']]) {
+    const lines = formatCaseLines({ a: { outcome: 'resolved', code: null, processId: badProcessId } });
+    assert.equal(lines[0], 'observation=case label="a" outcome="resolved" code=null', label);
+  }
+});
+
 test('formatRecordLines: only basename ever appears, full sha256, one line per (id, phase) actually present, ids deduplicated', () => {
   const beforeList = [approval(ORIGINAL_ID, '/scratch/vp-s14-xyz123/true-copy', 100, 'sha-true')];
   const afterList = [
@@ -252,4 +375,12 @@ test('formatRecordLines: an id absent from a phase emits no line for that phase;
   ]);
   assert.deepEqual(formatRecordLines(null, undefined, null), []);
   assert.deepEqual(formatRecordLines(beforeList, [], ['not-on-record']), []);
+});
+
+test('formatRecordLines: a duplicated id in a phase emits no line for that phase -- ambiguous, not fabricated', () => {
+  const duplicated = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    approval(ORIGINAL_ID, '/scratch/other-file', 999, 'sha-different'),
+  ];
+  assert.deepEqual(formatRecordLines(duplicated, [], [ORIGINAL_ID]), []);
 });
