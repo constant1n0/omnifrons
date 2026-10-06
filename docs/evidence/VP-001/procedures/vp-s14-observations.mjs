@@ -222,6 +222,34 @@ function basename(value) {
  * not location-sensitive, and the diff's whole point is to show the exact
  * identity bound before and after -- a short prefix could not distinguish
  * a silent rebind to a different file that happens to share one. */
+/** A `record-duplicate` diagnostic line for every (id, phase) pair where
+ * `id` appears more than once in that phase's list, for each id in `ids`
+ * (deduplicated, same order as given, `before` before `after` per id --
+ * mirrors `formatRecordLines`'s own iteration). `findApproval`'s own
+ * fail-closed rule makes a duplicated id read exactly like an absent one
+ * everywhere else in this module (`approval_recorded`,
+ * `original_record_unchanged`, `record_silently_rebound`,
+ * `reapproval_launched`, and `formatRecordLines` itself all see `null` or
+ * no line, with nothing to tell "ambiguous" apart from "missing"). This is
+ * the one place that tells them apart: a raw count per (id, phase), with
+ * no attempt to pick "the" record. Never changes `summarize`'s own
+ * fail-closed semantics -- this is a diagnostic line only, read
+ * independently of it. */
+export function formatDuplicateLines(beforeList, afterList, ids) {
+  const idList = [...new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [])];
+  const lists = { before: Array.isArray(beforeList) ? beforeList : [], after: Array.isArray(afterList) ? afterList : [] };
+  const lines = [];
+  for (const id of idList) {
+    for (const phase of ['before', 'after']) {
+      const count = lists[phase].filter((entry) => entry && entry.approvalId === id).length;
+      if (count > 1) {
+        lines.push(`observation=record-duplicate phase=${JSON.stringify(phase)} approval_id=${JSON.stringify(id)} count=${count}`);
+      }
+    }
+  }
+  return lines;
+}
+
 export function formatRecordLines(beforeList, afterList, ids) {
   const idList = [...new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [])];
   const lists = { before: Array.isArray(beforeList) ? beforeList : [], after: Array.isArray(afterList) ? afterList : [] };

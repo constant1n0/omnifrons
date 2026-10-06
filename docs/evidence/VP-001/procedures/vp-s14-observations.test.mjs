@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  CASE_LABELS, formatCaseLines, formatObservations, formatRecordLines, summarize,
+  CASE_LABELS, formatCaseLines, formatDuplicateLines, formatObservations, formatRecordLines, summarize,
 } from './vp-s14-observations.mjs';
 
 const approval = (approvalId, canonicalPath, size, sha256, status = 'active') => (
@@ -383,4 +383,60 @@ test('formatRecordLines: a duplicated id in a phase emits no line for that phase
     approval(ORIGINAL_ID, '/scratch/other-file', 999, 'sha-different'),
   ];
   assert.deepEqual(formatRecordLines(duplicated, [], [ORIGINAL_ID]), []);
+});
+
+test('formatDuplicateLines: a duplicated id in beforeList emits one record-duplicate line for that phase, with the exact count', () => {
+  const duplicated = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    approval(ORIGINAL_ID, '/scratch/other-file', 999, 'sha-different'),
+  ];
+  assert.deepEqual(formatDuplicateLines(duplicated, [], [ORIGINAL_ID]), [
+    'observation=record-duplicate phase="before" approval_id="aaaaaaaaaaaaaaaa" count=2',
+  ]);
+});
+
+test('formatDuplicateLines: a duplicated id in afterList (the re-approval id, not just the original) emits a line for that phase', () => {
+  const duplicated = [
+    approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true'),
+    approval(REAPPROVAL_ID, '/scratch/other-file', 999, 'sha-different'),
+  ];
+  assert.deepEqual(formatDuplicateLines([], duplicated, [ORIGINAL_ID, REAPPROVAL_ID]), [
+    'observation=record-duplicate phase="after" approval_id="bbbbbbbbbbbbbbbb" count=2',
+  ]);
+});
+
+test('formatDuplicateLines: three copies of the same id report count=3, not just "duplicated"', () => {
+  const triplicated = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    approval(ORIGINAL_ID, '/scratch/other-file', 999, 'sha-different'),
+    approval(ORIGINAL_ID, '/scratch/third-file', 1, 'sha-third'),
+  ];
+  assert.deepEqual(formatDuplicateLines(triplicated, [], [ORIGINAL_ID]), [
+    'observation=record-duplicate phase="before" approval_id="aaaaaaaaaaaaaaaa" count=3',
+  ]);
+});
+
+test('formatDuplicateLines: no duplicates in either phase emits nothing', () => {
+  const beforeList = [approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true')];
+  const afterList = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    approval(REAPPROVAL_ID, '/scratch/true-copy2', 100, 'sha-true'),
+  ];
+  assert.deepEqual(formatDuplicateLines(beforeList, afterList, [ORIGINAL_ID, REAPPROVAL_ID]), []);
+});
+
+test('formatDuplicateLines: ids are deduplicated before checking, so passing the same id twice never doubles its line', () => {
+  const duplicated = [
+    approval(ORIGINAL_ID, '/scratch/true-copy', 100, 'sha-true'),
+    approval(ORIGINAL_ID, '/scratch/other-file', 999, 'sha-different'),
+  ];
+  assert.deepEqual(formatDuplicateLines(duplicated, [], [ORIGINAL_ID, ORIGINAL_ID]), [
+    'observation=record-duplicate phase="before" approval_id="aaaaaaaaaaaaaaaa" count=2',
+  ]);
+});
+
+test('formatDuplicateLines: empty/malformed inputs never throw and report no duplicates', () => {
+  assert.deepEqual(formatDuplicateLines(null, undefined, null), []);
+  assert.deepEqual(formatDuplicateLines('not-a-list', 'not-a-list', [ORIGINAL_ID]), []);
+  assert.deepEqual(formatDuplicateLines([], [], ['not-on-record']), []);
 });
