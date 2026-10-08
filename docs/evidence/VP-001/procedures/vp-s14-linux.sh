@@ -11,29 +11,33 @@
 # bytes-only rewrite; case (c): a symlink swap to `shadowTargetExe`). The
 # scratch directory is removed unconditionally by an EXIT trap: `rm -rf`
 # never dereferences a symlink into its target when deleting a tree, so
-# the dangling `approvedExe` symlink case (c) leaves behind is itself
-# unlinked there, never the file (inside or outside the scratch dir) it
-# points to.
+# the `approvedExe` symlink case (c) leaves behind -- an in-tree link to
+# `shadowTargetExe`, which still exists -- is itself unlinked there,
+# never the file it points to.
 # Usage: vp-s14-linux.sh <artifact-path> <build-channel-digest>
 # Env: VP001_WEBDRIVER_BASE_URL (default: http://127.0.0.1:4444),
 # VP001_AV_TIMEOUT (default: 120s), VP001_SCENARIO_TIMEOUT (default: 300s),
 # VP001_FIXTURE_NAMES_TIMEOUT (default: 10s),
 # VP001_FIXTURE_BEHAVIOUR_TIMEOUT (default: 5s)
-# Exit: 0, 1, or 2 (a usage error, including a non-64-hex digest). Each
-# `timeout`-wrapped leg's status is mapped through leg-status.sh's
-# `map_leg_status`, for leg=av-feasibility-check/scenario (vp-s3-linux.sh's
-# own contract). A missing `true`/`false` binary is
+# Exit: 0, 1, or 2 (a usage error, including a non-64-hex digest). Four
+# legs run under `timeout`: av-feasibility-check and scenario map their
+# status through leg-status.sh's `map_leg_status` (vp-s3-linux.sh's own
+# contract); fixture-names and fixture-behaviour are also
+# `timeout`-wrapped but never go through `map_leg_status` -- each names
+# its own direct gate below instead. A missing `true`/`false` binary is
 # gate=fixture-source-missing, exit 1, before any fixture is created. The
 # FIXTURE_NAMES read (a `node -e` dynamic import, bounded by
 # VP001_FIXTURE_NAMES_TIMEOUT) outliving or being killed at that bound is
 # gate=fixture-names-timeout, exit 1 -- distinct from a missing,
-# non-plain, dot-segment (`.`/`..`), or non-unique entry, which is
-# gate=fixture-names-invalid, exit 1, before any trap or scenario. A
-# multi-call `true`/`false` (busybox, uutils) whose two applets are
-# byte-identical is gate=fixture-sources-indistinct, exit 1, before any
-# fixture is copied; one that copies fine but does not behave as its role
-# requires when run directly is gate=fixture-behaviour-mismatch
-# name=<basename> status=<n>, exit 1 -- both before the scenario runs.
+# non-string, non-plain, dot-segment (`.`/`..`), or non-unique entry,
+# which is gate=fixture-names-invalid, exit 1, before any trap or
+# scenario. A multi-call `true`/`false` (busybox, uutils) whose two
+# applets are byte-identical is gate=fixture-sources-indistinct, exit 1,
+# before any fixture is copied; one that copies fine but does not behave
+# as its role requires when run directly (including outliving or being
+# killed at VP001_FIXTURE_BEHAVIOUR_TIMEOUT) is
+# gate=fixture-behaviour-mismatch name=<basename> status=<n>, exit 1 --
+# both before the scenario runs.
 
 set -euo pipefail
 
@@ -62,6 +66,12 @@ AV_TIMEOUT="${VP001_AV_TIMEOUT:-120s}"
 # whose top level never finishes evaluating) would otherwise hang this
 # script forever before the AV/scenario legs' own bounds ever apply.
 FIXTURE_NAMES_TIMEOUT="${VP001_FIXTURE_NAMES_TIMEOUT:-10s}"
+# Each fixture is likewise run directly and briefly, with no dialog or
+# network either, to prove it behaves as its own role requires once
+# copied and renamed -- bounded the same way, so a fixture that itself
+# wedges cannot hang this script before the scenario leg's own bound
+# ever applies.
+FIXTURE_BEHAVIOUR_TIMEOUT="${VP001_FIXTURE_BEHAVIOUR_TIMEOUT:-5s}"
 
 webdriver_base_url="${VP001_WEBDRIVER_BASE_URL:-http://127.0.0.1:4444}"
 procedures_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -91,6 +101,16 @@ fixture_names_output="$(
       const { FIXTURE_NAMES } = await import(
         process.env.VP001_PROCEDURES_DIR + "/vp-s14-scenario.mjs"
       );
+      // A missing (or otherwise non-string) key would otherwise stringify
+      // to the literal "undefined" below, which the plain/dot-segment
+      // checks downstream do not reject -- so a missing key fails closed
+      // right here instead, into the same nonzero-status fallthrough an
+      // outright import failure already takes.
+      for (const key of ["approvedExe", "replacementExe", "shadowTargetExe"]) {
+        if (typeof FIXTURE_NAMES[key] !== "string" || FIXTURE_NAMES[key].length === 0) {
+          throw new Error("FIXTURE_NAMES." + key + " is not a non-empty string");
+        }
+      }
       process.stdout.write(
         FIXTURE_NAMES.approvedExe + "\n" + FIXTURE_NAMES.replacementExe + "\n" + FIXTURE_NAMES.shadowTargetExe + "\n"
       );
@@ -164,9 +184,9 @@ fi
 scratch_root="$(mktemp -d)"
 cleanup() {
   # `rm -rf` unlinks a symlink entry itself; it never dereferences it into
-  # whatever it points to, inside or outside this tree -- so the dangling
-  # `approved_exe` symlink case (c) may have left behind is always safe to
-  # remove this way.
+  # whatever it points to, inside or outside this tree -- so the in-tree
+  # `approved_exe` symlink to `shadow_target_exe` case (c) may have left
+  # behind is always safe to remove this way.
   rm -rf "${scratch_root}"
 }
 trap cleanup EXIT
@@ -181,11 +201,14 @@ chmod 755 "${scratch_root}/${approved_exe}" "${scratch_root}/${replacement_exe}"
 # renamed -- a multi-call binary can also fail its renamed applet lookup
 # outright (busybox's own "applet not found") rather than behave like
 # true/false at all. Each fixture is run directly, by its own role, under
-# a short bound.
-FIXTURE_BEHAVIOUR_TIMEOUT="${VP001_FIXTURE_BEHAVIOUR_TIMEOUT:-5s}"
-for fixture_role_pair in "${approved_exe}:0" "${shadow_target_exe}:0" "${replacement_exe}:1"; do
-  fixture_name="${fixture_role_pair%%:*}"
-  expected_status="${fixture_role_pair##*:}"
+# a short bound. Parallel arrays, not a single "name:status" string: a
+# fixture name may itself legally contain ":", which a delimiter-based
+# encoding would misread as part of the separator.
+fixture_behaviour_names=("${approved_exe}" "${shadow_target_exe}" "${replacement_exe}")
+fixture_behaviour_expected=(0 0 1)
+for i in "${!fixture_behaviour_names[@]}"; do
+  fixture_name="${fixture_behaviour_names[$i]}"
+  expected_status="${fixture_behaviour_expected[$i]}"
   fixture_status=0
   timeout --kill-after=2s "${FIXTURE_BEHAVIOUR_TIMEOUT}" "${scratch_root}/${fixture_name}" || fixture_status=$?
   if [[ "${fixture_status}" -ne "${expected_status}" ]]; then

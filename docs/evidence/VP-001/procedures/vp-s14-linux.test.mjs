@@ -30,6 +30,12 @@ const SCENARIO_MARKER = 'stub=scenario-ran';
 const LINUX_ONLY =
   process.platform === 'linux' ? {} : { skip: 'vp-s14-linux.sh needs GNU timeout/mapfile/type -P (Linux only)' };
 const AV_PASS = 'echo "gate=av-stub-pass"; exit 0';
+// Deliberately distinct bytes (different exit codes), the same shape a
+// real true/false pair must have. Used by every test below that needs
+// the driver's own true/false resolution to behave predictably
+// regardless of what this host's real true/false happen to be.
+const FAKE_TRUE_SCRIPT = '#!/bin/sh\nexit 0\n';
+const FAKE_FALSE_SCRIPT = '#!/bin/sh\nexit 1\n';
 
 // Every scenario-body fixture below must export FIXTURE_NAMES itself: the
 // driver imports it straight from vp-s14-scenario.mjs (not a separate
@@ -70,6 +76,15 @@ if (process.argv[1]) {
 }
 `;
 
+// A `:` in a fixture name must never be mistaken for the behaviour-check
+// loop's own "name:status" encoding -- the loop reads parallel arrays
+// instead, with no delimiter character at all, so this name is just an
+// ordinary (if unusual) file name throughout.
+const COLON_NAME_SCENARIO_BODY = `
+export const FIXTURE_NAMES = Object.freeze({ approvedExe: 'approved:exe', replacementExe: 'replacement-exe', shadowTargetExe: 'shadow-target-exe' });
+if (process.argv[1]) process.stdout.write('${SCENARIO_MARKER}\\n');
+`;
+
 // A stand-in blocker: the scenario's own failure, never a driver-level gate.
 const BLOCKER_SCENARIO_BODY = `${FIXTURE_NAMES_EXPORT}\nif (process.argv[1]) process.exitCode = 1;\n`;
 
@@ -102,6 +117,12 @@ const DOT_DOT_SEGMENT_SCENARIO_BODY =
 // name the same file, so the second `cp` silently overwrites the first.
 const DUPLICATE_NAMES_SCENARIO_BODY =
   "export const FIXTURE_NAMES = Object.freeze({ approvedExe: 'dup-exe', replacementExe: 'dup-exe', shadowTargetExe: 'shadow-target-exe' });\n";
+
+// One key is missing entirely (not merely empty): FIXTURE_NAMES.replacementExe
+// reads back as `undefined`, which the driver's reader must itself reject
+// rather than let it stringify into a seemingly valid name.
+const MISSING_KEY_SCENARIO_BODY =
+  "export const FIXTURE_NAMES = Object.freeze({ approvedExe: 'approved-exe', shadowTargetExe: 'shadow-target-exe' });\n";
 
 // The import itself fails, so FIXTURE_NAMES can never be read at all --
 // fewer names than expected, same failure family as a malformed name.
@@ -239,6 +260,15 @@ function buildPathWithoutTrueOrFalse() {
   return binDir;
 }
 
+/** Resolves a binary exactly as vp-s14-linux.sh itself does (`type -P`,
+ * bypassing any shell builtin) -- used only by the one test below that
+ * deliberately exercises this host's own real true/false rather than the
+ * fake stand-ins every other test uses. */
+function resolveViaTypeP(name) {
+  const result = spawnSync('bash', ['-c', `type -P ${name} || true`], { encoding: 'utf8' });
+  return result.stdout.trim();
+}
+
 /** Runs vp-s14-linux.sh with `avBody` for vp-s6-linux.sh's AV1/AV2 check
  * (bounded 1 s) and `scenarioBody` for vp-s14-scenario.mjs. `pathOverride`
  * replaces PATH entirely for the one test that needs `true`/`false` to be
@@ -268,21 +298,40 @@ function runWithAvStub({
 }
 
 test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
+  // Every test below that reaches the fixture path (past FIXTURE_NAMES
+  // validation) runs against these fake true/false stand-ins, not
+  // whatever `true`/`false` happen to be on this host: deliberately
+  // distinct bytes and the correct exit codes, so the suite's result
+  // never depends on whether the host's own true/false are a multi-call
+  // binary (busybox, uutils) that would otherwise trip the
+  // fixture-sources-indistinct guard for every one of them. The
+  // dedicated test further down documents the real-binary path instead.
+  const { binDir: fakeBinDir, path: fakeBinPath } = buildPathWithFakeTrueFalse({
+    trueScript: FAKE_TRUE_SCRIPT, falseScript: FAKE_FALSE_SCRIPT,
+  });
+  t.after(() => rmSync(fakeBinDir, { recursive: true, force: true }));
+
   // One run per fixture, inside the Linux gate, shared across assertions below.
-  const passingRun = runWithAvStub({ avBody: AV_PASS });
+  const passingRun = runWithAvStub({ avBody: AV_PASS, pathOverride: fakeBinPath });
   const rejectedRun = runWithAvStub({ avBody: 'echo "gate=av-stub-rejected"; exit 1' });
   const usageErrorRun = runWithAvStub({ avBody: 'exit 2' });
-  const scenarioBlockerRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: BLOCKER_SCENARIO_BODY });
-  const scenarioTimeoutRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: TIMEOUT_SCENARIO_BODY, scenarioTimeout: '1s' });
-  const scenarioKilledRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: IGNORE_SIGTERM_SCENARIO_BODY, scenarioTimeout: '1s' });
+  const scenarioBlockerRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: BLOCKER_SCENARIO_BODY, pathOverride: fakeBinPath });
+  const scenarioTimeoutRun = runWithAvStub({
+    avBody: AV_PASS, scenarioBody: TIMEOUT_SCENARIO_BODY, scenarioTimeout: '1s', pathOverride: fakeBinPath,
+  });
+  const scenarioKilledRun = runWithAvStub({
+    avBody: AV_PASS, scenarioBody: IGNORE_SIGTERM_SCENARIO_BODY, scenarioTimeout: '1s', pathOverride: fakeBinPath,
+  });
+  const colonNameRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: COLON_NAME_SCENARIO_BODY, pathOverride: fakeBinPath });
   const badNamesRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: BAD_NAMES_SCENARIO_BODY });
   const dotSegmentRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: DOT_SEGMENT_SCENARIO_BODY });
   const dotDotSegmentRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: DOT_DOT_SEGMENT_SCENARIO_BODY });
   const brokenImportRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: BROKEN_IMPORT_SCENARIO_BODY });
   const duplicateNamesRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: DUPLICATE_NAMES_SCENARIO_BODY });
+  const missingKeyRun = runWithAvStub({ avBody: AV_PASS, scenarioBody: MISSING_KEY_SCENARIO_BODY });
 
-  await t.test('FIXTURE_NAMES that are missing, not one plain name, a dot segment, two names colliding, or unreadable (import failure) stop the run with a named gate, before any trap or scenario', () => {
-    for (const run of [badNamesRun, dotSegmentRun, dotDotSegmentRun, brokenImportRun, duplicateNamesRun]) {
+  await t.test('FIXTURE_NAMES that are missing, not one plain name, a dot segment, two names colliding, missing a key, or unreadable (import failure) stop the run with a named gate, before any trap or scenario', () => {
+    for (const run of [badNamesRun, dotSegmentRun, dotDotSegmentRun, brokenImportRun, duplicateNamesRun, missingKeyRun]) {
       assert.equal(run.status, 1, run.stdout);
       assert.ok(run.stdout.includes('gate=fixture-names-invalid'), run.stdout);
       assert.ok(!run.stdout.includes(SCENARIO_MARKER), run.stdout);
@@ -297,6 +346,30 @@ test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
     assert.ok(passingRun.stdout.includes('mode=755'), passingRun.stdout);
     assert.ok(passingRun.stdout.includes('approved_eq_shadow=true'), passingRun.stdout);
     assert.ok(passingRun.stdout.includes('approved_eq_replacement=false'), passingRun.stdout);
+  });
+
+  await t.test("a ':' in a fixture name is never mistaken for the behaviour-check loop's name:status encoding: fixtures still prepare and the scenario still runs", () => {
+    assert.equal(colonNameRun.status, 0, colonNameRun.stdout);
+    assert.ok(colonNameRun.stdout.includes('gate=fixtures-prepared'), colonNameRun.stdout);
+    assert.ok(!colonNameRun.stdout.includes('gate=fixture-behaviour-mismatch'), colonNameRun.stdout);
+    assert.ok(colonNameRun.stdout.includes(SCENARIO_MARKER), colonNameRun.stdout);
+  });
+
+  await t.test('documents the real host true/false path: skips cleanly if this host\'s true and false are byte-identical (a multi-call coreutils), otherwise runs the driver unmodified', (st) => {
+    const trueBin = resolveViaTypeP('true');
+    const falseBin = resolveViaTypeP('false');
+    if (!trueBin || !falseBin) {
+      st.skip('this host has no true/false resolvable via `type -P`');
+      return;
+    }
+    if (readFileSync(trueBin).equals(readFileSync(falseBin))) {
+      st.skip("this host's true and false are byte-identical (a multi-call coreutils); the dedicated fake-PATH tests already prove the driver's own fixture-sources-indistinct guard");
+      return;
+    }
+    const run = runWithAvStub({ avBody: AV_PASS });
+    assert.equal(run.status, 0, run.stdout);
+    assert.ok(run.stdout.includes('gate=fixtures-prepared'), run.stdout);
+    assert.ok(run.stdout.includes(SCENARIO_MARKER), run.stdout);
   });
 
   await t.test('AV1/AV2 failure paths: a rejection keeps its gate/exit 1 and skips fixture prep/scenario; a usage error keeps exit 2', () => {
@@ -330,25 +403,31 @@ test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
     assert.ok(!run.stdout.includes(SCENARIO_MARKER), run.stdout);
   });
 
-  await t.test('byte-identical true/false sources (as from a multi-call binary) stop the run with a named gate, before any fixture is copied or the scenario runs', () => {
+  await t.test('byte-identical true/false sources (as from a multi-call binary) stop the run with a named gate, before any fixture is copied, the scenario runs, or any scratch directory (under TMPDIR) is created', () => {
     // Same script, same bytes -- the exact shape a multi-call true/false
     // (busybox, uutils) would present: renamed copies that cannot be told
     // apart by content, so a bytes-only rewrite in case (b) would change
     // nothing and the scenario would misread a false "changed" Fail.
     const identicalScript = '#!/bin/sh\nexit 0\n';
     const { binDir, path } = buildPathWithFakeTrueFalse({ trueScript: identicalScript, falseScript: identicalScript });
+    // This gate fires before `scratch_root="$(mktemp -d)"` ever runs, so
+    // TMPDIR (the same technique the fixture-source-missing test below
+    // uses) must stay empty, not merely end up cleaned afterward.
+    const tmpdirOverride = mkdtempSync(join(tmpdir(), 'vp-s14-tmpdir-'));
     try {
-      const run = runWithAvStub({ avBody: AV_PASS, pathOverride: path });
+      const run = runWithAvStub({ avBody: AV_PASS, pathOverride: path, extraEnv: { TMPDIR: tmpdirOverride } });
       assert.equal(run.status, 1, run.stdout);
       assert.ok(run.stdout.includes('gate=fixture-sources-indistinct'), run.stdout);
       assert.ok(!run.stdout.includes('gate=fixtures-prepared'), run.stdout);
       assert.ok(!run.stdout.includes(SCENARIO_MARKER), run.stdout);
+      assert.deepEqual(readdirSync(tmpdirOverride), [], 'no scratch directory must ever be created under TMPDIR');
     } finally {
+      rmSync(tmpdirOverride, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
     }
   });
 
-  await t.test('a fixture that does not behave as its role requires (e.g. a renamed multi-call applet) stops the run with a named gate before the scenario runs', () => {
+  await t.test('a fixture that does not behave as its role requires (e.g. a renamed multi-call applet) stops the run with a named gate before the scenario runs, and still removes its scratch directory (under TMPDIR)', () => {
     // Distinct content (so the source-digest guard above passes), but the
     // "false" source still exits 0 -- the behavioural half of the same
     // multi-call-binary risk: distinguishable bytes are not proof of
@@ -356,14 +435,20 @@ test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
     const trueScript = '#!/bin/sh\nexit 0\n';
     const wrongFalseScript = '#!/bin/sh\n# deliberately wrong: a role that must exit 1 here exits 0\nexit 0\n';
     const { binDir, path } = buildPathWithFakeTrueFalse({ trueScript, falseScript: wrongFalseScript });
+    // Unlike the indistinct-sources gate above, this one fires after
+    // `scratch_root="$(mktemp -d)"` has already run, so the proof here is
+    // that cleanup still removes it, not that it was never created.
+    const tmpdirOverride = mkdtempSync(join(tmpdir(), 'vp-s14-tmpdir-'));
     try {
-      const run = runWithAvStub({ avBody: AV_PASS, pathOverride: path });
+      const run = runWithAvStub({ avBody: AV_PASS, pathOverride: path, extraEnv: { TMPDIR: tmpdirOverride } });
       assert.equal(run.status, 1, run.stdout);
       assert.ok(run.stdout.includes('gate=fixture-behaviour-mismatch'), run.stdout);
       assert.ok(run.stdout.includes('status=0'), run.stdout);
       assert.ok(!run.stdout.includes('gate=fixtures-prepared'), run.stdout);
       assert.ok(!run.stdout.includes(SCENARIO_MARKER), run.stdout);
+      assert.deepEqual(readdirSync(tmpdirOverride), [], 'the scratch directory must be removed even when the behaviour-mismatch gate fires');
     } finally {
+      rmSync(tmpdirOverride, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
     }
   });
@@ -405,7 +490,8 @@ test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
     try {
       const recordPath = join(recordDir, 'scratch-path.txt');
       const normalRun = runWithAvStub({
-        avBody: AV_PASS, scenarioBody: RECORD_SCRATCH_SCENARIO_BODY, extraEnv: { VP001_TEST_SCRATCH_RECORD_PATH: recordPath },
+        avBody: AV_PASS, scenarioBody: RECORD_SCRATCH_SCENARIO_BODY, pathOverride: fakeBinPath,
+        extraEnv: { VP001_TEST_SCRATCH_RECORD_PATH: recordPath },
       });
       assert.equal(normalRun.status, 0, normalRun.stdout);
       assert.ok(existsSync(recordPath), normalRun.stdout);
@@ -415,7 +501,7 @@ test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
 
       const killedRecordPath = join(recordDir, 'scratch-path-killed.txt');
       const killedRun = runWithAvStub({
-        avBody: AV_PASS, scenarioBody: RECORD_AND_HANG_SCENARIO_BODY, scenarioTimeout: '1s',
+        avBody: AV_PASS, scenarioBody: RECORD_AND_HANG_SCENARIO_BODY, scenarioTimeout: '1s', pathOverride: fakeBinPath,
         extraEnv: { VP001_TEST_SCRATCH_RECORD_PATH: killedRecordPath },
       });
       assert.equal(killedRun.status, 1, killedRun.stdout);
@@ -435,7 +521,7 @@ test('vp-s14-linux.sh', LINUX_ONLY, async (t) => {
       writeFileSync(externalTarget, 'do-not-delete-me');
       const recordPath = join(recordDir, 'scratch-path.txt');
       const run = runWithAvStub({
-        avBody: AV_PASS, scenarioBody: DANGLING_SYMLINKS_SCENARIO_BODY,
+        avBody: AV_PASS, scenarioBody: DANGLING_SYMLINKS_SCENARIO_BODY, pathOverride: fakeBinPath,
         extraEnv: { VP001_TEST_EXTERNAL_TARGET: externalTarget, VP001_TEST_SCRATCH_RECORD_PATH: recordPath },
       });
       assert.equal(run.status, 0, run.stdout);
