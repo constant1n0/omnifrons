@@ -1,0 +1,51 @@
+Openbox-Message: Unable to find a valid menu file "/var/lib/openbox/debian-menu.xml"
+gate=wm-ready
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+gate=av1-digest-match digest=28b8b8f37d22efd3827e0f154cb46f2196ab2c7021bf4c0b701d519afd09a004
+gate=av2-variant-scan-absent binary=<extract-dir>/squashfs-root/usr/bin/omnifrons-shell
+
+(omnifrons-shell:41095): dbind-WARNING **: 23:13:26.108: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=f1-session-created session_id=ef1804c9-d57b-4f4b-977b-d00dd0a7ddf5
+gate=session-closed session_id=ef1804c9-d57b-4f4b-977b-d00dd0a7ddf5
+gate=fixtures-prepared
+
+(omnifrons-shell:41246): dbind-WARNING **: 23:13:58.229: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+gate=session-created session_id=acd8f823-f3bb-47eb-b6b4-dc493984c0b7
+dialog_attempt=1 strategy=focus-ctrl-l
+
+(omnifrons-shell:41246): Gtk-CRITICAL **: 23:14:29.871: gtk_widget_event: assertion 'WIDGET_REALIZED_FOR_EVENT (widget, event)' failed
+dialog_closed=focus-ctrl-l
+gate=approved approval_id=95aa5bc37b6e821d basename=approved-exe
+gate=mutated case=b before_size=26936 after_size=26936
+gate=mutated case=c
+dialog_attempt=1 strategy=focus-ctrl-l
+dialog_closed=focus-ctrl-l
+gate=reapproved approval_id=20e37ee90c49cf0f basename=approved-exe
+observation=case label="a" outcome="resolved" code=null process_id=41432
+observation=case label="b" outcome="rejected" code="changed-since-approval"
+observation=case label="c" outcome="rejected" code="shadowed-path"
+observation=case label="d" outcome="resolved" code=null process_id=41499
+observation=record phase="before" approval_id="95aa5bc37b6e821d" basename="approved-exe" size=26936 sha256="8a63c98320173f79e263115e10cefc170155e47d1fd4b5a70e4429d2699cae28" status="active"
+observation=record phase="after" approval_id="95aa5bc37b6e821d" basename="approved-exe" size=26936 sha256="8a63c98320173f79e263115e10cefc170155e47d1fd4b5a70e4429d2699cae28" status="active"
+observation=record phase="after" approval_id="20e37ee90c49cf0f" basename="shadow-target-exe" size=26936 sha256="8a63c98320173f79e263115e10cefc170155e47d1fd4b5a70e4429d2699cae28" status="active"
+observation=location_scheme_is_app_protocol value=true
+observation=approval_recorded value=true
+observation=unchanged_launch_allowed value=true
+observation=rewrite_attempted value=true
+observation=rewrite_denied_changed value=true
+observation=shadow_attempted value=true
+observation=shadow_denied_shadowed value=true
+observation=original_record_unchanged value=true
+observation=reapproval_launched value=true
+observation=changed_launch_allowed value=false
+observation=shadow_launch_allowed value=false
+observation=record_silently_rebound value=false
+gate=session-closed session_id=acd8f823-f3bb-47eb-b6b4-dc493984c0b7

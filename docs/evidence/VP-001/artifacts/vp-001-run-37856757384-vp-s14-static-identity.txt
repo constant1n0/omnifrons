@@ -1,0 +1,24 @@
+gate=static-identity head=5e9550fff5a0a4289b2f374110c86670fe131c6f
+gate=static-identity-section name=launch-gate
+   Compiling omnifrons-app v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-app)
+    Finished `release` profile [optimized] target(s) in 0.42s
+     Running tests/launch_gate.rs (target/release/deps/launch_gate-ea557be0b046417f)
+
+running 4 tests
+test rewritten_file_is_denied_with_both_digests ... ok
+test revoked_approval_is_denied ... ok
+test re_approval_after_revoke_is_allowed ... ok
+test shadowed_path_is_denied_with_both_paths ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+gate=static-identity-section-exit name=launch-gate status=0
+gate=static-identity-section name=prober
+   Compiling omnifrons-adapters v0.1.0 (/home/runner/work/omnifrons/omnifrons/crates/omnifrons-adapters)
+    Finished `release` profile [optimized] target(s) in 0.35s
+     Running tests/fs_prober.rs (target/release/deps/fs_prober-ebcbdaa8f93b5b87)
+
+running 1 test
+test unix_tests::a_symlink_resolves_to_its_canonical_target_and_follows_a_swap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+gate=static-identity-section-exit name=prober status=0

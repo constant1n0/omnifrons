@@ -1167,3 +1167,261 @@ to the CI artifact entry.
 | `evidence_artifact` | dfe68f8e2ec4ef97b0680f69c03308a9fe1bde8d8528b86a5ed6910659366ed5 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-37140480853-vp-s13-transcript.txt`, copied from run 37140480853's `vp-001-transcripts` artifact entry `vp-001-vp-s13-transcript.txt` |
 | `feasibility_evidence_artifact` | 28ab5bc2556219f39246e9410cd9d3aa14e6912967ae3bc28c5260f06b4e05e9 -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-37140480853-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
 | `static_boundary_evidence_artifact` | d06eb156e5d0c20094644f9a77cb7f780d1e548b5b8aa95b1ab2518641651641 -- SHA-256 of the retained file, byte-identical to its CI artifact entry (it holds no runner path to redact), `docs/evidence/VP-001/artifacts/vp-001-run-37140480853-vp-s13-static-boundary.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-vp-s13-static-boundary.txt` |
+
+## VP-001 VP-S14 scenario -- run 37856757384 (2026-10-08)
+
+The first execution of VP-S14 (executable identity, re-probe, shadowed-path
+resistance; desktop-stack-verification-plan.md:135), against the packaged
+AppImage on the pinned Linux baseline, run through `vp-s14-linux.sh` at
+head 5e9550f (`5e9550fff5a0a4289b2f374110c86670fe131c6f`). The plan's
+own procedure column reads "Approve an executable, replace or shadow
+it, relaunch", with expected outcome "Material change forces renewed
+approval before launch" and evidence column "Approval-record diff"
+(desktop-stack-verification-plan.md:135). `vp-s14-linux.sh` reuses
+`vp-s6-linux.sh --mode=feasibility-check` for AV1/AV2, exactly as
+`vp-s13-linux.sh` and `vp-s3-linux.sh` do, then prepares three fixture files
+under a scratch directory before running `vp-s14-scenario.mjs`: copies of the
+real `true` and `false` binaries, named `approved-exe`, `replacement-exe`
+and `shadow-target-exe` by `FIXTURE_NAMES` (`vp-s14-scenario.mjs`),
+read by the driver through node the same way `vp-s13-linux.sh` reads
+`TRAP_NAMES` from `vp-s13-probe.mjs`. The driver guards two integrity
+assumptions before copying anything: the two source binaries must not be
+byte-identical (`gate=fixture-sources-indistinct` otherwise), and each
+copied, renamed fixture must still behave by its own role when run directly
+(`gate=fixture-behaviour-mismatch` otherwise). The scratch directory's own
+path crosses through argv only, never the transcript: neither the driver
+nor the scenario ever prints it, only basenames (`vp-s14-linux.sh`:222-224).
+
+The run itself (37856757384, on `main`) was created at 2026-10-08T22:58:32Z
+and completed at 23:17:23Z, with all three packaging jobs (Linux, Windows,
+macOS) concluding success; only the Linux job carries VP-S14's own scenario
+and static-identity steps, since both are conditioned on `runner.os ==
+'Linux'` in the workflow.
+
+The retained VP-S14 transcript opens with one line of Openbox menu-file
+noise, then `gate=wm-ready`, then the same tauri-driver connection-refused
+preamble VP-001-VP-S13-01's own carries (`Error serving connection:
+hyper::Error(User(Service), client error (Connect)) ... Connection refused (os
+error 111)`), then `gate=av1-digest-match` and `gate=av2-variant-scan-absent`,
+both before any session is attempted. The retained feasibility
+transcript does not open with either the noise, `gate=wm-ready`, or the
+preamble: its first line is `gate=av1-digest-match`, as VP-001-VP-S1-03,
+VP-001-VP-S3-03 and VP-001-VP-S13-01 already established for their own
+feasibility transcripts. `identity_gated` is derived the same way every
+prior VP-S1/VP-S3/VP-S13 row derives it: both `gate=av1-digest-match` and
+`gate=av2-variant-scan-absent` appear, in both transcripts, before the
+scenario session was created.
+
+The AV1 digest gated in both transcripts of this run
+(`28b8b8f37d22efd3827e0f154cb46f2196ab2c7021bf4c0b701d519afd09a004`,
+equal to both `build_channel_digest` and `exercised_artifact_digest`
+below; AV2's `variant_scan` is `absent`) does not match a separate
+validation dispatch against the same head 5e9550f (run 37854685078, not
+filed as a row and its artifacts not retained in this repository), which
+gated `5365be98b20175c255f5244fd9b92e796f79552f0dc22ac25c34888a96c79c00`
+for a packaged build of that same commit, with every other observation
+identical. This is the same non-reproducibility VP-001-VP-S3-03 and
+VP-001-VP-S13-01 recorded for their own commits; this row states no cause
+for it either -- nothing observed here demonstrates one -- and that run's
+own match cannot be re-checked here, since it is not retained.
+
+After the AV1/AV2 gates, `vp-s14-linux.sh`'s own reused `vp-s6-linux.sh
+--mode=feasibility-check` subprocess opened and closed one feasibility session
+of its own, `gate=f1-session-created` / `gate=session-closed` (session
+`ef1804c9-d57b-4f4b-977b-d00dd0a7ddf5`) -- the same two-sessions-per-run
+structure the VP-S1, VP-S3 and VP-S13 rows describe. The three fixtures
+were then copied, chmoded 755, and each run directly to confirm its own
+behaviour, `gate=fixtures-prepared`. A fresh `omnifrons-shell` process
+then started for the scenario's own session attempt, and it succeeded:
+`gate=session-created session_id=acd8f823-f3bb-47eb-b6b4-dc493984c0b7`.
+
+The native "Open File" chooser was driven by the `focus-ctrl-l` strategy
+for both the original pick and case (d)'s re-pick: `dialog_attempt=1
+strategy=focus-ctrl-l` then `dialog_closed=focus-ctrl-l`, each time. The
+first pick's two lines are separated in the transcript by one
+`Gtk-CRITICAL` widget-assertion line from the `omnifrons-shell` process
+(pid 41246), noise of the kind earlier rows catalogue, with no bearing on
+either outcome. The
+original candidate was approved, `gate=approved approval_id=95aa5bc37b6e821d
+basename=approved-exe` -- this gate's own `basename` is the fixture-slot label
+the scenario passes it (`FIXTURE_NAMES.approvedExe`), not a resolved canonical
+path; the bound identity itself is only visible in the approval-record
+diff below.
+
+Case (a), launching the untouched approved copy, resolved with
+`process_id=41432` (`observation=case label="a" outcome="resolved" code=null
+process_id=41432`). The approved file's bytes were then overwritten in place
+with the replacement fixture's (`copyFileSync(replacementPath, approvedPath)`,
+`vp-s14-scenario.mjs`:202): `gate=mutated case=b before_size=26936
+after_size=26936`, the size unchanged because `true` and `false` are
+the same size, 26936 bytes, on this baseline. The scenario checks, not
+merely asserts, that this copy left the file's inode and mode unchanged
+(`vp-s14-scenario.mjs`:201-217); had either changed, the scenario would
+have thrown `mutation-b-invariant-broken` instead of emitting this gate,
+so a bytes-only rewrite -- the mechanism case (b) exists to prove -- is
+what this run exercised. Case (b) was then sent and rejected with the typed
+`changed-since-approval` code (`observation=case label="b" outcome="rejected"
+code="changed-since-approval"`).
+
+The approved path was then replaced outright: unlinked, then re-created
+as a symlink to the shadow-target fixture (`unlinkSync`/`symlinkSync`,
+`vp-s14-scenario.mjs`:222-223), `gate=mutated case=c`. Case (c) was sent and
+rejected with the typed `shadowed-path` code (`observation=case label="c"
+outcome="rejected" code="shadowed-path"`).
+
+The two denial codes carry different wire detail, verified against source by
+`vp-s14-probe.mjs`:45-51: `shadowed-path` carries no `detail` field at all
+(`ShellError::new`, never `with_detail`), while `changed-since-approval`
+carries `detail: { recordedSha256Short, observedSha256Short }` -- both
+digests as short hex prefixes (`src-tauri/src/ipc/dto.rs`:1744-1759;
+`commands.rs`:122-151). Neither response body is retained; only the typed
+codes above are.
+
+A fresh pick of the same path -- now resolving through the symlink to the
+shadow-target fixture -- was approved as a new candidate: `gate=reapproved
+approval_id=20e37ee90c49cf0f basename=approved-exe`, the same fixture-slot
+label as the original approval's own gate, for the same reason. Case
+(d), launching under this re-approval, resolved with `process_id=41499`
+(`observation=case label="d" outcome="resolved" code=null process_id=41499`).
+
+The approval-record diff -- the plan's own evidence column for VP-S14 --
+is carried by three `observation=record` lines, each holding the canonical
+identity's basename (never the scratch directory's full path), size and full
+SHA-256: the original record (`approval_id=95aa5bc37b6e821d`) is identical
+before and after every mutation (`basename="approved-exe" size=26936
+sha256="8a63c98320173f79e263115e10cefc170155e47d1fd4b5a70e4429d2699cae28"
+status="active"`, both phases); the re-approval record
+(`approval_id=20e37ee90c49cf0f`) exists only in the after list, bound to
+`basename="shadow-target-exe"` -- the resolved canonical target, not the
+picked path's own name -- at the same size and the same SHA-256. The two
+digests are equal because each record binds the identity probed at its own
+approval time: the original's is the untouched copy of `true` it approved,
+never re-probed into the record by either later denial; the re-approval's
+is `shadow-target-exe`, another untouched copy of `true`. By the after
+phase `approved-exe` itself had been overwritten with `false`'s bytes and
+then replaced by a symlink, and neither record reflects that.
+
+The twelve remaining observation lines matched every fact
+`derive_executable_identity` (`tools/evidence-validator/src/derive.rs`) needs,
+in `summarize`'s own declared order: `location_scheme_is_app_protocol=true`,
+`approval_recorded=true`, `unchanged_launch_allowed=true`,
+`rewrite_attempted=true`, `rewrite_denied_changed=true`,
+`shadow_attempted=true`, `shadow_denied_shadowed=true`,
+`original_record_unchanged=true`, `reapproval_launched=true`,
+`changed_launch_allowed=false`, `shadow_launch_allowed=false`,
+`record_silently_rebound=false`. `location_scheme_is_app_protocol`
+is `true` only when `location.protocol` was exactly `tauri:`
+(`vp-s14-observations.mjs`:155); the transcript itself never prints
+the scheme string, only this derived boolean. None of the three
+demonstrated-failure facts `derive_executable_identity` checks
+first held: `changed_launch_allowed`, `shadow_launch_allowed`, nor
+`record_silently_rebound`.
+
+The retained static-identity artifact
+(`vp-001-run-37856757384-vp-s14-static-identity.txt`, CI step
+"VP-001 VP-S14 static executable identity (evidence run)") opens
+`gate=static-identity head=5e9550fff5a0a4289b2f374110c86670fe131c6f`,
+this run's head. Its `launch-gate` section runs four tests under
+`--features contract-tests` (`rewritten_file_is_denied_with_both_digests`,
+`shadowed_path_is_denied_with_both_paths`, `revoked_approval_is_denied`,
+`re_approval_after_revoke_is_allowed`) and its `prober` section runs one
+(`unix_tests::a_symlink_resolves_to_its_canonical_target_and_follows_a_swap`);
+each section ends `status=0`. Both selections run through the same `pinned`
+helper (`docs/evidence/VP-001/procedures/pinned-tests.sh`) VP-001-VP-S13-01's
+own static artifact uses, sourced by the workflow step at this run's head:
+the artifact records the outcome, not the invocation, but the workflow's
+exact-name test selection is what makes `status=0` mean every named test ran
+and passed, not merely that nothing was run. This gives `static_gate_pinned`
+true.
+
+Every fact `derive_executable_identity` requires for `Pass` was then true,
+so it yields `(Pass, RenewalRequired)` -- the public `renewal-required`
+token below.
+
+This Pass is bounded to exactly what `ExecutableIdentity` binds: the canonical
+path, size and SHA-256 (`crates/omnifrons-domain/src/executable.rs`:105-126,
+whose own `PartialEq` compares only those three fields). ADR 0002's own
+Executable approval paragraph (`docs/adr/0002-desktop-technology-stack.md`:67)
+also lists version, adapter, transport, plugin inventory and
+security-relevant configuration as identity evidence; none of those is
+bound by `ExecutableIdentity`, so this row says nothing about whether any
+of them changed between the original approval and either mutation. That
+gap is tracked separately, not by this scenario (`derive.rs`:471-476).
+
+This is the Linux baseline VP-001-BASE-01 only. Per VP-001-R15, a passing
+result does not transfer between baselines; this run exercised no Windows
+junction behaviour and no macOS signature, and the packaged Linux AppImage
+this row exercises carries no code signature of its own.
+
+`executable_approve` has no de-duplication or supersession of its own: the
+re-approval in case (d) is a fresh record with its own new `approval_id`,
+created because the scenario called `executable_approve` again, not because
+any mechanism under test renews the original record automatically. This
+scenario proves that a changed or shadowed executable is refused and that a
+fresh approval of the resolved target then launches; it does not exercise,
+and this row does not claim, any automatic renewal flow.
+
+`executable_approve(candidateId)` was invoked over IPC directly,
+from the probe's in-page script builders (`vp-s14-probe.mjs`) acting on
+`window.__TAURI_INTERNALS__.invoke` -- this scenario drives no DOM at all,
+unlike VP-S13. Any typed-digest confirmation step the renderer's own UI
+presents before calling `executable_approve` is a UI affordance on top of
+that call, not a precondition the IPC command itself enforces, so this row
+does not evidence that UI gate either way.
+
+As already noted, the response bodies behind every case outcome are not
+retained; only the typed outcome, code and (for a resolved case) process
+id are.
+
+Timing context: within the Linux job, the Ubuntu job log (not a retained
+artifact) records the VP-S14 scenario step running from 23:13:22 to 23:14:35
+UTC, and the VP-S14 static executable identity step running from 23:16:35
+to 23:16:36 UTC, its release build already cached by the earlier static
+steps the job ran first. This row states no cause for either duration and
+derives no finer-grained interval within either step.
+
+No row in docs/desktop-stack-verification-plan.md's VP-001-R* requirements
+table names VP-S14; only VP-S14's own scenario-catalog row does.
+
+Each `evidence_artifact` digest below is the SHA-256 of the retained,
+redacted file at the path it names -- the file in this repository, not the
+CI artifact entry it was copied from, whose runner paths were rewritten to
+`<extract-dir>` before retention. The static-identity artifact carries no such
+path to redact: its `/home/runner/work/omnifrons/omnifrons/crates/...` lines
+are GitHub runner paths, not personal ones, and are retained byte-identical
+to the CI artifact entry.
+
+| field | value |
+| --- | --- |
+| `record_id` | VP-001-VP-S14-01 |
+| `kind` | scenario |
+| `scenario_id` | VP-S14 |
+| `baseline_id` | VP-001-BASE-01 |
+| `result` | pass |
+| `observed_state` | renewal-required |
+| `build_channel` | packaged-ci |
+| `build_channel_digest` | 28b8b8f37d22efd3827e0f154cb46f2196ab2c7021bf4c0b701d519afd09a004 |
+| `exercised_artifact_digest` | 28b8b8f37d22efd3827e0f154cb46f2196ab2c7021bf4c0b701d519afd09a004 |
+| `variant_scan` | absent |
+| `procedure_ref` | docs/evidence/VP-001/procedures/vp-s14-linux.sh |
+| `blocker` | none -- the scenario ran to completion and every `derive_executable_identity` `Pass` proof was observed |
+| `identity_gated` | true -- derived from `gate=av1-digest-match` and `gate=av2-variant-scan-absent`, both before the scenario session was created, in both retained transcripts |
+| `location_scheme_is_app_protocol` | true -- `observation=location_scheme_is_app_protocol value=true`; the probe sets this only when `location.protocol` is exactly `tauri:`. |
+| `static_gate_pinned` | true -- the retained static-identity artifact's `launch-gate` section (4 tests) and `prober` section (1 test) each end `status=0`. |
+| `approval_recorded` | true -- `observation=approval_recorded value=true`. |
+| `unchanged_launch_allowed` | true -- `observation=unchanged_launch_allowed value=true`; case (a) resolved with `process_id=41432`. |
+| `rewrite_attempted` | true -- `observation=rewrite_attempted value=true`; case (b) settled, `outcome="rejected" code="changed-since-approval"`. |
+| `rewrite_denied_changed` | true -- `observation=rewrite_denied_changed value=true`. |
+| `shadow_attempted` | true -- `observation=shadow_attempted value=true`; case (c) settled, `outcome="rejected" code="shadowed-path"`. |
+| `shadow_denied_shadowed` | true -- `observation=shadow_denied_shadowed value=true`. |
+| `original_record_unchanged` | true -- `observation=original_record_unchanged value=true`; the two `observation=record` lines for `approval_id=95aa5bc37b6e821d` are identical before and after |
+| `reapproval_launched` | true -- `observation=reapproval_launched value=true`; case (d) resolved with `process_id=41499`; the re-approval's own record (`approval_id=20e37ee90c49cf0f`) appears only after, bound to a different canonical basename |
+| `changed_launch_allowed` | false -- `observation=changed_launch_allowed value=false`. |
+| `shadow_launch_allowed` | false -- `observation=shadow_launch_allowed value=false`. |
+| `record_silently_rebound` | false -- `observation=record_silently_rebound value=false`. |
+| `run_date` | 2026-10-08 |
+| `ci_run` | workflow tauri-build.yml, workflow_dispatch (vp001_scenario: true), run 37856757384, head 5e9550f, conclusion success |
+| `retention` | GitHub retains this run's `vp-001-linux-baseline` and `vp-001-transcripts` artifacts only until 2027-01-06 |
+| `evidence_artifact` | e3396f708b52073e6e72af7543e056ac1876e99784eedec4c004fad3c74beeef -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-37856757384-vp-s14-transcript.txt`, copied from run 37856757384's `vp-001-transcripts` artifact entry `vp-001-vp-s14-transcript.txt` |
+| `feasibility_evidence_artifact` | b03a0c79ff08534f6aa7ebc8edf97599d42f66ef816e8f54f60ef0bb0d4a09fd -- SHA-256 of the retained redacted file `docs/evidence/VP-001/artifacts/vp-001-run-37856757384-feasibility-transcript.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-feasibility-transcript.txt` |
+| `static_identity_evidence_artifact` | 56ea196d97aab0cf20a7afdb38cf002e8a35c45fe343776783ce3f31e909fef2 -- SHA-256 of the retained file, byte-identical to its CI artifact entry (it holds no runner path to redact), `docs/evidence/VP-001/artifacts/vp-001-run-37856757384-vp-s14-static-identity.txt`, copied from the same run's `vp-001-transcripts` artifact entry `vp-001-vp-s14-static-identity.txt` |
