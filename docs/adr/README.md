@@ -113,6 +113,7 @@ An exception never changes a failed test into a pass. It records bounded accepte
 | [ADR-0002: Desktop technology stack](0002-desktop-technology-stack.md) | Proposed | Proposes Tauri 2 with framework-independent Rust core and React/TypeScript renderer. | Reproducible cross-platform verification plan, security review, and confirmed Rust ownership. |
 | [ADR-0003: Local Markdown and tiered assets](0003-local-markdown-and-tiered-assets.md) | Accepted | Keeps Markdown always local and separates optional heavy-asset storage. | Owner decision recorded; implementation diagnostics and provider conformance remain required. |
 | [ADR-0004: Fully open platform with custom integrated apps](0004-open-platform-and-custom-apps.md) | Accepted | Publishes the entire general product as free software; monetization through per-client custom apps above the platform. | Owner decision recorded; legal advice on service terms required before first reliant engagement. |
+| [ADR-0005: Agent identity and portable definition](0005-agent-identity-and-portable-definition.md) | Proposed | Proposes a project-root agent definition (canonical `AGENTS.md`, `@AGENTS.md` wrapper, indexed local skills) written only through a consented dry-run, plan id, and apply path; portable configuration that never authorizes execution. | A new VP-001 scenario, Linux first: one definition loads identically through each built-in adapter and survives a model switch; migration of prototype-adapted agents verified on a copy. |
 
 ## Planned governance artifact
 

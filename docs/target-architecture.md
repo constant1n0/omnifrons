@@ -40,6 +40,7 @@ It does not own model inference, provider accounts, hidden reasoning, private ve
 - **Engram Git Sync profile:** Engram's supported Git-based memory export/import mode.
 - **Engram Cloud profile:** Optional alternative memory synchronization authority.
 - **Logical agent:** Omnifrons-owned durable identity; never a vendor session ID.
+- **Agent definition:** Proposed by [ADR-0005](adr/0005-agent-identity-and-portable-definition.md): the project-root artifact (canonical `AGENTS.md`, wrapper, skills index) a Logical agent runs; portable configuration that never authorizes execution.
 - **WorkspaceRoot:** Registered parent for projects and portable Omnifrons state.
 - **ActiveProjectRoot:** Selected project and default harness `cwd`/requested scope.
 - **Scope mode:** `sandbox-enforced`, `harness-enforced`, or `advisory`.

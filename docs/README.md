@@ -65,6 +65,7 @@ A cross-reference into another document never cites a line number. Line numbers 
 | ADR-0002: Desktop technology stack | Proposed |
 | ADR-0003: Local Markdown and tiered assets | Accepted |
 | ADR-0004: Fully open platform and custom integrated apps | Accepted |
+| ADR-0005: Agent identity and portable definition | Proposed |
 | Product name: Omnifrons | Selected; formal trademark clearance pending |
 
 Unreconciled early visual and generic-wrapper notes are historical inputs, not current architecture. They should be restored only with explicit status and reconciliation rather than silently mixed into this baseline.
