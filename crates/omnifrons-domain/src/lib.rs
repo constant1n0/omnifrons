@@ -6,6 +6,7 @@
 //! contracts run and test without a desktop shell or an async runtime.
 
 pub mod adapter;
+pub mod definition;
 pub mod executable;
 pub mod guidance;
 pub mod outbox;
