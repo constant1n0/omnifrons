@@ -21,6 +21,11 @@ fn row(name: &str, description: &str, path: &str) -> SkillRow {
         name: name.to_string(),
         description: description.to_string(),
         path: path.to_string(),
+        // This file never exercises `unsafe_row_fields`'s undecodable-
+        // bytes note (Finding 1): every row here is a plain fixture,
+        // never decoded from bytes, so there is no real decode outcome
+        // to carry.
+        had_undecodable_bytes: false,
     }
 }
 

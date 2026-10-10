@@ -26,6 +26,7 @@
 //! it is judged unsafe exactly as the prototype's own surrogate would be
 //! -- only the text shown for it differs.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::skills_index::{SkillRow, link_target, table_cell};
@@ -347,6 +348,16 @@ pub struct SkillMetadata {
     /// The project-relative POSIX path of the skill's `SKILL.md`, as
     /// given.
     pub path: String,
+    /// True when decoding `bytes` to
+    /// UTF-8 needed to replace at least one byte that was not valid
+    /// UTF-8 with `U+FFFD` ([`String::from_utf8_lossy`] returned
+    /// `Cow::Owned`) -- the file itself held invalid UTF-8, as opposed
+    /// to a `name` or `description` that simply, legitimately,
+    /// contains a literal `U+FFFD` character already. `false` means
+    /// the file's bytes were valid UTF-8 end to end, so any `U+FFFD`
+    /// a caller finds in `name` or `description` is the file's own
+    /// text, not a replacement marker.
+    pub had_undecodable_bytes: bool,
 }
 
 /// One indexed field (`name` or `description`) whose front matter `\u`
@@ -393,6 +404,14 @@ fn folder_name(path: &str) -> String {
 /// UTF-8 (this module's stand-in for the prototype's
 /// `has_undecodable_bytes`, which tests for its own surrogate-escape
 /// marker instead; see the module documentation).
+///
+/// A purely textual check, so it cannot
+/// tell a real replacement apart from a legitimate, validly-encoded
+/// literal `U+FFFD` already present in the source -- both simply
+/// contain the character. [`unsafe_row_fields`] no longer uses this
+/// function to decide its undecodable-bytes note; it instead reads
+/// [`SkillRow::had_undecodable_bytes`], the decode outcome carried
+/// from [`read_skill_metadata`].
 #[must_use]
 pub fn has_undecodable_bytes(text: &str) -> bool {
     text.contains('\u{FFFD}')
@@ -683,6 +702,14 @@ fn fold_scalar(parts: &[String]) -> Result<String, Vec<u16>> {
 /// any write, since UTF-8 has no form for it.
 pub fn read_skill_metadata(path: &str, bytes: &[u8]) -> Result<SkillMetadata, SkillMetadataError> {
     let text = String::from_utf8_lossy(bytes);
+    // `from_utf8_lossy` returns
+    // `Cow::Owned` exactly when it had to replace at least one byte
+    // that was not valid UTF-8 -- `Cow::Borrowed` means `bytes` was
+    // already valid UTF-8 end to end, so a `U+FFFD` found later in
+    // `name` or `description` is the file's own text, not a
+    // replacement marker. Matching only `Cow::Owned(_)`, never binding
+    // its `String`, reads the decode outcome without moving `text`.
+    let had_undecodable_bytes = matches!(text, Cow::Owned(_));
     let parts = frontmatter_parts(&text);
     let mut invalid = Vec::new();
     let mut fields: HashMap<&'static str, String> = HashMap::new();
@@ -708,6 +735,7 @@ pub fn read_skill_metadata(path: &str, bytes: &[u8]) -> Result<SkillMetadata, Sk
         name,
         description,
         path: path.to_string(),
+        had_undecodable_bytes,
     })
 }
 
@@ -808,12 +836,19 @@ pub fn unsafe_row_fields(rows: &[SkillRow]) -> Vec<String> {
         name,
         description,
         path,
+        had_undecodable_bytes,
     } in rows
     {
         for (field_name, value) in [("name", name), ("description", description)] {
             let words = unsafe_at_tokens(&table_cell(value), true);
             if !words.is_empty() {
-                let note = if has_undecodable_bytes(value) {
+                // Gated on the row's own
+                // carried decode outcome, not on whether `value` merely
+                // *contains* `U+FFFD` (`has_undecodable_bytes`) -- a
+                // legitimate, validly-encoded `U+FFFD` would otherwise
+                // false-positive this note even though the file never
+                // held invalid UTF-8.
+                let note = if *had_undecodable_bytes {
                     UNDECODABLE_NOTE
                 } else {
                     ""

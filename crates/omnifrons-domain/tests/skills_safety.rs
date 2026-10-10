@@ -199,6 +199,7 @@ fn read_skill_metadata_reads_name_and_description_from_front_matter() {
             name: "alpha".to_string(),
             description: "Alpha tasks.".to_string(),
             path: "skills/alpha/SKILL.md".to_string(),
+            had_undecodable_bytes: false,
         }
     );
 }
@@ -600,6 +601,24 @@ fn row(name: &str, description: &str, path: &str) -> SkillRow {
         name: name.to_string(),
         description: description.to_string(),
         path: path.to_string(),
+        // A hand-built fixture, never decoded from bytes: there is no
+        // real decode outcome to carry, so every case that does not
+        // care about Finding 1's undecodable-bytes note gets `false`.
+        had_undecodable_bytes: false,
+    }
+}
+
+/// Bridges a decoded [`SkillMetadata`] into the [`SkillRow`]
+/// [`unsafe_row_fields`] checks, carrying [`SkillMetadata::had_undecodable_bytes`]
+/// through unchanged -- the same bridging ADR-0005 sub-slice 1e's
+/// still-unbuilt discovery service will eventually do in production
+/// (Finding 1).
+fn to_row(metadata: SkillMetadata) -> SkillRow {
+    SkillRow {
+        name: metadata.name,
+        description: metadata.description,
+        path: metadata.path,
+        had_undecodable_bytes: metadata.had_undecodable_bytes,
     }
 }
 
@@ -670,6 +689,25 @@ fn unsafe_row_fields_refuses_every_unsafe_field_case() {
             "missing {expected:?} in {problems:?}"
         );
     }
+}
+
+/// Finding 2: every case above uses at most one unsafe word per field,
+/// so `quoted_words`'s own de-duplication ("a", "b": each distinct
+/// word once, in order) has never been asserted at the
+/// `unsafe_row_fields` level. `"@a and @a"` reports the same word
+/// `"@a"` twice ([`unsafe_at_tokens`]); the refusal text must still
+/// quote it once, exactly matching the single-word format used
+/// throughout this file.
+#[test]
+fn unsafe_row_fields_quotes_a_repeated_unsafe_word_once() {
+    let rows = [row("dup", "@a and @a", "skills/dup/SKILL.md")];
+    let problems = unsafe_row_fields(&rows);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p == "'skills/dup/SKILL.md' (its description holds \"@a\")"),
+        "{problems:?}"
+    );
 }
 
 /// Translated from the prototype's `ESCAPED_AT` in
@@ -760,6 +798,43 @@ fn unsafe_row_fields_refuses_paths_that_break_the_link_or_import() {
     }
 }
 
+/// Finding 3: `python_repr`'s quote-switching -- double quotes when
+/// the path holds a single quote but no double quote; single quotes,
+/// with the single quote escaped, when it holds both -- is otherwise
+/// exercised only by the backslash- and `\n`-escaping cases above.
+/// Python's own `repr()` is the oracle the module documentation
+/// already cites for this rule (verified separately with `python3`;
+/// see this task's report for the exact command and output). The
+/// trigger here is an unsafe `@` in the description, not the path
+/// itself, so each case exercises `python_repr` with no other safety
+/// rule involved.
+#[test]
+fn unsafe_row_fields_quotes_a_path_holding_only_a_single_quote_in_double_quotes() {
+    let rows = [row("x", "@unsafe", "skills/it's/SKILL.md")];
+    let problems = unsafe_row_fields(&rows);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p == "\"skills/it's/SKILL.md\" (its description holds \"@unsafe\")"),
+        "{problems:?}"
+    );
+}
+
+/// Finding 3: a path holding both quote kinds falls back to
+/// single-quote wrapping with the embedded single quote escaped and
+/// the embedded double quotes left bare, matching Python's `repr()`.
+#[test]
+fn unsafe_row_fields_quotes_a_path_holding_both_quote_kinds_in_single_quotes() {
+    let rows = [row("x", "@unsafe", "skills/it's/\"quoted\"/SKILL.md")];
+    let problems = unsafe_row_fields(&rows);
+    assert!(
+        problems.iter().any(|p| {
+            p == "'skills/it\\'s/\"quoted\"/SKILL.md' (its description holds \"@unsafe\")"
+        }),
+        "{problems:?}"
+    );
+}
+
 /// Adapted from the prototype's `LATIN1_SKILLS` in
 /// `test_undecodable_bytes_never_crash_any_output` (VER-H-001): a raw
 /// byte that is not valid UTF-8 right next to an unsafe `@` is still
@@ -769,16 +844,34 @@ fn unsafe_row_fields_refuses_paths_that_break_the_link_or_import() {
 /// `skills_safety` module documentation), so the quoted word and the
 /// appended note differ from the prototype's exact text while the
 /// behaviour -- flagged, not crashed -- matches it.
+///
+/// Review follow-up (Finding 1): rewritten from a hand-built `row()`
+/// fixture carrying a literal, already-valid `U+FFFD`, to real raw
+/// bytes decoded through [`read_skill_metadata`] -- the only way to
+/// observe a genuine `Cow::Owned` decode outcome rather than assuming
+/// one. `0xFF` is never a valid UTF-8 lead or continuation byte, so
+/// `String::from_utf8_lossy` replaces it with exactly one `U+FFFD`
+/// (the same single-invalid-byte shape as `0xE9`/`0xF1` elsewhere in
+/// this file).
 #[test]
 fn unsafe_row_fields_notes_a_raw_invalid_byte_next_to_an_unsafe_at() {
-    let rows = [
-        row(
-            "es",
-            "Escribe a jos\u{FFFD}@ejemplo.es",
-            "skills/es/SKILL.md",
-        ),
-        row("caf\u{FFFD}@home", "d", "skills/fr/SKILL.md"),
-    ];
+    let mut description_bytes = b"---\nname: es\ndescription: Escribe a jos".to_vec();
+    description_bytes.push(0xFF);
+    description_bytes.extend_from_slice(b"@ejemplo.es\n---\n");
+    let description_metadata =
+        read_skill_metadata("skills/es/SKILL.md", &description_bytes).unwrap();
+    assert!(
+        description_metadata.had_undecodable_bytes,
+        "{description_metadata:?}"
+    );
+
+    let mut name_bytes = b"---\nname: caf".to_vec();
+    name_bytes.push(0xFF);
+    name_bytes.extend_from_slice(b"@home\ndescription: d\n---\n");
+    let name_metadata = read_skill_metadata("skills/fr/SKILL.md", &name_bytes).unwrap();
+    assert!(name_metadata.had_undecodable_bytes, "{name_metadata:?}");
+
+    let rows = [to_row(description_metadata), to_row(name_metadata)];
     let problems = unsafe_row_fields(&rows);
     assert!(
         problems.iter().any(|p| {
@@ -793,6 +886,33 @@ fn unsafe_row_fields_notes_a_raw_invalid_byte_next_to_an_unsafe_at() {
             p.starts_with("'skills/fr/SKILL.md' (its name holds \"caf\u{FFFD}@home\"")
                 && p.contains("not valid UTF-8")
         }),
+        "{problems:?}"
+    );
+}
+
+/// Finding 1 (RED first against the pre-fix `unsafe_row_fields`, which
+/// keyed the note off `has_undecodable_bytes(value)` -- whether the
+/// decoded field merely *contains* `U+FFFD` -- rather than off whether
+/// the file's own bytes needed lossy replacement): a validly-encoded,
+/// literal `U+FFFD` written directly in a `SKILL.md`'s source text
+/// decodes with no replacement at all, so
+/// [`SkillMetadata::had_undecodable_bytes`] is `false`. The `@` right
+/// after it still has to stay unsafe (the module documentation's own
+/// point: `U+FFFD` is neither a letter, digit, nor one of the
+/// word-safe punctuation characters, however it got there), but the
+/// refusal must NOT carry the undecodable-bytes note: this file never
+/// actually held invalid UTF-8.
+#[test]
+fn unsafe_row_fields_omits_the_note_for_a_legitimate_literal_replacement_character() {
+    let bytes = "---\nname: es\ndescription: Escribe a jos\u{FFFD}@ejemplo.es\n---\n".as_bytes();
+    let metadata = read_skill_metadata("skills/es/SKILL.md", bytes).unwrap();
+    assert!(!metadata.had_undecodable_bytes, "{metadata:?}");
+
+    let problems = unsafe_row_fields(&[to_row(metadata)]);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p == "'skills/es/SKILL.md' (its description holds \"jos\u{FFFD}@ejemplo.es\")"),
         "{problems:?}"
     );
 }

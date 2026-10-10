@@ -368,6 +368,7 @@ pub fn rows_to_generate(prefix_text: &[u8], discovered: &[SkillRow]) -> Vec<Skil
             name: row.name.clone(),
             description: row.description.clone(),
             path,
+            had_undecodable_bytes: row.had_undecodable_bytes,
         });
     }
     normalized.retain(|row| !covered.contains(&row.path));
@@ -453,6 +454,15 @@ pub struct SkillRow {
     pub description: String,
     /// The project-relative POSIX path of the skill's `SKILL.md`.
     pub path: String,
+    /// Review follow-up (Finding 1): true when decoding this skill's
+    /// `SKILL.md` bytes to UTF-8 needed to replace at least one byte
+    /// that was not valid UTF-8 ([`crate::skills_safety::SkillMetadata::had_undecodable_bytes`],
+    /// carried through unchanged). [`crate::skills_safety::unsafe_row_fields`]
+    /// conditions its undecodable-bytes note on this flag, not on
+    /// whether `name` or `description` merely contains a `U+FFFD`
+    /// character -- a legitimate, validly-encoded `U+FFFD` sets this
+    /// to `false`.
+    pub had_undecodable_bytes: bool,
 }
 
 /// A Markdown table cell (the prototype's `table_cell`): embedded line
