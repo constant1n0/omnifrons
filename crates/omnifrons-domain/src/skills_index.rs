@@ -52,43 +52,51 @@ fn skip_spaces(chars: &[char], start: usize) -> usize {
 /// the closing `)`, or `None` when nothing here matches.
 fn match_link(chars: &[char], start: usize) -> Option<(String, usize)> {
     let target_start = skip_spaces(chars, start);
-    let mut pos = target_start;
-    let mut bracketed = false;
-    if chars.get(pos) == Some(&'<') {
-        let mut scan = pos + 1;
+    if chars.get(target_start) == Some(&'<') {
+        let mut scan = target_start + 1;
         while chars.get(scan).is_some_and(|c| *c != '<' && *c != '>') {
             scan += 1;
         }
-        if chars.get(scan) == Some(&'>') {
-            pos = scan + 1;
-            bracketed = true;
-        }
-        // Else: a nested `<` (or no closing `>` at all) before the
-        // first `>`, so this is not a valid bracketed target. Fall
-        // through to the bare-target branch below, starting over from
-        // `target_start` -- the same `<` that opened the failed
-        // attempt is just an ordinary character there (review
-        // follow-up, correction pass: the regex alternation
-        // `(<[^<>]*>|[^()\s]+)` tries its second branch here; an
-        // earlier version returned no match at all instead).
-    }
-    if !bracketed {
-        pos = target_start;
-        if !chars
-            .get(pos)
-            .is_some_and(|c| *c != '(' && *c != ')' && !c.is_whitespace())
+        if chars.get(scan) == Some(&'>')
+            && let Some(matched) = finish_match(chars, target_start, scan + 1)
         {
-            return None;
+            return Some(matched);
         }
-        while chars
-            .get(pos)
-            .is_some_and(|c| *c != '(' && *c != ')' && !c.is_whitespace())
-        {
-            pos += 1;
-        }
+        // Else: either a nested `<` (or no closing `>` at all) before
+        // the first `>`, or a bracketed target that closes but whose
+        // remainder never reaches `)` -- so this is not a valid
+        // bracketed target after all. Fall through to the bare-target
+        // branch below, starting over from `target_start` -- the same
+        // `<` that opened the failed attempt is just an ordinary
+        // character there (review follow-up, correction pass: the
+        // regex alternation `(<[^<>]*>|[^()\s]+)` backtracks into its
+        // second branch in both cases; an earlier version returned no
+        // match at all instead).
     }
-    let target: String = chars[target_start..pos].iter().collect();
-    let after_target = pos;
+    let mut pos = target_start;
+    if !chars
+        .get(pos)
+        .is_some_and(|c| *c != '(' && *c != ')' && !c.is_whitespace())
+    {
+        return None;
+    }
+    while chars
+        .get(pos)
+        .is_some_and(|c| *c != '(' && *c != ')' && !c.is_whitespace())
+    {
+        pos += 1;
+    }
+    finish_match(chars, target_start, pos)
+}
+
+/// The optional quoted title and the closing `)` that follow a
+/// matched target, shared by both of [`match_link`]'s branches:
+/// returns the target text (`chars[target_start..target_end]`) and the
+/// index just past the closing `)`, or `None` when the remainder does
+/// not reach it.
+fn finish_match(chars: &[char], target_start: usize, target_end: usize) -> Option<(String, usize)> {
+    let target: String = chars[target_start..target_end].iter().collect();
+    let after_target = target_end;
     let ws_pos = skip_spaces(chars, after_target);
     if ws_pos > after_target
         && let Some(quote) = chars
@@ -333,19 +341,37 @@ pub fn read_skill_index(text: &[u8], discovered: &[String]) -> SkillIndexStatus 
 /// there is none -- in `discovered`'s own order (the prototype's
 /// `plan_block`: `covered = set(indexed_skills(root, prefix)); skills =
 /// [path for path in discovered if path not in covered]`, together
-/// with the row-reading `plan_block` does for each one it keeps). This
-/// function only filters the rows it is handed: discovering a
-/// project's skills in the first place, and attributing a nested
-/// project's skills to their own agent rather than its parent's, is
-/// ADR-0005 sub-slice 1e's job, not this one's.
+/// with the row-reading `plan_block` does for each one it keeps). Each
+/// row's path is normalized through [`normalize_relative_target`] and
+/// de-duplicated by that normalized path (first occurrence kept)
+/// before comparing against [`indexed_skill_targets`]'s own normalized
+/// output, exactly as [`read_skill_index`] already normalizes
+/// `discovered` -- otherwise a `./`-prefixed or repeated path would
+/// compare unequal to an already-covered target and be regenerated as
+/// a duplicate link (review follow-up, correction pass). This function
+/// only filters the rows it is handed: discovering a project's skills
+/// in the first place, and attributing a nested project's skills to
+/// their own agent rather than its parent's, is ADR-0005 sub-slice 1e's
+/// job, not this one's.
 #[must_use]
 pub fn rows_to_generate(prefix_text: &[u8], discovered: &[SkillRow]) -> Vec<SkillRow> {
     let covered = indexed_skill_targets(prefix_text);
-    discovered
-        .iter()
-        .filter(|row| !covered.contains(&row.path))
-        .cloned()
-        .collect()
+    let mut seen: Vec<String> = Vec::with_capacity(discovered.len());
+    let mut normalized: Vec<SkillRow> = Vec::with_capacity(discovered.len());
+    for row in discovered {
+        let path = normalize_relative_target(&row.path);
+        if seen.contains(&path) {
+            continue;
+        }
+        seen.push(path.clone());
+        normalized.push(SkillRow {
+            name: row.name.clone(),
+            description: row.description.clone(),
+            path,
+        });
+    }
+    normalized.retain(|row| !covered.contains(&row.path));
+    normalized
 }
 
 /// Whether the skills block needs to exist at all (the prototype's own

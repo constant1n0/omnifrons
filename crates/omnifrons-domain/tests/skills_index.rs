@@ -12,8 +12,8 @@
 
 use omnifrons_domain::skills_index::{
     INDEX_HEADING, PRECEDENCE_PHRASES, PRECEDENCE_RULE, RULE_HEADING, SkillIndexStatus, SkillRow,
-    block_needed, has_precedence_phrases, indexed_skill_targets, read_skill_index, render_body,
-    render_row, rows_to_generate,
+    block_needed, has_precedence_phrases, indexed_skill_targets, normalize_relative_target,
+    read_skill_index, render_body, render_row, rows_to_generate,
 };
 
 fn row(name: &str, description: &str, path: &str) -> SkillRow {
@@ -393,6 +393,44 @@ fn rows_to_generate_only_filters_the_given_rows_never_discovers_more() {
     );
 }
 
+/// Review follow-up (WARNING, correction pass): `indexed_skill_targets`
+/// returns normalized targets, but comparing a row's raw,
+/// un-normalized `path` against them let a `./`-prefixed row slip past
+/// as "not yet covered" and be regenerated as a duplicate link.
+#[test]
+fn rows_to_generate_treats_a_dot_slash_prefixed_row_as_already_covered() {
+    let already = row("x", "X.", "./skills/x/SKILL.md");
+    let discovered = [already];
+    let prefix = b"[x](skills/x/SKILL.md)\n";
+    assert_eq!(
+        rows_to_generate(prefix, &discovered),
+        Vec::<SkillRow>::new()
+    );
+}
+
+/// The same normalization applies to a `.` segment in the middle of a
+/// row's path, not only a leading `./`.
+#[test]
+fn rows_to_generate_treats_a_dot_segment_in_the_middle_as_already_covered() {
+    let already = row("x", "X.", "skills/./x/SKILL.md");
+    let discovered = [already];
+    let prefix = b"[x](skills/x/SKILL.md)\n";
+    assert_eq!(
+        rows_to_generate(prefix, &discovered),
+        Vec::<SkillRow>::new()
+    );
+}
+
+/// A repeated row -- the same path handed in twice -- is de-duplicated,
+/// first occurrence kept, exactly as `read_skill_index` de-duplicates
+/// `discovered`.
+#[test]
+fn rows_to_generate_deduplicates_a_repeated_row_first_seen_kept() {
+    let dup = row("dup", "Dup.", "skills/dup/SKILL.md");
+    let discovered = [dup.clone(), dup.clone()];
+    assert_eq!(rows_to_generate(b"", &discovered), vec![dup]);
+}
+
 /// Review follow-up (correction pass): an invalid `%XX` escape (not two
 /// hex digits) is left exactly as written -- the prototype's `unquote`
 /// never raises on it.
@@ -444,6 +482,22 @@ fn indexed_skill_targets_falls_through_to_bare_target_for_a_nested_angle_bracket
     assert_eq!(
         indexed_skill_targets(text),
         vec!["skills/<weird>/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (SUGGESTION): the regex alternation
+/// `(<[^<>]*>|[^()\s]+)` also falls through to the bare-target branch
+/// when the bracketed target closes but the remainder does not reach
+/// `)` -- here, trailing text right after the closing `>`, with no
+/// space before it and so no room for a quoted title -- rather than
+/// failing to match at all.
+#[test]
+fn indexed_skill_targets_falls_through_to_bare_target_when_the_bracket_closes_but_the_remainder_misses_the_paren()
+ {
+    let text = b"[a](<s>kills/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["<s>kills/SKILL.md".to_string()]
     );
 }
 
@@ -558,4 +612,40 @@ fn read_skill_index_deduplicates_a_repeated_discovered_path() {
     let status = read_skill_index(b"No links here.\n", &discovered);
     assert_eq!(status.discovered, vec!["skills/x/SKILL.md".to_string()]);
     assert_eq!(status.missing, vec!["skills/x/SKILL.md".to_string()]);
+}
+
+/// Review follow-up (SUGGESTION): an unresolvable leading `..` is
+/// kept, exactly as `posixpath.normpath` keeps it (verified with
+/// `python3 -c "import posixpath;
+/// print(posixpath.normpath('../SKILL.md'))"`, which prints
+/// `../SKILL.md`).
+#[test]
+fn normalize_relative_target_keeps_an_unresolvable_leading_dot_dot() {
+    assert_eq!(normalize_relative_target("../SKILL.md"), "../SKILL.md");
+}
+
+/// Review follow-up (SUGGESTION): two real segments fully absorb two
+/// trailing `..`, leaving nothing to retain (verified with
+/// `python3 -c "import posixpath;
+/// print(posixpath.normpath('skills/x/../../SKILL.md'))"`, which
+/// prints `SKILL.md` -- not `../SKILL.md`).
+#[test]
+fn normalize_relative_target_fully_absorbs_two_dot_dots_into_two_real_segments() {
+    assert_eq!(
+        normalize_relative_target("skills/x/../../SKILL.md"),
+        "SKILL.md"
+    );
+}
+
+/// Review follow-up (SUGGESTION): a `..` that follows an
+/// already-retained `..` is retained in turn rather than popping it
+/// (verified with `python3 -c "import posixpath;
+/// print(posixpath.normpath('../../a/../SKILL.md'))"`, which prints
+/// `../../SKILL.md`).
+#[test]
+fn normalize_relative_target_retains_a_dot_dot_that_follows_another_retained_one() {
+    assert_eq!(
+        normalize_relative_target("../../a/../SKILL.md"),
+        "../../SKILL.md"
+    );
 }
