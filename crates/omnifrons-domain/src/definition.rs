@@ -538,13 +538,14 @@ fn apply_secondary_and_host_extras(
         );
     }
     if state == RootState::Canonical && !dir.host_extras.is_empty() {
+        // Sorted (byte order), not the caller's construction order, so
+        // the reason is independent of it too (review follow-up).
+        let mut extras = dir.host_extras.clone();
+        extras.sort();
         return Classification::new(
             RootState::HostExtras,
             Some(IdentityKind::Agents),
-            format!(
-                "canonical, with host extras: {}",
-                dir.host_extras.join(", ")
-            ),
+            format!("canonical, with host extras: {}", extras.join(", ")),
         );
     }
     Classification::new(state, Some(source), reason)
@@ -640,16 +641,24 @@ pub fn title(bytes: &[u8]) -> Option<String> {
 /// content is a bare closing sequence with no text before it and so
 /// reduces to empty either way.
 fn strip_closing_hash_run(heading: &str) -> &str {
-    let without_trailing_spaces = heading.trim_end_matches(' ');
+    let without_trailing_spaces = heading.trim_end_matches(is_space_or_tab);
     let core = without_trailing_spaces.trim_end_matches('#');
     if core.len() == without_trailing_spaces.len() {
         return heading; // No trailing `#` at all: nothing to strip.
     }
-    if core.is_empty() || core.ends_with(' ') {
+    if core.is_empty() || core.ends_with(is_space_or_tab) {
         core
     } else {
         heading
     }
+}
+
+/// A space or a tab: the two ASCII whitespace characters `CommonMark`
+/// accepts immediately before an ATX heading's closing `#` run (review
+/// follow-up: the prototype's own `rstrip("#")` never had to make this
+/// distinction unconditionally).
+const fn is_space_or_tab(c: char) -> bool {
+    matches!(c, ' ' | '\t')
 }
 
 /// A Markdown fence delimiter line (the prototype's `is_fence`): a

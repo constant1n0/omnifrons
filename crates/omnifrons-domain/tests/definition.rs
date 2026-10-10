@@ -580,6 +580,11 @@ fn title_strips_a_bom_and_reads_a_tilde_fence() {
 fn title_strips_a_closing_hash_run_only_when_commonmark_allows_it() {
     assert_eq!(title(b"# C#\n"), Some("C#".to_string()));
     assert_eq!(title(b"# Title #\n"), Some("Title".to_string()));
+    assert_eq!(
+        title(b"# Title\t#\n"),
+        Some("Title".to_string()),
+        "a tab, like a space, precedes a closing hash run"
+    );
     assert_eq!(title(b"# #\n"), None);
 }
 
@@ -618,4 +623,75 @@ fn directory_identity_new_rejects_a_duplicate_kind() {
             kind: IdentityKind::Claude
         })
     ));
+}
+
+/// Review follow-up (final 1a review, 2026-10-09): the host-extras
+/// reason joined `dir.host_extras` in the caller's order; it now sorts
+/// the names first, so two directories holding the same extras in a
+/// different order get the same reason.
+#[test]
+fn host_extras_reason_is_independent_of_the_extras_order() {
+    let forward = with_host_extras(
+        canonical_dir(Vec::new()),
+        &["CLAUDE.local.md", ".cursor/rules"],
+    );
+    let backward = with_host_extras(
+        canonical_dir(Vec::new()),
+        &[".cursor/rules", "CLAUDE.local.md"],
+    );
+    assert_eq!(classify(&forward).reason, classify(&backward).reason);
+    assert_eq!(
+        classify(&forward).reason,
+        "canonical, with host extras: .cursor/rules, CLAUDE.local.md"
+    );
+}
+
+/// Review follow-up: the one accepted `CLAUDE.md` symlink combined with
+/// the rules that run after the pair rule -- a differing secondary file
+/// still conflicts (compared against the same `AGENTS.md` bytes the
+/// symlink stands in for), host extras still mark `host_extras`, and an
+/// import-only `AGENTS.md` is still refused before either rule gets a
+/// say.
+#[test]
+fn accepted_claude_link_combines_with_the_secondary_and_host_extras_rules() {
+    let conflicting_secondary = directory(vec![
+        identity_file(IdentityKind::Agents, SIMPLE_BODY),
+        symlink_file(IdentityKind::Claude, "AGENTS.md"),
+        identity_file(IdentityKind::Gemini, OTHER_BODY),
+    ]);
+    assert_eq!(classify(&conflicting_secondary).state, RootState::Conflict);
+    assert_eq!(
+        classify(&conflicting_secondary).reason,
+        "GEMINI.md differ from AGENTS.md"
+    );
+
+    let extras = with_host_extras(
+        directory(vec![
+            identity_file(IdentityKind::Agents, SIMPLE_BODY),
+            symlink_file(IdentityKind::Claude, "./AGENTS.md"),
+        ]),
+        &["CLAUDE.local.md"],
+    );
+    assert_eq!(classify(&extras).state, RootState::HostExtras);
+
+    let import_only_agents = directory(vec![
+        identity_file(IdentityKind::Agents, WRAPPER),
+        symlink_file(IdentityKind::Claude, "AGENTS.md"),
+    ]);
+    assert_eq!(classify(&import_only_agents).state, RootState::Unsafe);
+    assert_eq!(
+        classify(&import_only_agents).reason,
+        "AGENTS.md holds only imports and cannot be canonical"
+    );
+}
+
+/// [`DuplicateIdentityKindError`]'s `Display` text names the repeated
+/// kind by its file name, matching every other reason string's
+/// spelling.
+#[test]
+fn duplicate_identity_kind_error_displays_the_kind_by_file_name() {
+    let error = DuplicateIdentityKindError {
+        kind: IdentityKind::Claude,
+    };
+    assert_eq!(error.to_string(), "CLAUDE.md is present more than once");
 }
