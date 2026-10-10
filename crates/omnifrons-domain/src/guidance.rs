@@ -16,6 +16,17 @@
 //! Nothing here reads a note as an instruction: the note is content the
 //! product proposes and the user disposes of, never authority
 //! (HAP-001-R22, D18).
+//!
+//! A third kind, [`ManagedFileKind::Skills`] (ADR-0005 "Agent identity
+//! and portable definition" decision 2), owns a second, independent
+//! block in the same default file as the guidance note
+//! ([`DEFAULT_GUIDANCE_FILE`]): the two coexist because every function
+//! below locates, classifies, and plans over one kind's sentinel pair
+//! at a time, never the whole file. Unlike the guidance note, the
+//! skills block's body is not a fixed template -- it is the
+//! caller-supplied index of a project's discovered skills plus the
+//! precedence rule ([`crate::skills_index`]), rendered outside this
+//! module.
 
 use std::fmt;
 use std::ops::Range;
@@ -28,6 +39,13 @@ use crate::publication::{is_bidi_control, is_reserved_device_name};
 /// template gets a later token, and a block carrying an earlier one is
 /// `outdated`.
 pub const GUIDANCE_TEMPLATE_VERSION: &str = "hap-001-guidance-v1";
+
+/// The version the skills-index block's sentinels carry (ADR-0005
+/// decision 2): a separate template family from
+/// [`GUIDANCE_TEMPLATE_VERSION`], since the skills block's body is
+/// caller-supplied (the discovered skills and the precedence rule;
+/// [`crate::skills_index`]) rather than one fixed template text.
+pub const SKILLS_TEMPLATE_VERSION: &str = "adr-0005-skills-v1";
 
 /// The guidance file a project is offered the note for when the user names
 /// none (HAP-001 § Agent guidance note: "`AGENTS.md` or the harness's
@@ -86,11 +104,18 @@ pub enum ManagedFileKind {
     Guidance,
     /// The project's [`IGNORE_FILE`], holding the outbox ignore rule.
     Ignore,
+    /// The skills index and precedence-rule block (ADR-0005 decision
+    /// 2): the same file as [`Self::Guidance`] by default
+    /// ([`DEFAULT_GUIDANCE_FILE`]) -- the two kinds coexist in one
+    /// file, each owning its own sentinel pair, and
+    /// [`ManagedBlock::locate`] finds one kind at a time without
+    /// disturbing the other's lines.
+    Skills,
 }
 
 impl ManagedFileKind {
     /// Every kind, for exhaustive iteration and parsing.
-    pub const ALL: [Self; 2] = [Self::Guidance, Self::Ignore];
+    pub const ALL: [Self; 3] = [Self::Guidance, Self::Ignore, Self::Skills];
 
     /// This kind's stable token.
     #[must_use]
@@ -98,6 +123,7 @@ impl ManagedFileKind {
         match self {
             Self::Guidance => "guidance",
             Self::Ignore => "ignore",
+            Self::Skills => "skills",
         }
     }
 
@@ -113,13 +139,14 @@ impl ManagedFileKind {
         match self {
             Self::Guidance => "<!-- omnifrons:begin guidance ",
             Self::Ignore => "# omnifrons:begin ignore ",
+            Self::Skills => "<!-- omnifrons:begin skills ",
         }
     }
 
     /// What follows the digest on the begin sentinel's line.
     const fn begin_suffix(self) -> &'static str {
         match self {
-            Self::Guidance => " -->",
+            Self::Guidance | Self::Skills => " -->",
             Self::Ignore => "",
         }
     }
@@ -129,6 +156,20 @@ impl ManagedFileKind {
         match self {
             Self::Guidance => "<!-- omnifrons:end guidance -->",
             Self::Ignore => "# omnifrons:end ignore",
+            Self::Skills => "<!-- omnifrons:end skills -->",
+        }
+    }
+
+    /// The template version this kind's block carries when built fresh
+    /// through [`ManagedBlock::new`]: [`Self::Guidance`] and
+    /// [`Self::Ignore`] share [`GUIDANCE_TEMPLATE_VERSION`] (one
+    /// HAP-001 template); [`Self::Skills`] carries its own
+    /// [`SKILLS_TEMPLATE_VERSION`] (ADR-0005 decision 2), since its
+    /// body is a separate, caller-supplied template family.
+    const fn template_version(self) -> &'static str {
+        match self {
+            Self::Guidance | Self::Ignore => GUIDANCE_TEMPLATE_VERSION,
+            Self::Skills => SKILLS_TEMPLATE_VERSION,
         }
     }
 }
@@ -283,6 +324,19 @@ impl ManagedTarget {
         }
     }
 
+    /// The skills-index file: fixed at [`DEFAULT_GUIDANCE_FILE`]
+    /// (ADR-0005 decision 2 -- the skills block lives in the
+    /// definition's canonical guidance file, never in a user-named
+    /// one), unlike [`Self::guidance`]'s target, which takes the
+    /// user's own name.
+    #[must_use]
+    pub fn skills() -> Self {
+        Self {
+            kind: ManagedFileKind::Skills,
+            name: ManagedFileName::default_guidance(),
+        }
+    }
+
     /// The kind.
     #[must_use]
     pub const fn kind(&self) -> ManagedFileKind {
@@ -364,7 +418,7 @@ impl ManagedBlock {
         let digest = digest(body.as_bytes());
         Self {
             kind,
-            version: GUIDANCE_TEMPLATE_VERSION.to_string(),
+            version: kind.template_version().to_string(),
             body,
             digest,
         }
@@ -387,12 +441,47 @@ impl ManagedBlock {
         Self::new(ManagedFileKind::Ignore, ignore_rule(outbox), digest)
     }
 
-    /// The block `kind` manages for `outbox`.
-    #[must_use]
-    pub fn for_kind(kind: ManagedFileKind, outbox: &OutboxPath, digest: DigestFn) -> Self {
+    /// The skills block: `body` is the caller-supplied canonical
+    /// index/precedence text ([`crate::skills_index::render_body`]).
+    /// Unlike [`Self::guidance`] and [`Self::ignore`], this module
+    /// computes none of it: it has no notion of a project's discovered
+    /// skills, so the app layer that scans for them builds the body and
+    /// passes it here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptySkillsBody`] for an empty `body`:
+    /// [`crate::skills_index::render_body`] documents that shape as "no
+    /// block to write", so building one here would write a degenerate
+    /// sentinel pair around nothing instead of nothing at all.
+    pub fn skills(body: impl Into<String>, digest: DigestFn) -> Result<Self, EmptySkillsBody> {
+        let body = body.into();
+        if body.is_empty() {
+            return Err(EmptySkillsBody);
+        }
+        Ok(Self::new(ManagedFileKind::Skills, body, digest))
+    }
+
+    /// The block `kind` manages for `outbox`. [`ManagedFileKind::Skills`]
+    /// has no outbox-derived body -- its content comes from a
+    /// project's discovered skills, not its outbox path -- so this
+    /// always refuses it with [`EmptySkillsBody`]: build a populated
+    /// skills block directly through [`Self::skills`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptySkillsBody`] for [`ManagedFileKind::Skills`],
+    /// always; never for [`ManagedFileKind::Guidance`] or
+    /// [`ManagedFileKind::Ignore`].
+    pub fn for_kind(
+        kind: ManagedFileKind,
+        outbox: &OutboxPath,
+        digest: DigestFn,
+    ) -> Result<Self, EmptySkillsBody> {
         match kind {
-            ManagedFileKind::Guidance => Self::guidance(outbox, digest),
-            ManagedFileKind::Ignore => Self::ignore(outbox, digest),
+            ManagedFileKind::Guidance => Ok(Self::guidance(outbox, digest)),
+            ManagedFileKind::Ignore => Ok(Self::ignore(outbox, digest)),
+            ManagedFileKind::Skills => Self::skills(String::new(), digest),
         }
     }
 
@@ -561,6 +650,16 @@ pub struct Located {
     /// The canonical body between the sentinels.
     pub body: String,
 }
+
+/// [`ManagedBlock::skills`] or [`ManagedBlock::for_kind`] was asked to
+/// build a skills block from an empty body (review follow-up,
+/// correction pass): [`crate::skills_index::render_body`] documents an
+/// empty body as "no block to write", so building one here is refused
+/// rather than silently writing a degenerate sentinel pair around
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the skills block's body is empty; render_body said there is nothing to write")]
+pub struct EmptySkillsBody;
 
 /// Why a managed file cannot be planned over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

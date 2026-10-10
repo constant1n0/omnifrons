@@ -18,7 +18,8 @@
 use omnifrons_adapters::{FsProjectTextFile, FsSnapshotStore, Sha2Hasher};
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::guidance::{
-    GuidanceError, GuidancePorts, apply, pin, preview, remove, restore, snapshots, status,
+    GuidanceError, GuidancePorts, apply, pin, preview, remove, restore, restore_target_kind,
+    snapshots, status,
 };
 use omnifrons_app::managed_file::ProjectTextFileError;
 use omnifrons_app::outbox_policy::OutboxPolicyStore as _;
@@ -107,6 +108,13 @@ impl From<GuidanceError> for ShellError {
                 ShellErrorCode::GuidanceFileInvalid,
                 "the managed file did not read back as written",
             ),
+            // Unreachable today: no request this shell builds ever
+            // targets the skills kind (correction pass).
+            GuidanceError::SkillsUnsupported => Self::new(
+                ShellErrorCode::InvalidRequest,
+                "the skills kind has no outbox-derived body; it is not supported through this \
+                 operation",
+            ),
         }
     }
 }
@@ -125,7 +133,9 @@ fn invalid(message: &str) -> ShellError {
 
 /// A guidance command's target: the kind and, for the guidance kind, the
 /// file the user named at the workspace root (default `AGENTS.md`);
-/// ignored for the ignore kind, which always manages `.gitignore`.
+/// ignored for the ignore kind, which always manages `.gitignore`; for
+/// the skills kind, refused unless it names `AGENTS.md` or none at all
+/// (ADR-0005 decision 2: the skills block never moves).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidanceRequest {
     pub kind: ManagedFileKind,
@@ -141,6 +151,17 @@ impl GuidanceRequest {
                 Ok(ManagedTarget::guidance(ManagedFileName::guidance(name)?))
             }
             ManagedFileKind::Ignore => Ok(ManagedTarget::ignore()),
+            // The compiler forces this arm now that the domain
+            // `ManagedFileKind` has three variants, but it is
+            // unreachable over IPC today: `ManagedFileKindDto` carries
+            // no `skills` token, so `self.kind` can never actually be
+            // `Skills` here until ADR-0005's sub-slice 1g adds one.
+            ManagedFileKind::Skills => match self.file.as_deref() {
+                Some(file) if file != DEFAULT_GUIDANCE_FILE => Err(invalid(
+                    "the skills block is only managed in the default guidance file",
+                )),
+                _ => Ok(ManagedTarget::skills()),
+            },
         }
     }
 }
@@ -226,7 +247,7 @@ pub fn guidance_status_for(
         &target,
         &declared,
     )?;
-    Ok(GuidanceStatusDto::from_status(target.kind(), &status))
+    GuidanceStatusDto::from_status(target.kind(), &status)
 }
 
 /// The proposal (`guidance_preview`): what an apply would write, and the
@@ -251,7 +272,7 @@ pub fn guidance_preview_for(
         &target,
         &declared,
     )?;
-    Ok(GuidancePreviewDto::from_preview(target.kind(), &preview))
+    GuidancePreviewDto::from_preview(target.kind(), &preview)
 }
 
 /// The approved write (`guidance_apply`), bound to `file_sha256`.
@@ -285,7 +306,7 @@ pub fn guidance_apply_for(
         expected,
     )?;
     Ok(GuidanceAppliedDto {
-        kind: target.kind().into(),
+        kind: target.kind().try_into()?,
         file: target.file_name().to_string(),
         action: applied.action.into(),
         snapshot_id: applied.snapshot_id.map(|id| id.to_hex()),
@@ -323,7 +344,7 @@ pub fn guidance_remove_for(
         expected,
     )?;
     Ok(GuidanceAppliedDto {
-        kind: target.kind().into(),
+        kind: target.kind().try_into()?,
         file: target.file_name().to_string(),
         action: GuidanceActionTag::Remove,
         snapshot_id: Some(removed.snapshot_id.to_hex()),
@@ -332,7 +353,12 @@ pub fn guidance_remove_for(
 }
 
 /// Every snapshot of `kind` for the active project, newest first
-/// (`guidance_snapshots`).
+/// (`guidance_snapshots`). `kind` is always DTO-derived
+/// (`ManagedFileKindDto` carries no `skills` token), and the store's own
+/// listing is already scoped to it, so this never actually meets a
+/// manifest `SnapshotDto::from_manifest` could not convert; filtered
+/// again here (correction pass) so that invariant is enforced, not just
+/// assumed.
 ///
 /// # Errors
 ///
@@ -344,7 +370,11 @@ pub fn guidance_snapshots_for(
 ) -> Result<Vec<SnapshotDto>, ShellError> {
     let mut installer = Installer::open(publication, workspace)?;
     let listed = snapshots(&mut installer.ports(&[workspace]), workspace, kind)?;
-    Ok(listed.iter().map(SnapshotDto::from_manifest).collect())
+    listed
+        .iter()
+        .filter(|manifest| manifest.kind == kind)
+        .map(SnapshotDto::from_manifest)
+        .collect()
 }
 
 /// Pin or unpin the snapshot `id` (`guidance_pin`); a pinned snapshot is
@@ -371,7 +401,7 @@ pub fn guidance_pin_for(
             .iter()
             .find(|manifest| manifest.id == id)
         {
-            return Ok(SnapshotDto::from_manifest(manifest));
+            return SnapshotDto::from_manifest(manifest);
         }
     }
     Err(ShellError::from(GuidanceError::Snapshot(
@@ -402,9 +432,21 @@ pub fn guidance_restore_for(
     let id = parse_snapshot_id(id)?;
     let expected = parse_expected(file_sha256)?;
     let mut installer = Installer::open(publication, workspace)?;
-    let restored = restore(&mut installer.ports(&[workspace]), workspace, id, expected)?;
+    // Read-only: find out what kind this id would restore, and refuse a
+    // kind this wire cannot represent, before `restore` gets a chance to
+    // write anything (correction pass -- this used to be discovered only
+    // after the write, from the restored target's own kind).
+    let requested_kind = restore_target_kind(&mut installer.ports(&[workspace]), workspace, id)?;
+    let kind = ManagedFileKindDto::try_from(requested_kind)?;
+    let restored = restore(
+        &mut installer.ports(&[workspace]),
+        workspace,
+        requested_kind,
+        id,
+        expected,
+    )?;
     Ok(GuidanceAppliedDto {
-        kind: restored.target.kind().into(),
+        kind,
         file: restored.target.file_name().to_string(),
         action: GuidanceActionTag::Restore,
         snapshot_id: Some(restored.snapshot_id.to_hex()),
@@ -615,7 +657,7 @@ mod tests {
     use omnifrons_adapters::Sha2Hasher;
     use omnifrons_app::WorkspaceRoot;
     use omnifrons_app::content_hasher::ContentHasher as _;
-    use omnifrons_domain::guidance::{GuidanceNote, ManagedFileKind};
+    use omnifrons_domain::guidance::{GuidanceNote, ManagedFileKind, ManagedTarget};
     use omnifrons_domain::outbox::OutboxPath;
 
     use super::{
@@ -628,6 +670,51 @@ mod tests {
     use crate::ipc::publication::RunActivity;
     use crate::outbox_state::OutboxState;
     use crate::publication_state::PublicationState;
+
+    /// `GuidanceRequest::target`'s `Skills` arm (review follow-up): the
+    /// default and the explicit `AGENTS.md` both yield the fixed skills
+    /// target, and any other named file is refused with the same
+    /// path-free `invalid-request` shape the function already uses for
+    /// a malformed guidance file name.
+    #[test]
+    fn guidance_request_target_for_skills_is_fixed_at_the_default_guidance_file() {
+        for file in [None, Some("AGENTS.md")] {
+            let request = GuidanceRequest {
+                kind: ManagedFileKind::Skills,
+                file: file.map(str::to_string),
+            };
+            assert_eq!(
+                request.target().expect("the default guidance file"),
+                ManagedTarget::skills(),
+                "{file:?}"
+            );
+        }
+        let elsewhere = GuidanceRequest {
+            kind: ManagedFileKind::Skills,
+            file: Some("CLAUDE.md".to_string()),
+        };
+        let error = elsewhere.target().expect_err("refused");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+    }
+
+    /// The wire contract stays closed over `Skills` until ADR-0005's
+    /// sub-slice 1g: `Guidance` and `Ignore` still convert, and `Skills`
+    /// is refused as `invalid-request`, never silently coerced into one
+    /// of the other two.
+    #[test]
+    fn managed_file_kind_dto_refuses_the_skills_kind_until_it_is_exposed_over_ipc() {
+        assert_eq!(
+            ManagedFileKindDto::try_from(ManagedFileKind::Guidance),
+            Ok(ManagedFileKindDto::Guidance)
+        );
+        assert_eq!(
+            ManagedFileKindDto::try_from(ManagedFileKind::Ignore),
+            Ok(ManagedFileKindDto::Ignore)
+        );
+        let error = ManagedFileKindDto::try_from(ManagedFileKind::Skills)
+            .expect_err("not yet exposed over IPC");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+    }
 
     /// No supervised process is running.
     struct Idle;
@@ -1016,6 +1103,38 @@ mod tests {
         );
     }
 
+    /// Review follow-up (correction pass): with both a guidance and an
+    /// ignore snapshot recorded, each kind's listing shows only its own
+    /// -- the defensive filter `guidance_snapshots_for` now applies
+    /// before converting is exercised, not just assumed from the
+    /// store's own kind-scoped listing.
+    #[test]
+    fn snapshots_for_lists_only_its_own_kind_even_when_both_exist() {
+        let fixture = Fixture::new("snapshots-both-kinds");
+        fixture
+            .apply(&Fixture::agents(), None)
+            .expect("applied guidance");
+        fixture
+            .apply(&Fixture::request(ManagedFileKind::Ignore, None), None)
+            .expect("applied ignore");
+        let guidance = guidance_snapshots_for(
+            &fixture.workspace(),
+            &fixture.publication,
+            ManagedFileKind::Guidance,
+        )
+        .expect("list");
+        assert_eq!(guidance.len(), 1);
+        assert_eq!(guidance[0].kind, ManagedFileKindDto::Guidance);
+        let ignore = guidance_snapshots_for(
+            &fixture.workspace(),
+            &fixture.publication,
+            ManagedFileKind::Ignore,
+        )
+        .expect("list");
+        assert_eq!(ignore.len(), 1);
+        assert_eq!(ignore[0].kind, ManagedFileKindDto::Ignore);
+    }
+
     #[test]
     fn snapshots_are_listed_newest_first_pinned_and_restored() {
         let fixture = Fixture::new("snapshots");
@@ -1310,6 +1429,10 @@ mod tests {
             (
                 GuidanceError::VerifyFailed,
                 ShellErrorCode::GuidanceFileInvalid,
+            ),
+            (
+                GuidanceError::SkillsUnsupported,
+                ShellErrorCode::InvalidRequest,
             ),
         ];
         for (error, code) in cases {

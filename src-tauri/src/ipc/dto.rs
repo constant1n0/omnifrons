@@ -1038,7 +1038,12 @@ impl ArtifactStateFrame {
 
 /// [`omnifrons_domain::guidance::ManagedFileKind`], as it crosses IPC
 /// both ways (spike slice 5c): the `kind` of every guidance command,
-/// `"guidance"` or `"ignore"` and nothing else.
+/// `"guidance"` or `"ignore"` and nothing else. The wire contract stays
+/// closed over `Skills` until ADR-0005's sub-slice 1g wires the
+/// renderer: the DTO -> domain direction below stays total (every wire
+/// token still names a domain kind), but the domain -> DTO direction is
+/// fallible ([`TryFrom`]), since [`omnifrons_domain::guidance::ManagedFileKind::Skills`]
+/// has no wire token to become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManagedFileKindDto {
@@ -1046,12 +1051,21 @@ pub enum ManagedFileKindDto {
     Ignore,
 }
 
-impl From<omnifrons_domain::guidance::ManagedFileKind> for ManagedFileKindDto {
-    fn from(kind: omnifrons_domain::guidance::ManagedFileKind) -> Self {
+impl TryFrom<omnifrons_domain::guidance::ManagedFileKind> for ManagedFileKindDto {
+    type Error = ShellError;
+
+    /// `Err` (`invalid-request`) for
+    /// [`omnifrons_domain::guidance::ManagedFileKind::Skills`]: that
+    /// kind is not exposed over IPC yet (ADR-0005 sub-slice 1g).
+    fn try_from(kind: omnifrons_domain::guidance::ManagedFileKind) -> Result<Self, Self::Error> {
         use omnifrons_domain::guidance::ManagedFileKind;
         match kind {
-            ManagedFileKind::Guidance => Self::Guidance,
-            ManagedFileKind::Ignore => Self::Ignore,
+            ManagedFileKind::Guidance => Ok(Self::Guidance),
+            ManagedFileKind::Ignore => Ok(Self::Ignore),
+            ManagedFileKind::Skills => Err(ShellError::new(
+                ShellErrorCode::InvalidRequest,
+                "the skills kind is not exposed over IPC yet",
+            )),
         }
     }
 }
@@ -1134,13 +1148,16 @@ pub struct GuidanceStatusDto {
 }
 
 impl GuidanceStatusDto {
-    #[must_use]
+    /// # Errors
+    ///
+    /// Propagates [`ManagedFileKindDto`]'s `TryFrom` refusal when `kind`
+    /// is [`omnifrons_domain::guidance::ManagedFileKind::Skills`].
     pub fn from_status(
         kind: omnifrons_domain::guidance::ManagedFileKind,
         status: &omnifrons_app::guidance::GuidanceStatus,
-    ) -> Self {
-        Self {
-            kind: kind.into(),
+    ) -> Result<Self, ShellError> {
+        Ok(Self {
+            kind: kind.try_into()?,
             file: status.file.clone(),
             exists: status.exists,
             managed: ManagedStatusTag::from(&status.managed),
@@ -1149,7 +1166,7 @@ impl GuidanceStatusDto {
             file_sha256_short: status.file_sha256.map(|digest| digest.short_hex()),
             snapshots: u32::try_from(status.snapshots).unwrap_or(u32::MAX),
             pinned: u32::try_from(status.pinned).unwrap_or(u32::MAX),
-        }
+        })
     }
 }
 
@@ -1170,20 +1187,23 @@ pub struct GuidancePreviewDto {
 }
 
 impl GuidancePreviewDto {
-    #[must_use]
+    /// # Errors
+    ///
+    /// Propagates [`ManagedFileKindDto`]'s `TryFrom` refusal when `kind`
+    /// is [`omnifrons_domain::guidance::ManagedFileKind::Skills`].
     pub fn from_preview(
         kind: omnifrons_domain::guidance::ManagedFileKind,
         preview: &omnifrons_app::guidance::GuidancePreview,
-    ) -> Self {
-        Self {
-            kind: kind.into(),
+    ) -> Result<Self, ShellError> {
+        Ok(Self {
+            kind: kind.try_into()?,
             file: preview.file.clone(),
             action: preview.action.into(),
             proposed: preview.proposed_block.clone(),
             file_sha256: preview.file_sha256.map(|digest| digest.to_hex()),
             file_sha256_short: preview.file_sha256.map(|digest| digest.short_hex()),
             result_sha256_short: preview.result_sha256.short_hex(),
-        }
+        })
     }
 }
 
@@ -1220,18 +1240,24 @@ pub struct SnapshotDto {
 }
 
 impl SnapshotDto {
-    #[must_use]
-    pub fn from_manifest(manifest: &omnifrons_app::snapshot_store::SnapshotManifest) -> Self {
-        Self {
+    /// # Errors
+    ///
+    /// Propagates [`ManagedFileKindDto`]'s `TryFrom` refusal when
+    /// `manifest.kind` is
+    /// [`omnifrons_domain::guidance::ManagedFileKind::Skills`].
+    pub fn from_manifest(
+        manifest: &omnifrons_app::snapshot_store::SnapshotManifest,
+    ) -> Result<Self, ShellError> {
+        Ok(Self {
             id: manifest.id.to_hex(),
-            kind: manifest.kind.into(),
+            kind: manifest.kind.try_into()?,
             file: manifest.file.clone(),
             existed: manifest.existed,
             sha256_short: manifest.sha256.short_hex(),
             size: manifest.size,
             taken_at: system_time_to_millis(manifest.taken_at),
             pinned: manifest.pinned,
-        }
+        })
     }
 }
 
@@ -3345,17 +3371,17 @@ mod tests {
         assert_eq!(ignore, super::ManagedFileKindDto::Ignore);
         assert!(serde_json::from_str::<super::ManagedFileKindDto>("\"other\"").is_err());
         assert!(serde_json::from_str::<super::ManagedFileKindDto>("\"Guidance\"").is_err());
-        for kind in omnifrons_domain::guidance::ManagedFileKind::ALL {
-            assert_eq!(
-                json(&super::ManagedFileKindDto::from(kind)),
-                serde_json::json!(kind.as_str())
-            );
-            assert_eq!(
-                omnifrons_domain::guidance::ManagedFileKind::from(super::ManagedFileKindDto::from(
-                    kind
-                )),
-                kind
-            );
+        // Only `Guidance` and `Ignore` have a wire token; `Skills` is
+        // refused (`TryFrom`), not silently dropped -- see
+        // `src-tauri/src/ipc/guidance.rs`'s own
+        // `managed_file_kind_dto_refuses_the_skills_kind_until_it_is_exposed_over_ipc`.
+        for kind in [
+            omnifrons_domain::guidance::ManagedFileKind::Guidance,
+            omnifrons_domain::guidance::ManagedFileKind::Ignore,
+        ] {
+            let dto = super::ManagedFileKindDto::try_from(kind).expect("representable over IPC");
+            assert_eq!(json(&dto), serde_json::json!(kind.as_str()));
+            assert_eq!(omnifrons_domain::guidance::ManagedFileKind::from(dto), kind);
         }
     }
 

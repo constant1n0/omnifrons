@@ -12,7 +12,8 @@ use omnifrons_domain::executable::Sha256Digest;
 use omnifrons_domain::guidance::{
     ApplyAction, DEFAULT_GUIDANCE_FILE, GUIDANCE_TEMPLATE_VERSION, GuidanceNote, IGNORE_FILE,
     LineEnding, Located, ManagedBlock, ManagedFileError, ManagedFileKind, ManagedFileName,
-    ManagedFileNameError, ManagedStatus, ManagedTarget, plan_apply, plan_remove, status,
+    ManagedFileNameError, ManagedStatus, ManagedTarget, SKILLS_TEMPLATE_VERSION, plan_apply,
+    plan_remove, status,
 };
 use omnifrons_domain::outbox::OutboxPath;
 
@@ -147,9 +148,14 @@ fn a_target_names_the_file_its_kind_manages() {
     assert_eq!(ignore.file_name(), ".gitignore");
     assert_eq!(ManagedFileKind::Guidance.as_str(), "guidance");
     assert_eq!(ManagedFileKind::Ignore.as_str(), "ignore");
+    assert_eq!(ManagedFileKind::Skills.as_str(), "skills");
     assert_eq!(
         ManagedFileKind::parse("ignore"),
         Some(ManagedFileKind::Ignore)
+    );
+    assert_eq!(
+        ManagedFileKind::parse("skills"),
+        Some(ManagedFileKind::Skills)
     );
     assert_eq!(ManagedFileKind::parse("other"), None);
 }
@@ -191,7 +197,9 @@ fn blocks_carry_the_sentinels_of_their_kind_with_the_body_digest_pinned() {
     let dotted = ManagedBlock::ignore(&OutboxPath::new("./out/").expect("valid"), &fake_digest);
     assert_eq!(dotted.body(), "/out/");
     assert_eq!(
-        ManagedBlock::for_kind(ManagedFileKind::Ignore, &outbox(), &fake_digest).body(),
+        ManagedBlock::for_kind(ManagedFileKind::Ignore, &outbox(), &fake_digest)
+            .expect("ignore never refuses")
+            .body(),
         ignore.body()
     );
 
@@ -212,11 +220,16 @@ fn blocks_carry_the_sentinels_of_their_kind_with_the_body_digest_pinned() {
 /// `OutboxPath::new` refuses it (`crates/omnifrons-domain/tests/outbox.rs`).
 #[test]
 fn a_rendered_block_carries_exactly_one_begin_and_one_end_line_for_every_accepted_path() {
-    const BEGIN: [&str; 2] = [
+    const BEGIN: [&str; 3] = [
         "<!-- omnifrons:begin guidance ",
         "# omnifrons:begin ignore ",
+        "<!-- omnifrons:begin skills ",
     ];
-    const END: [&str; 2] = ["<!-- omnifrons:end guidance -->", "# omnifrons:end ignore"];
+    const END: [&str; 3] = [
+        "<!-- omnifrons:end guidance -->",
+        "# omnifrons:end ignore",
+        "<!-- omnifrons:end skills -->",
+    ];
     let declared = [
         ".omnifrons/outbox",
         "./out/",
@@ -231,7 +244,17 @@ fn a_rendered_block_carries_exactly_one_begin_and_one_end_line_for_every_accepte
     for raw in declared {
         let outbox = OutboxPath::new(raw).expect("accepted by the path rule");
         for (index, kind) in ManagedFileKind::ALL.into_iter().enumerate() {
-            let block = ManagedBlock::for_kind(kind, &outbox, &fake_digest);
+            // Skills has no outbox-derived body (`for_kind` always
+            // refuses it, review follow-up); exercise the same sentinel
+            // shape with a real, caller-supplied body instead.
+            let block = match kind {
+                ManagedFileKind::Skills => {
+                    ManagedBlock::skills(SKILLS_BODY, &fake_digest).expect("non-empty fixture")
+                }
+                ManagedFileKind::Guidance | ManagedFileKind::Ignore => {
+                    ManagedBlock::for_kind(kind, &outbox, &fake_digest).expect("outbox-derived")
+                }
+            };
             for ending in [LineEnding::Lf, LineEnding::CrLf] {
                 let rendered = block.render(ending);
                 let lines: Vec<&str> = rendered
@@ -584,5 +607,133 @@ fn plan_remove_deletes_only_the_block_and_one_adjacent_blank_line() {
     assert_eq!(
         plan_remove(&only, &located, false).result.as_deref(),
         Some("")
+    );
+}
+
+// -- the skills kind (ADR-0005 "Agent identity and portable definition"
+// decision 2, sub-slice 1b): a second, independent block in the same
+// default file as the guidance note, with its own sentinel family and
+// template version. The body is caller-supplied (`skills_index`'s job,
+// sub-slice 1b's part C), not a fixed template, so these tests build it
+// directly rather than through a `GuidanceNote`-style renderer.
+
+/// A skills block for `body` (ADR-0005 decision 2): the caller-supplied
+/// canonical index/precedence text, not derived from an outbox path.
+/// `body` is always non-empty in these fixtures, so the refusal
+/// [`ManagedBlock::skills`] carries for an empty one never fires here.
+fn skills_block(body: &str) -> ManagedBlock {
+    ManagedBlock::skills(body, &fake_digest).expect("fixture body is never empty")
+}
+
+/// Review follow-up (correction pass): an empty skills body is refused,
+/// not rendered as a degenerate sentinel pair around nothing --
+/// [`crate::skills_index::render_body`] (via
+/// `omnifrons_domain::skills_index`) documents that shape as "no block
+/// to write". `for_kind` always hits this, since it has no
+/// outbox-derived body for the skills kind; `skills("")` hits it
+/// directly.
+#[test]
+fn an_empty_skills_body_is_refused_not_rendered() {
+    assert_eq!(
+        ManagedBlock::for_kind(ManagedFileKind::Skills, &outbox(), &fake_digest),
+        Err(omnifrons_domain::guidance::EmptySkillsBody)
+    );
+    assert_eq!(
+        ManagedBlock::skills("", &fake_digest),
+        Err(omnifrons_domain::guidance::EmptySkillsBody)
+    );
+    assert!(ManagedBlock::skills(SKILLS_BODY, &fake_digest).is_ok());
+}
+
+/// A representative canonical skills body: one index row, no
+/// precedence rule -- enough to exercise the sentinel and digest
+/// machinery without depending on `skills_index`'s own rendering.
+const SKILLS_BODY: &str = "## Local skill index\n\n\
+| Skill | Use when | Path |\n\
+| --- | --- | --- |\n\
+| demo | For demos | skills/demo/SKILL.md |";
+
+/// The skills block carries its own sentinel family
+/// (`<!-- omnifrons:begin skills ... -->` / `<!-- omnifrons:end skills
+/// -->`) and its own template version, distinct from the guidance and
+/// ignore kinds' shared [`GUIDANCE_TEMPLATE_VERSION`].
+#[test]
+fn a_skills_block_carries_its_own_sentinels_and_version() {
+    let block = skills_block(SKILLS_BODY);
+    assert_eq!(block.kind(), ManagedFileKind::Skills);
+    assert_eq!(block.version(), SKILLS_TEMPLATE_VERSION);
+    assert_ne!(SKILLS_TEMPLATE_VERSION, GUIDANCE_TEMPLATE_VERSION);
+    assert_eq!(block.body(), SKILLS_BODY);
+    assert_eq!(block.digest(), fake_digest(SKILLS_BODY.as_bytes()));
+    let rendered = block.render(LineEnding::Lf);
+    assert_eq!(
+        rendered,
+        format!(
+            "<!-- omnifrons:begin skills {SKILLS_TEMPLATE_VERSION} sha256:{} -->\n{SKILLS_BODY}\n<!-- omnifrons:end skills -->",
+            fake_digest(SKILLS_BODY.as_bytes()).to_hex()
+        )
+    );
+    assert!(!rendered.ends_with('\n'), "the caller adds the terminator");
+}
+
+/// `locate` finds the skills block next to a guidance block in one
+/// file, each by its own sentinel pair: the two kinds coexist in the
+/// same managed file without disturbing each other's lines.
+#[test]
+fn locate_finds_a_skills_block_next_to_a_guidance_block_in_one_file() {
+    let guidance = guidance_block();
+    let skills = skills_block(SKILLS_BODY);
+    let text = format!(
+        "# Title\n\n{}\n\n{}\n",
+        guidance.render(LineEnding::Lf),
+        skills.render(LineEnding::Lf)
+    );
+    let located_guidance = ManagedBlock::locate(ManagedFileKind::Guidance, &text, &fake_digest)
+        .expect("intact")
+        .expect("present");
+    assert_eq!(located_guidance.body, guidance.body());
+    let located_skills = ManagedBlock::locate(ManagedFileKind::Skills, &text, &fake_digest)
+        .expect("intact")
+        .expect("present");
+    assert_eq!(located_skills.body, skills.body());
+    assert_eq!(located_skills.version, SKILLS_TEMPLATE_VERSION);
+}
+
+/// `status` classifies a skills block exactly as it does a guidance
+/// one: absent, current, modified inside its sentinels, or malformed.
+#[test]
+fn status_classifies_a_skills_block_current_modified_malformed_and_absent() {
+    let block = skills_block(SKILLS_BODY);
+    let current = file_with("# Title\n\n", &block, "\n");
+    assert_eq!(status(None, &block, &fake_digest), ManagedStatus::Absent);
+    assert_eq!(
+        status(Some("# Title\n"), &block, &fake_digest),
+        ManagedStatus::Absent
+    );
+    assert_eq!(
+        status(Some(&current), &block, &fake_digest),
+        ManagedStatus::Current
+    );
+    let edited = current.replace("demo/SKILL.md", "demo2/SKILL.md");
+    assert_eq!(
+        status(Some(&edited), &block, &fake_digest),
+        ManagedStatus::Modified
+    );
+    let broken = current.replace("<!-- omnifrons:end skills -->", "");
+    assert_eq!(
+        status(Some(&broken), &block, &fake_digest),
+        ManagedStatus::Malformed
+    );
+}
+
+/// The skills block's digest covers the canonical body -- `\n`-joined,
+/// no trailing newline -- exactly as the guidance block's does.
+#[test]
+fn a_skills_blocks_digest_covers_the_canonical_body_with_no_trailing_newline() {
+    let block = skills_block(SKILLS_BODY);
+    assert_eq!(block.digest(), fake_digest(SKILLS_BODY.as_bytes()));
+    assert_ne!(
+        block.digest(),
+        fake_digest(format!("{SKILLS_BODY}\n").as_bytes())
     );
 }

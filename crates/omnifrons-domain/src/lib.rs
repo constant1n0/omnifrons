@@ -13,5 +13,6 @@ pub mod outbox;
 pub mod output;
 pub mod publication;
 pub mod scope;
+pub mod skills_index;
 pub mod terminal;
 pub mod wrong_root;

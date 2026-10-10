@@ -532,8 +532,14 @@ fn a_snapshot_whose_bytes_disagree_with_its_manifest_is_refused_at_restore() {
         workspaces: &workspaces,
     };
     assert_eq!(
-        restore(&mut ports, &workspace, id, Some(hasher.sha256(current)))
-            .map(|restored| restored.restored),
+        restore(
+            &mut ports,
+            &workspace,
+            ManagedFileKind::Guidance,
+            id,
+            Some(hasher.sha256(current)),
+        )
+        .map(|restored| restored.restored),
         Err(GuidanceError::Snapshot(SnapshotStoreError::Corrupt))
     );
     assert_eq!(

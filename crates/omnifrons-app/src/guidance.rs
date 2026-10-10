@@ -23,8 +23,9 @@
 
 use omnifrons_domain::executable::Sha256Digest;
 use omnifrons_domain::guidance::{
-    ApplyAction, IGNORE_FILE, LineEnding, ManagedBlock, ManagedFileError, ManagedFileKind,
-    ManagedFileName, ManagedStatus, ManagedTarget, plan_apply, plan_remove, status as block_status,
+    ApplyAction, DEFAULT_GUIDANCE_FILE, IGNORE_FILE, LineEnding, ManagedBlock, ManagedFileError,
+    ManagedFileKind, ManagedFileName, ManagedStatus, ManagedTarget, plan_apply, plan_remove,
+    status as block_status,
 };
 use omnifrons_domain::outbox::OutboxPath;
 use omnifrons_domain::publication::ProjectIdentity;
@@ -85,6 +86,17 @@ pub enum GuidanceError {
     /// digest.
     #[error("the written file does not read back as planned")]
     VerifyFailed,
+    /// [`status`], [`preview`], or [`apply`] was asked to act on
+    /// [`ManagedFileKind::Skills`] (correction pass): that kind has no
+    /// outbox-derived body ([`ManagedBlock::for_kind`] always refuses
+    /// it), so none of the three can render one. Unreachable through
+    /// this shell's current IPC surface, which never builds a skills
+    /// target; a caller that needs the skills kind renders its own
+    /// body through [`ManagedBlock::skills`] instead.
+    #[error(
+        "the skills kind has no outbox-derived body; it is not supported through this operation"
+    )]
+    SkillsUnsupported,
 }
 
 impl GuidanceError {
@@ -100,6 +112,7 @@ impl GuidanceError {
             Self::Unmanaged => "unmanaged",
             Self::Snapshot(error) => error.reason(),
             Self::VerifyFailed => "verify-failed",
+            Self::SkillsUnsupported => "skills-unsupported",
         }
     }
 }
@@ -343,7 +356,8 @@ pub fn status(
     let current = read_current(ports, workspace, target)?;
     let hasher = ports.hasher;
     let digest = digest_fn(hasher);
-    let block = ManagedBlock::for_kind(target.kind(), outbox, &digest);
+    let block = ManagedBlock::for_kind(target.kind(), outbox, &digest)
+        .map_err(|_| GuidanceError::SkillsUnsupported)?;
     let managed = block_status(current.text()?, &block, &digest);
     let listed = ports
         .snapshots
@@ -383,7 +397,8 @@ pub fn preview(
     let current = read_current(ports, workspace, target)?;
     let hasher = ports.hasher;
     let digest = digest_fn(hasher);
-    let block = ManagedBlock::for_kind(target.kind(), outbox, &digest);
+    let block = ManagedBlock::for_kind(target.kind(), outbox, &digest)
+        .map_err(|_| GuidanceError::SkillsUnsupported)?;
     let text = current.text()?;
     let plan = plan_apply(text, &block, &digest).map_err(block_error)?;
     let ending = text.map_or(LineEnding::Lf, LineEnding::dominant);
@@ -417,7 +432,8 @@ pub fn apply(
     bind(&current, expected_file_sha256)?;
     let hasher = ports.hasher;
     let digest = digest_fn(hasher);
-    let block = ManagedBlock::for_kind(target.kind(), outbox, &digest);
+    let block = ManagedBlock::for_kind(target.kind(), outbox, &digest)
+        .map_err(|_| GuidanceError::SkillsUnsupported)?;
     let plan = plan_apply(current.text()?, &block, &digest).map_err(block_error)?;
     if plan.action == ApplyAction::NoOp {
         return Ok(GuidanceApplied {
@@ -502,30 +518,71 @@ pub fn remove(
 }
 
 /// The target a snapshot manifest names, or `Corrupt` when the manifest
-/// names a file its kind could not manage.
+/// names a file its kind could not manage. The skills kind only ever
+/// manages [`DEFAULT_GUIDANCE_FILE`] (ADR-0005 decision 2: the skills
+/// block lives in the definition's canonical guidance file, never in a
+/// user-named one), so a skills manifest naming any other file is
+/// corrupt too.
 fn target_of(manifest: &SnapshotManifest) -> Result<ManagedTarget, GuidanceError> {
     match manifest.kind {
         ManagedFileKind::Guidance => ManagedFileName::guidance(&manifest.file)
             .map(ManagedTarget::guidance)
             .map_err(|_| GuidanceError::Snapshot(SnapshotStoreError::Corrupt)),
         ManagedFileKind::Ignore if manifest.file == IGNORE_FILE => Ok(ManagedTarget::ignore()),
-        ManagedFileKind::Ignore => Err(GuidanceError::Snapshot(SnapshotStoreError::Corrupt)),
+        ManagedFileKind::Skills if manifest.file == DEFAULT_GUIDANCE_FILE => {
+            Ok(ManagedTarget::skills())
+        }
+        ManagedFileKind::Ignore | ManagedFileKind::Skills => {
+            Err(GuidanceError::Snapshot(SnapshotStoreError::Corrupt))
+        }
     }
+}
+
+/// The kind of the snapshot `id` would restore, read-only: no write, no
+/// snapshot taken. Lets a caller refuse early -- before [`restore`]
+/// would otherwise write -- when it cannot act on that kind (the IPC
+/// layer's DTO boundary, for instance, which does not expose every
+/// domain kind).
+///
+/// # Errors
+///
+/// As [`restore`]'s own manifest lookup: [`GuidanceError::WorkAreaInvalid`]
+/// or [`GuidanceError::Snapshot`] with [`SnapshotStoreError::Unknown`]
+/// for an id the store does not hold.
+pub fn restore_target_kind(
+    ports: &mut GuidancePorts<'_>,
+    workspace: &WorkspaceRoot,
+    id: SnapshotId,
+) -> Result<ManagedFileKind, GuidanceError> {
+    check_work_area(ports)?;
+    let project = derive_project_identity(ports.hasher, workspace);
+    let (manifest, _bytes) = ports
+        .snapshots
+        .read(&project, id)
+        .map_err(GuidanceError::Snapshot)?;
+    Ok(manifest.kind)
 }
 
 /// Restore the snapshot `id`, bound to `expected_file_sha256`: the state
 /// before the restore is snapshotted first (deduplicated), then the
 /// snapshot's bytes are written back, or the file is removed when the
-/// snapshot recorded an absent file.
+/// snapshot recorded an absent file. Refused before any of that --
+/// exactly like an unknown id -- when the snapshot's own manifest kind
+/// differs from `requested_kind`: a caller states what kind it asked to
+/// restore, not just what it is prepared to receive after the fact
+/// (correction pass: this used to be checked only after writing, via
+/// the IPC layer's own DTO conversion of the *restored* target's kind).
 ///
 /// # Errors
 ///
 /// Returns [`GuidanceError::Snapshot`] with
-/// [`SnapshotStoreError::Unknown`] for an id the store does not hold, and
-/// every other variant as the step that refused or failed.
+/// [`SnapshotStoreError::Unknown`] for an id the store does not hold, or
+/// whose manifest kind differs from `requested_kind`, and every other
+/// variant as the step that refused or failed.
 pub fn restore(
     ports: &mut GuidancePorts<'_>,
     workspace: &WorkspaceRoot,
+    requested_kind: ManagedFileKind,
     id: SnapshotId,
     expected_file_sha256: Option<Sha256Digest>,
 ) -> Result<GuidanceRestored, GuidanceError> {
@@ -535,6 +592,9 @@ pub fn restore(
         .snapshots
         .read(&project, id)
         .map_err(GuidanceError::Snapshot)?;
+    if manifest.kind != requested_kind {
+        return Err(GuidanceError::Snapshot(SnapshotStoreError::Unknown));
+    }
     if ports.hasher.sha256(&bytes) != manifest.sha256 {
         return Err(GuidanceError::Snapshot(SnapshotStoreError::Corrupt));
     }

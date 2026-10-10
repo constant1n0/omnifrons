@@ -133,6 +133,7 @@ impl Fixture {
 
     fn block(&self, kind: ManagedFileKind) -> ManagedBlock {
         ManagedBlock::for_kind(kind, &outbox(), &|bytes| self.hasher.sha256(bytes))
+            .expect("guidance and ignore never refuse")
     }
 }
 
@@ -697,6 +698,7 @@ fn restore_snapshots_the_current_state_then_brings_the_snapshot_back() {
     let restored = restore(
         &mut fixture.ports(&[&workspace]),
         &workspace,
+        ManagedFileKind::Guidance,
         original,
         Some(applied.result_sha256),
     )
@@ -715,6 +717,7 @@ fn restore_snapshots_the_current_state_then_brings_the_snapshot_back() {
     restore(
         &mut fixture.ports(&[&workspace]),
         &workspace,
+        ManagedFileKind::Guidance,
         restored.snapshot_id,
         shown,
     )
@@ -745,12 +748,151 @@ fn restore_snapshots_the_current_state_then_brings_the_snapshot_back() {
     let restored = restore(
         &mut fixture.ports(&[&workspace]),
         &workspace,
+        ManagedFileKind::Guidance,
         absent_id,
         Some(applied.result_sha256),
     )
     .expect("restored the absence");
     assert_eq!(restored.result_sha256, None);
     assert_eq!(fixture.text("AGENTS.md"), None, "the file is removed");
+}
+
+/// Review follow-up (ADR-0005 decision 2, sub-slice 1b): a restored
+/// skills snapshot always resolves to [`DEFAULT_GUIDANCE_FILE`] -- the
+/// skills block never moves -- and a manifest naming any other file is
+/// corrupt, exactly like an ignore manifest naming anything but
+/// `.gitignore`. There is no `apply`/`preview` path for the skills kind
+/// yet (ADR-0005's sub-slice 1e), so the manifest is recorded directly,
+/// as the "restored absence" case above already does for a synthetic
+/// manifest.
+#[test]
+fn restore_resolves_a_skills_snapshot_to_the_default_guidance_file_only() {
+    let mut fixture = Fixture::new("restore-skills");
+    let workspace = fixture.workspace();
+    fixture.files.plant("AGENTS.md", b"# Title\n");
+    let project = project_of(&fixture);
+    let skills_bytes: &[u8] = b"## Local skill index\n";
+    let manifest = omnifrons_app::snapshot_store::SnapshotManifest {
+        schema: omnifrons_app::snapshot_store::SNAPSHOT_SCHEMA_VERSION,
+        id: omnifrons_app::snapshot_store::SnapshotId(501),
+        kind: ManagedFileKind::Skills,
+        file: omnifrons_domain::guidance::DEFAULT_GUIDANCE_FILE.to_string(),
+        existed: true,
+        sha256: fixture.digest_of(skills_bytes),
+        size: skills_bytes.len() as u64,
+        taken_at: fixture.clock.now(),
+        pinned: false,
+    };
+    let id = manifest.id;
+    omnifrons_app::snapshot_store::SnapshotStore::record(
+        &mut fixture.snapshots,
+        &project,
+        manifest.clone(),
+        skills_bytes,
+    )
+    .expect("record");
+    fixture.tick();
+    let expected = fixture.file_digest("AGENTS.md");
+    let restored = restore(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        ManagedFileKind::Skills,
+        id,
+        expected,
+    )
+    .expect("a skills snapshot resolves to the default guidance file");
+    assert_eq!(restored.target, ManagedTarget::skills());
+    assert_eq!(
+        fixture.text("AGENTS.md").as_deref(),
+        Some("## Local skill index\n")
+    );
+
+    // A skills manifest naming any other file is corrupt: the skills
+    // block only ever lives in the default guidance file.
+    let elsewhere = omnifrons_app::snapshot_store::SnapshotManifest {
+        id: omnifrons_app::snapshot_store::SnapshotId(502),
+        file: "CLAUDE.md".to_string(),
+        taken_at: fixture.clock.now(),
+        ..manifest
+    };
+    let elsewhere_id = elsewhere.id;
+    omnifrons_app::snapshot_store::SnapshotStore::record(
+        &mut fixture.snapshots,
+        &project,
+        elsewhere,
+        skills_bytes,
+    )
+    .expect("record");
+    fixture.tick();
+    assert!(matches!(
+        restore(
+            &mut fixture.ports(&[&workspace]),
+            &workspace,
+            ManagedFileKind::Skills,
+            elsewhere_id,
+            None,
+        ),
+        Err(GuidanceError::Snapshot(SnapshotStoreError::Corrupt))
+    ));
+}
+
+/// Review follow-up (correction pass): the kind check must run before
+/// any write, not after -- a caller asking to restore under one kind
+/// (a `guidance` request, say) is refused when the snapshot's own
+/// manifest says a different kind (here, `skills`), exactly like an
+/// unknown id: no write, no new snapshot. This is what lets the IPC
+/// layer convert the *requested* kind to a DTO before calling
+/// `restore`, rather than discovering after writing that the kind it
+/// actually restored has no wire token.
+#[test]
+fn restore_refuses_a_snapshot_whose_kind_differs_from_the_requested_kind() {
+    let mut fixture = Fixture::new("restore-kind-mismatch");
+    let workspace = fixture.workspace();
+    fixture.files.plant("AGENTS.md", b"# Title\n");
+    let project = project_of(&fixture);
+    let skills_bytes: &[u8] = b"## Local skill index\n";
+    let manifest = omnifrons_app::snapshot_store::SnapshotManifest {
+        schema: omnifrons_app::snapshot_store::SNAPSHOT_SCHEMA_VERSION,
+        id: omnifrons_app::snapshot_store::SnapshotId(601),
+        kind: ManagedFileKind::Skills,
+        file: omnifrons_domain::guidance::DEFAULT_GUIDANCE_FILE.to_string(),
+        existed: true,
+        sha256: fixture.digest_of(skills_bytes),
+        size: skills_bytes.len() as u64,
+        taken_at: fixture.clock.now(),
+        pinned: false,
+    };
+    let id = manifest.id;
+    omnifrons_app::snapshot_store::SnapshotStore::record(
+        &mut fixture.snapshots,
+        &project,
+        manifest,
+        skills_bytes,
+    )
+    .expect("record");
+    let before = fixture.snapshots.manifests(&project).len();
+    fixture.tick();
+    let expected = fixture.file_digest("AGENTS.md");
+    assert!(matches!(
+        restore(
+            &mut fixture.ports(&[&workspace]),
+            &workspace,
+            ManagedFileKind::Guidance,
+            id,
+            expected,
+        ),
+        Err(GuidanceError::Snapshot(SnapshotStoreError::Unknown))
+    ));
+    assert_eq!(
+        fixture.text("AGENTS.md").as_deref(),
+        Some("# Title\n"),
+        "no write"
+    );
+    assert_eq!(
+        fixture.snapshots.manifests(&project).len(),
+        before,
+        "no new snapshot"
+    );
 }
 
 #[test]
@@ -761,6 +903,7 @@ fn restore_refuses_an_unknown_snapshot_and_a_changed_file() {
         restore(
             &mut fixture.ports(&[&workspace]),
             &workspace,
+            ManagedFileKind::Guidance,
             omnifrons_app::snapshot_store::SnapshotId(1),
             None,
         )
@@ -779,6 +922,7 @@ fn restore_refuses_an_unknown_snapshot_and_a_changed_file() {
         restore(
             &mut fixture.ports(&[&workspace]),
             &workspace,
+            ManagedFileKind::Guidance,
             applied.snapshot_id.expect("snapshot"),
             None,
         )
@@ -813,6 +957,7 @@ fn restore_refuses_a_snapshot_whose_bytes_do_not_match_its_manifest() {
         restore(
             &mut fixture.ports(&[&workspace]),
             &workspace,
+            ManagedFileKind::Guidance,
             corrupt,
             shown,
         )
@@ -934,6 +1079,7 @@ fn a_work_area_inside_the_workspace_refuses_every_operation() {
         restore(
             &mut fixture.ports(&workspaces),
             &workspace,
+            ManagedFileKind::Guidance,
             omnifrons_app::snapshot_store::SnapshotId(1),
             None,
         )
