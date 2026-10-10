@@ -11,8 +11,9 @@
 //! own line-ending parameter, not this module's concern.
 
 use omnifrons_domain::skills_index::{
-    INDEX_HEADING, PRECEDENCE_PHRASES, PRECEDENCE_RULE, RULE_HEADING, SkillRow,
-    has_precedence_phrases, render_body, render_row,
+    INDEX_HEADING, PRECEDENCE_PHRASES, PRECEDENCE_RULE, RULE_HEADING, SkillIndexStatus, SkillRow,
+    block_needed, has_precedence_phrases, indexed_skill_targets, read_skill_index, render_body,
+    render_row, rows_to_generate,
 };
 
 fn row(name: &str, description: &str, path: &str) -> SkillRow {
@@ -200,4 +201,361 @@ fn render_body_with_no_rows_renders_only_the_rule_section() {
 #[test]
 fn render_body_with_nothing_to_say_is_empty() {
     assert_eq!(render_body(&[], false), "");
+}
+
+/// Translated from the shape the prototype's `skill_link_targets`/
+/// `indexed_skills` scan for (ADR-0005 sub-slice 1c): a Markdown link
+/// outside fenced code whose target's basename is `SKILL.md`.
+#[test]
+fn indexed_skill_targets_extracts_links_outside_fences() {
+    let text = b"Intro.\n\n[a](skills/a/SKILL.md)\n\n```\n[b](skills/b/SKILL.md)\n```\n\n[c](skills/c/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec![
+            "skills/a/SKILL.md".to_string(),
+            "skills/c/SKILL.md".to_string()
+        ]
+    );
+}
+
+/// An angle-bracketed target has its brackets stripped, and a
+/// `#fragment` is stripped before the basename check.
+#[test]
+fn indexed_skill_targets_strips_angle_brackets_and_fragments() {
+    let text = b"[sp](<skills/has space/SKILL.md>)\n[x](skills/x/SKILL.md#section)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec![
+            "skills/has space/SKILL.md".to_string(),
+            "skills/x/SKILL.md".to_string()
+        ]
+    );
+}
+
+/// A link whose target does not end in `SKILL.md`, or that points at an
+/// absolute URL, is never indexed.
+#[test]
+fn indexed_skill_targets_ignores_non_skill_links_and_urls() {
+    let text = b"[r](README.md)\n[u](https://example.com/SKILL.md)\n";
+    assert_eq!(indexed_skill_targets(text), Vec::<String>::new());
+}
+
+/// Normalized like `posixpath.normpath` (the prototype's
+/// `indexed_skills`), and de-duplicated once two targets normalize to
+/// the same path.
+#[test]
+fn indexed_skill_targets_normalizes_dot_segments_and_dedupes() {
+    let text = b"[a](./skills/./x/../x/SKILL.md)\n[b](skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// A percent-escaped target is decoded before the basename and
+/// extension checks (the prototype's `unquote`).
+#[test]
+fn indexed_skill_targets_percent_decodes() {
+    let text = b"[sp](skills/my%20skill/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/my skill/SKILL.md".to_string()]
+    );
+}
+
+/// An absolute-looking target needs the scanned root to relativize
+/// against (the prototype's `os.path.relpath`); this pure function has
+/// no root, so it documents the limit and passes it through unchanged
+/// -- ADR-0005 sub-slice 1e's discovery service, which does have a
+/// root, relativizes it before comparing paths.
+#[test]
+fn indexed_skill_targets_passes_an_absolute_target_through_unchanged() {
+    let text = b"[a](/abs/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["/abs/skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// Translated from the prototype's `test_scan_reports_skill_index_status`:
+/// `missing` is discovered but not indexed, `dangling` is indexed but
+/// not discovered, and `discovered` is echoed back for the app layer's
+/// report.
+#[test]
+fn read_skill_index_reports_discovered_indexed_missing_and_dangling() {
+    let discovered = vec![
+        "skills/alpha/SKILL.md".to_string(),
+        "skills/beta/SKILL.md".to_string(),
+    ];
+    let text = b"[alpha](skills/alpha/SKILL.md) and [gone](skills/gone/SKILL.md)\n";
+    let status: SkillIndexStatus = read_skill_index(text, &discovered);
+    assert_eq!(status.discovered, discovered);
+    assert_eq!(
+        status.indexed,
+        vec![
+            "skills/alpha/SKILL.md".to_string(),
+            "skills/gone/SKILL.md".to_string()
+        ]
+    );
+    assert_eq!(status.missing, vec!["skills/beta/SKILL.md".to_string()]);
+    assert_eq!(status.dangling, vec!["skills/gone/SKILL.md".to_string()]);
+    assert!(!status.precedence);
+}
+
+/// Nothing discovered and nothing indexed: every list is empty, and the
+/// rule is reported absent unless it is actually stated.
+#[test]
+fn read_skill_index_with_nothing_discovered_or_indexed() {
+    let status = read_skill_index(b"# Plain\n\nNo links here.\n", &[]);
+    assert_eq!(status.discovered, Vec::<String>::new());
+    assert_eq!(status.indexed, Vec::<String>::new());
+    assert_eq!(status.missing, Vec::<String>::new());
+    assert_eq!(status.dangling, Vec::<String>::new());
+    assert!(!status.precedence);
+}
+
+/// Translated from the prototype's `test_block_is_not_added_without_need`:
+/// with nothing discovered at all, no block is ever needed -- not even
+/// when the text already carries a dangling link and states the
+/// precedence rule (`plan_block`'s own early return, `if not
+/// discovered: return None`, before it even looks at the index status).
+#[test]
+fn block_needed_is_false_without_any_discovered_skills() {
+    let status = read_skill_index(b"# Plain\n\nNothing skill-related here.\n", &[]);
+    assert!(!block_needed(&status));
+
+    let text =
+        format!("# D\n\n[gone](skills/gone/SKILL.md)\n\n{RULE_HEADING}\n\n{PRECEDENCE_RULE}\n");
+    let status = read_skill_index(text.as_bytes(), &[]);
+    assert_eq!(status.dangling, vec!["skills/gone/SKILL.md".to_string()]);
+    assert!(status.precedence);
+    assert!(!block_needed(&status));
+}
+
+/// Everything discovered is indexed and the rule is already stated: no
+/// block is needed (the prototype's `atlas` case).
+#[test]
+fn block_needed_is_false_when_everything_is_indexed_with_precedence() {
+    let discovered = vec!["skills/alpha/SKILL.md".to_string()];
+    let text = format!(
+        "# Atlas\n\n[alpha](skills/alpha/SKILL.md)\n\n{RULE_HEADING}\n\n{PRECEDENCE_RULE}\n"
+    );
+    let status = read_skill_index(text.as_bytes(), &discovered);
+    assert!(status.missing.is_empty());
+    assert!(status.precedence);
+    assert!(!block_needed(&status));
+}
+
+/// A block is needed when a discovered skill is missing from the
+/// index, or when the precedence rule is not yet stated, or both.
+#[test]
+fn block_needed_is_true_when_something_is_missing_or_precedence_is_absent() {
+    let discovered = vec!["skills/alpha/SKILL.md".to_string()];
+    let nothing_indexed = read_skill_index(b"No links here.\n", &discovered);
+    assert!(block_needed(&nothing_indexed));
+
+    let indexed_without_precedence =
+        read_skill_index(b"[alpha](skills/alpha/SKILL.md)\n", &discovered);
+    assert!(indexed_without_precedence.missing.is_empty());
+    assert!(!indexed_without_precedence.precedence);
+    assert!(block_needed(&indexed_without_precedence));
+}
+
+/// `rows_to_generate` returns only the discovered rows the prefix text
+/// does not already link, in discovery order.
+#[test]
+fn rows_to_generate_returns_discovered_rows_not_already_indexed() {
+    let already = row("alpha", "A.", "skills/alpha/SKILL.md");
+    let own = row("own", "Own.", "skills/own/SKILL.md");
+    let discovered = [already, own.clone()];
+    let prefix = b"[alpha](skills/alpha/SKILL.md)\n";
+    assert_eq!(rows_to_generate(prefix, &discovered), vec![own]);
+}
+
+/// Translated from the prototype's
+/// `test_parent_block_never_indexes_child_skills` (the generated-rows
+/// rule only; discovery and nesting are ADR-0005 sub-slice 1e's job):
+/// `rows_to_generate` only ever filters the rows it is handed -- it
+/// never discovers a skill on its own, so a nested child's skill never
+/// appears unless the caller's own discovery already put it in
+/// `discovered`.
+#[test]
+fn rows_to_generate_only_filters_the_given_rows_never_discovers_more() {
+    let own = row("own", "Own.", "skills/own/SKILL.md");
+    let discovered = [own.clone()];
+    let prefix = b"# Parent\n\nThe child/ folder is another agent.\n";
+    let rows = rows_to_generate(prefix, &discovered);
+    assert_eq!(rows, vec![own]);
+    assert!(
+        !rows
+            .iter()
+            .any(|generated| generated.path.contains("child"))
+    );
+}
+
+/// Review follow-up (correction pass): an invalid `%XX` escape (not two
+/// hex digits) is left exactly as written -- the prototype's `unquote`
+/// never raises on it.
+#[test]
+fn indexed_skill_targets_leaves_an_invalid_percent_escape_as_written() {
+    let text = b"[a](skills/x%zzdir/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/x%zzdir/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up: a `%XX` escape whose decoded byte is not valid
+/// UTF-8 is replaced with `U+FFFD` rather than discarding the whole
+/// decode, even when a validly-decoded escape follows it on the same
+/// target (the prototype shows the byte as `\xNN`; this translation
+/// uses the UTF-8 replacement character instead, as the `skills_safety`
+/// module documents for the same reason).
+#[test]
+fn indexed_skill_targets_replaces_an_invalid_utf8_escape_next_to_a_valid_one() {
+    let text = b"[a](skills/x%E9%20y/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/x\u{FFFD} y/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up: a percent-encoded non-UTF-8 directory name in the
+/// canonical text still matches a lossily-decoded discovered path (the
+/// one ADR-0005 sub-slice 1e's filesystem walk would report for the
+/// same on-disk bytes), so it is never reported as both missing and
+/// dangling for the same skill.
+#[test]
+fn read_skill_index_matches_a_percent_encoded_target_to_its_lossily_decoded_discovered_path() {
+    let discovered = vec!["skills/x\u{FFFD} y/SKILL.md".to_string()];
+    let text = b"[a](skills/x%E9%20y/SKILL.md)\n";
+    let status = read_skill_index(text, &discovered);
+    assert!(status.missing.is_empty(), "{status:?}");
+    assert!(status.dangling.is_empty(), "{status:?}");
+}
+
+/// Review follow-up (SUGGESTION): the regex alternation
+/// `(<[^<>]*>|[^()\s]+)` falls through to the bare-target branch when
+/// the angle-bracketed attempt cannot close -- here, a nested `<` before
+/// any `>` -- rather than matching nothing at all.
+#[test]
+fn indexed_skill_targets_falls_through_to_bare_target_for_a_nested_angle_bracket() {
+    let text = b"[a](<skills/<weird>/SKILL.md>)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/<weird>/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (coverage): a double-quoted link title is matched
+/// and ignored -- the target is the bare path only.
+#[test]
+fn indexed_skill_targets_ignores_a_double_quoted_title() {
+    let text = b"[a](skills/x/SKILL.md \"A title\")\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (coverage): a single-quoted link title is matched
+/// and ignored the same way.
+#[test]
+fn indexed_skill_targets_ignores_a_single_quoted_title() {
+    let text = b"[a](skills/x/SKILL.md 'A title')\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (coverage): a title whose opening quote never
+/// closes on the same line makes the whole link fail to match -- the
+/// prototype's regex has no closing quote to anchor on either -- so
+/// this line indexes nothing, while a later, well-formed line still
+/// does.
+#[test]
+fn indexed_skill_targets_ignores_a_link_with_an_unterminated_quoted_title() {
+    let text = b"[a](skills/x/SKILL.md \"untitled)\n[b](skills/y/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/y/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (coverage): text after a properly closed title, but
+/// before the closing `)`, also makes the link fail to match.
+#[test]
+fn indexed_skill_targets_ignores_a_link_with_trailing_content_after_a_closed_quote() {
+    let text = b"[a](skills/x/SKILL.md \"title\" extra)\n[b](skills/y/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/y/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (coverage): a bare target followed by stray,
+/// unquoted text before `)` is not a title, so the link fails to match.
+#[test]
+fn indexed_skill_targets_ignores_a_bare_target_followed_by_stray_text_before_the_paren() {
+    let text = b"[a](skills/x/SKILL.md stray)\n[b](skills/y/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec!["skills/y/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (coverage): a tilde fence hides a link exactly as a
+/// backtick fence does.
+#[test]
+fn indexed_skill_targets_excludes_links_inside_a_tilde_fence() {
+    let text =
+        b"[a](skills/a/SKILL.md)\n\n~~~\n[b](skills/b/SKILL.md)\n~~~\n\n[c](skills/c/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec![
+            "skills/a/SKILL.md".to_string(),
+            "skills/c/SKILL.md".to_string()
+        ]
+    );
+}
+
+/// Review follow-up (coverage): CRLF line endings are stripped before a
+/// line is scanned for links.
+#[test]
+fn indexed_skill_targets_handles_crlf_line_endings() {
+    let text = b"[a](skills/a/SKILL.md)\r\n[b](skills/b/SKILL.md)\r\n";
+    assert_eq!(
+        indexed_skill_targets(text),
+        vec![
+            "skills/a/SKILL.md".to_string(),
+            "skills/b/SKILL.md".to_string()
+        ]
+    );
+}
+
+/// Review follow-up (SUGGESTION): a `./`-prefixed discovered path
+/// normalizes to the same form `indexed_skill_targets` reports, so it
+/// is never wrongly listed as missing.
+#[test]
+fn read_skill_index_normalizes_a_dot_slash_prefixed_discovered_path() {
+    let discovered = vec!["./skills/x/SKILL.md".to_string()];
+    let text = b"[x](skills/x/SKILL.md)\n";
+    let status = read_skill_index(text, &discovered);
+    assert_eq!(status.discovered, vec!["skills/x/SKILL.md".to_string()]);
+    assert!(status.missing.is_empty(), "{status:?}");
+}
+
+/// Review follow-up (SUGGESTION): a repeated discovered path is
+/// de-duplicated, first occurrence kept, both in the echoed
+/// `discovered` list and in any derived list.
+#[test]
+fn read_skill_index_deduplicates_a_repeated_discovered_path() {
+    let discovered = vec![
+        "skills/x/SKILL.md".to_string(),
+        "skills/x/SKILL.md".to_string(),
+    ];
+    let status = read_skill_index(b"No links here.\n", &discovered);
+    assert_eq!(status.discovered, vec!["skills/x/SKILL.md".to_string()]);
+    assert_eq!(status.missing, vec!["skills/x/SKILL.md".to_string()]);
 }
