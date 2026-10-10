@@ -290,6 +290,203 @@ fn read_skill_metadata_allows_a_raw_invalid_byte_alone() {
     assert!(metadata.description.contains('\u{FFFD}'));
 }
 
+/// A `SKILL.md` whose description is the literal double-quoted text
+/// `"{inner}"`, with `inner` written exactly as given and no escaping
+/// applied, so a test can build a deliberately malformed JSON scalar
+/// without hand-counting backslashes in a Rust string literal.
+fn raw_quoted_skill(name: &str, inner: &str) -> Vec<u8> {
+    format!("---\nname: \"{name}\"\ndescription: \"{inner}\"\n---\n").into_bytes()
+}
+
+/// Review follow-up (doc fix): the prototype's continuation rule is not
+/// "only an indented line continues" -- any non-blank line that does
+/// not itself start a new key continues the previous one, indented or
+/// not. `description:http://x` has no space after its colon, so it
+/// fails the prototype's own `FRONTMATTER_KEY` regex
+/// (`([A-Za-z0-9_-]+):(?:[ \t]+(.*))?`, verified with `python3 -c
+/// "import re; print(re.compile(r'([A-Za-z0-9_-]+):(?:[ \t]+(.*))?')
+/// .fullmatch('description:http://x'))"`, which prints `None`) and is
+/// not indented either, yet it still continues `name`'s value.
+#[test]
+fn read_skill_metadata_continues_a_key_with_a_non_indented_line_that_is_not_a_key_line() {
+    let bytes = b"---\nname: alpha\ndescription:http://x\n---\n".to_vec();
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.name, "alpha description:http://x");
+}
+
+/// Coverage (R3-002): every `BLOCK_SCALARS` header folds the same way
+/// -- the header itself is dropped and its continuation lines join
+/// with one space, `|` included.
+#[test]
+fn read_skill_metadata_folds_each_block_scalar_header_and_drops_it() {
+    for header in ["|", ">", "|-", ">-", "|+", ">+"] {
+        let bytes = format!(
+            "---\nname: alpha\ndescription: {header}\n  First line.\n  Second line.\n---\n"
+        )
+        .into_bytes();
+        let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+        assert_eq!(
+            metadata.description, "First line. Second line.",
+            "header {header:?}"
+        );
+    }
+}
+
+/// Coverage (R3-002): a single-quoted scalar's doubled `''` unescapes
+/// to one `'`.
+#[test]
+fn read_skill_metadata_unescapes_a_doubled_single_quote() {
+    let bytes = b"---\nname: alpha\ndescription: 'It''s fine.'\n---\n".to_vec();
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, "It's fine.");
+}
+
+/// Coverage (R3-002): a plain scalar's ` #` comment is stripped, but a
+/// `#` with no space before it (as in `C#`) is kept.
+#[test]
+fn read_skill_metadata_strips_a_plain_scalar_comment_but_keeps_an_unspaced_hash() {
+    let bytes = b"---\nname: alpha\ndescription: C# notes here # trailing comment\n---\n".to_vec();
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, "C# notes here");
+}
+
+/// Coverage (R3-002): the first of a repeated key wins.
+#[test]
+fn read_skill_metadata_keeps_the_first_of_a_repeated_key() {
+    let bytes = b"---\nname: first\nname: second\n---\n".to_vec();
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.name, "first");
+}
+
+/// Coverage (R3-002): `...` closes the front matter block exactly as
+/// `---` does.
+#[test]
+fn read_skill_metadata_closes_the_block_with_three_dots() {
+    let bytes = b"---\nname: alpha\ndescription: Alpha tasks.\n...\n".to_vec();
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.name, "alpha");
+    assert_eq!(metadata.description, "Alpha tasks.");
+}
+
+/// Coverage (R3-002): an indented continuation line and a later,
+/// non-indented line that is not itself a key both continue the same
+/// key, joined with single spaces.
+#[test]
+fn read_skill_metadata_joins_an_indented_and_a_non_indented_continuation_line() {
+    let bytes = b"---\nname: alpha beta\n  gamma\ndelta epsilon\n---\n".to_vec();
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.name, "alpha beta gamma delta epsilon");
+}
+
+/// Coverage (R3-002): a leading UTF-8 BOM before the opening `---` is
+/// skipped.
+#[test]
+fn read_skill_metadata_skips_a_leading_utf8_bom() {
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(b"---\nname: alpha\ndescription: Alpha tasks.\n---\n");
+    let metadata = read_skill_metadata("skills/alpha/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.name, "alpha");
+    assert_eq!(metadata.description, "Alpha tasks.");
+}
+
+/// Coverage (R3-002): without a closing `---` or `...`, the block is
+/// not read partially -- there are no fields at all, so `name` falls
+/// back to the folder name rather than the frontmatter's own (unread)
+/// `name:` line.
+#[test]
+fn read_skill_metadata_reads_no_fields_from_a_block_with_no_closer() {
+    let bytes = b"---\nname: alpha\ndescription: Alpha tasks.\n".to_vec();
+    let metadata = read_skill_metadata("skills/zzz/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.name, "zzz");
+    assert_eq!(metadata.description, "");
+}
+
+/// R3-003/R3-004 (behavior change): whenever `CPython`'s strict
+/// `json.loads` would raise, the prototype's `fold_scalar` falls back
+/// to the *whole* raw inner text, unchanged -- never a partially
+/// decoded string. An unrecognized escape such as `\q` makes the whole
+/// decode fail, so the earlier, otherwise-valid `\n` right before it is
+/// never turned into an actual newline either.
+#[test]
+fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unknown_escape() {
+    let mut inner = String::from("a");
+    inner.push('\\');
+    inner.push('n');
+    inner.push('b');
+    inner.push('\\');
+    inner.push('q');
+    inner.push('c');
+    let bytes = raw_quoted_skill("u0", &inner);
+    let metadata = read_skill_metadata("skills/u0/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, inner);
+}
+
+/// R3-003/R3-004: a `\u` escape not followed by exactly four
+/// hexadecimal digits falls back the same way, in each of its shapes
+/// -- a leading `+` (the `hex4`/`u32::from_str_radix` case this review
+/// flagged), fewer than four digits, and four digits that are not all
+/// hexadecimal.
+#[test]
+fn read_skill_metadata_falls_back_to_the_raw_text_on_a_malformed_unicode_escape() {
+    for escape in ["+12f", "12", "12gg"] {
+        let mut inner = String::from("a");
+        inner.push('\\');
+        inner.push('n');
+        inner.push('b');
+        inner.push('\\');
+        inner.push('u');
+        inner.push_str(escape);
+        let bytes = raw_quoted_skill("u1", &inner);
+        let metadata = read_skill_metadata("skills/u1/SKILL.md", &bytes).unwrap();
+        assert_eq!(metadata.description, inner, "escape {escape:?}");
+    }
+}
+
+/// R3-003/R3-004: a trailing lone backslash right before the closing
+/// quote falls back the same way.
+#[test]
+fn read_skill_metadata_falls_back_to_the_raw_text_on_a_trailing_lone_backslash() {
+    let mut inner = String::from("a");
+    inner.push('\\');
+    inner.push('n');
+    inner.push('b');
+    inner.push('\\');
+    let bytes = raw_quoted_skill("u2", &inner);
+    let metadata = read_skill_metadata("skills/u2/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, inner);
+}
+
+/// R3-003/R3-004: a literal, unescaped control character (here, a raw
+/// tab byte) inside the value falls back the same way.
+#[test]
+fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unescaped_control_character() {
+    let mut inner = String::from("a");
+    inner.push('\\');
+    inner.push('n');
+    inner.push('b');
+    inner.push('\t');
+    inner.push('c');
+    let bytes = raw_quoted_skill("u3", &inner);
+    let metadata = read_skill_metadata("skills/u3/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, inner);
+}
+
+/// R3-003/R3-004: an unescaped `"` inside the value ends the JSON
+/// string literal early, which always leaves trailing content, so it
+/// falls back the same way.
+#[test]
+fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unescaped_embedded_quote() {
+    let mut inner = String::from("a");
+    inner.push('\\');
+    inner.push('n');
+    inner.push('b');
+    inner.push('"');
+    inner.push('c');
+    let bytes = raw_quoted_skill("u4", &inner);
+    let metadata = read_skill_metadata("skills/u4/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, inner);
+}
+
 use omnifrons_domain::skills_index::SkillRow;
 use omnifrons_domain::skills_safety::unsafe_row_fields;
 

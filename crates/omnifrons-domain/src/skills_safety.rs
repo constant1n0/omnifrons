@@ -290,12 +290,14 @@ fn parse_frontmatter_key(line: &str) -> Option<(&str, &str)> {
 /// The raw (unfolded) value lines of each top-level front matter key in
 /// a leading `---` block (the prototype's `frontmatter_parts`): a line
 /// matching `key: value` that is not itself indented starts a new key;
-/// an indented, non-blank line continues the previous key's value across
-/// lines. The first of repeated keys wins. Without a closing `---` or
-/// `...` line, there is no front matter at all -- a truncated block is
-/// not read partially. Line splitting is `\n`/`\r\n` only: YAML front
-/// matter is not expected to carry one of Unicode's other line or
-/// paragraph separators.
+/// any other non-blank line continues the previous key's value across
+/// lines, regardless of its own indentation -- including a non-indented
+/// line that simply does not match the `key: value` shape at all (for
+/// example, no space after its colon). The first of repeated keys wins.
+/// Without a closing `---` or `...` line, there is no front matter at
+/// all -- a truncated block is not read partially. Line splitting is
+/// `\n`/`\r\n` only: YAML front matter is not expected to carry one of
+/// Unicode's other line or paragraph separators.
 fn frontmatter_parts(text: &str) -> HashMap<String, Vec<String>> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut lines = text.lines();
@@ -335,20 +337,56 @@ fn frontmatter_parts(text: &str) -> HashMap<String, Vec<String>> {
 
 /// The `u32` value of the four hexadecimal digits at
 /// `chars[start..start+4]`, or `None` when they are not all hex digits
-/// or run past the end.
+/// or run past the end. Checks each character with
+/// [`char::is_ascii_hexdigit`] first, rather than delegating straight
+/// to [`u32::from_str_radix`]: that parser accepts an optional leading
+/// `+` (`"+12f"` parses as `0x12f`), which `CPython`'s strict `json`
+/// scanner does not allow inside a `\u` escape -- the `+` is simply
+/// not one of the four required hex digits, so the whole escape is
+/// malformed (review follow-up, correction pass).
 fn hex4(chars: &[char], start: usize) -> Option<u32> {
     if start + 4 > chars.len() {
         return None;
     }
-    let digits: String = chars[start..start + 4].iter().collect();
-    u32::from_str_radix(&digits, 16).ok()
+    let digits = &chars[start..start + 4];
+    if !digits.iter().all(char::is_ascii_hexdigit) {
+        return None;
+    }
+    let text: String = digits.iter().collect();
+    u32::from_str_radix(&text, 16).ok()
+}
+
+/// The outcome of a successful [`decode_json_string`] parse: either a
+/// plain decoded string, or every lone surrogate a `\u` escape produced
+/// (see [`decode_json_string`]'s own documentation).
+enum DecodedScalar {
+    /// A valid JSON string literal, decoded with no lone surrogate.
+    Valid(String),
+    /// A valid JSON string literal whose `\u` escapes decoded to one or
+    /// more lone surrogates, in order (the prototype's
+    /// `escaped_surrogates`): UTF-8 has no form for them.
+    LoneSurrogates(Vec<u16>),
 }
 
 /// Decodes a double-quoted front matter scalar's escapes -- the JSON
 /// string grammar the prototype's `json.loads` applies through
-/// `fold_scalar` -- returning the decoded text, or every lone surrogate
-/// a `\u` escape produced, in order, when one or more cannot combine
-/// into a valid Unicode scalar value. A high surrogate (`U+D800`-
+/// `fold_scalar` -- or `None` when `CPython`'s strict `json.loads` would
+/// raise on this exact text. `json.loads` raises on: an escape it does
+/// not define (anything after `\` other than `" \ / b f n r t u`); a
+/// `\u` not followed by exactly four hexadecimal digits; a trailing
+/// lone backslash right before the closing quote; a literal, unescaped
+/// control character (`U+0000`-`U+001F`) in the text; or an unescaped
+/// `"`, which ends the JSON string literal early and always leaves
+/// trailing, unparsed content, since `inner` never includes the
+/// value's own final quote. On `None`, [`fold_scalar`] falls back to
+/// the raw, unescaped `inner` text unchanged -- the prototype's own
+/// `except ValueError: return value[1:-1]`, which returns the *whole*
+/// value with only its outer quotes stripped, never a partially
+/// decoded string: an earlier, otherwise-valid escape in the same text
+/// is not decoded either once a later one fails.
+///
+/// A complete decode may still produce every lone surrogate a `\u`
+/// escape produced, when any did. A high surrogate (`U+D800`-
 /// `U+DBFF`) immediately followed by another `\u` escape of a low
 /// surrogate (`U+DC00`-`U+DFFF`) combines into the one character the
 /// pair encodes; every other surrogate escape -- a high one with
@@ -357,18 +395,28 @@ fn hex4(chars: &[char], start: usize) -> Option<u32> {
 /// prototype, a raw byte that is not valid UTF-8 can never surface here
 /// as a surrogate: it was already replaced with `U+FFFD` before this
 /// text was decoded, so the two can never be confused.
-fn decode_json_string(inner: &str) -> Result<String, Vec<u16>> {
+fn decode_json_string(inner: &str) -> Option<DecodedScalar> {
     let chars: Vec<char> = inner.chars().collect();
     let mut out = String::new();
     let mut lone: Vec<u16> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] != '\\' || i + 1 >= chars.len() {
-            out.push(chars[i]);
+        let c = chars[i];
+        if c == '"' {
+            return None; // an unescaped quote ends the literal early (trailing data)
+        }
+        if ('\u{0000}'..='\u{001F}').contains(&c) {
+            return None; // a literal, unescaped control character
+        }
+        if c != '\\' {
+            out.push(c);
             i += 1;
             continue;
         }
-        match chars[i + 1] {
+        let Some(&next) = chars.get(i + 1) else {
+            return None; // a trailing lone backslash before the closing quote
+        };
+        match next {
             '"' => {
                 out.push('"');
                 i += 2;
@@ -403,10 +451,7 @@ fn decode_json_string(inner: &str) -> Result<String, Vec<u16>> {
             }
             'u' => {
                 let Some(value) = hex4(&chars, i + 2) else {
-                    out.push('\\');
-                    out.push('u');
-                    i += 2;
-                    continue;
+                    return None; // not exactly four hexadecimal digits
                 };
                 if (0xD800..=0xDBFF).contains(&value) {
                     let paired_low = (chars.get(i + 6) == Some(&'\\')
@@ -434,20 +479,23 @@ fn decode_json_string(inner: &str) -> Result<String, Vec<u16>> {
                     i += 6;
                 }
             }
-            other => {
-                out.push('\\');
-                out.push(other);
-                i += 2;
-            }
+            _ => return None, // an escape the JSON string grammar does not define
         }
     }
-    if lone.is_empty() { Ok(out) } else { Err(lone) }
+    Some(if lone.is_empty() {
+        DecodedScalar::Valid(out)
+    } else {
+        DecodedScalar::LoneSurrogates(lone)
+    })
 }
 
 /// One front matter value: quoted, plain, or a `>`/`|` block (folded)
 /// (the prototype's `fold_scalar`). Returns every lone surrogate a
 /// double-quoted value's `\u` escapes produced, when any did
-/// ([`decode_json_string`]).
+/// ([`decode_json_string`]). When the double-quoted text is not a
+/// valid JSON string literal at all, returns the raw inner text
+/// unchanged, exactly as the prototype's own
+/// `except ValueError: return value[1:-1]` fallback does.
 fn fold_scalar(parts: &[String]) -> Result<String, Vec<u16>> {
     let head = parts[0].trim();
     if is_block_scalar_header(head) {
@@ -459,7 +507,11 @@ fn fold_scalar(parts: &[String]) -> Result<String, Vec<u16>> {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() >= 2 && chars[0] == '"' && chars[chars.len() - 1] == '"' {
         let inner: String = chars[1..chars.len() - 1].iter().collect();
-        return decode_json_string(&inner);
+        return match decode_json_string(&inner) {
+            Some(DecodedScalar::Valid(decoded)) => Ok(decoded),
+            Some(DecodedScalar::LoneSurrogates(lone)) => Err(lone),
+            None => Ok(inner),
+        };
     }
     if chars.len() >= 2 && chars[0] == '\'' && chars[chars.len() - 1] == '\'' {
         let inner: String = chars[1..chars.len() - 1].iter().collect();

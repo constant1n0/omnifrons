@@ -421,6 +421,21 @@ fn rows_to_generate_treats_a_dot_segment_in_the_middle_as_already_covered() {
     );
 }
 
+/// Review follow-up (R3-005, correction pass): `rows_to_generate`
+/// normalizes an uncovered row's own path too, not only the covered
+/// targets it compares against -- a `./`-prefixed row that is not yet
+/// covered comes back with its path already normalized, its name and
+/// description unchanged.
+#[test]
+fn rows_to_generate_normalizes_the_path_of_an_uncovered_row() {
+    let uncovered = row("x", "X.", "./skills/x/SKILL.md");
+    let discovered = [uncovered];
+    assert_eq!(
+        rows_to_generate(b"", &discovered),
+        vec![row("x", "X.", "skills/x/SKILL.md")]
+    );
+}
+
 /// A repeated row -- the same path handed in twice -- is de-duplicated,
 /// first occurrence kept, exactly as `read_skill_index` de-duplicates
 /// `discovered`.
