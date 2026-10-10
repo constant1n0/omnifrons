@@ -93,6 +93,53 @@ fn unsafe_at_tokens_shortens_long_words() {
     assert_eq!(unsafe_at_tokens(&long, true), vec![expected]);
 }
 
+/// Review follow-up (Finding 1): the old `is_combining_mark` table only
+/// covered five Unicode blocks, so a mark outside them was judged
+/// directly by `char::is_alphanumeric` instead of being skipped past --
+/// and, for a mark with the Unicode `Other_Alphabetic` property, that
+/// judged it as a word character, the permissive direction the
+/// module's documentation says the rule never takes. The complete
+/// general-category `M*` table fixes the skip for a mark anywhere in
+/// Unicode, not just the five original blocks.
+#[test]
+fn unsafe_at_tokens_skips_a_combining_mark_outside_the_old_five_blocks() {
+    let refused = [
+        // A Hebrew point (U+05B4, category Mn, outside the five old
+        // blocks) right after a space is skipped, then the space
+        // itself is judged: not a word character, so the `@` is
+        // unsafe.
+        (" \u{05B4}@x", vec!["\u{05B4}@x"]),
+        // A Devanagari vowel sign (U+093E, category Mc, outside the
+        // five old blocks) right after `(` is skipped the same way.
+        ("(\u{093E}@x", vec!["(\u{093E}@x"]),
+        // A mark outside the five old blocks at the very start of the
+        // text has nothing left before it once skipped.
+        ("\u{05B4}@x", vec!["\u{05B4}@x"]),
+    ];
+    for (text, expected) in refused {
+        assert_eq!(unsafe_at_tokens(text, true), expected, "case {text:?}");
+    }
+
+    // The same mark is still only skipped, never itself treated as the
+    // qualifying word character: preceded by an ordinary letter, the
+    // `@` stays inside a word (VER-H-004's rule extended past the five
+    // old blocks).
+    let allowed: Vec<String> = unsafe_at_tokens("a\u{05B4}@x", true);
+    assert!(allowed.is_empty(), "{allowed:?}");
+}
+
+/// Review follow-up (Finding 1): `char::is_alphanumeric` counts a
+/// circled or squared Latin letter as alphabetic (Unicode's
+/// `Other_Alphabetic` property), but `CPython`'s `str.isalnum()` -- a
+/// stricter, Letter-category-only check -- does not. Without the
+/// exclusion table such a letter right before an `@` would be judged a
+/// word character, the same permissive direction a wrongly-skipped
+/// combining mark was.
+#[test]
+fn unsafe_at_tokens_refuses_a_circled_letter_pythons_isalnum_rejects() {
+    assert_eq!(unsafe_at_tokens("\u{24B6}@x", true), vec!["\u{24B6}@x"]);
+}
+
 use omnifrons_domain::skills_safety::{
     SkillMetadata, SkillMetadataError, SkillSafetyRefusal, read_skill_metadata,
 };
@@ -485,6 +532,64 @@ fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unescaped_embedded_quote
     let bytes = raw_quoted_skill("u4", &inner);
     let metadata = read_skill_metadata("skills/u4/SKILL.md", &bytes).unwrap();
     assert_eq!(metadata.description, inner);
+}
+
+/// Review follow-up (Finding 2): every ordinary escape
+/// `decode_json_string` defines -- `\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
+/// `\r`, `\t` -- decodes to its real character through
+/// `read_skill_metadata`. Until now only a `\u` surrogate pair
+/// ([`read_skill_metadata_decodes_a_complete_surrogate_pair`]) had a
+/// success-path assertion; every other test touching one of these
+/// escapes used a malformed scalar that falls back to the raw,
+/// undecoded text instead, so a mapping could regress with nothing
+/// pinning it. `inner` is built with `push` rather than a source
+/// literal spelling the escape and its decoded character next to each
+/// other, the same ambiguity
+/// [`read_skill_metadata_decodes_a_complete_surrogate_pair`] avoids the
+/// same way.
+#[test]
+fn read_skill_metadata_decodes_every_ordinary_escape_to_its_real_character() {
+    let escapes: [(char, char); 8] = [
+        ('"', '"'),
+        ('\\', '\\'),
+        ('/', '/'),
+        ('b', '\u{0008}'),
+        ('f', '\u{000C}'),
+        ('n', '\n'),
+        ('r', '\r'),
+        ('t', '\t'),
+    ];
+    for (index, (escape, decoded)) in escapes.into_iter().enumerate() {
+        let mut inner = String::from("x");
+        inner.push('\\');
+        inner.push(escape);
+        inner.push('y');
+        let mut expected = String::from("x");
+        expected.push(decoded);
+        expected.push('y');
+        let name = format!("e{index}");
+        let bytes = raw_quoted_skill(&name, &inner);
+        let metadata = read_skill_metadata(&format!("skills/{name}/SKILL.md"), &bytes).unwrap();
+        assert_eq!(metadata.description, expected, "escape {escape:?}");
+    }
+}
+
+/// Finding 2: two escapes in the same scalar both decode, which pins
+/// the index advancing exactly past each one -- an escape handler that
+/// advanced the index by the wrong amount would corrupt or drop the
+/// second escape, something a test exercising only one escape per
+/// scalar could never show.
+#[test]
+fn read_skill_metadata_decodes_two_escapes_in_the_same_scalar() {
+    let mut inner = String::from("x");
+    inner.push('\\');
+    inner.push('t');
+    inner.push('\\');
+    inner.push('n');
+    inner.push('y');
+    let bytes = raw_quoted_skill("e8", &inner);
+    let metadata = read_skill_metadata("skills/e8/SKILL.md", &bytes).unwrap();
+    assert_eq!(metadata.description, "x\t\ny");
 }
 
 use omnifrons_domain::skills_index::SkillRow;
