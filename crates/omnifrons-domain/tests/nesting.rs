@@ -146,3 +146,160 @@ fn warning_chain_orders_inside_then_outside_ancestors() {
         ]
     );
 }
+
+/// `relate` still accepts the scan root `"."` and an ordinary nested
+/// path like `"a/b"` -- the degenerate-shape checks below reject only
+/// the new malformed shapes, never these.
+#[test]
+fn relate_still_accepts_the_scan_root_and_an_ordinary_nested_path() {
+    assert!(nesting::relate(&["."], &[]).is_ok());
+    assert!(nesting::relate(&["a/b"], &[]).is_ok());
+}
+
+/// `relate` refuses an empty root: there is nothing to resolve against
+/// the scan root.
+#[test]
+fn relate_rejects_an_empty_root() {
+    assert_eq!(nesting::relate(&[""], &[]), Err(NestingError::EmptyPath));
+}
+
+/// `relate` refuses a root prefixed with a redundant `./`: the scan
+/// root is spelled exactly `.`, never as a prefix of another path.
+#[test]
+fn relate_rejects_a_dot_slash_prefixed_root() {
+    assert_eq!(
+        nesting::relate(&["./a"], &[]),
+        Err(NestingError::DotSlashPrefix("./a".to_string()))
+    );
+}
+
+/// `relate` refuses a root with a trailing slash.
+#[test]
+fn relate_rejects_a_trailing_slash_root() {
+    assert_eq!(
+        nesting::relate(&["a/"], &[]),
+        Err(NestingError::TrailingSlash("a/".to_string()))
+    );
+}
+
+/// `relate` refuses a root with a doubled slash.
+#[test]
+fn relate_rejects_a_doubled_slash_root() {
+    assert_eq!(
+        nesting::relate(&["a//b"], &[]),
+        Err(NestingError::DoubledSlash("a//b".to_string()))
+    );
+}
+
+/// `relate` refuses a root with a bare `.` component in the middle --
+/// only the whole path may be `.`, naming the scan root itself.
+#[test]
+fn relate_rejects_a_dot_component_in_the_middle() {
+    assert_eq!(
+        nesting::relate(&["a/./b"], &[]),
+        Err(NestingError::DotComponent("a/./b".to_string()))
+    );
+}
+
+/// `relate` takes the nearest (first) of two outside ancestors as the
+/// parent of every root that has no inner parent -- never the second,
+/// even though both `roots` entries fall back to it the same way.
+#[test]
+fn relate_uses_the_nearest_of_two_outside_ancestors_for_every_parentless_root() {
+    let roots = ["a", "b"];
+    let outer = [
+        Ancestor {
+            path: "near".to_string(),
+            identity_files: vec!["AGENTS.md".to_string()],
+        },
+        Ancestor {
+            path: "far".to_string(),
+            identity_files: vec!["CLAUDE.md".to_string()],
+        },
+    ];
+    let relations = nesting::relate(&roots, &outer).unwrap();
+
+    for relation in &relations {
+        assert_eq!(relation.parent, Some(Parent::Outside("near".to_string())));
+    }
+}
+
+/// A port scanning a sub-directory discovers only a non-`"."` root
+/// (`roots = ["a"]`); a non-empty `outer` still makes `a`'s parent the
+/// outside ancestor, with consent required -- the same fallback `"."`
+/// alone gets.
+#[test]
+fn relate_gives_a_non_dot_only_root_its_outside_ancestor_as_parent() {
+    let roots = ["a"];
+    let outer = [Ancestor {
+        path: "atlas".to_string(),
+        identity_files: vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()],
+    }];
+    let relations = nesting::relate(&roots, &outer).unwrap();
+
+    let a = relations.iter().find(|r| r.root == "a").unwrap();
+    assert_eq!(a.parent, Some(Parent::Outside("atlas".to_string())));
+    assert!(a.consent_required());
+}
+
+/// The same sub-directory-only scan with no outside ancestors leaves
+/// `a` without a parent at all.
+#[test]
+fn relate_gives_a_non_dot_only_root_no_parent_without_outer_ancestors() {
+    let roots = ["a"];
+    let relations = nesting::relate(&roots, &[]).unwrap();
+
+    let a = relations.iter().find(|r| r.root == "a").unwrap();
+    assert_eq!(a.parent, None);
+    assert!(!a.consent_required());
+}
+
+/// `nearest_root` is non-fallible and trusts its scan-root-relative
+/// precondition: given an absolute `path`, `"."`'s own empty
+/// component list still matches as a prefix, so a `roots` slice
+/// holding `"."` reports it as the containing root rather than
+/// rejecting the input. Pins the documented precondition; this is not
+/// a validity check.
+#[test]
+fn nearest_root_reports_dot_for_an_absolute_path_when_dot_is_a_root() {
+    let roots = ["."];
+    assert_eq!(nesting::nearest_root(&roots, "/etc/passwd"), Some("."));
+}
+
+/// The same precondition means a `roots` slice without `"."` has no
+/// root to match an absolute `path` against, even though `"."` itself
+/// would have matched it.
+#[test]
+fn nearest_root_returns_none_for_an_absolute_path_without_dot_among_roots() {
+    let roots = ["a", "b"];
+    assert_eq!(nesting::nearest_root(&roots, "/etc/passwd"), None);
+}
+
+/// `ancestor_chain` inherits the same precondition through
+/// `nearest_root`: an absolute `root` argument still resolves its
+/// inside-scan prefix via `"."` rather than being rejected.
+#[test]
+fn ancestor_chain_inherits_the_absolute_path_precondition() {
+    let roots = [".", "child"];
+    assert_eq!(nesting::ancestor_chain(&roots, "/etc/passwd"), ["."]);
+}
+
+/// `warning_chain` inherits the same precondition transitively: an
+/// absolute `root` still resolves through `"."` before the outside
+/// ancestors are appended.
+#[test]
+fn warning_chain_inherits_the_absolute_path_precondition() {
+    let roots = ["."];
+    let outer = [Ancestor {
+        path: "atlas".to_string(),
+        identity_files: vec!["AGENTS.md".to_string()],
+    }];
+    let chain = nesting::warning_chain(&roots, "/etc/passwd", &outer);
+    assert_eq!(
+        chain,
+        [
+            ChainLink::Root(".".to_string()),
+            ChainLink::Outside(outer[0].clone()),
+        ]
+    );
+}

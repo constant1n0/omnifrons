@@ -28,11 +28,13 @@
 //! ## Model
 //!
 //! Every path handled here is POSIX-style and relative to one scan
-//! root: `"."` names the scan root itself, and a well-formed path never
-//! carries a leading `/` or a `..` component. This module normalizes
-//! nothing -- a port hands in already-clean paths -- and [`relate`],
-//! its one fallible entry point, rejects a malformed root through
-//! [`NestingError`] rather than guessing at an answer.
+//! root: `"."` names the scan root itself, and a well-formed path is
+//! never empty, never carries a leading `/`, a `..` component, or a
+//! bare `.` component, and never doubles or trails its `/`
+//! separators. This module normalizes nothing -- a port hands in
+//! already-clean paths -- and [`relate`], its one fallible entry
+//! point, rejects a malformed root through [`NestingError`] rather
+//! than guessing at an answer.
 //!
 //! The functions below mirror the prototype's by name: [`nearest_root`]
 //! is its `nearest_root`; [`relate`] is the parent/nested assignment
@@ -40,9 +42,12 @@
 //! [`warning_chain`] composes that chain with the outside ancestors the
 //! way its warnings walk does.
 
-/// Why a [`relate`] argument was rejected: a root/path must be a clean,
-/// scan-root-relative POSIX path, never absolute and never carrying a
-/// `..` component. An ancestor's own path (see [`Ancestor`]) is outside
+/// Why a [`relate`] argument was rejected: a root/path must be a
+/// clean, scan-root-relative POSIX path -- never empty, never
+/// absolute, never carrying a `..` or a bare `.` component, never
+/// doubled- or trailing-slashed, and never prefixed with a redundant
+/// `./` (the scan root is spelled exactly `.`, never as a prefix of
+/// another path). An ancestor's own path (see [`Ancestor`]) is outside
 /// this precondition entirely, since it names a location outside the
 /// scan root and so cannot be written as a clean relative path without
 /// a leading `..` of its own.
@@ -57,6 +62,27 @@ pub enum NestingError {
     /// against the scan root.
     #[error("{0} contains a `..` component")]
     ParentComponent(String),
+    /// The path is empty: there is nothing to resolve against the
+    /// scan root.
+    #[error("the root path is empty")]
+    EmptyPath,
+    /// The path starts with a redundant `./`: the scan root is spelled
+    /// exactly `.`, never as a prefix of another path.
+    #[error("{0} starts with a redundant `./`; the scan root is spelled `.`")]
+    DotSlashPrefix(String),
+    /// The path ends with a `/`, which a clean relative path never
+    /// needs.
+    #[error("{0} ends with a trailing `/`")]
+    TrailingSlash(String),
+    /// Two of the path's components are separated by an empty one --
+    /// a doubled `/`.
+    #[error("{0} contains an empty component (a doubled `/`)")]
+    DoubledSlash(String),
+    /// One of the path's components is a bare `.`, which is only
+    /// meaningful as the whole path (the scan root itself); a port
+    /// hands in paths already resolved against it.
+    #[error("{0} contains a `.` component")]
+    DotComponent(String),
 }
 
 /// An agent root above the scan root, outside every root [`relate`] was
@@ -165,15 +191,34 @@ fn inner_parent<'a>(roots: &[&'a str], root: &str) -> Option<&'a str> {
 }
 
 /// Rejects a root/path argument that is not a clean, scan-root-relative
-/// POSIX path: absolute, or carrying a `..` component. Every other
-/// shape is accepted unexamined, exactly as this module's precondition
-/// promises -- a port hands in already-clean paths.
+/// POSIX path: empty, absolute, carrying a `..` or a bare `.`
+/// component, doubled- or trailing-slashed, or prefixed with a
+/// redundant `./`. Every other shape is accepted unexamined, exactly as
+/// this module's precondition promises -- a port hands in already-clean
+/// paths.
 fn validate_relative(path: &str) -> Result<(), NestingError> {
     if path.starts_with('/') {
         return Err(NestingError::AbsolutePath(path.to_string()));
     }
-    if path != "." && path.split('/').any(|part| part == "..") {
-        return Err(NestingError::ParentComponent(path.to_string()));
+    if path.is_empty() {
+        return Err(NestingError::EmptyPath);
+    }
+    if path == "." {
+        return Ok(());
+    }
+    if path.starts_with("./") {
+        return Err(NestingError::DotSlashPrefix(path.to_string()));
+    }
+    if path.ends_with('/') {
+        return Err(NestingError::TrailingSlash(path.to_string()));
+    }
+    for part in path.split('/') {
+        match part {
+            "" => return Err(NestingError::DoubledSlash(path.to_string())),
+            ".." => return Err(NestingError::ParentComponent(path.to_string())),
+            "." => return Err(NestingError::DotComponent(path.to_string())),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -182,6 +227,17 @@ fn validate_relative(path: &str) -> Result<(), NestingError> {
 /// exactly as the prototype's `nearest_root`: `"."` contains every
 /// path, and when more than one root contains `path`, the one with the
 /// most components wins.
+///
+/// `path` carries the same scan-root-relative precondition as
+/// [`relate`]'s `roots` entries, but this function is non-fallible and
+/// never checks it -- a port hands in already-clean paths. Given an
+/// absolute `path` instead, `"."`'s own empty component list is still
+/// a prefix of anything, so a `roots` slice that includes `"."`
+/// reports it as the containing root rather than rejecting the input;
+/// a `roots` slice without `"."` reports `None`, since no other
+/// root's components can prefix a leading empty one. Callers that
+/// cannot guarantee the precondition should validate through
+/// [`relate`] first.
 #[must_use]
 pub fn nearest_root<'a>(roots: &[&'a str], path: &str) -> Option<&'a str> {
     let path_components = components(path);
@@ -203,7 +259,7 @@ pub fn nearest_root<'a>(roots: &[&'a str], path: &str) -> Option<&'a str> {
 /// children -- the parent/nested assignment from the prototype's
 /// `scan()`.
 ///
-/// For a root that is not `"."` (the scan root itself), the parent is
+/// Every root's parent, including `"."` (the scan root itself), is
 /// the deepest *other* root in `roots` enclosing its own parent
 /// directory, if one exists ("inner"); otherwise the parent is the
 /// *nearest* ancestor outside the scan -- `outer`'s first entry. The
@@ -213,10 +269,13 @@ pub fn nearest_root<'a>(roots: &[&'a str], path: &str) -> Option<&'a str> {
 /// `find_ancestors` returns its ancestors nearest first, the nearest
 /// outside ancestor becomes the parent -- never the outermost one.
 ///
-/// `"."` itself always gets `parent: None`: the prototype forces this
-/// with its own root-identity guard in the same assignment, and this
-/// module's `"."` convention for the scan root makes the guard
-/// unnecessary here -- `parent_of` already returns `None` for `"."`.
+/// `"."` never has an inner parent of its own -- `parent_of` returns
+/// `None` for `"."`, so its only possible parent is the
+/// `outer_parent` fallback above. That means `"."` gets `parent:
+/// None` only when `outer` is empty; given a non-empty `outer`,
+/// scanning a nested root alone (`roots = ["."]`) reports `"."`
+/// itself as needing that nearest outside ancestor's consent, exactly
+/// like any other root with no inner parent.
 ///
 /// `nested` lists, for each root, every other root whose own inner
 /// parent (as just defined) is this one, in the order `roots` was
@@ -275,6 +334,10 @@ pub fn relate(roots: &[&str], outer: &[Ancestor]) -> Result<Vec<RootRelation>, N
 /// terminates for the same reason the prototype's does -- each step's
 /// root is strictly shallower than the last -- and it stops exactly
 /// where the prototype's own inside-the-scan check would turn false.
+///
+/// `root` inherits [`nearest_root`]'s scan-root-relative precondition:
+/// an absolute `root` is never rejected here either, since every step
+/// still routes through `nearest_root`.
 #[must_use]
 pub fn ancestor_chain<'a>(roots: &[&'a str], root: &str) -> Vec<&'a str> {
     let mut chain = Vec::new();
@@ -289,6 +352,8 @@ pub fn ancestor_chain<'a>(roots: &[&'a str], root: &str) -> Vec<&'a str> {
 /// The full warning chain for `root`: its [`ancestor_chain`] inside the
 /// scan, followed by `outer`'s ancestors outside it, in `outer`'s own
 /// order -- the prototype composes its own warning chain the same way.
+/// `root` inherits the same scan-root-relative precondition
+/// transitively, through [`ancestor_chain`].
 #[must_use]
 pub fn warning_chain(roots: &[&str], root: &str, outer: &[Ancestor]) -> Vec<ChainLink> {
     let mut chain: Vec<ChainLink> = ancestor_chain(roots, root)
