@@ -1,7 +1,8 @@
 //! Host instruction-loader table (ADR-0005 sub-slice 1d).
 //!
 //! `HostLoader` is plain data: no filesystem access, and no behaviour
-//! beyond the lookups [`host`] and [`order_index`] provide. The table
+//! beyond the lookups [`host`], [`order_index`], and
+//! [`HostLoader::reads`] provide. The table
 //! starts from the nine hosts the `base_omnifrons` prototype's
 //! `HOSTS.md` documented (accessed 2026-09-25), and carries each row's
 //! source URL, access date, and verification status unchanged. The
@@ -74,15 +75,26 @@ pub enum ImportSupport {
 }
 
 /// One host's documented instruction-loading behaviour: plain data, with
-/// no filesystem access and no behaviour beyond this module's lookups.
+/// no filesystem access and no behaviour beyond this module's lookups,
+/// including [`reads`](Self::reads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HostLoader {
     /// The host's name, exactly as the prototype's `HOST_ORDER` spells
     /// it.
     pub name: &'static str,
-    /// The identity/instruction files this host loads, per the table's
-    /// "Project instruction files" column, in the table's own order.
+    /// The identity/instruction files this host loads when present, per
+    /// the table's "Project instruction files" column, in the table's
+    /// own order. See [`fallback_files`](Self::fallback_files) for
+    /// files this host reads only in their absence.
     pub files: &'static [&'static str],
+    /// The files this host reads only when none of
+    /// [`files`](Self::files) exists in the working directory or above
+    /// it, per the table's Notes column. Claude Code's Notes document
+    /// this as "Reads `AGENTS.md` only when no `CLAUDE.md`,
+    /// `.claude/CLAUDE.md` or `CLAUDE.local.md` exists in the working
+    /// directory or above it (v2.1.277 or later)"; every other host's
+    /// Notes document no such conditional fallback, so this is empty.
+    pub fallback_files: &'static [&'static str],
     /// The documented directory walk, or [`Walk::Undocumented`] when the
     /// table names no direction.
     pub walk: Walk,
@@ -108,12 +120,27 @@ pub struct HostLoader {
     pub status: &'static str,
 }
 
+impl HostLoader {
+    /// Whether this host can ever load `file`: present in
+    /// [`files`](Self::files) (loaded when present) or in
+    /// [`fallback_files`](Self::fallback_files) (loaded only when none
+    /// of `files` exists). This is the loose "can this host ever read
+    /// it" question a switch check asks; it does not touch the
+    /// filesystem or resolve which directory would actually supply the
+    /// file.
+    #[must_use]
+    pub fn reads(&self, file: &str) -> bool {
+        self.files.contains(&file) || self.fallback_files.contains(&file)
+    }
+}
+
 /// The nine hosts the `base_omnifrons` prototype's `HOSTS.md` documented
 /// (accessed 2026-09-25), in the prototype's `HOST_ORDER`.
 pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Claude Code",
         files: &["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"],
+        fallback_files: &["AGENTS.md"],
         walk: Walk::AncestorsAtLaunch,
         imports: ImportSupport::AtPath,
         upward_kinds: &["CLAUDE.md", ".claude/CLAUDE.md"],
@@ -126,6 +153,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Codex",
         files: &["AGENTS.override.md", "AGENTS.md"],
+        fallback_files: &[],
         walk: Walk::GitRootToCwd,
         imports: ImportSupport::None,
         upward_kinds: &[],
@@ -138,6 +166,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Gemini CLI",
         files: &["GEMINI.md"],
+        fallback_files: &[],
         walk: Walk::Undocumented,
         imports: ImportSupport::AtPath,
         upward_kinds: &[],
@@ -153,6 +182,7 @@ pub const HOSTS: [HostLoader; 9] = [
         // slash; the prototype's EXTRA_READERS key for the same path
         // omits it (see module tests for both literal forms).
         files: &["AGENTS.md", "GEMINI.md", ".agents/rules/"],
+        fallback_files: &[],
         walk: Walk::Undocumented,
         imports: ImportSupport::Includes,
         upward_kinds: &[],
@@ -165,6 +195,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Qwen Code",
         files: &["QWEN.md", "AGENTS.md"],
+        fallback_files: &[],
         walk: Walk::Upward,
         imports: ImportSupport::None,
         upward_kinds: &["QWEN.md", "AGENTS.md"],
@@ -177,6 +208,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "OpenCode",
         files: &["AGENTS.md", "CLAUDE.md"],
+        fallback_files: &[],
         walk: Walk::Upward,
         imports: ImportSupport::None,
         upward_kinds: &[],
@@ -189,6 +221,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Kimi",
         files: &["AGENTS.md", ".kimi/AGENTS.md"],
+        fallback_files: &[],
         walk: Walk::GitRootToCwd,
         imports: ImportSupport::None,
         upward_kinds: &[],
@@ -201,6 +234,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Cursor",
         files: &["AGENTS.md"],
+        fallback_files: &[],
         walk: Walk::NestedOnly,
         imports: ImportSupport::None,
         upward_kinds: &[],
@@ -213,6 +247,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Copilot",
         files: &["AGENTS.md"],
+        fallback_files: &[],
         walk: Walk::NearestInTree,
         imports: ImportSupport::None,
         upward_kinds: &[],

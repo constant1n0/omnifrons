@@ -136,6 +136,40 @@ fn host_files_match_the_documented_table() {
     assert_eq!(hosts::host("Copilot").unwrap().files, ["AGENTS.md"]);
 }
 
+/// Each host's `fallback_files`, transcribed from the table's Notes
+/// column: the files a host reads only when none of `files` exists in
+/// the working directory or above it. Claude Code's Notes document this
+/// fallback to `AGENTS.md` (v2.1.277 or later); every other host's Notes
+/// document no such conditional fallback, so each is empty.
+#[test]
+fn fallback_files_are_set_only_for_claude_code() {
+    for host in &hosts::HOSTS {
+        let expected: &[&str] = if host.name == "Claude Code" {
+            &["AGENTS.md"]
+        } else {
+            &[]
+        };
+        assert_eq!(
+            host.fallback_files, expected,
+            "{} fallback_files",
+            host.name
+        );
+    }
+}
+
+/// `reads` is the loose "can this host ever read it" question a switch
+/// check asks: true when `file` is in `files` or in `fallback_files`,
+/// regardless of which list it came from.
+#[test]
+fn reads_reports_files_and_fallback_files() {
+    let claude_code = hosts::host("Claude Code").unwrap();
+    assert!(claude_code.reads("AGENTS.md"));
+    assert!(!claude_code.reads("GEMINI.md"));
+
+    let codex = hosts::host("Codex").unwrap();
+    assert!(codex.reads("AGENTS.md"));
+}
+
 /// Walk-pruning, host-config, and generated-state directories, verbatim
 /// from the prototype's `SKIP_DIRS`, `HOST_CONFIG_DIRS`, and
 /// `GENERATED_STATE_DIRS`.
