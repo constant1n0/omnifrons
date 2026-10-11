@@ -11,6 +11,7 @@ pub mod executable;
 mod fences;
 pub mod guidance;
 pub mod hosts;
+pub mod nesting;
 pub mod outbox;
 pub mod output;
 pub mod publication;
