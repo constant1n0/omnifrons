@@ -588,6 +588,31 @@ fn title_strips_a_closing_hash_run_only_when_commonmark_allows_it() {
     assert_eq!(title(b"# #\n"), None);
 }
 
+/// A fence closes only on a compatible delimiter (`CommonMark`'s rule,
+/// shared with [`crate::skills_index::indexed_skill_targets`] through
+/// `crate::fences::FenceTracker`): a `~~~` line found inside a backtick
+/// fence is content, not a close, so the heading right after it stays
+/// hidden; a closing run shorter than the opener's does not close it
+/// either; a run at least as long as the opener's does.
+#[test]
+fn title_closes_a_fence_only_on_a_compatible_delimiter() {
+    assert_eq!(
+        title(b"```\n~~~\n# Fake\n```\n\n# Real title\n"),
+        Some("Real title".to_string()),
+        "a mismatched ~~~ delimiter must not close a backtick fence"
+    );
+    assert_eq!(
+        title(b"````\n# Hidden\n```\n# Still hidden\n````\n\n# Title\n"),
+        Some("Title".to_string()),
+        "a shorter closing run must not close a longer-run fence"
+    );
+    assert_eq!(
+        title(b"```\n# Hidden\n````\n\n# Title\n"),
+        Some("Title".to_string()),
+        "a longer closing run must close a shorter-run fence"
+    );
+}
+
 /// Review follow-up: every token `as_str` produces parses back to the
 /// same variant, and an unrecognized token parses to `None` (review
 /// finding 7).

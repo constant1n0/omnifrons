@@ -411,9 +411,13 @@ pub struct ManagedBlock {
 impl ManagedBlock {
     /// A block of `kind` with `body` (canonical: `\n`-separated, no
     /// trailing newline), at [`GUIDANCE_TEMPLATE_VERSION`], its digest
-    /// taken from the body bytes through `digest`.
+    /// taken from the body bytes through `digest`. Private: this
+    /// carries no guard of its own against an empty `Skills` body, so
+    /// every caller goes through [`Self::for_kind`], [`Self::guidance`],
+    /// [`Self::ignore`], or [`Self::skills`] instead, and [`Self::skills`]
+    /// is the one that refuses an empty body before ever reaching here.
     #[must_use]
-    pub fn new(kind: ManagedFileKind, body: impl Into<String>, digest: DigestFn) -> Self {
+    fn new(kind: ManagedFileKind, body: impl Into<String>, digest: DigestFn) -> Self {
         let body = body.into();
         let digest = digest(body.as_bytes());
         Self {
@@ -866,8 +870,30 @@ pub fn plan_remove(current: &str, located: &Located, created_by_us: bool) -> Rem
 
 #[cfg(test)]
 mod tests {
-    use super::{LineEnding, ManagedFileKind, parse_begin, strip_terminator};
+    use super::{LineEnding, ManagedBlock, ManagedFileKind, parse_begin, strip_terminator};
     use crate::executable::Sha256Digest;
+
+    /// A digest double, local to this module: enough to tell two bodies
+    /// apart, with no claim to being cryptographic.
+    fn digest(bytes: &[u8]) -> Sha256Digest {
+        let mut out = [0u8; 32];
+        out[0] = u8::try_from(bytes.len() % 251).expect("fits");
+        Sha256Digest(out)
+    }
+
+    /// `new` carries no guard of its own: asked directly for a `Skills`
+    /// block with an empty body, it builds one. This is exactly why it
+    /// stays private -- [`ManagedBlock::skills`] and
+    /// [`ManagedBlock::for_kind`] are the only public ways to a
+    /// `Skills` block, and both refuse an empty body before ever
+    /// reaching `new` (see `tests/guidance.rs`'s
+    /// `an_empty_skills_body_is_refused_not_rendered`).
+    #[test]
+    fn new_itself_builds_a_degenerate_empty_skills_block() {
+        let block = ManagedBlock::new(ManagedFileKind::Skills, "", &digest);
+        assert_eq!(block.kind(), ManagedFileKind::Skills);
+        assert!(block.body().is_empty());
+    }
 
     #[test]
     fn terminators_are_stripped_whole() {

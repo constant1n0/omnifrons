@@ -22,15 +22,6 @@
 /// prototype's `SKILL_FILE`).
 const SKILL_FILE: &str = "SKILL.md";
 
-/// A Markdown fence delimiter line (the prototype's `is_fence`, and the
-/// same rule [`crate::definition::title`] uses): a trimmed line starting
-/// with three backticks or three tildes. Both the opening and closing
-/// delimiter toggle the fence state and are themselves excluded from
-/// link detection.
-fn is_fence_delimiter(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("```") || trimmed_line.starts_with("~~~")
-}
-
 /// The index just past the run of whitespace starting at `start`:
 /// Unicode `White_Space`, via [`char::is_whitespace`] (review follow-up,
 /// correction pass: not just ASCII -- the prototype's `\s` in its
@@ -188,16 +179,68 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Splits an absolute POSIX path into its normalized components, the
+/// way `posixpath.normpath` normalizes one that is already absolute: a
+/// `.` segment and a repeated `/` are dropped, and a `..` drops the
+/// component before it when there is one, or is itself dropped
+/// silently when there is not -- an absolute path can never retain a
+/// leading `..` the way a relative one does, since there is nothing
+/// above its root to name. [`normalize_relative_target`] is the
+/// relative-path twin of this helper and keeps an unresolvable leading
+/// `..` for exactly that reason.
+fn normalized_absolute_components(path: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The path of an absolute `target` relative to an absolute `root`,
+/// lexically (the prototype's `os.path.relpath(target, root)`, which
+/// normalizes both paths before diffing them so the result never
+/// depends on a real filesystem): both paths' normalized components
+/// are compared left to right; the result is one `..` for every
+/// `root` component past the common prefix, then every `target`
+/// component past it, joined with `/`; `.` when the two paths are
+/// equal. `root` is the caller's own scanned workspace root -- an
+/// absolute POSIX path, with or without a trailing `/` -- never
+/// resolved or read from a filesystem here.
+fn relative_to_root(target: &str, root: &str) -> String {
+    let root_components = normalized_absolute_components(root);
+    let target_components = normalized_absolute_components(target);
+    let common = root_components
+        .iter()
+        .zip(target_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out: Vec<&str> =
+        Vec::with_capacity((root_components.len() - common) + (target_components.len() - common));
+    out.extend(std::iter::repeat_n("..", root_components.len() - common));
+    out.extend_from_slice(&target_components[common..]);
+    if out.is_empty() {
+        ".".to_string()
+    } else {
+        out.join("/")
+    }
+}
+
 /// Normalizes a linked `SKILL.md` target the way the prototype's
 /// `indexed_skills` does for a path it already knows is relative
 /// (`posixpath.normpath`): collapses `.` segments and repeated `/`, and
 /// resolves `a/../` by dropping the segment before it, keeping an
 /// unresolvable leading `..` as the library call does. A target that
-/// looks absolute (starts with `/`) is returned unchanged: the
-/// prototype relativizes it against the scanned root
-/// (`os.path.relpath`), which needs a real filesystem root this pure
-/// function does not have; the caller that does have one (ADR-0005 sub-
-/// slice 1e's discovery service) relativizes it before comparing paths.
+/// looks absolute (starts with `/`) is returned unchanged: this pure
+/// function takes no root, so it cannot relativize one --
+/// [`indexed_skill_targets`] does that itself, against its own `root`
+/// parameter, calling this function only for a target that is not
+/// absolute.
 #[must_use]
 pub fn normalize_relative_target(path: &str) -> String {
     if path.starts_with('/') {
@@ -229,24 +272,28 @@ pub fn normalize_relative_target(path: &str) -> String {
 /// normalization, merged into one function here): angle brackets are
 /// stripped, the target is percent-decoded, a link to an absolute URL
 /// (`://` anywhere in it) is never a local skill link, and the
-/// surviving target is normalized through [`normalize_relative_target`].
+/// surviving target is normalized -- relativized against `root` when
+/// it is itself absolute ([`relative_to_root`]), through
+/// [`normalize_relative_target`] otherwise, exactly as the prototype's
+/// `indexed_skills(root, data)` branches on `posixpath.isabs(target)`.
 /// Sorted and de-duplicated, as the prototype's own `sorted(set(...))`
 /// is. A hand-written index row in a project's own text is exactly one
 /// of these targets; this function does not care whether the row was
 /// written by a person or generated by Omnifrons.
+///
+/// `root` is the caller's scanned workspace root: an absolute POSIX
+/// path, with or without a trailing `/`. It is used only to relativize
+/// an absolute target lexically ([`relative_to_root`]); this function
+/// never reads a filesystem.
 #[must_use]
-pub fn indexed_skill_targets(text: &[u8]) -> Vec<String> {
+pub fn indexed_skill_targets(text: &[u8], root: &str) -> Vec<String> {
     let decoded = String::from_utf8_lossy(text);
-    let mut in_fence = false;
+    let mut fence = crate::fences::FenceTracker::new();
     let mut targets: Vec<String> = Vec::new();
     for raw_line in decoded.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let trimmed = line.trim();
-        if is_fence_delimiter(trimmed) {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
+        if fence.advance(trimmed) {
             continue;
         }
         for raw_target in link_targets_in_line(line) {
@@ -262,7 +309,12 @@ pub fn indexed_skill_targets(text: &[u8]) -> Vec<String> {
             if basename(&target) != SKILL_FILE {
                 continue;
             }
-            targets.push(normalize_relative_target(&target));
+            let normalized = if target.starts_with('/') {
+                relative_to_root(&target, root)
+            } else {
+                normalize_relative_target(&target)
+            };
+            targets.push(normalized);
         }
     }
     targets.sort();
@@ -300,14 +352,17 @@ pub struct SkillIndexStatus {
 /// [`normalize_relative_target`] and de-duplicated (first occurrence
 /// kept, order preserved) before any comparison, so a caller-supplied
 /// `./`-prefixed or repeated path never produces a spurious
-/// `missing`/`dangling` pair for the skill it actually names (review
-/// follow-up, correction pass). [`SkillIndexStatus::missing`] is the
-/// normalized `discovered` minus [`indexed_skill_targets`], in
-/// `discovered`'s own order; [`SkillIndexStatus::dangling`] is the
-/// indexed targets minus the normalized `discovered`, in their sorted
-/// order.
+/// `missing`/`dangling` pair for the skill it actually names.
+/// [`SkillIndexStatus::missing`] is the normalized `discovered` minus
+/// [`indexed_skill_targets`], in `discovered`'s own order;
+/// [`SkillIndexStatus::dangling`] is the indexed targets minus the
+/// normalized `discovered`, in their sorted order. `root` is threaded
+/// straight through to [`indexed_skill_targets`] to relativize an
+/// absolute link; `discovered` itself is always relative (a project's
+/// own discovery already reports paths relative to its root), so it is
+/// never relativized here.
 #[must_use]
-pub fn read_skill_index(text: &[u8], discovered: &[String]) -> SkillIndexStatus {
+pub fn read_skill_index(text: &[u8], discovered: &[String], root: &str) -> SkillIndexStatus {
     let mut normalized_discovered: Vec<String> = Vec::with_capacity(discovered.len());
     for path in discovered {
         let normalized = normalize_relative_target(path);
@@ -315,7 +370,7 @@ pub fn read_skill_index(text: &[u8], discovered: &[String]) -> SkillIndexStatus 
             normalized_discovered.push(normalized);
         }
     }
-    let indexed = indexed_skill_targets(text);
+    let indexed = indexed_skill_targets(text, root);
     let missing = normalized_discovered
         .iter()
         .filter(|path| !indexed.contains(path))
@@ -352,10 +407,12 @@ pub fn read_skill_index(text: &[u8], discovered: &[String]) -> SkillIndexStatus 
 /// only filters the rows it is handed: discovering a project's skills
 /// in the first place, and attributing a nested project's skills to
 /// their own agent rather than its parent's, is ADR-0005 sub-slice 1e's
-/// job, not this one's.
+/// job, not this one's. `root` is threaded straight through to
+/// [`indexed_skill_targets`] to relativize an absolute link already
+/// covering a row.
 #[must_use]
-pub fn rows_to_generate(prefix_text: &[u8], discovered: &[SkillRow]) -> Vec<SkillRow> {
-    let covered = indexed_skill_targets(prefix_text);
+pub fn rows_to_generate(prefix_text: &[u8], discovered: &[SkillRow], root: &str) -> Vec<SkillRow> {
+    let covered = indexed_skill_targets(prefix_text, root);
     let mut seen: Vec<String> = Vec::with_capacity(discovered.len());
     let mut normalized: Vec<SkillRow> = Vec::with_capacity(discovered.len());
     for row in discovered {
@@ -511,19 +568,29 @@ fn split_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// The link target for a row's path (the prototype's `link_target`):
-/// wrapped in angle brackets when the path holds whitespace or `(`,
-/// `)`, `<`, or `>` -- the characters that would otherwise break a bare
-/// Markdown link target.
+/// The link target for a row's path (the prototype's `link_target`,
+/// deliberately diverging from it in one way): `%` and `#` are
+/// percent-encoded first -- `%` to `%25`, then `#` to `%23`, in that
+/// order, so encoding `#` never introduces a `%` that gets re-encoded
+/// -- then the result is wrapped in angle brackets when it holds
+/// whitespace or `(`, `)`, `<`, or `>`, the characters that would
+/// otherwise break a bare Markdown link target. The prototype's
+/// `link_target` encodes neither `%` nor `#`, so a path such as
+/// `skills/c#/SKILL.md` renders a link its own reader (and this
+/// port's [`indexed_skill_targets`]) always misreads: a bare `#` is
+/// read as a fragment separator and truncates the target right there.
+/// Encoding both here, and decoding them back on the read side exactly
+/// as any other `%XX` escape ([`percent_decode`]), closes that gap.
 #[must_use]
 pub fn link_target(path: &str) -> String {
-    if path
+    let escaped = path.replace('%', "%25").replace('#', "%23");
+    if escaped
         .chars()
         .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'))
     {
-        format!("<{path}>")
+        format!("<{escaped}>")
     } else {
-        path.to_string()
+        escaped
     }
 }
 

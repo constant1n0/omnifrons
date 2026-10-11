@@ -765,7 +765,12 @@ fn unsafe_row_fields_refuses_paths_that_break_the_link_or_import() {
         (
             "skills/a> @evil.md#x/SKILL.md",
             vec![
-                "'skills/a> @evil.md#x/SKILL.md' (its path holds \"@evil.md#x/SKILL.md>\")",
+                // `skills_index::link_target` percent-encodes a path's
+                // `#` so the generated link survives
+                // `indexed_skill_targets`'s own fragment split, so the
+                // word this check reports around the `@` shows the
+                // encoded `%23`, not the path's own literal `#`.
+                "'skills/a> @evil.md#x/SKILL.md' (its path holds \"@evil.md%23x/SKILL.md>\")",
                 "'skills/a> @evil.md#x/SKILL.md' (its path holds '>', which breaks the link)",
             ],
         ),

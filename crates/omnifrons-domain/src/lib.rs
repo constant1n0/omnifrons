@@ -8,6 +8,7 @@
 pub mod adapter;
 pub mod definition;
 pub mod executable;
+mod fences;
 pub mod guidance;
 pub mod outbox;
 pub mod output;

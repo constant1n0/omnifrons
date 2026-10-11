@@ -609,15 +609,11 @@ pub fn title(bytes: &[u8]) -> Option<String> {
     let decoded = String::from_utf8_lossy(bytes);
     let content = decoded.strip_prefix('\u{feff}').unwrap_or(&decoded);
 
-    let mut in_fence = false;
+    let mut fence = crate::fences::FenceTracker::new();
     for raw_line in content.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let trimmed = line.trim();
-        if is_fence_delimiter(trimmed) {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
+        if fence.advance(trimmed) {
             continue;
         }
         if let Some(heading) = trimmed.strip_prefix("# ") {
@@ -659,12 +655,4 @@ fn strip_closing_hash_run(heading: &str) -> &str {
 /// distinction unconditionally).
 const fn is_space_or_tab(c: char) -> bool {
     matches!(c, ' ' | '\t')
-}
-
-/// A Markdown fence delimiter line (the prototype's `is_fence`): a
-/// trimmed line starting with three backticks or three tildes. Both the
-/// opening and closing delimiter toggle [`title`]'s fence state and are
-/// themselves excluded from heading detection.
-fn is_fence_delimiter(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("```") || trimmed_line.starts_with("~~~")
 }
