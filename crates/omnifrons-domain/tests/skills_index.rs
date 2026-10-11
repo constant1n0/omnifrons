@@ -387,6 +387,42 @@ fn indexed_skill_targets_still_normalizes_a_relative_target_as_before() {
     );
 }
 
+/// `indexed_skill_targets` threads `root` straight through to the
+/// private `relative_to_root` (`src/skills_index.rs`), which treats a
+/// non-absolute `root` as no root at all. An empty root has no
+/// leading `/`, so an absolute link target passes through this public
+/// function unrelativized rather than being guessed at.
+#[test]
+fn indexed_skill_targets_with_an_empty_root_leaves_an_absolute_target_unchanged() {
+    let text = b"[a](/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, ""),
+        vec!["/workspace/skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// The same fallback applies to a `root` that is a relative path
+/// rather than an absolute one.
+#[test]
+fn indexed_skill_targets_with_a_relative_root_leaves_an_absolute_target_unchanged() {
+    let text = b"[a](/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "relative/root"),
+        vec!["/workspace/skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// Contrast case for the two fallback tests above: the same text,
+/// relativized once `root` is actually an absolute POSIX path.
+#[test]
+fn indexed_skill_targets_with_an_absolute_root_relativizes_the_same_target() {
+    let text = b"[a](/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "/workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
 /// An absolute link inside the root names exactly the discovered
 /// relative path: neither missing nor dangling.
 #[test]

@@ -876,6 +876,16 @@ pub fn unsafe_row_fields(rows: &[SkillRow]) -> Vec<String> {
                 // about bytes it never held; and a field that merely
                 // *contains* a legitimate, validly-encoded `U+FFFD`
                 // in a file that decoded cleanly must not be either.
+                //
+                // Residual limitation, accepted for now: neither
+                // signal records which field a file's one real
+                // invalid byte actually landed in, so a field holding
+                // a legitimate, validly encoded `U+FFFD` still cannot
+                // be told apart from one that was itself lossily
+                // decoded when the real bad byte sits elsewhere --
+                // the body, or a sibling field. Telling the two cases
+                // apart would need per-field decode provenance, which
+                // this row shape does not carry.
                 let note = if *had_undecodable_bytes && has_undecodable_bytes(value) {
                     UNDECODABLE_NOTE
                 } else {

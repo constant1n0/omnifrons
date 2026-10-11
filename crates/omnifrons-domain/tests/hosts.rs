@@ -154,3 +154,124 @@ fn skip_dirs_host_config_dirs_and_generated_state_dirs_match_the_prototype() {
     assert_eq!(hosts::HOST_CONFIG_DIRS, [".claude", ".kimi", ".agents"]);
     assert_eq!(hosts::GENERATED_STATE_DIRS, [".atl"]);
 }
+
+/// Each host's documented walk shape, `@`-import support, source URL,
+/// access date, and status text, transcribed from the table's
+/// Notes/Status/Sources columns (not copied from `hosts.rs`); one
+/// assertion group per host, literal values. The source URL is the
+/// first one listed under each row's footnote when a footnote lists
+/// more than one.
+#[test]
+fn host_loader_documentary_fields_match_the_documented_table() {
+    let claude_code = hosts::host("Claude Code").unwrap();
+    assert_eq!(claude_code.walk, hosts::Walk::AncestorsAtLaunch);
+    assert_eq!(claude_code.imports, hosts::ImportSupport::AtPath);
+    assert_eq!(claude_code.source, "https://code.claude.com/docs/en/memory");
+    assert_eq!(claude_code.accessed, "2026-09-25");
+    assert_eq!(claude_code.status, "Verified");
+
+    let codex = hosts::host("Codex").unwrap();
+    assert_eq!(codex.walk, hosts::Walk::GitRootToCwd);
+    assert_eq!(codex.imports, hosts::ImportSupport::None);
+    assert_eq!(
+        codex.source,
+        "https://learn.chatgpt.com/docs/agent-configuration/agents-md"
+    );
+    assert_eq!(codex.accessed, "2026-09-25");
+    assert_eq!(codex.status, "Verified");
+
+    let gemini_cli = hosts::host("Gemini CLI").unwrap();
+    assert_eq!(gemini_cli.walk, hosts::Walk::Undocumented);
+    assert_eq!(gemini_cli.imports, hosts::ImportSupport::AtPath);
+    assert_eq!(
+        gemini_cli.source,
+        "https://geminicli.com/docs/cli/gemini-md/"
+    );
+    assert_eq!(gemini_cli.accessed, "2026-09-25");
+    assert_eq!(
+        gemini_cli.status,
+        "Verified (docs page); configuration reference unverified"
+    );
+
+    let antigravity = hosts::host("Antigravity").unwrap();
+    assert_eq!(antigravity.walk, hosts::Walk::Undocumented);
+    assert_eq!(antigravity.imports, hosts::ImportSupport::Includes);
+    assert_eq!(antigravity.source, "https://antigravity.google/docs/rules/");
+    assert_eq!(antigravity.accessed, "2026-09-25");
+    assert_eq!(antigravity.status, "Verified");
+
+    let qwen_code = hosts::host("Qwen Code").unwrap();
+    assert_eq!(qwen_code.walk, hosts::Walk::Upward);
+    assert_eq!(qwen_code.imports, hosts::ImportSupport::None);
+    assert_eq!(
+        qwen_code.source,
+        "https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/utils/memory-constants.ts"
+    );
+    assert_eq!(qwen_code.accessed, "2026-09-25");
+    assert_eq!(qwen_code.status, "Verified (source); user docs unverified");
+
+    let opencode = hosts::host("OpenCode").unwrap();
+    assert_eq!(opencode.walk, hosts::Walk::Upward);
+    assert_eq!(opencode.imports, hosts::ImportSupport::None);
+    assert_eq!(opencode.source, "https://opencode.ai/docs/rules/");
+    assert_eq!(opencode.accessed, "2026-09-25");
+    assert_eq!(opencode.status, "Verified (docs); source file unverified");
+
+    let kimi = hosts::host("Kimi").unwrap();
+    assert_eq!(kimi.walk, hosts::Walk::GitRootToCwd);
+    assert_eq!(kimi.imports, hosts::ImportSupport::None);
+    assert_eq!(
+        kimi.source,
+        "https://github.com/MoonshotAI/kimi-cli/blob/main/src/kimi_cli/soul/agent.py"
+    );
+    assert_eq!(kimi.accessed, "2026-09-25");
+    assert_eq!(
+        kimi.status,
+        "Verified (kimi-cli source); kimi-code docs unverified"
+    );
+
+    let cursor = hosts::host("Cursor").unwrap();
+    assert_eq!(cursor.walk, hosts::Walk::NestedOnly);
+    assert_eq!(cursor.imports, hosts::ImportSupport::None);
+    assert_eq!(cursor.source, "https://cursor.com/docs/context/rules");
+    assert_eq!(cursor.accessed, "2026-09-25");
+    assert_eq!(cursor.status, "Verified; `.cursorrules` unverified");
+
+    let copilot = hosts::host("Copilot").unwrap();
+    assert_eq!(copilot.walk, hosts::Walk::NearestInTree);
+    assert_eq!(copilot.imports, hosts::ImportSupport::None);
+    assert_eq!(
+        copilot.source,
+        "https://docs.github.com/en/copilot/how-tos/configure-custom-instructions/add-repository-instructions"
+    );
+    assert_eq!(copilot.accessed, "2026-09-25");
+    assert_eq!(copilot.status, "Verified");
+}
+
+/// Cross-field invariant: a host blind to `@` imports
+/// (`import_blind == true`) must document no import support, and a
+/// host documenting import support (`imports != None`) must not be
+/// import-blind. Both directions are checked explicitly even though
+/// each is the other's contrapositive, so either clause failing points
+/// straight at the host that disagrees.
+#[test]
+fn import_blind_agrees_with_documented_import_support_for_every_host() {
+    for host in &hosts::HOSTS {
+        if host.import_blind {
+            assert_eq!(
+                host.imports,
+                hosts::ImportSupport::None,
+                "{}: import_blind is true but imports is {:?}",
+                host.name,
+                host.imports
+            );
+        }
+        if host.imports != hosts::ImportSupport::None {
+            assert!(
+                !host.import_blind,
+                "{}: imports is {:?} but import_blind is true",
+                host.name, host.imports
+            );
+        }
+    }
+}

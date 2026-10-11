@@ -982,3 +982,38 @@ fn unsafe_row_fields_requires_both_the_flag_and_the_fields_own_undecodable_bytes
         "{unsafe_problems:?}"
     );
 }
+
+/// Pins a residual limitation documented alongside `unsafe_row_fields`'s
+/// note gate: `description` carries a literal, validly encoded
+/// `U+FFFD` typed directly in the source (same as the "clean" case
+/// above), but this time the file's one real invalid byte sits in the
+/// body, well past the front matter -- so the whole-file
+/// `had_undecodable_bytes` flag is still set. The gate cannot tell
+/// this field's legitimate `U+FFFD` apart from one that was itself
+/// lossily decoded, so the note is attached even though `description`
+/// never held a byte that was not valid UTF-8. This is current,
+/// accepted behavior; the test pins it so a future fix that adds
+/// per-field decode provenance changes this assertion visibly rather
+/// than silently.
+#[test]
+fn unsafe_row_fields_still_attaches_the_note_to_a_legitimate_fffd_when_the_bad_byte_is_in_the_body()
+{
+    let mut bytes = "---\nname: es\ndescription: Escribe a jos\u{FFFD}@ejemplo.es\n---\nBody text "
+        .as_bytes()
+        .to_vec();
+    bytes.push(0xFF);
+    bytes.extend_from_slice(b" trails off.\n");
+    let metadata = read_skill_metadata("skills/es/SKILL.md", &bytes).unwrap();
+    assert!(metadata.had_undecodable_bytes, "{metadata:?}");
+    assert!(metadata.description.contains('\u{FFFD}'), "{metadata:?}");
+
+    let problems = unsafe_row_fields(&[to_row(metadata)]);
+    assert!(
+        problems.iter().any(|p| {
+            p.starts_with("'skills/es/SKILL.md' (its description holds \"jos\u{FFFD}@ejemplo.es\"")
+                && p.contains("not valid UTF-8")
+                && p.contains("re-save")
+        }),
+        "{problems:?}"
+    );
+}
