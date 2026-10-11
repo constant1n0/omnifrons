@@ -511,7 +511,7 @@ pub struct SkillRow {
     pub description: String,
     /// The project-relative POSIX path of the skill's `SKILL.md`.
     pub path: String,
-    /// Review follow-up (Finding 1): true when decoding this skill's
+    /// True when decoding this skill's
     /// `SKILL.md` bytes to UTF-8 needed to replace at least one byte
     /// that was not valid UTF-8 ([`crate::skills_safety::SkillMetadata::had_undecodable_bytes`],
     /// carried through unchanged). [`crate::skills_safety::unsafe_row_fields`]
@@ -638,4 +638,101 @@ pub fn render_body(rows: &[SkillRow], include_rule: bool) -> String {
         sections.push(format!("{RULE_HEADING}\n\n{PRECEDENCE_RULE}"));
     }
     sections.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_to_root;
+
+    /// `relative_to_root`'s own empty-result case: a target equal to
+    /// `root` relativizes to `.`. Reachable only by calling this
+    /// private helper directly -- every target `indexed_skill_targets`
+    /// recognizes as a skill link already ends in `SKILL.md`, so it can
+    /// never equal a bare root path through that public API. Verified
+    /// with `python3 -c "import os;
+    /// print(os.path.relpath('/workspace', '/workspace'))"`, which
+    /// prints `.`.
+    #[test]
+    fn relative_to_root_of_a_target_equal_to_the_root_is_dot() {
+        assert_eq!(relative_to_root("/workspace", "/workspace"), ".");
+    }
+
+    /// A target inside `root` relativizes to the path past their
+    /// common prefix. Verified with `python3 -c "import os;
+    /// print(os.path.relpath('/workspace/skills/x/SKILL.md',
+    /// '/workspace'))"`, which prints `skills/x/SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_target_inside_the_root() {
+        assert_eq!(
+            relative_to_root("/workspace/skills/x/SKILL.md", "/workspace"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// A target outside `root` relativizes to the `../`-prefixed form.
+    /// Verified with `python3 -c "import os;
+    /// print(os.path.relpath('/elsewhere/skills/x/SKILL.md',
+    /// '/workspace'))"`, which prints `../elsewhere/skills/x/SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_target_outside_the_root() {
+        assert_eq!(
+            relative_to_root("/elsewhere/skills/x/SKILL.md", "/workspace"),
+            "../elsewhere/skills/x/SKILL.md"
+        );
+    }
+
+    /// A trailing slash on `root` (documented above as allowed)
+    /// changes nothing for an inside target. Verified with
+    /// `python3 -c "import os;
+    /// print(os.path.relpath('/workspace/skills/x/SKILL.md',
+    /// '/workspace/'))"`, which prints `skills/x/SKILL.md` -- the same
+    /// as without the trailing slash.
+    #[test]
+    fn relative_to_root_with_a_trailing_slash_on_the_root_for_an_inside_target() {
+        assert_eq!(
+            relative_to_root("/workspace/skills/x/SKILL.md", "/workspace/"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The same trailing slash changes nothing for an outside target.
+    /// Verified with `python3 -c "import os;
+    /// print(os.path.relpath('/elsewhere/skills/x/SKILL.md',
+    /// '/workspace/'))"`, which prints
+    /// `../elsewhere/skills/x/SKILL.md` -- unchanged.
+    #[test]
+    fn relative_to_root_with_a_trailing_slash_on_the_root_for_an_outside_target() {
+        assert_eq!(
+            relative_to_root("/elsewhere/skills/x/SKILL.md", "/workspace/"),
+            "../elsewhere/skills/x/SKILL.md"
+        );
+    }
+
+    /// A `root` holding dot segments normalizes before the comparison,
+    /// exactly like a target does: `/workspace/./sub/../` resolves to
+    /// `/workspace`, so an inside target relativizes the same as
+    /// against the plain root. Verified with
+    /// `python3 -c "import os;
+    /// print(os.path.relpath('/workspace/skills/x/SKILL.md',
+    /// '/workspace/./sub/../'))"`, which prints `skills/x/SKILL.md`.
+    #[test]
+    fn relative_to_root_with_dot_segments_in_the_root_for_an_inside_target() {
+        assert_eq!(
+            relative_to_root("/workspace/skills/x/SKILL.md", "/workspace/./sub/../"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The same dot-segment root normalization applies for an outside
+    /// target. Verified with `python3 -c "import os;
+    /// print(os.path.relpath('/elsewhere/skills/x/SKILL.md',
+    /// '/workspace/./sub/../'))"`, which prints
+    /// `../elsewhere/skills/x/SKILL.md`.
+    #[test]
+    fn relative_to_root_with_dot_segments_in_the_root_for_an_outside_target() {
+        assert_eq!(
+            relative_to_root("/elsewhere/skills/x/SKILL.md", "/workspace/./sub/../"),
+            "../elsewhere/skills/x/SKILL.md"
+        );
+    }
 }

@@ -21,10 +21,10 @@ fn row(name: &str, description: &str, path: &str) -> SkillRow {
         name: name.to_string(),
         description: description.to_string(),
         path: path.to_string(),
-        // This file never exercises `unsafe_row_fields`'s undecodable-
-        // bytes note (Finding 1): every row here is a plain fixture,
-        // never decoded from bytes, so there is no real decode outcome
-        // to carry.
+        // This helper always produces a plain fixture with no real
+        // decode outcome to carry; a test that needs
+        // `had_undecodable_bytes: true` builds its `SkillRow` literal
+        // directly instead of going through `row`.
         had_undecodable_bytes: false,
     }
 }
@@ -357,20 +357,17 @@ fn indexed_skill_targets_normalizes_dot_segments_before_relativizing() {
     );
 }
 
-/// An absolute target equal to `root` itself relativizes to `.`
-/// (`os.path.relpath`'s own empty-result case). Verified with
-/// `python3 -c "import os; print(os.path.relpath('/workspace', '/workspace'))"`,
-/// which prints `.`. This target's basename is not `SKILL.md`, so it is
-/// included here only to pin the relpath helper's own degenerate case,
-/// not as a realistic skill link.
+/// An absolute link to a skill file directly under `root` -- one path
+/// component deeper than the root itself, not equal to it -- comes
+/// back as the bare filename. This is `relative_to_root`'s ordinary
+/// case, not its empty-result `.` case: every target
+/// `indexed_skill_targets` recognizes as a skill link already ends in
+/// `SKILL.md`, so it can never equal a bare root path and never
+/// reaches the `.` branch through this public API. That branch is
+/// pinned directly, by calling `relative_to_root` itself, in its own
+/// unit tests in `src/skills_index.rs`.
 #[test]
-fn relativizing_an_absolute_target_equal_to_the_root_is_dot() {
-    // Routed through a relative discovered/indexed pair that *does*
-    // end in `SKILL.md`, since `indexed_skill_targets` only relativizes
-    // candidates it already recognizes as skill links; the degenerate
-    // `.` case itself is exercised directly by
-    // `read_skill_index_treats_an_absolute_target_inside_the_root_as_its_relative_path`
-    // below, where the absolute link names the root's own `SKILL.md`.
+fn indexed_skill_targets_relativizes_a_skill_file_directly_under_the_root_to_its_bare_filename() {
     let text = b"[a](/workspace/SKILL.md)\n";
     assert_eq!(
         indexed_skill_targets(text, "/workspace"),
@@ -568,7 +565,7 @@ fn rows_to_generate_treats_a_dot_segment_in_the_middle_as_already_covered() {
     );
 }
 
-/// Review follow-up (R3-005, correction pass): `rows_to_generate`
+/// `rows_to_generate`
 /// normalizes an uncovered row's own path too, not only the covered
 /// targets it compares against -- a `./`-prefixed row that is not yet
 /// covered comes back with its path already normalized, its name and
@@ -591,6 +588,26 @@ fn rows_to_generate_deduplicates_a_repeated_row_first_seen_kept() {
     let dup = row("dup", "Dup.", "skills/dup/SKILL.md");
     let discovered = [dup.clone(), dup.clone()];
     assert_eq!(rows_to_generate(b"", &discovered, "/workspace"), vec![dup]);
+}
+
+/// `rows_to_generate` carries a row's `had_undecodable_bytes` flag
+/// through its normalized copy unchanged, for a row that has it set as
+/// well as a sibling that does not -- the copy must not default the
+/// flag to `false` regardless of the input.
+#[test]
+fn rows_to_generate_carries_had_undecodable_bytes_through_unchanged() {
+    let undecodable = SkillRow {
+        name: "undecodable".to_string(),
+        description: "Undecodable.".to_string(),
+        path: "skills/undecodable/SKILL.md".to_string(),
+        had_undecodable_bytes: true,
+    };
+    let clean = row("clean", "Clean.", "skills/clean/SKILL.md");
+    let discovered = [undecodable.clone(), clean.clone()];
+    assert_eq!(
+        rows_to_generate(b"", &discovered, "/workspace"),
+        vec![undecodable, clean]
+    );
 }
 
 /// Review follow-up (correction pass): an invalid `%XX` escape (not two
