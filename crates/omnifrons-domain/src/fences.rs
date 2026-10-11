@@ -18,13 +18,30 @@
 //! fixtures opens and closes a fence with the same character and run
 //! length, the one case where the naive toggle and the precise rule
 //! agree.
+//!
+//! `CommonMark` also forbids an info string (text trailing the run,
+//! other than whitespace) on a closing fence, though it allows one on
+//! an opening fence; the prototype's `is_fence` has no notion of an
+//! info string at all, so it would toggle a fence closed on, say, a
+//! backtick run immediately followed by a language tag, found inside
+//! one -- the same kind of misreading the compatible-delimiter rule
+//! above already guards against. This tracker refuses to close on
+//! such a line -- content, not a close -- for the same reason, and it
+//! is the same kind of deviation: no translated prototype fixture
+//! carries an info string on a fence line, so this is strictly more
+//! precise, never a regression.
 
 /// The character and run length a fence-shaped line opens or closes
-/// with.
+/// with, and whether anything other than whitespace follows the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FenceDelimiter {
     marker: char,
     run: usize,
+    /// True when the run of `marker` characters is followed by any
+    /// non-whitespace text: an info string, in `CommonMark` terms.
+    /// `CommonMark` allows one on an opening fence but never on a
+    /// closing one; see [`Self::closes`].
+    has_info_string: bool,
 }
 
 impl FenceDelimiter {
@@ -33,22 +50,37 @@ impl FenceDelimiter {
     /// backticks or tildes at the very start (the shared `is_fence`
     /// rule [`crate::definition::title`] and
     /// [`crate::skills_index::indexed_skill_targets`] both already
-    /// applied before this tracker existed).
+    /// applied before this tracker existed). Indexing
+    /// `trimmed_line[run..]` by `run` is always on a character
+    /// boundary: every one of the `run` characters counted is the
+    /// same one-byte ASCII `marker`, so the byte offset and the
+    /// character offset agree.
     fn of(trimmed_line: &str) -> Option<Self> {
         let marker = trimmed_line.chars().next()?;
         if marker != '`' && marker != '~' {
             return None;
         }
         let run = trimmed_line.chars().take_while(|c| *c == marker).count();
-        (run >= 3).then_some(Self { marker, run })
+        if run < 3 {
+            return None;
+        }
+        let has_info_string = trimmed_line[run..].chars().any(|c| !c.is_whitespace());
+        Some(Self {
+            marker,
+            run,
+            has_info_string,
+        })
     }
 
     /// Whether `self`, read while a fence opened by `opener` is still
     /// open, is a compatible closer: the same character, with a run at
     /// least as long as the opener's (`CommonMark`'s closing-fence
-    /// rule).
+    /// rule), and no info string -- `CommonMark` forbids one on a
+    /// closing fence, though it allows one on an opening fence (review
+    /// follow-up, close it: an earlier version accepted a closer
+    /// carrying one, which the module documentation now explains).
     fn closes(self, opener: Self) -> bool {
-        self.marker == opener.marker && self.run >= opener.run
+        self.marker == opener.marker && self.run >= opener.run && !self.has_info_string
     }
 }
 
@@ -84,10 +116,11 @@ impl FenceTracker {
             None => self.opener = Some(delimiter),
             Some(opener) if delimiter.closes(opener) => self.opener = None,
             Some(_) => {
-                // A fence-shaped line of the wrong character or too
-                // short a run, found while a fence is already open: it
-                // is content, not a close (`CommonMark`), so the fence
-                // stays open.
+                // A fence-shaped line that cannot close the fence
+                // already open -- the wrong character, too short a
+                // run, or an info string on an otherwise-matching run
+                // -- is content, not a close (`CommonMark`), so the
+                // fence stays open.
             }
         }
         true
@@ -133,6 +166,69 @@ mod tests {
         assert!(tracker.advance("````"));
         assert!(tracker.advance("```"), "shorter run: still open");
         assert!(tracker.advance("````"), "same run: closes");
+        assert!(!tracker.advance("outside"));
+    }
+
+    /// Review follow-up (close it): an info string on an
+    /// otherwise-matching run does not close the fence --
+    /// `CommonMark` forbids one on a closing fence -- so the line is
+    /// content, and the fence stays open until a plain closer with no
+    /// trailing text is found.
+    #[test]
+    fn an_info_string_on_an_otherwise_matching_line_does_not_close_the_fence() {
+        let mut tracker = FenceTracker::new();
+        assert!(tracker.advance("```"));
+        assert!(
+            tracker.advance("```rust"),
+            "an info string keeps this line as content, not a close"
+        );
+        assert!(
+            tracker.advance("```"),
+            "a plain run of the same length finally closes it"
+        );
+        assert!(!tracker.advance("outside"));
+    }
+
+    /// Trailing whitespace after the run is never an info string, so
+    /// it still closes the fence.
+    #[test]
+    fn trailing_whitespace_after_the_run_still_closes_the_fence() {
+        let mut tracker = FenceTracker::new();
+        assert!(tracker.advance("```"));
+        assert!(
+            tracker.advance("``` "),
+            "trailing whitespace only: still closes"
+        );
+        assert!(!tracker.advance("outside"));
+    }
+
+    /// An opening fence may carry an info string: `CommonMark` only
+    /// forbids one on a closing fence.
+    #[test]
+    fn an_opening_fence_may_carry_an_info_string() {
+        let mut tracker = FenceTracker::new();
+        assert!(
+            tracker.advance("```rust"),
+            "an info string does not block opening"
+        );
+        assert!(tracker.advance("still inside"));
+        assert!(tracker.advance("```"));
+        assert!(!tracker.advance("outside"));
+    }
+
+    /// A shorter run carrying an info string, found while a
+    /// longer-run fence is already open, is content: too short to
+    /// close regardless of the info string, and it does not replace
+    /// the already-open fence's own opener.
+    #[test]
+    fn a_shorter_run_with_an_info_string_does_not_open_a_new_fence_while_one_is_open() {
+        let mut tracker = FenceTracker::new();
+        assert!(tracker.advance("````"));
+        assert!(
+            tracker.advance("```rust"),
+            "too short to close, info string or not: still content"
+        );
+        assert!(tracker.advance("````"), "same run as the opener: closes");
         assert!(!tracker.advance("outside"));
     }
 }

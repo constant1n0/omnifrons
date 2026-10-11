@@ -212,7 +212,21 @@ fn normalized_absolute_components(path: &str) -> Vec<&str> {
 /// equal. `root` is the caller's own scanned workspace root -- an
 /// absolute POSIX path, with or without a trailing `/` -- never
 /// resolved or read from a filesystem here.
+///
+/// When `root` is not itself an absolute path (empty, or a relative
+/// path such as `"workspace"`), there is no meaningful position left
+/// to relativize `target` against: treating an empty `root` as having
+/// zero components, or a relative one as though it were anchored at
+/// the same place as `target`, both only produce a plausible-looking
+/// but wrong path (review follow-up, close it). This function instead
+/// treats a non-absolute `root` as no root at all and returns `target`
+/// unchanged -- every caller's own fallback for an absolute target
+/// before this function existed to relativize one -- rather than ever
+/// panicking: the domain never panics on a caller's input.
 fn relative_to_root(target: &str, root: &str) -> String {
+    if !root.starts_with('/') {
+        return target.to_string();
+    }
     let root_components = normalized_absolute_components(root);
     let target_components = normalized_absolute_components(target);
     let common = root_components
@@ -284,7 +298,12 @@ pub fn normalize_relative_target(path: &str) -> String {
 /// `root` is the caller's scanned workspace root: an absolute POSIX
 /// path, with or without a trailing `/`. It is used only to relativize
 /// an absolute target lexically ([`relative_to_root`]); this function
-/// never reads a filesystem.
+/// never reads a filesystem. A non-absolute `root` (empty, or a
+/// relative path) is treated as no root at all, so an absolute target
+/// passes through unrelativized -- [`relative_to_root`] documents the
+/// fallback -- and the same holds for [`read_skill_index`] and
+/// [`rows_to_generate`] below, which both thread `root` straight
+/// through to this function.
 #[must_use]
 pub fn indexed_skill_targets(text: &[u8], root: &str) -> Vec<String> {
     let decoded = String::from_utf8_lossy(text);
@@ -515,10 +534,13 @@ pub struct SkillRow {
     /// `SKILL.md` bytes to UTF-8 needed to replace at least one byte
     /// that was not valid UTF-8 ([`crate::skills_safety::SkillMetadata::had_undecodable_bytes`],
     /// carried through unchanged). [`crate::skills_safety::unsafe_row_fields`]
-    /// conditions its undecodable-bytes note on this flag, not on
-    /// whether `name` or `description` merely contains a `U+FFFD`
-    /// character -- a legitimate, validly-encoded `U+FFFD` sets this
-    /// to `false`.
+    /// conditions its undecodable-bytes note on this flag together
+    /// with whether the specific unsafe field's own value contains
+    /// `U+FFFD`: this flag alone is set for the *whole* file, so a
+    /// field whose invalid byte sits elsewhere in the file (a sibling
+    /// field, or the body past the front matter) must not be
+    /// decorated with a note about bytes it never actually held. A
+    /// legitimate, validly-encoded `U+FFFD` sets this flag to `false`.
     pub had_undecodable_bytes: bool,
 }
 
@@ -733,6 +755,38 @@ mod tests {
         assert_eq!(
             relative_to_root("/elsewhere/skills/x/SKILL.md", "/workspace/./sub/../"),
             "../elsewhere/skills/x/SKILL.md"
+        );
+    }
+
+    /// Review follow-up (behavior change): `relative_to_root` documents
+    /// its `root` as an absolute POSIX path but never checked that
+    /// before this fix. An empty root has no leading `/` either, so it
+    /// is "no root" -- there is nothing to relativize the target
+    /// against -- and the function falls back to the target unchanged
+    /// rather than guessing a lexically-wrong relativization. Before
+    /// this fix, an empty root made every root component vanish, so
+    /// the result silently dropped the target's own leading `/`
+    /// (`"workspace/skills/x/SKILL.md"`, not the absolute path it
+    /// started from) -- a plausible-looking but wrong path.
+    #[test]
+    fn relative_to_root_with_an_empty_root_falls_back_to_the_target_unchanged() {
+        assert_eq!(
+            relative_to_root("/workspace/skills/x/SKILL.md", ""),
+            "/workspace/skills/x/SKILL.md"
+        );
+    }
+
+    /// The same fallback applies to a `root` that is a relative path
+    /// rather than an absolute one: before this fix, a relative root
+    /// such as `"workspace"` happened to share a leading component with
+    /// the target's own normalized components and was silently treated
+    /// as if it meant `/workspace`, again producing a plausible-looking
+    /// but wrong relativization instead of the documented fallback.
+    #[test]
+    fn relative_to_root_with_a_relative_root_falls_back_to_the_target_unchanged() {
+        assert_eq!(
+            relative_to_root("/workspace/skills/x/SKILL.md", "workspace"),
+            "/workspace/skills/x/SKILL.md"
         );
     }
 }

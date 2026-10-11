@@ -609,17 +609,14 @@ fn row(name: &str, description: &str, path: &str) -> SkillRow {
 }
 
 /// Bridges a decoded [`SkillMetadata`] into the [`SkillRow`]
-/// [`unsafe_row_fields`] checks, carrying [`SkillMetadata::had_undecodable_bytes`]
-/// through unchanged -- the same bridging ADR-0005 sub-slice 1e's
-/// still-unbuilt discovery service will eventually do in production
-/// (Finding 1).
+/// [`unsafe_row_fields`] checks, through [`SkillRow`]'s own
+/// `From<SkillMetadata>` impl (review follow-up, close it: this
+/// helper used to build the row by hand; now it simply calls the
+/// production bridge, so these tests exercise exactly the code
+/// ADR-0005 sub-slice 1e's still-unbuilt discovery service will
+/// eventually call too).
 fn to_row(metadata: SkillMetadata) -> SkillRow {
-    SkillRow {
-        name: metadata.name,
-        description: metadata.description,
-        path: metadata.path,
-        had_undecodable_bytes: metadata.had_undecodable_bytes,
-    }
+    metadata.into()
 }
 
 /// Translated from the `EMAIL_SKILLS` check in the prototype's
@@ -919,5 +916,69 @@ fn unsafe_row_fields_omits_the_note_for_a_legitimate_literal_replacement_charact
             .iter()
             .any(|p| p == "'skills/es/SKILL.md' (its description holds \"jos\u{FFFD}@ejemplo.es\")"),
         "{problems:?}"
+    );
+}
+
+/// Review follow-up (behavior change): the undecodable-bytes note must
+/// require both the row's own `had_undecodable_bytes` flag AND the
+/// offending field's own value actually containing `U+FFFD`
+/// ([`omnifrons_domain::skills_safety::has_undecodable_bytes`]) --
+/// not the flag alone. Before this fix,
+/// `unsafe_row_fields` read only the flag, so a `SKILL.md` whose only
+/// invalid byte sat in its body, well past the front matter, still had
+/// every unsafe word in its perfectly clean `description` decorated
+/// with a note about bytes that field never held.
+#[test]
+fn unsafe_row_fields_requires_both_the_flag_and_the_fields_own_undecodable_bytes() {
+    // (a) The invalid byte lies in the body, after the closing `---`:
+    // the front-matter-derived `description` stays clean, but decoding
+    // the *whole* file still needed a replacement, so the row's flag
+    // is set. The note must not appear.
+    let mut clean_field_bytes =
+        b"---\nname: es\ndescription: See @notes for context.\n---\nBody text ".to_vec();
+    clean_field_bytes.push(0xFF);
+    clean_field_bytes.extend_from_slice(b" trails off.\n");
+    let clean_field_metadata =
+        read_skill_metadata("skills/es/SKILL.md", &clean_field_bytes).unwrap();
+    assert!(
+        clean_field_metadata.had_undecodable_bytes,
+        "{clean_field_metadata:?}"
+    );
+    assert!(
+        !clean_field_metadata.description.contains('\u{FFFD}'),
+        "{clean_field_metadata:?}"
+    );
+    let clean_problems = unsafe_row_fields(&[to_row(clean_field_metadata)]);
+    assert!(
+        clean_problems
+            .iter()
+            .any(|p| p == "'skills/es/SKILL.md' (its description holds \"@notes\")"),
+        "{clean_problems:?}"
+    );
+
+    // (b) The invalid byte sits right inside the description, next to
+    // the unsafe `@`: the field's own value holds `U+FFFD`, so the
+    // note must still appear.
+    let mut unsafe_field_bytes = b"---\nname: es\ndescription: Escribe a jos".to_vec();
+    unsafe_field_bytes.push(0xFF);
+    unsafe_field_bytes.extend_from_slice(b"@ejemplo.es\n---\n");
+    let unsafe_field_metadata =
+        read_skill_metadata("skills/es/SKILL.md", &unsafe_field_bytes).unwrap();
+    assert!(
+        unsafe_field_metadata.had_undecodable_bytes,
+        "{unsafe_field_metadata:?}"
+    );
+    assert!(
+        unsafe_field_metadata.description.contains('\u{FFFD}'),
+        "{unsafe_field_metadata:?}"
+    );
+    let unsafe_problems = unsafe_row_fields(&[to_row(unsafe_field_metadata)]);
+    assert!(
+        unsafe_problems.iter().any(|p| {
+            p.starts_with("'skills/es/SKILL.md' (its description holds \"jos\u{FFFD}@ejemplo.es\"")
+                && p.contains("not valid UTF-8")
+                && p.contains("re-save")
+        }),
+        "{unsafe_problems:?}"
     );
 }

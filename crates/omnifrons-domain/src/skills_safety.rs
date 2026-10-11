@@ -408,10 +408,13 @@ fn folder_name(path: &str) -> String {
 /// A purely textual check, so it cannot
 /// tell a real replacement apart from a legitimate, validly-encoded
 /// literal `U+FFFD` already present in the source -- both simply
-/// contain the character. [`unsafe_row_fields`] no longer uses this
-/// function to decide its undecodable-bytes note; it instead reads
-/// [`SkillRow::had_undecodable_bytes`], the decode outcome carried
-/// from [`read_skill_metadata`].
+/// contain the character. [`unsafe_row_fields`] (review follow-up,
+/// close it) never decides its undecodable-bytes note from this check
+/// alone: it requires this AND [`SkillRow::had_undecodable_bytes`]
+/// together, so a field that merely contains a legitimate `U+FFFD` in
+/// a row that decoded cleanly stays unnoted, and a clean field in a
+/// row whose *other* field or body held the real invalid byte stays
+/// unnoted too.
 #[must_use]
 pub fn has_undecodable_bytes(text: &str) -> bool {
     text.contains('\u{FFFD}')
@@ -739,6 +742,27 @@ pub fn read_skill_metadata(path: &str, bytes: &[u8]) -> Result<SkillMetadata, Sk
     })
 }
 
+/// Bridges a decoded [`SkillMetadata`] into the [`SkillRow`] shape
+/// [`unsafe_row_fields`] checks and [`crate::skills_index::render_row`]
+/// renders (review follow-up, close it): `name`, `description`, and
+/// `path` carried straight through -- the same project-relative
+/// `SKILL.md` path either side already names -- and
+/// [`SkillMetadata::had_undecodable_bytes`] carried through unchanged
+/// into [`SkillRow::had_undecodable_bytes`]. This is the production
+/// half of the bridge ADR-0005 sub-slice 1e's still-unbuilt discovery
+/// service will call once it reads real `SKILL.md` files from a
+/// workspace; until then, this crate's own tests are the only caller.
+impl From<SkillMetadata> for SkillRow {
+    fn from(metadata: SkillMetadata) -> Self {
+        Self {
+            name: metadata.name,
+            description: metadata.description,
+            path: metadata.path,
+            had_undecodable_bytes: metadata.had_undecodable_bytes,
+        }
+    }
+}
+
 /// Appended to a flagged name or description that holds a byte that is
 /// not valid UTF-8 (the prototype's `UNDECODABLE_NOTE`, adapted: the
 /// prototype shows the byte as `\xNN`; this module shows `U+FFFD`
@@ -842,13 +866,17 @@ pub fn unsafe_row_fields(rows: &[SkillRow]) -> Vec<String> {
         for (field_name, value) in [("name", name), ("description", description)] {
             let words = unsafe_at_tokens(&table_cell(value), true);
             if !words.is_empty() {
-                // Gated on the row's own
-                // carried decode outcome, not on whether `value` merely
-                // *contains* `U+FFFD` (`has_undecodable_bytes`) -- a
-                // legitimate, validly-encoded `U+FFFD` would otherwise
-                // false-positive this note even though the file never
-                // held invalid UTF-8.
-                let note = if *had_undecodable_bytes {
+                // Gated on both the row's own carried decode outcome
+                // AND whether this specific field's value actually
+                // holds `U+FFFD` (`has_undecodable_bytes`, review
+                // follow-up, close it): the flag alone is set for the
+                // *whole* file, so a clean field in a file whose only
+                // invalid byte sits elsewhere -- its body, or the
+                // other field -- must not be decorated with a note
+                // about bytes it never held; and a field that merely
+                // *contains* a legitimate, validly-encoded `U+FFFD`
+                // in a file that decoded cleanly must not be either.
+                let note = if *had_undecodable_bytes && has_undecodable_bytes(value) {
                     UNDECODABLE_NOTE
                 } else {
                     ""
