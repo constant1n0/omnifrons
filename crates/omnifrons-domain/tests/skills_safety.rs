@@ -93,7 +93,7 @@ fn unsafe_at_tokens_shortens_long_words() {
     assert_eq!(unsafe_at_tokens(&long, true), vec![expected]);
 }
 
-/// Review follow-up (Finding 1): the old `is_combining_mark` table only
+/// Review follow-up: the old `is_combining_mark` table only
 /// covered five Unicode blocks, so a mark outside them was judged
 /// directly by `char::is_alphanumeric` instead of being skipped past --
 /// and, for a mark with the Unicode `Other_Alphabetic` property, that
@@ -128,7 +128,7 @@ fn unsafe_at_tokens_skips_a_combining_mark_outside_the_old_five_blocks() {
     assert!(allowed.is_empty(), "{allowed:?}");
 }
 
-/// Review follow-up (Finding 1): `char::is_alphanumeric` counts a
+/// Review follow-up: `char::is_alphanumeric` counts a
 /// circled or squared Latin letter as alphabetic (Unicode's
 /// `Other_Alphabetic` property), but `CPython`'s `str.isalnum()` -- a
 /// stricter, Letter-category-only check -- does not. Without the
@@ -362,7 +362,7 @@ fn read_skill_metadata_continues_a_key_with_a_non_indented_line_that_is_not_a_ke
     assert_eq!(metadata.name, "alpha description:http://x");
 }
 
-/// Coverage (R3-002): every `BLOCK_SCALARS` header folds the same way
+/// Coverage: every `BLOCK_SCALARS` header folds the same way
 /// -- the header itself is dropped and its continuation lines join
 /// with one space, `|` included.
 #[test]
@@ -380,7 +380,7 @@ fn read_skill_metadata_folds_each_block_scalar_header_and_drops_it() {
     }
 }
 
-/// Coverage (R3-002): a single-quoted scalar's doubled `''` unescapes
+/// Coverage: a single-quoted scalar's doubled `''` unescapes
 /// to one `'`.
 #[test]
 fn read_skill_metadata_unescapes_a_doubled_single_quote() {
@@ -389,7 +389,7 @@ fn read_skill_metadata_unescapes_a_doubled_single_quote() {
     assert_eq!(metadata.description, "It's fine.");
 }
 
-/// Coverage (R3-002): a plain scalar's ` #` comment is stripped, but a
+/// Coverage: a plain scalar's ` #` comment is stripped, but a
 /// `#` with no space before it (as in `C#`) is kept.
 #[test]
 fn read_skill_metadata_strips_a_plain_scalar_comment_but_keeps_an_unspaced_hash() {
@@ -398,7 +398,7 @@ fn read_skill_metadata_strips_a_plain_scalar_comment_but_keeps_an_unspaced_hash(
     assert_eq!(metadata.description, "C# notes here");
 }
 
-/// Coverage (R3-002): the first of a repeated key wins.
+/// Coverage: the first of a repeated key wins.
 #[test]
 fn read_skill_metadata_keeps_the_first_of_a_repeated_key() {
     let bytes = b"---\nname: first\nname: second\n---\n".to_vec();
@@ -406,7 +406,7 @@ fn read_skill_metadata_keeps_the_first_of_a_repeated_key() {
     assert_eq!(metadata.name, "first");
 }
 
-/// Coverage (R3-002): `...` closes the front matter block exactly as
+/// Coverage: `...` closes the front matter block exactly as
 /// `---` does.
 #[test]
 fn read_skill_metadata_closes_the_block_with_three_dots() {
@@ -416,7 +416,7 @@ fn read_skill_metadata_closes_the_block_with_three_dots() {
     assert_eq!(metadata.description, "Alpha tasks.");
 }
 
-/// Coverage (R3-002): an indented continuation line and a later,
+/// Coverage: an indented continuation line and a later,
 /// non-indented line that is not itself a key both continue the same
 /// key, joined with single spaces.
 #[test]
@@ -426,7 +426,7 @@ fn read_skill_metadata_joins_an_indented_and_a_non_indented_continuation_line() 
     assert_eq!(metadata.name, "alpha beta gamma delta epsilon");
 }
 
-/// Coverage (R3-002): a leading UTF-8 BOM before the opening `---` is
+/// Coverage: a leading UTF-8 BOM before the opening `---` is
 /// skipped.
 #[test]
 fn read_skill_metadata_skips_a_leading_utf8_bom() {
@@ -437,7 +437,7 @@ fn read_skill_metadata_skips_a_leading_utf8_bom() {
     assert_eq!(metadata.description, "Alpha tasks.");
 }
 
-/// Coverage (R3-002): without a closing `---` or `...`, the block is
+/// Coverage: without a closing `---` or `...`, the block is
 /// not read partially -- there are no fields at all, so `name` falls
 /// back to the folder name rather than the frontmatter's own (unread)
 /// `name:` line.
@@ -449,7 +449,7 @@ fn read_skill_metadata_reads_no_fields_from_a_block_with_no_closer() {
     assert_eq!(metadata.description, "");
 }
 
-/// R3-003/R3-004 (behavior change): whenever `CPython`'s strict
+/// Review follow-up: whenever `CPython`'s strict
 /// `json.loads` would raise, the prototype's `fold_scalar` falls back
 /// to the *whole* raw inner text, unchanged -- never a partially
 /// decoded string. An unrecognized escape such as `\q` makes the whole
@@ -469,7 +469,7 @@ fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unknown_escape() {
     assert_eq!(metadata.description, inner);
 }
 
-/// R3-003/R3-004: a `\u` escape not followed by exactly four
+/// Review follow-up: a `\u` escape not followed by exactly four
 /// hexadecimal digits falls back the same way, in each of its shapes
 /// -- a leading `+` (the `hex4`/`u32::from_str_radix` case this review
 /// flagged), fewer than four digits, and four digits that are not all
@@ -490,7 +490,7 @@ fn read_skill_metadata_falls_back_to_the_raw_text_on_a_malformed_unicode_escape(
     }
 }
 
-/// R3-003/R3-004: a trailing lone backslash right before the closing
+/// Review follow-up: a trailing lone backslash right before the closing
 /// quote falls back the same way.
 #[test]
 fn read_skill_metadata_falls_back_to_the_raw_text_on_a_trailing_lone_backslash() {
@@ -504,7 +504,7 @@ fn read_skill_metadata_falls_back_to_the_raw_text_on_a_trailing_lone_backslash()
     assert_eq!(metadata.description, inner);
 }
 
-/// R3-003/R3-004: a literal, unescaped control character (here, a raw
+/// Review follow-up: a literal, unescaped control character (here, a raw
 /// tab byte) inside the value falls back the same way.
 #[test]
 fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unescaped_control_character() {
@@ -519,7 +519,7 @@ fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unescaped_control_charac
     assert_eq!(metadata.description, inner);
 }
 
-/// R3-003/R3-004: an unescaped `"` inside the value ends the JSON
+/// Review follow-up: an unescaped `"` inside the value ends the JSON
 /// string literal early, which always leaves trailing content, so it
 /// falls back the same way.
 #[test]
@@ -535,7 +535,7 @@ fn read_skill_metadata_falls_back_to_the_raw_text_on_an_unescaped_embedded_quote
     assert_eq!(metadata.description, inner);
 }
 
-/// Review follow-up (Finding 2): every ordinary escape
+/// Review follow-up: every ordinary escape
 /// `decode_json_string` defines -- `\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
 /// `\r`, `\t` -- decodes to its real character through
 /// `read_skill_metadata`. Until now only a `\u` surrogate pair
@@ -575,7 +575,7 @@ fn read_skill_metadata_decodes_every_ordinary_escape_to_its_real_character() {
     }
 }
 
-/// Finding 2: two escapes in the same scalar both decode, which pins
+/// Review follow-up: two escapes in the same scalar both decode, which pins
 /// the index advancing exactly past each one -- an escape handler that
 /// advanced the index by the wrong amount would corrupt or drop the
 /// second escape, something a test exercising only one escape per
@@ -603,7 +603,7 @@ fn row(name: &str, description: &str, path: &str) -> SkillRow {
         path: path.to_string(),
         // A hand-built fixture, never decoded from bytes: there is no
         // real decode outcome to carry, so every case that does not
-        // care about Finding 1's undecodable-bytes note gets `false`.
+        // care about the undecodable-bytes note gets `false`.
         had_undecodable_bytes: false,
     }
 }
@@ -688,7 +688,7 @@ fn unsafe_row_fields_refuses_every_unsafe_field_case() {
     }
 }
 
-/// Finding 2: every case above uses at most one unsafe word per field,
+/// Review follow-up: every case above uses at most one unsafe word per field,
 /// so `quoted_words`'s own de-duplication ("a", "b": each distinct
 /// word once, in order) has never been asserted at the
 /// `unsafe_row_fields` level. `"@a and @a"` reports the same word
@@ -800,7 +800,7 @@ fn unsafe_row_fields_refuses_paths_that_break_the_link_or_import() {
     }
 }
 
-/// Finding 3: `python_repr`'s quote-switching -- double quotes when
+/// Review follow-up: `python_repr`'s quote-switching -- double quotes when
 /// the path holds a single quote but no double quote; single quotes,
 /// with the single quote escaped, when it holds both -- is otherwise
 /// exercised only by the backslash- and `\n`-escaping cases above.
@@ -822,7 +822,7 @@ fn unsafe_row_fields_quotes_a_path_holding_only_a_single_quote_in_double_quotes(
     );
 }
 
-/// Finding 3: a path holding both quote kinds falls back to
+/// Review follow-up: a path holding both quote kinds falls back to
 /// single-quote wrapping with the embedded single quote escaped and
 /// the embedded double quotes left bare, matching Python's `repr()`.
 #[test]
@@ -847,7 +847,7 @@ fn unsafe_row_fields_quotes_a_path_holding_both_quote_kinds_in_single_quotes() {
 /// appended note differ from the prototype's exact text while the
 /// behaviour -- flagged, not crashed -- matches it.
 ///
-/// Review follow-up (Finding 1): rewritten from a hand-built `row()`
+/// Review follow-up: rewritten from a hand-built `row()`
 /// fixture carrying a literal, already-valid `U+FFFD`, to real raw
 /// bytes decoded through [`read_skill_metadata`] -- the only way to
 /// observe a genuine `Cow::Owned` decode outcome rather than assuming
@@ -892,7 +892,7 @@ fn unsafe_row_fields_notes_a_raw_invalid_byte_next_to_an_unsafe_at() {
     );
 }
 
-/// Finding 1 (RED first against the pre-fix `unsafe_row_fields`, which
+/// Review follow-up (RED first against the pre-fix `unsafe_row_fields`, which
 /// keyed the note off `has_undecodable_bytes(value)` -- whether the
 /// decoded field merely *contains* `U+FFFD` -- rather than off whether
 /// the file's own bytes needed lossy replacement): a validly-encoded,
