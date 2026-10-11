@@ -303,3 +303,72 @@ fn warning_chain_inherits_the_absolute_path_precondition() {
         ]
     );
 }
+
+/// `relate` lists a parent's `nested` children in the exact order
+/// `roots` was given, not sorted -- a parent with three children given
+/// out of alphabetical order still reports them back in that same,
+/// non-alphabetical order.
+#[test]
+fn relate_nested_preserves_the_given_order_for_three_children() {
+    let roots = [".", "charlie", "alpha", "bravo"];
+    let relations = nesting::relate(&roots, &[]).unwrap();
+
+    let root = relations.iter().find(|r| r.root == ".").unwrap();
+    assert_eq!(root.nested, ["charlie", "alpha", "bravo"]);
+}
+
+/// Listing a grandchild, then its own child, then the scan root --
+/// children before parents, the reverse of every other test's order --
+/// still resolves every parent correctly and leaves every `nested`
+/// list the same as the natural, parents-first order gives: `relate`'s
+/// two-pass construction does not depend on a child appearing after
+/// its parent in `roots`.
+#[test]
+fn relate_resolves_parents_correctly_when_children_precede_parents() {
+    let roots = ["child/grandchild", "child", "."];
+    let relations = nesting::relate(&roots, &[]).unwrap();
+
+    let root = relations.iter().find(|r| r.root == ".").unwrap();
+    assert_eq!(root.parent, None);
+    assert_eq!(root.nested, ["child"]);
+
+    let child = relations.iter().find(|r| r.root == "child").unwrap();
+    assert_eq!(child.parent, Some(Parent::Root(".".to_string())));
+    assert_eq!(child.nested, ["child/grandchild"]);
+
+    let grandchild = relations
+        .iter()
+        .find(|r| r.root == "child/grandchild")
+        .unwrap();
+    assert_eq!(grandchild.parent, Some(Parent::Root("child".to_string())));
+    assert!(grandchild.nested.is_empty());
+}
+
+/// `relate` refuses a root that appears twice in `roots`, naming that
+/// root.
+#[test]
+fn relate_rejects_a_duplicated_root() {
+    assert_eq!(
+        nesting::relate(&["a", "a"], &[]),
+        Err(NestingError::DuplicateRoot("a".to_string()))
+    );
+}
+
+/// A duplicated scan root `"."` is refused the same way as any other
+/// duplicated root.
+#[test]
+fn relate_rejects_a_duplicated_scan_root() {
+    assert_eq!(
+        nesting::relate(&[".", "."], &[]),
+        Err(NestingError::DuplicateRoot(".".to_string()))
+    );
+}
+
+/// Distinct roots, even ones sharing a common prefix, are never
+/// flagged as duplicates.
+#[test]
+fn relate_does_not_flag_distinct_roots_as_duplicates() {
+    let roots = [".", "a", "a/b"];
+    let relations = nesting::relate(&roots, &[]).unwrap();
+    assert_eq!(relations.len(), roots.len());
+}

@@ -47,10 +47,12 @@
 /// absolute, never carrying a `..` or a bare `.` component, never
 /// doubled- or trailing-slashed, and never prefixed with a redundant
 /// `./` (the scan root is spelled exactly `.`, never as a prefix of
-/// another path). An ancestor's own path (see [`Ancestor`]) is outside
-/// this precondition entirely, since it names a location outside the
-/// scan root and so cannot be written as a clean relative path without
-/// a leading `..` of its own.
+/// another path). Every entry of `roots` must also be distinct from
+/// every other -- `relate` rejects a root repeated anywhere in the
+/// slice. An ancestor's own path (see [`Ancestor`]) is outside this
+/// precondition entirely, since it names a location outside the scan
+/// root and so cannot be written as a clean relative path without a
+/// leading `..` of its own.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NestingError {
     /// The path starts with `/`, so it cannot be relative to the scan
@@ -83,6 +85,10 @@ pub enum NestingError {
     /// hands in paths already resolved against it.
     #[error("{0} contains a `.` component")]
     DotComponent(String),
+    /// The same root appears more than once in `roots`: a repeat can
+    /// never be assigned a single, unambiguous parent and nested list.
+    #[error("{0} is a duplicate root")]
+    DuplicateRoot(String),
 }
 
 /// An agent root above the scan root, outside every root [`relate`] was
@@ -285,11 +291,17 @@ pub fn nearest_root<'a>(roots: &[&'a str], path: &str) -> Option<&'a str> {
 /// # Errors
 ///
 /// Returns [`NestingError`] if any entry of `roots` is not a clean,
-/// scan-root-relative POSIX path. `outer`'s ancestor paths are never
-/// checked this way; see [`Ancestor`].
+/// scan-root-relative POSIX path, or if the same root appears more
+/// than once in `roots`. `outer`'s ancestor paths are never checked
+/// this way; see [`Ancestor`].
 pub fn relate(roots: &[&str], outer: &[Ancestor]) -> Result<Vec<RootRelation>, NestingError> {
     for &root in roots {
         validate_relative(root)?;
+    }
+    for (index, &root) in roots.iter().enumerate() {
+        if roots[..index].contains(&root) {
+            return Err(NestingError::DuplicateRoot(root.to_string()));
+        }
     }
 
     let outer_parent = outer.first().map(|ancestor| ancestor.path.as_str());
