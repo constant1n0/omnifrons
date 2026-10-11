@@ -10,6 +10,7 @@ pub mod definition;
 pub mod executable;
 mod fences;
 pub mod guidance;
+pub mod hosts;
 pub mod outbox;
 pub mod output;
 pub mod publication;
