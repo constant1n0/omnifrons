@@ -136,16 +136,18 @@ fn host_files_match_the_documented_table() {
     assert_eq!(hosts::host("Copilot").unwrap().files, ["AGENTS.md"]);
 }
 
-/// Each host's `fallback_files`, transcribed from the table's Notes
-/// column: the files a host reads only when none of `files` exists in
-/// the working directory or above it. Claude Code's Notes document this
-/// fallback to `AGENTS.md` (v2.1.277 or later); every other host's Notes
+/// Each host's `fallback_files`: the files a host reads only when none
+/// of `files` exists in the working directory or above it. Claude Code's
+/// Notes document this fallback to `AGENTS.md` (v2.1.277 or later), and
+/// the official Claude Code memory documentation adds `.claude/AGENTS.md`
+/// to the same fallback (read at session start from the working
+/// directory and above), which the table omits; every other host's Notes
 /// document no such conditional fallback, so each is empty.
 #[test]
 fn fallback_files_are_set_only_for_claude_code() {
     for host in &hosts::HOSTS {
         let expected: &[&str] = if host.name == "Claude Code" {
-            &["AGENTS.md"]
+            &["AGENTS.md", ".claude/AGENTS.md"]
         } else {
             &[]
         };
@@ -164,6 +166,7 @@ fn fallback_files_are_set_only_for_claude_code() {
 fn reads_reports_files_and_fallback_files() {
     let claude_code = hosts::host("Claude Code").unwrap();
     assert!(claude_code.reads("AGENTS.md"));
+    assert!(claude_code.reads(".claude/AGENTS.md"));
     assert!(!claude_code.reads("GEMINI.md"));
 
     let codex = hosts::host("Codex").unwrap();

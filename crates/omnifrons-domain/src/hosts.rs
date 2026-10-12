@@ -92,8 +92,17 @@ pub struct HostLoader {
     /// it, per the table's Notes column. Claude Code's Notes document
     /// this as "Reads `AGENTS.md` only when no `CLAUDE.md`,
     /// `.claude/CLAUDE.md` or `CLAUDE.local.md` exists in the working
-    /// directory or above it (v2.1.277 or later)"; every other host's
-    /// Notes document no such conditional fallback, so this is empty.
+    /// directory or above it (v2.1.277 or later)". The official Claude
+    /// Code memory documentation ("When Claude Code reads AGENTS.md",
+    /// read 2026-10-12) adds `.claude/AGENTS.md` to that fallback: at
+    /// session start it loads every `AGENTS.md` and `.claude/AGENTS.md`
+    /// in the working directory and the directories above it. The table
+    /// omits the second file, so this row follows the documentation
+    /// there, a deliberate deviation. The same documentation makes the
+    /// rule depend on a configurable instruction-files mode
+    /// (`claude-md-or-agents-md` by default); the table models only the
+    /// default. Every other host's Notes document no such conditional
+    /// fallback, so theirs is empty.
     pub fallback_files: &'static [&'static str],
     /// The documented directory walk, or [`Walk::Undocumented`] when the
     /// table names no direction.
@@ -140,7 +149,7 @@ pub const HOSTS: [HostLoader; 9] = [
     HostLoader {
         name: "Claude Code",
         files: &["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"],
-        fallback_files: &["AGENTS.md"],
+        fallback_files: &["AGENTS.md", ".claude/AGENTS.md"],
         walk: Walk::AncestorsAtLaunch,
         imports: ImportSupport::AtPath,
         upward_kinds: &["CLAUDE.md", ".claude/CLAUDE.md"],
