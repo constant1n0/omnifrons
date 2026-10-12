@@ -219,6 +219,29 @@ fn child_not_mentioned_still_fires_with_no_readers_mirroring_the_prototype() {
     );
 }
 
+/// Pinned prototype parity, not a port gap: the prototype's own
+/// `agent_warnings` only calls `child_warnings` when `text is not
+/// None` -- `text: Optional[bytes]` being `None` skips the call
+/// entirely, rather than treating `None` as empty text that would warn
+/// for every nested agent. The port mirrors this exactly: a root with
+/// nested agents but no readable canonical text emits no
+/// `child_not_mentioned` warning at all.
+#[test]
+fn no_canonical_text_skips_child_warnings_mirroring_the_prototype() {
+    let identity_kinds = [IdentityKind::Claude];
+    let nested = ["child-one", "child-two"];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        text: None,
+        nested: &nested,
+        ..blank_input()
+    });
+    assert!(
+        with_code(&warnings, WarningCode::ChildNotMentioned).is_empty(),
+        "{warnings:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // test_warning_host_imports_for_override_and_imports
 // ---------------------------------------------------------------------
@@ -292,6 +315,35 @@ fn size_warnings_fire_past_each_hosts_own_cap() {
             .collect();
         assert_eq!(codes, expected, "size {size}: {warnings:?}");
     }
+}
+
+/// Pinned exact detail text, thousands-grouped like the prototype's own
+/// `f"{size:,}"`: oracle via `python3 -c "print(f'{32769:,}')"` ->
+/// "32,769", `python3 -c "print(f'{32768:,}')"` -> "32,768", and
+/// `python3 -c "print(f'{24000:,}')"` -> "24,000".
+#[test]
+fn size_warning_details_use_thousands_grouping() {
+    let size = 32_769;
+    let body = format!("# Big\n{}\n", "x".repeat(size - 7));
+    assert_eq!(body.len(), size);
+    let warnings = agent_warnings(&AgentInput {
+        text: Some(&body),
+        ..blank_input()
+    });
+
+    let codex = with_code(&warnings, WarningCode::SizeCodex);
+    assert_eq!(codex.len(), 1, "{warnings:?}");
+    assert_eq!(
+        codex[0].detail,
+        "the canonical text is 32,769 bytes; Codex stops adding instruction files at 32 KiB (32,768 bytes) by default"
+    );
+
+    let antigravity = with_code(&warnings, WarningCode::SizeAntigravity);
+    assert_eq!(antigravity.len(), 1, "{warnings:?}");
+    assert_eq!(
+        antigravity[0].detail,
+        "the canonical text is 32,769 bytes; Antigravity truncates a rule file above 24,000 bytes"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -450,6 +502,44 @@ fn an_at_right_after_inline_code_is_reported_by_both_import_functions() {
         boundary[0].detail.contains("\"`code`@notes.md\""),
         "{}",
         boundary[0].detail
+    );
+}
+
+/// Pinned prototype parity, not a port gap: the prototype's own
+/// `is_fence` also strips a line before testing its prefix, so a
+/// backtick or tilde run indented by four or more spaces -- an
+/// indented code block in `CommonMark`, never a fence -- still opens
+/// or closes a fence in the prototype's own `unfenced`, exactly as it
+/// does here. The `@notes.md` import between the indented delimiters
+/// below is therefore hidden from both `host_imports` and
+/// `host_imports_boundary`; the same text with the indentation removed
+/// shows the warning fires normally, confirming the indented fence --
+/// not something else -- is what hid it.
+#[test]
+fn an_indented_backtick_run_still_toggles_fencing_mirroring_the_prototype() {
+    let wrapped = "# Doc\n\n    ```\n@notes.md\n    ```\n\nAfter.\n";
+    let warnings = agent_warnings(&AgentInput {
+        text: Some(wrapped),
+        ..blank_input()
+    });
+    assert!(
+        with_code(&warnings, WarningCode::HostImports).is_empty(),
+        "{warnings:?}"
+    );
+    assert!(
+        with_code(&warnings, WarningCode::HostImportsBoundary).is_empty(),
+        "{warnings:?}"
+    );
+
+    let unwrapped = "# Doc\n\n@notes.md\n\nAfter.\n";
+    let warnings = agent_warnings(&AgentInput {
+        text: Some(unwrapped),
+        ..blank_input()
+    });
+    assert_eq!(
+        with_code(&warnings, WarningCode::HostImports).len(),
+        1,
+        "{warnings:?}"
     );
 }
 

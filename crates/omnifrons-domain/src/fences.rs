@@ -30,6 +30,21 @@
 //! is the same kind of deviation: no translated prototype fixture
 //! carries an info string on a fence line, so this is strictly more
 //! precise, never a regression.
+//!
+//! Trimming is a caller contract, not a judgment this tracker makes on
+//! its own: every caller -- the private `unfenced_lines` in
+//! `warnings.rs`, [`crate::definition::title`], and
+//! [`crate::skills_index::indexed_skill_targets`] -- already trims each
+//! line before calling [`FenceTracker::advance`]. That mirrors the
+//! prototype's `is_fence`, which also strips each line before testing
+//! its prefix, so a backtick or tilde run indented by four or more
+//! spaces -- an indented code block in `CommonMark`, never a fence --
+//! still opens or closes a fence here, in every one of those three
+//! callers, exactly as it does in the prototype's own `unfenced`. This
+//! is deliberate prototype parity, not a precision gap this tracker
+//! could close on its own: telling an indented code block apart from a
+//! fence needs each line's original indentation, and every caller
+//! already discards that before this tracker ever sees the line.
 
 /// The character and run length a fence-shaped line opens or closes
 /// with, and whether anything other than whitespace follows the run.
@@ -107,7 +122,10 @@ impl FenceTracker {
     /// while a fence is already open -- is itself content because its
     /// character or run length cannot close the open fence; a
     /// non-fence line is excluded exactly when a fence is still open
-    /// around it.
+    /// around it. Trimming before the call is the caller's job, not
+    /// this method's -- see the module documentation for why that is
+    /// deliberate prototype parity, not a gap, even for an indented
+    /// backtick or tilde run.
     pub(crate) fn advance(&mut self, trimmed_line: &str) -> bool {
         let Some(delimiter) = FenceDelimiter::of(trimmed_line) else {
             return self.opener.is_some();

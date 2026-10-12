@@ -287,6 +287,15 @@ fn quoted_words(words: &[String]) -> String {
 /// deviation from the prototype's own any-delimiter toggle (see
 /// `fences.rs`'s module documentation); no prototype fixture this module
 /// translates tells the two apart.
+///
+/// Trims each line before handing it to [`FenceTracker::advance`],
+/// mirroring the prototype's `is_fence`, which also strips a line
+/// before testing its prefix. So a backtick or tilde run indented by
+/// four or more spaces -- an indented code block in `CommonMark`, never
+/// a fence -- still opens or closes a fence here too, exactly as in the
+/// prototype's own `unfenced`. This is deliberate prototype parity, not
+/// a port-only gap: see `fences.rs`'s module documentation for why the
+/// tracker itself never judges indentation at all.
 fn unfenced_lines(text: &str) -> Vec<&str> {
     let mut tracker = FenceTracker::new();
     let mut lines = Vec::new();
@@ -766,7 +775,7 @@ pub fn agent_warnings(input: &AgentInput<'_>) -> Vec<Warning> {
 // for its own private-to-`pub(crate)` `FenceTracker`.
 #[cfg(test)]
 mod tests {
-    use super::{WarningCode, import_pattern_matches, make_warning};
+    use super::{WarningCode, format_count, import_pattern_matches, make_warning};
 
     fn matches_for(line: &str) -> Vec<(usize, usize)> {
         let chars: Vec<char> = line.chars().collect();
@@ -811,5 +820,17 @@ mod tests {
             "detail".to_string(),
         );
         assert_eq!(warning.hosts, vec!["Codex", "OpenCode"]);
+    }
+
+    /// Oracle: `python3 -c "print(f'{n:,}')"` for n = 0, 999, 1000, and
+    /// 1234567 prints "0", "999", "1,000", and "1,234,567" -- matching
+    /// the prototype's own `f"{n:,}"` exactly, since `format_count`
+    /// only ever receives a non-negative byte count.
+    #[test]
+    fn format_count_matches_pythons_thousands_grouping() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1000), "1,000");
+        assert_eq!(format_count(1_234_567), "1,234,567");
     }
 }
