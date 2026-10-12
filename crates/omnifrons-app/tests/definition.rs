@@ -19,8 +19,9 @@ use omnifrons_app::contract::definition::{
 };
 use omnifrons_app::contract::publication::FakeHasher;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan};
+use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSnapshot};
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, RootState, WRAPPER};
-use omnifrons_domain::nesting::Parent;
+use omnifrons_domain::nesting::{NestingError, Parent};
 use omnifrons_domain::warnings::WarningCode;
 
 /// A drop-guard temp directory standing in for a scanned workspace.
@@ -55,6 +56,43 @@ fn identity(kind: IdentityKind, bytes: &[u8]) -> IdentityFile {
         kind,
         bytes: bytes.to_vec(),
         shape: FileShape::Regular,
+    }
+}
+
+/// A symlinked identity file of `kind`, pointing at `target`: never read
+/// for content, so its bytes are empty, matching
+/// [`IdentityFile::bytes`]'s own documented shape for this case.
+fn symlinked_identity(kind: IdentityKind, target: &str) -> IdentityFile {
+    IdentityFile {
+        kind,
+        bytes: Vec::new(),
+        shape: FileShape::Symlink {
+            target: target.to_string(),
+        },
+    }
+}
+
+/// An irregular identity file of `kind` -- neither a regular file nor a
+/// symlink, and never read for content either, so its bytes are empty.
+fn irregular_identity(kind: IdentityKind) -> IdentityFile {
+    IdentityFile {
+        kind,
+        bytes: Vec::new(),
+        shape: FileShape::Irregular,
+    }
+}
+
+/// A [`DefinitionTree`] stub that always fails with a fixed error,
+/// exercising `scan`'s `DefinitionTreeError` -> `DefinitionError::Tree`
+/// mapping for a reason [`InMemoryDefinitionTree`] never itself
+/// produces (it only ever reports
+/// [`DefinitionTreeError::RootUnreadable`]), so the mapping is proven
+/// generic rather than tied to one coincidental variant.
+struct FailingTree(DefinitionTreeError);
+
+impl DefinitionTree for FailingTree {
+    fn snapshot(&self, _root: &WorkspaceRoot) -> Result<TreeSnapshot, DefinitionTreeError> {
+        Err(self.0)
     }
 }
 
@@ -316,4 +354,267 @@ fn definition_tree_contract_fails_a_malformed_snapshot() {
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
 
     definition_tree_contract(&tree, &workspace);
+}
+
+/// `definition_tree_contract` passes the prototype's real top-down
+/// skill order: the scan root's own `SKILL.md` always precedes every
+/// skill found inside a subdirectory, and subdirectories are visited in
+/// sorted name order -- `.hidden`, `1dir`, `A`, `a` -- regardless of how
+/// each subdirectory's name compares to the literal string `SKILL.md`.
+#[test]
+fn definition_tree_contract_passes_the_real_top_down_skill_order() {
+    let project = TempDir::new("skill-order-ok");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .skill("SKILL.md", b"---\n".to_vec())
+        .skill(".hidden/SKILL.md", b"---\n".to_vec())
+        .skill("1dir/SKILL.md", b"---\n".to_vec())
+        .skill("A/SKILL.md", b"---\n".to_vec())
+        .skill("a/SKILL.md", b"---\n".to_vec())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
+/// The order a naive per-component comparison of the *full* skill path
+/// (basename included) would accept is not the real top-down order: it
+/// sorts the scan root's own `SKILL.md` wherever the literal string
+/// `SKILL.md` happens to fall among sibling directory names, instead of
+/// always first.
+#[test]
+#[should_panic(expected = "sorted walk order")]
+fn definition_tree_contract_fails_the_old_component_sorted_skill_order() {
+    let project = TempDir::new("skill-order-bad");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .skill(".hidden/SKILL.md", b"---\n".to_vec())
+        .skill("1dir/SKILL.md", b"---\n".to_vec())
+        .skill("A/SKILL.md", b"---\n".to_vec())
+        .skill("SKILL.md", b"---\n".to_vec())
+        .skill("a/SKILL.md", b"---\n".to_vec())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
+/// A [`DefinitionTree`] port failure is surfaced as
+/// `DefinitionError::Tree`, carrying that error's own delegated
+/// `reason()` token -- proven with a reason
+/// [`InMemoryDefinitionTree`] never itself produces, so the mapping is
+/// generic rather than coincidental.
+#[test]
+fn tree_port_failure_maps_to_definition_error_tree_with_its_reason() {
+    let project = TempDir::new("tree-failure");
+    let workspace = project.workspace();
+    let tree = FailingTree(DefinitionTreeError::EntryTooLarge);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let error = scan(&ports, &workspace).expect_err("a failing tree port is surfaced");
+
+    assert!(matches!(
+        error,
+        DefinitionError::Tree(DefinitionTreeError::EntryTooLarge)
+    ));
+    assert_eq!(error.reason(), "tree(entry-too-large)");
+}
+
+/// A root path repeated in the port's own snapshot is refused by
+/// `nesting::relate` and surfaced as `DefinitionError::Nesting`,
+/// carrying that error's own delegated `reason()` token.
+#[test]
+fn duplicate_root_from_the_port_maps_to_definition_error_nesting_with_its_reason() {
+    let project = TempDir::new("duplicate-root");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            "dup",
+            vec![identity(IdentityKind::Agents, b"# One\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "dup",
+            vec![identity(IdentityKind::Claude, b"# Two\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let error = scan(&ports, &workspace).expect_err("a duplicate root path is refused");
+
+    assert!(matches!(
+        error,
+        DefinitionError::Nesting(NestingError::DuplicateRoot(_))
+    ));
+    assert_eq!(error.reason(), "nesting(duplicate-root)");
+}
+
+/// A symlinked identity file and an irregular one both report no
+/// content: `bytes: 0` and `sha256: None`, since neither is ever read.
+#[test]
+fn symlinked_and_irregular_identity_files_report_no_bytes_or_hash() {
+    let project = TempDir::new("unsafe-shapes");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                symlinked_identity(IdentityKind::Agents, "elsewhere"),
+                irregular_identity(IdentityKind::Claude),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(report.agents.len(), 1);
+    let agent = &report.agents[0];
+    let agents_report = agent
+        .identity_files
+        .iter()
+        .find(|file| file.kind == IdentityKind::Agents)
+        .expect("AGENTS.md reported");
+    assert_eq!(agents_report.bytes, 0);
+    assert_eq!(agents_report.sha256, None);
+    assert_eq!(
+        agents_report.shape,
+        FileShape::Symlink {
+            target: "elsewhere".to_string()
+        }
+    );
+
+    let claude_report = agent
+        .identity_files
+        .iter()
+        .find(|file| file.kind == IdentityKind::Claude)
+        .expect("CLAUDE.md reported");
+    assert_eq!(claude_report.bytes, 0);
+    assert_eq!(claude_report.sha256, None);
+    assert_eq!(claude_report.shape, FileShape::Irregular);
+}
+
+/// A skill outside every discovered root is dropped from every agent's
+/// `discovered` list, not just the nearest one.
+#[test]
+fn skill_outside_every_root_is_dropped_from_every_agents_discovered_list() {
+    let project = TempDir::new("outside-skill");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            "agent",
+            vec![identity(IdentityKind::Agents, b"# Agent\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "other",
+            vec![identity(IdentityKind::Agents, b"# Other\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("outside/SKILL.md", b"---\n".to_vec())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(report.agents.len(), 2);
+    for agent in &report.agents {
+        assert!(
+            agent.skills.discovered.is_empty(),
+            "a skill outside every root must not be attributed to {}, got {:?}",
+            agent.path,
+            agent.skills.discovered
+        );
+    }
+}
+
+/// An outside ancestor's `identity_files` must use the identity kind's
+/// token form (`"agents"`): that form is parsed and feeds the warning
+/// chain, while the file-name form (`"AGENTS.md"`) is silently dropped
+/// as unrecognized, producing no `ancestor_*` warning for that ancestor
+/// at all.
+#[test]
+fn outside_ancestor_identity_form_controls_the_warning_chain() {
+    let hasher = FakeHasher;
+
+    let file_name_project = TempDir::new("ancestor-file-name-form");
+    let file_name_workspace = file_name_project.workspace();
+    let file_name_snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Claude, b"# Root\n\nReal content.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .ancestor("/outside", vec!["AGENTS.md".to_string()])
+        .build();
+    let file_name_tree =
+        InMemoryDefinitionTree::new().with_snapshot(&file_name_workspace, file_name_snapshot);
+    let file_name_ports = DefinitionPorts {
+        tree: &file_name_tree,
+        hasher: &hasher,
+    };
+    let file_name_report = scan(&file_name_ports, &file_name_workspace).expect("scan succeeds");
+    let file_name_root = &file_name_report.agents[0];
+    assert!(
+        !file_name_root.warnings.iter().any(|warning| matches!(
+            warning.code,
+            WarningCode::AncestorShadowing | WarningCode::AncestorExposure
+        )),
+        "a file-name-form ancestor entry must be dropped silently, got {:?}",
+        file_name_root.warnings
+    );
+
+    let token_project = TempDir::new("ancestor-token-form");
+    let token_workspace = token_project.workspace();
+    let token_snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Claude, b"# Root\n\nReal content.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .ancestor("/outside", vec!["agents".to_string()])
+        .build();
+    let token_tree = InMemoryDefinitionTree::new().with_snapshot(&token_workspace, token_snapshot);
+    let token_ports = DefinitionPorts {
+        tree: &token_tree,
+        hasher: &hasher,
+    };
+    let token_report = scan(&token_ports, &token_workspace).expect("scan succeeds");
+    let token_root = &token_report.agents[0];
+    assert!(
+        token_root
+            .warnings
+            .iter()
+            .any(|warning| warning.code == WarningCode::AncestorShadowing),
+        "a token-form ancestor entry must produce an ancestor_shadowing warning, got {:?}",
+        token_root.warnings
+    );
 }

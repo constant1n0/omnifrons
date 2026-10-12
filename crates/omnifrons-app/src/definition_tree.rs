@@ -32,13 +32,28 @@
 //!   in the prototype's own sorted walk order: a pre-order, depth-first
 //!   walk that visits each directory's children in name-sorted order
 //!   (the prototype's `sorted(dirnames)` at every level of `os.walk`).
+//!   In particular, a directory's own `SKILL.md`, if any, is recorded
+//!   the instant that directory is visited, before any of its
+//!   subdirectories are descended into -- it is never reordered
+//!   relative to a descendant's `SKILL.md` by comparing the file name
+//!   `SKILL.md` against a subdirectory's own name, as if the two were
+//!   siblings at the same level.
 //!   [`crate::contract::definition::definition_tree_contract`] asserts
 //!   this order mechanically.
 //! - [`TreeSnapshot::ancestors`] holds the agent roots above the scan
 //!   root, nearest first (the prototype's `find_ancestors`, walking
 //!   `root.parents`), stopping at the user's home directory boundary --
 //!   the prototype's own `user_home()` guard in `has_identity_files`,
-//!   applied by the adapter, never by this port's caller.
+//!   applied by the adapter, never by this port's caller. Each
+//!   `Ancestor::identity_files` entry the adapter supplies must be that
+//!   file's identity-kind *token* (for example `"agents"`, the form
+//!   [`omnifrons_domain::definition::IdentityKind::as_str`] returns),
+//!   never the file-name form (`"AGENTS.md"`):
+//!   [`crate::definition`]'s own warnings composition parses every
+//!   entry with [`omnifrons_domain::definition::IdentityKind::parse`],
+//!   which only recognizes the token form, so a file-name-form entry is
+//!   silently dropped from that ancestor's warning chain rather than
+//!   reported as an error.
 //!
 //! This module only declares the shape; sub-slice 1f's filesystem adapter
 //! is the one piece of code that must honor every rule above against a
@@ -66,7 +81,9 @@ pub struct TreeSnapshot {
     pub directories: Vec<DirectoryEntry>,
     /// Every discovered `SKILL.md`, in the prototype's sorted walk order.
     pub skills: Vec<SkillFile>,
-    /// The agent roots above the scan root, nearest first.
+    /// The agent roots above the scan root, nearest first. Each
+    /// entry's `identity_files` must use the token form, never the
+    /// file-name form -- see this module's own documentation.
     pub ancestors: Vec<Ancestor>,
 }
 

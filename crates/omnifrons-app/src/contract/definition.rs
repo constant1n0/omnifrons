@@ -148,21 +148,46 @@ fn assert_clean_relative(path: &str, label: &str) {
     );
 }
 
-/// `paths` are already in the prototype's own sorted walk order: a
+/// A skill path's own parent directory (mirrors `crate::definition`'s
+/// own, private `parent_directory` convention for the same shape): the
+/// path with its final `/`-separated segment dropped, or `"."` for a
+/// skill at the scan root -- the directory the prototype's walk was
+/// visiting the instant it recorded this `SKILL.md`.
+fn skill_parent(path: &str) -> &str {
+    path.rfind('/').map_or(".", |index| &path[..index])
+}
+
+/// `entries` pairs each item's own display path with the *ordering key*
+/// that fixes its position in the prototype's sorted walk order: a
 /// pre-order, depth-first walk visiting each directory's children in
-/// name-sorted order. Comparing each path's own component sequence
-/// lexicographically (a shorter sequence that is a prefix of a longer
-/// one sorts first) reproduces exactly that order, including for a
-/// filtered subset such as "only the directories holding an identity
-/// file": removing entries from a pre-order walk never reorders the ones
-/// that remain, and two fixed entries' relative order under this
-/// comparison never depends on what other entries exist.
-fn assert_sorted_by_walk_order<'a>(paths: impl Iterator<Item = &'a str>, label: &str) {
-    let keys: Vec<Vec<&str>> = paths.map(components).collect();
-    for pair in keys.windows(2) {
+/// name-sorted order. For a [`DirectoryEntry`] that key is its own
+/// path; for a [`SkillFile`] it is the file's parent directory
+/// ([`skill_parent`]), never the skill's own path -- the walk records a
+/// directory's own file the instant it visits that directory, before
+/// descending into any of its subdirectories, so the file's place in
+/// the order is exactly its parent's, regardless of the file name
+/// itself. Comparing full skill paths (basename included) would instead
+/// compare the literal string `"SKILL.md"` against real subdirectory
+/// names as if it were one more sibling to sort among them, wrongly
+/// moving a directory's own skill after a subdirectory whose name sorts
+/// below `"SKILL.md"` (for example `"A"`, `"1dir"`, or `".hidden"`).
+///
+/// Comparing each key's own component sequence lexicographically (a
+/// shorter sequence that is a prefix of a longer one always sorts
+/// first) reproduces exactly the walk order for these keys: removing
+/// entries from a pre-order walk never reorders the ones that remain,
+/// and two fixed directories' relative order under this comparison
+/// never depends on what other entries exist.
+fn assert_sorted_by_walk_order<'a>(entries: impl Iterator<Item = (&'a str, &'a str)>, label: &str) {
+    let keyed: Vec<(&str, Vec<&str>)> = entries
+        .map(|(display, key)| (display, components(key)))
+        .collect();
+    for pair in keyed.windows(2) {
         assert!(
-            pair[0] <= pair[1],
-            "{label} must be in the prototype's sorted walk order"
+            pair[0].1 <= pair[1].1,
+            "{label} must be in the prototype's sorted walk order ({} then {})",
+            pair[0].0,
+            pair[1].0
         );
     }
 }
@@ -200,7 +225,7 @@ pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoo
         snapshot
             .directories
             .iter()
-            .map(|directory| directory.path.as_str()),
+            .map(|directory| (directory.path.as_str(), directory.path.as_str())),
         "directories",
     );
 
@@ -214,7 +239,10 @@ pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoo
         );
     }
     assert_sorted_by_walk_order(
-        snapshot.skills.iter().map(|skill| skill.path.as_str()),
+        snapshot
+            .skills
+            .iter()
+            .map(|skill| (skill.path.as_str(), skill_parent(skill.path.as_str()))),
         "skills",
     );
 
