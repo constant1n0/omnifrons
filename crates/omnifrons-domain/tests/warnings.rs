@@ -188,6 +188,37 @@ fn child_mentioned_in_the_text_produces_no_warning() {
     assert!(with_code(&warnings, WarningCode::ChildNotMentioned).is_empty());
 }
 
+/// Pinned: the prototype's `child_warnings` (~1054-1072) never skips the
+/// warning when `readers` is empty -- it has no upward-loader kind and
+/// no `AGENTS.md`/`CLAUDE.md` to add `OpenCode` either, exactly a
+/// Gemini-only agent's own files. It still appends one `child_not_mentioned`
+/// warning per unmentioned nested agent, with an empty `hosts` list and
+/// `host_list([])` ("") spliced into the detail, producing a double
+/// space right before "can load them inside" rather than any host name.
+/// The port mirrors this exactly, rather than skipping or rewording it.
+#[test]
+fn child_not_mentioned_still_fires_with_no_readers_mirroring_the_prototype() {
+    let identity_kinds = [IdentityKind::Gemini];
+    let nested = ["sub-agent"];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        text: Some("# Gemini-only\n\nNo mention of the nested agent here.\n"),
+        nested: &nested,
+        ..blank_input()
+    });
+
+    let matches = with_code(&warnings, WarningCode::ChildNotMentioned);
+    assert_eq!(matches.len(), 1, "{warnings:?}");
+    assert!(matches[0].hosts.is_empty(), "{:?}", matches[0]);
+    assert!(
+        matches[0]
+            .detail
+            .contains("instructions;  can load them inside sub-agent/"),
+        "{}",
+        matches[0].detail
+    );
+}
+
 // ---------------------------------------------------------------------
 // test_warning_host_imports_for_override_and_imports
 // ---------------------------------------------------------------------
@@ -382,6 +413,46 @@ fn an_at_fully_inside_inline_code_is_never_a_boundary_warning() {
     assert!(with_code(&warnings, WarningCode::HostImports).is_empty());
 }
 
+/// Pinned, mirroring a gap the prototype's own two functions share (see
+/// `boundary_import_warnings`'s doc comment): `import_warnings` matches
+/// against a line with inline-code spans *removed*, while
+/// `boundary_import_warnings` matches (for its own exclusion check)
+/// against a line with those spans only *masked*, same length, same
+/// positions. For `` `code`@notes.md ``, removing the span leaves
+/// `@notes.md` at the very start of the remaining text -- a new match
+/// that masking alone never creates, since masking leaves that `@`
+/// sitting right after a backtick, which the import pattern always
+/// refuses. The result: both functions report the very same token. This
+/// is not a port bug to fix; it is what the prototype itself does for
+/// this exact shape, so the port mirrors it rather than inventing an
+/// exclusion the prototype never had.
+#[test]
+fn an_at_right_after_inline_code_is_reported_by_both_import_functions() {
+    let warnings = agent_warnings(&AgentInput {
+        text: Some("`code`@notes.md\n"),
+        ..blank_input()
+    });
+
+    let imports = with_code(&warnings, WarningCode::HostImports);
+    assert_eq!(imports.len(), 1, "{warnings:?}");
+    assert!(
+        imports[0].detail.contains("@notes.md"),
+        "{}",
+        imports[0].detail
+    );
+    assert!(imports[0].hosts.contains(&"OpenCode"));
+    assert!(!imports[0].hosts.contains(&"Claude Code"));
+
+    let boundary = with_code(&warnings, WarningCode::HostImportsBoundary);
+    assert_eq!(boundary.len(), 1, "{warnings:?}");
+    assert_eq!(boundary[0].hosts, vec!["Claude Code"]);
+    assert!(
+        boundary[0].detail.contains("\"`code`@notes.md\""),
+        "{}",
+        boundary[0].detail
+    );
+}
+
 // ---------------------------------------------------------------------
 // test_real_atlas_and_echo_have_no_boundary_warning, translated with
 // generic stand-in prose -- never the prototype's own Atlas/Echo
@@ -427,4 +498,71 @@ fn warnings_come_out_sorted_by_warning_order() {
     let mut sorted = positions.clone();
     sorted.sort_unstable();
     assert_eq!(positions, sorted, "{warnings:?}");
+}
+
+// ---------------------------------------------------------------------
+// An unrecognized `host_extras` entry (`agent_warnings` ~1172-1175)
+// ---------------------------------------------------------------------
+
+/// The prototype's `EXTRA_READERS[extra]` is a plain dict lookup: an
+/// `extra` outside the table raises `KeyError`, crashing the whole scan.
+/// The port deliberately does not mirror that crash (see
+/// `agent_warnings`'s own `continue` comment) -- a caller is expected to
+/// supply only names [`omnifrons_domain::hosts::extra_readers`]
+/// resolves, and an unrecognized one is skipped without a warning
+/// instead.
+#[test]
+fn an_unknown_host_extra_is_skipped_without_a_warning() {
+    let host_extras = ["totally-unknown-file"];
+    let warnings = agent_warnings(&AgentInput {
+        host_extras: &host_extras,
+        ..blank_input()
+    });
+    assert!(
+        with_code(&warnings, WarningCode::ExtraHostFile).is_empty(),
+        "{warnings:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// WarningCode tokens and order
+// ---------------------------------------------------------------------
+
+/// `as_str`/`parse` round trip for every one of the nine codes, and an
+/// unrecognized token parses to `None`.
+#[test]
+fn every_warning_code_round_trips_through_as_str_and_parse() {
+    for code in WarningCode::ALL {
+        assert_eq!(WarningCode::parse(code.as_str()), Some(code), "{code:?}");
+    }
+    assert_eq!(WarningCode::parse("not-a-code"), None);
+}
+
+/// Each code's own discriminant equals its position in `ALL` -- the
+/// prototype's `WARNING_ORDER.index(code)`, which `agent_warnings` sorts
+/// warnings by.
+#[test]
+fn every_warning_code_discriminant_matches_its_position_in_all() {
+    for (index, code) in WarningCode::ALL.into_iter().enumerate() {
+        assert_eq!(code as usize, index, "{code:?}");
+    }
+}
+
+/// The nine tokens, spelled exactly as the prototype's `WARNING_ORDER`
+/// tuple.
+#[test]
+fn warning_code_tokens_match_the_prototypes_warning_order() {
+    let expected = [
+        "ancestor_exposure",
+        "ancestor_shadowing",
+        "child_not_mentioned",
+        "host_imports",
+        "host_imports_boundary",
+        "extra_host_file",
+        "size_codex",
+        "size_antigravity",
+        "generated_state_dir",
+    ];
+    let actual: Vec<&str> = WarningCode::ALL.iter().map(WarningCode::as_str).collect();
+    assert_eq!(actual, expected);
 }

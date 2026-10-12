@@ -103,6 +103,17 @@ fn extra_readers_maps_each_extra_file_to_its_prototype_host_tuple() {
     assert_eq!(hosts::EXTRA_READERS, expected);
 }
 
+/// `extra_readers` is a small lookup over `EXTRA_READERS`: `Some` its
+/// readers for every entry the table documents, `None` for a name
+/// outside it.
+#[test]
+fn extra_readers_resolves_every_known_extra_and_none_for_an_unknown_one() {
+    for &(name, readers) in hosts::EXTRA_READERS {
+        assert_eq!(hosts::extra_readers(name), Some(readers), "{name}");
+    }
+    assert_eq!(hosts::extra_readers("unknown-extra.md"), None);
+}
+
 /// Each host's loaded-file list, transcribed from the table's "Project
 /// instruction files" column; one assertion per host, literal values.
 #[test]

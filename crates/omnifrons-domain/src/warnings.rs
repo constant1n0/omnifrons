@@ -599,8 +599,29 @@ fn import_warnings(override_bytes: Option<&[u8]>, text: Option<&str>) -> Vec<War
 /// `host_imports_boundary` warnings: every `@` outside fenced code,
 /// with inline-code spans masked, that
 /// [`crate::skills_safety::unsafe_at_tokens`] judges Claude Code might
-/// load as an import, excluding any already counted by
-/// [`import_warnings`] (the prototype's `boundary_import_warnings`).
+/// load as an import, excluding any [`import_warnings`]-pattern match
+/// found on this same *masked* line (the prototype's
+/// `boundary_import_warnings`).
+///
+/// # Known double report, inherited from the prototype
+///
+/// That exclusion is checked against a match on the *masked* line --
+/// never against [`import_warnings`]'s own, separately-computed result,
+/// which instead matches against a line with every inline-code span
+/// *removed* outright. Removing a span can turn an `@` that used to
+/// follow a code span's closing backtick into one that now follows
+/// whitespace or sits at the start of the line -- a new match masking
+/// alone can never produce, since masking keeps every character's
+/// position, backticks included. For `` `code`@notes.md ``, that is
+/// exactly what happens: [`import_warnings`] reports it (removing the
+/// span leaves `@notes.md` at the very start of what remains, which
+/// matches), and this function reports it too (masking leaves that same
+/// `@` sitting right after a backtick, which the import pattern always
+/// refuses, so this function's own exclusion check never fires for it).
+/// The prototype's two functions disagree the very same way on the very
+/// same input -- this is not a port-only gap introduced by translating
+/// them, so this function does not special-case it; see
+/// `tests/warnings.rs`'s pinned case for the exact double report.
 ///
 /// For each unfenced line, this neutralizes (to a backtick) exactly the
 /// `@` characters that either sit strictly inside an inline-code span's
