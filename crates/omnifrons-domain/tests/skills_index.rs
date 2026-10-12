@@ -913,3 +913,32 @@ fn normalize_relative_target_retains_a_dot_dot_that_follows_another_retained_one
         "../../SKILL.md"
     );
 }
+
+/// Review follow-up (behavior change, verbatim UNC roots): a scanned
+/// workspace root rendered in its real Windows verbatim UNC spelling
+/// (`//?/UNC/server/share`, the slash-normalized form of
+/// `\\?\UNC\server\share`) relativizes an absolute Markdown link under
+/// the same share exactly as the plain `//server/share` spelling
+/// already does -- `relative_to_root`'s own unit tests in
+/// `src/skills_index.rs` cover the oracle parity this extends to a root
+/// threaded through the public API.
+#[test]
+fn indexed_skill_targets_relativizes_under_a_verbatim_unc_root() {
+    let text = b"[a](//server/share/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "//?/UNC/server/share"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// The same verbatim-UNC rewrite applies to a Markdown link's own
+/// target, not only the scanned root: a verbatim-spelled link under a
+/// plain-spelled root of the same share still relativizes.
+#[test]
+fn indexed_skill_targets_relativizes_a_verbatim_unc_target_against_a_plain_unc_root() {
+    let text = b"[a](//?/UNC/server/share/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "//server/share"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}

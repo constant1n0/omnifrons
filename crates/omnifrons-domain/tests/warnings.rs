@@ -320,6 +320,52 @@ fn claude_code_fallback_is_disabled_for_child_warnings_too_once_a_claude_md_exis
     );
 }
 
+/// Edge case named in review: an agent with no identity kinds of its
+/// own at all -- not even its own `AGENTS.md` -- and no `CLAUDE.md`
+/// variant anywhere in its chain still qualifies for the fallback
+/// (vacuously: it holds none of Claude Code's own files either, so
+/// `claude_code_falls_back_to_agents` never returns early on that
+/// check), but the `AGENTS.md`-only ancestor it shadows reads as
+/// `ancestor_shadowing`, not `ancestor_exposure`: `ancestor_warnings`'
+/// own `own` check tests whether *this agent's* `identity_kinds`
+/// contains the matched file kind, and an empty `identity_kinds` can
+/// never satisfy that, no matter which kind is checked. Contrast
+/// `claude_code_falls_back_and_fires_ancestor_exposure_for_an_agents_only_ancestor`
+/// above, whose agent does hold its own `AGENTS.md`.
+///
+/// In practice, a directory with no identity file at all is never
+/// itself a scanned agent root (ADR-0005 sub-slice 1e/1f's filesystem
+/// adapter only recognizes a root that holds at least one identity
+/// file); this case is a contract `agent_warnings` still upholds for
+/// whatever [`AgentInput`] it is given, not a state a real scan can
+/// actually produce.
+#[test]
+fn claude_code_fallback_applies_but_reads_as_shadowing_for_an_agent_with_no_identity_kinds_at_all()
+{
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let shadowing = with_code(&warnings, WarningCode::AncestorShadowing);
+    assert_eq!(shadowing.len(), 1, "{warnings:?}");
+    assert!(
+        shadowing[0].hosts.contains(&"Claude Code"),
+        "{:?}",
+        shadowing[0]
+    );
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorExposure)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // test_warning_child_not_mentioned
 // ---------------------------------------------------------------------

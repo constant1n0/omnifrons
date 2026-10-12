@@ -489,6 +489,16 @@ fn mentions(text: &str, relative: &str) -> bool {
 /// `identity_kinds`/`host_extras` nor any ancestor in `chain` holds any
 /// of `claude_code`'s own [`crate::hosts::HostLoader::files`]
 /// (`CLAUDE.md`, `.claude/CLAUDE.md`, or the `CLAUDE.local.md` extra).
+///
+/// This checks `chain` as a whole, not only this agent's own root,
+/// because the documented rule is itself chain-wide, not root-specific:
+/// the official Claude Code memory documentation says Claude reads
+/// `AGENTS.md` "only when you have no `CLAUDE.md` in your working
+/// directory or above it", counting `CLAUDE.md`, `.claude/CLAUDE.md`,
+/// and `CLAUDE.local.md` in the working directory or any directory
+/// above it -- so one `CLAUDE.md` variant anywhere in `chain` disables
+/// the fallback here exactly as one on this agent's own root already
+/// does.
 fn claude_code_falls_back_to_agents(
     claude_code: &hosts::HostLoader,
     identity_kinds: &[IdentityKind],

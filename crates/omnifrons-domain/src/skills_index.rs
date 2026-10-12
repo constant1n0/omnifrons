@@ -18,6 +18,8 @@
 //! [`crate::guidance::ManagedBlock`] supplies both, exactly as it
 //! already does for the guidance note.
 
+use std::borrow::Cow;
+
 /// The file name every discovered or indexed skill ends in (the
 /// prototype's `SKILL_FILE`).
 const SKILL_FILE: &str = "SKILL.md";
@@ -181,13 +183,30 @@ fn basename(path: &str) -> &str {
 
 /// A leading `//?/` segment -- the slash-normalized form of Windows'
 /// own `\\?\` verbatim prefix, which disables further parsing of the
-/// string that follows it (`C:\`, `UNC\server\share`, ...).
-/// [`relative_to_root`] and [`indexed_skill_targets`] both strip it,
-/// from the root and the target alike, before judging either absolute:
-/// a caller may render a canonical root or a Markdown link with or
-/// without it, and the two forms must relativize the same way.
-fn strip_verbatim_prefix(path: &str) -> &str {
-    path.strip_prefix("//?/").unwrap_or(path)
+/// string that follows it -- stripped, with one further rewrite: a
+/// verbatim UNC root's own real spelling is `//?/UNC/server/share/...`
+/// (the slash-normalized form of `\\?\UNC\server\share\...`), never a
+/// flat `//?/server/share/...`, so stripping only `//?/` would leave
+/// `UNC/server/share/...` -- no leading `/` at all, which
+/// [`is_absolute_path`] then rejects as not absolute. This rewrites
+/// that shape to the ordinary `//server/share/...` one before anything
+/// else inspects it. A verbatim drive root (`//?/C:/...`) needs no such
+/// rewrite and comes back as the plain stripped slice, exactly as
+/// before. [`relative_to_root`] and [`indexed_skill_targets`] both
+/// apply this, from the root and the target alike, so a caller may
+/// render a canonical root or a Markdown link with or without either
+/// verbatim spelling and the two forms relativize the same way.
+/// Borrowed in every case except the UNC rewrite, which must allocate:
+/// no substring of `path` itself spells `//server/share/...`, since the
+/// two slashes that open it are never adjacent in the verbatim original.
+fn strip_verbatim_prefix(path: &str) -> Cow<'_, str> {
+    let Some(rest) = path.strip_prefix("//?/") else {
+        return Cow::Borrowed(path);
+    };
+    match rest.strip_prefix("UNC/") {
+        Some(after_unc) => Cow::Owned(format!("//{after_unc}")),
+        None => Cow::Borrowed(rest),
+    }
 }
 
 /// `path` is a bare Windows drive letter component (`"C:"`, any ASCII
@@ -210,11 +229,12 @@ fn is_drive_absolute(path: &str) -> bool {
 /// (a UNC path such as `//server/share/...` already satisfies this,
 /// since it too starts with `/`), or a Windows drive path (`X:/...`).
 /// [`strip_verbatim_prefix`] is applied first, so a `//?/`-prefixed
-/// spelling of either form is recognized the same way as the
-/// unprefixed one.
+/// spelling of either form -- including a verbatim UNC root's own,
+/// differently-shaped `//?/UNC/server/share/...` -- is recognized the
+/// same way as the unprefixed one.
 fn is_absolute_path(path: &str) -> bool {
     let path = strip_verbatim_prefix(path);
-    path.starts_with('/') || is_drive_absolute(path)
+    path.starts_with('/') || is_drive_absolute(&path)
 }
 
 /// Splits an absolute path (POSIX, Windows drive, or UNC; see
@@ -224,26 +244,81 @@ fn is_absolute_path(path: &str) -> bool {
 /// component before it when there is one, or is itself dropped
 /// silently when there is not -- an absolute path can never retain a
 /// leading `..` the way a relative one does, since there is nothing
-/// above its root to name. A leading `//?/` is stripped first, exactly
-/// as [`is_absolute_path`] strips it before judging. A UNC path's own
-/// doubled leading `/` collapses the same way any other doubled `/`
-/// does, since both its empty segments are dropped alongside it.
+/// above its root to name. A leading `//?/` is normalized first,
+/// exactly as [`is_absolute_path`] normalizes it before judging --
+/// including a verbatim UNC root's own `//?/UNC/server/share/...`
+/// shape, rewritten to the ordinary `//server/share/...` one
+/// ([`strip_verbatim_prefix`]). A UNC path's own doubled leading `/`
+/// collapses the same way any other doubled `/` does, since both its
+/// empty segments are dropped alongside it. Each component is owned
+/// rather than borrowed from `path`: [`strip_verbatim_prefix`]'s own
+/// verbatim-UNC rewrite may need to allocate a new string with no
+/// substring of the original `path` to borrow a component from.
 /// [`normalize_relative_target`] is the relative-path twin of this
 /// helper and keeps an unresolvable leading `..` for exactly that
 /// reason.
-fn normalized_absolute_components(path: &str) -> Vec<&str> {
+fn normalized_absolute_components(path: &str) -> Vec<String> {
     let path = strip_verbatim_prefix(path);
-    let mut out: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for segment in path.split('/') {
         match segment {
             "" | "." => {}
             ".." => {
                 out.pop();
             }
-            other => out.push(other),
+            other => out.push(other.to_string()),
         }
     }
     out
+}
+
+/// Which filesystem mount an absolute path belongs to: a bare POSIX
+/// path (`/`-rooted, not UNC), a Windows drive letter (normalized to
+/// lowercase, matching [`is_drive_letter_component`]'s own
+/// case-insensitivity), or a UNC `//server/share` root (its server and
+/// share both normalized to lowercase -- a real UNC root is
+/// case-insensitive the same way a drive letter is). [`relative_to_root`]
+/// relativizes a target only when [`mount_of`] agrees the two paths
+/// share a mount: `ntpath.relpath` itself raises `ValueError` across a
+/// mismatch (its own `splitdrive` plus `normcase`; see
+/// `relative_to_root`'s own unit tests for the oracle's exact error
+/// text), which this port has no error channel to reproduce, so it
+/// falls back to the target unchanged instead -- the same "no
+/// meaningful position to relativize against" policy this function's
+/// own doc comment already documents for a non-absolute root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mount {
+    /// A `/`-rooted path that is not a UNC root.
+    Posix,
+    /// A Windows drive letter, lowercased.
+    Drive(char),
+    /// A UNC root's server and share, both lowercased.
+    Unc(String, String),
+}
+
+/// `path`'s [`Mount`] ([`strip_verbatim_prefix`] applied first, exactly
+/// as every sibling classifier in this module applies it first).
+/// `path` is assumed already [`is_absolute_path`] -- every caller here
+/// checks that before calling this function, so this function never
+/// needs to itself.
+fn mount_of(path: &str) -> Mount {
+    let path = strip_verbatim_prefix(path);
+    if is_drive_absolute(&path) {
+        return Mount::Drive(char::from(path.as_bytes()[0].to_ascii_lowercase()));
+    }
+    // `is_absolute_path` guarantees a leading `/` whenever
+    // `is_drive_absolute` just failed; a UNC root's own doubled leading
+    // `/` is the only thing that tells it apart from a bare POSIX root
+    // here, since both otherwise share a single leading `/`.
+    if let Some(rest) = path.strip_prefix("//") {
+        let mut parts = rest.splitn(3, '/');
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        if !server.is_empty() && !share.is_empty() {
+            return Mount::Unc(server.to_lowercase(), share.to_lowercase());
+        }
+    }
+    Mount::Posix
 }
 
 /// Whether `root`'s and `target`'s components at the same position
@@ -264,12 +339,12 @@ fn components_match(a: &str, b: &str, is_first: bool) -> bool {
 /// The number of `root_components`/`target_components` that match from
 /// the start ([`components_match`]), stopping at the first mismatch or
 /// the shorter list's end.
-fn common_prefix_len(root_components: &[&str], target_components: &[&str]) -> usize {
+fn common_prefix_len(root_components: &[String], target_components: &[String]) -> usize {
     let mut common = 0;
     while common < root_components.len() && common < target_components.len() {
         if !components_match(
-            root_components[common],
-            target_components[common],
+            &root_components[common],
+            &target_components[common],
             common == 0,
         ) {
             break;
@@ -295,10 +370,20 @@ fn common_prefix_len(root_components: &[&str], target_components: &[&str]) -> us
 /// Windows drive path (`X:/...`, any ASCII letter, either case) and a
 /// UNC path (`//server/share/...`) both count too
 /// ([`is_absolute_path`]), and either form may carry a leading `//?/`
-/// verbatim prefix, stripped from `root` and `target` alike before
-/// anything else is compared ([`strip_verbatim_prefix`]). Verified
-/// against Python's `ntpath.relpath` -- see this function's own unit
-/// tests for the exact oracle outputs.
+/// verbatim prefix -- a drive's own flat `//?/C:/...`, or a UNC root's
+/// own, differently-shaped `//?/UNC/server/share/...` -- normalized
+/// from `root` and `target` alike before anything else is compared
+/// ([`strip_verbatim_prefix`]). Verified against Python's
+/// `ntpath.relpath` -- see this function's own unit tests for the exact
+/// oracle outputs.
+///
+/// `target` is relativized only when it shares `root`'s own [`Mount`]
+/// ([`mount_of`]): `ntpath.relpath` itself raises `ValueError` across
+/// two different mounts (its own `splitdrive` plus `normcase`), which
+/// this port has no error channel to reproduce, so a cross-mount
+/// `target` instead comes back unchanged -- a deliberate port policy,
+/// not a gap, and this function's own unit tests cite the oracle's
+/// exact error text for each mount pairing it refuses to relativize.
 ///
 /// When `root` is not itself an absolute path (empty, or a relative
 /// path such as `"workspace"`), there is no meaningful position left
@@ -314,13 +399,16 @@ fn relative_to_root(target: &str, root: &str) -> String {
     if !is_absolute_path(root) {
         return target.to_string();
     }
+    if mount_of(target) != mount_of(root) {
+        return target.to_string();
+    }
     let root_components = normalized_absolute_components(root);
     let target_components = normalized_absolute_components(target);
     let common = common_prefix_len(&root_components, &target_components);
     let mut out: Vec<&str> =
         Vec::with_capacity((root_components.len() - common) + (target_components.len() - common));
     out.extend(std::iter::repeat_n("..", root_components.len() - common));
-    out.extend_from_slice(&target_components[common..]);
+    out.extend(target_components[common..].iter().map(String::as_str));
     if out.is_empty() {
         ".".to_string()
     } else {
@@ -380,19 +468,24 @@ pub fn normalize_relative_target(path: &str) -> String {
 ///
 /// `root` is the caller's scanned workspace root: an absolute path --
 /// POSIX (`/workspace`), a Windows drive (`C:/workspace`, either
-/// letter case), or UNC (`//server/share`), each optionally `//?/`
-/// -verbatim-prefixed -- with or without a trailing `/`. It is used
-/// only to relativize an absolute target lexically
+/// letter case), or UNC (`//server/share`) -- with or without a
+/// trailing `/`, and optionally carrying a leading `//?/` verbatim
+/// prefix: a drive's own flat `//?/C:/workspace`, or a UNC root's own,
+/// differently-shaped `//?/UNC/server/share` ([`strip_verbatim_prefix`]
+/// normalizes either spelling the same way before anything classifies
+/// it). It is used only to relativize an absolute target lexically
 /// ([`relative_to_root`]); a target is judged absolute by that same
 /// extended rule, not only a leading `/`, so a Windows-rooted link
 /// relativizes against a Windows-rooted root exactly as a POSIX link
-/// already does against a POSIX root ([`is_absolute_path`]). This
-/// function never reads a filesystem. A non-absolute `root` (empty, or
-/// a relative path) is treated as no root at all, so an absolute
-/// target passes through unrelativized -- [`relative_to_root`]
-/// documents the fallback -- and the same holds for
-/// [`read_skill_index`] and [`rows_to_generate`] below, which both
-/// thread `root` straight through to this function.
+/// already does against a POSIX root ([`is_absolute_path`]), and a
+/// target on a different mount than `root` is never relativized at all
+/// ([`relative_to_root`]'s own documented policy). This function never
+/// reads a filesystem. A non-absolute `root` (empty, or a relative
+/// path) is treated as no root at all, so an absolute target passes
+/// through unrelativized -- [`relative_to_root`] documents the
+/// fallback -- and the same holds for [`read_skill_index`] and
+/// [`rows_to_generate`] below, which both thread `root` straight
+/// through to this function.
 #[must_use]
 pub fn indexed_skill_targets(text: &[u8], root: &str) -> Vec<String> {
     let decoded = String::from_utf8_lossy(text);
@@ -988,5 +1081,108 @@ mod tests {
     #[test]
     fn relative_to_root_of_a_unc_target_equal_to_the_root() {
         assert_eq!(relative_to_root("//server/share", "//server/share"), ".");
+    }
+
+    /// Review follow-up (behavior change, cross-mount targets): a
+    /// drive-absolute target and a POSIX root are on different mounts
+    /// and must never be relativized against each other -- the same
+    /// "no meaningful position to relativize against" fallback this
+    /// function's own doc comment already documents for a non-absolute
+    /// root, extended to a cross-mount pair of absolute ones. Verified
+    /// with `python3 -c "import ntpath;
+    /// print(ntpath.relpath(r'C:\x\SKILL.md', r'\workspace'))"`, which
+    /// raises `ValueError: path is on mount 'C:', start on mount ''`.
+    #[test]
+    fn relative_to_root_of_a_drive_absolute_target_against_a_posix_root_is_unchanged() {
+        assert_eq!(
+            relative_to_root("C:/x/SKILL.md", "/workspace"),
+            "C:/x/SKILL.md"
+        );
+    }
+
+    /// The reverse: a POSIX-absolute target against a drive root is
+    /// also on a different mount. Verified with
+    /// `python3 -c "import ntpath;
+    /// print(ntpath.relpath(r'\x\SKILL.md', r'C:\workspace'))"`, which
+    /// raises `ValueError: path is on mount '', start on mount 'C:'`.
+    #[test]
+    fn relative_to_root_of_a_posix_target_against_a_drive_root_is_unchanged() {
+        assert_eq!(
+            relative_to_root("/x/SKILL.md", "C:/workspace"),
+            "/x/SKILL.md"
+        );
+    }
+
+    /// Two different drive letters are two different mounts, not a
+    /// single "drive" mount they both share. Verified with
+    /// `python3 -c "import ntpath;
+    /// print(ntpath.relpath(r'D:\x\SKILL.md', r'C:\workspace'))"`,
+    /// which raises `ValueError: path is on mount 'D:', start on mount
+    /// 'C:'`.
+    #[test]
+    fn relative_to_root_of_a_target_on_a_different_drive_letter_is_unchanged() {
+        assert_eq!(
+            relative_to_root("D:/x/SKILL.md", "C:/workspace"),
+            "D:/x/SKILL.md"
+        );
+    }
+
+    /// A UNC target under a different share is a different mount too,
+    /// even sharing the same server. Verified with
+    /// `python3 -c "import ntpath;
+    /// print(ntpath.relpath(r'\\server\other\x\SKILL.md',
+    /// r'\\server\share\workspace'))"`, which raises `ValueError: path
+    /// is on mount '\\\\server\\other', start on mount
+    /// '\\\\server\\share'`.
+    #[test]
+    fn relative_to_root_of_a_unc_target_on_a_different_share_is_unchanged() {
+        assert_eq!(
+            relative_to_root("//server/other/x/SKILL.md", "//server/share/workspace"),
+            "//server/other/x/SKILL.md"
+        );
+    }
+
+    /// Review follow-up (behavior change, verbatim UNC roots): the real
+    /// Windows verbatim spelling of a UNC root is
+    /// `//?/UNC/server/share/...` (the slash-normalized form of
+    /// `\\?\UNC\server\share\...`), never a flat `//?/server/share/...`
+    /// -- [`strip_verbatim_prefix`] now rewrites it to the ordinary
+    /// `//server/share/...` shape before anything classifies it, so a
+    /// target inside it relativizes exactly as
+    /// `relative_to_root_of_a_unc_target_inside_the_root` above already
+    /// does for the plain-spelled root.
+    #[test]
+    fn relative_to_root_with_a_verbatim_unc_root_relativizes_an_inside_target() {
+        assert_eq!(
+            relative_to_root("//server/share/skills/x/SKILL.md", "//?/UNC/server/share"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The same verbatim UNC root rewrite for a target outside it,
+    /// mirroring `relative_to_root_of_a_unc_target_outside_the_root`
+    /// above.
+    #[test]
+    fn relative_to_root_with_a_verbatim_unc_root_relativizes_an_outside_target() {
+        assert_eq!(
+            relative_to_root(
+                "//server/share/elsewhere/SKILL.md",
+                "//?/UNC/server/share/workspace"
+            ),
+            "../elsewhere/SKILL.md"
+        );
+    }
+
+    /// The rewrite applies to a verbatim-spelled `target` too, not only
+    /// a verbatim-spelled `root`: the same share, one plain and one
+    /// verbatim, still relativizes exactly as two plain spellings
+    /// already do (`relative_to_root_of_a_unc_target_inside_the_root`
+    /// above).
+    #[test]
+    fn relative_to_root_with_a_verbatim_unc_target_against_a_plain_unc_root_of_the_same_share() {
+        assert_eq!(
+            relative_to_root("//?/UNC/server/share/skills/x/SKILL.md", "//server/share"),
+            "skills/x/SKILL.md"
+        );
     }
 }
