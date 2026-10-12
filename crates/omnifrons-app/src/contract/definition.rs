@@ -1,0 +1,233 @@
+//! Fakes and a reusable contract for the `DefinitionTree` port (ADR-0005
+//! sub-slice 1e-A): an `InMemoryDefinitionTree` that returns a prepared
+//! `TreeSnapshot` for a given workspace root, a small builder so a test
+//! never has to assemble every field's `Vec` by hand, and
+//! `definition_tree_contract`, which any implementation -- this fake
+//! today, sub-slice 1f's filesystem adapter later -- must pass.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use omnifrons_domain::definition::IdentityFile;
+use omnifrons_domain::nesting::Ancestor;
+
+use crate::definition_tree::{
+    DefinitionTree, DefinitionTreeError, DirectoryEntry, SkillFile, TreeSnapshot,
+};
+use crate::harness_adapter::WorkspaceRoot;
+
+/// An in-memory [`DefinitionTree`] test double: one prepared
+/// [`TreeSnapshot`] per workspace root, keyed by its canonical path.
+#[derive(Debug, Default)]
+pub struct InMemoryDefinitionTree {
+    snapshots: HashMap<PathBuf, TreeSnapshot>,
+}
+
+impl InMemoryDefinitionTree {
+    /// A double with no prepared snapshot for any root.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Prepares `snapshot` as the result of scanning `root`.
+    #[must_use]
+    pub fn with_snapshot(mut self, root: &WorkspaceRoot, snapshot: TreeSnapshot) -> Self {
+        self.snapshots.insert(root.path().to_path_buf(), snapshot);
+        self
+    }
+}
+
+impl DefinitionTree for InMemoryDefinitionTree {
+    fn snapshot(&self, root: &WorkspaceRoot) -> Result<TreeSnapshot, DefinitionTreeError> {
+        self.snapshots
+            .get(root.path())
+            .cloned()
+            .ok_or(DefinitionTreeError::RootUnreadable)
+    }
+}
+
+/// A builder for a [`TreeSnapshot`] fixture (ADR-0005 sub-slice 1e-A): a
+/// test adds a directory, a skill, or an ancestor one call at a time
+/// instead of assembling every field's `Vec` by hand.
+#[derive(Debug, Default)]
+pub struct TreeSnapshotBuilder {
+    directories: Vec<DirectoryEntry>,
+    skills: Vec<SkillFile>,
+    ancestors: Vec<Ancestor>,
+}
+
+impl TreeSnapshotBuilder {
+    /// An empty snapshot under construction.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a directory holding `identity_files`, found at `path` (POSIX,
+    /// relative to the scan root; `"."` for the scan root itself).
+    #[must_use]
+    pub fn directory(
+        mut self,
+        path: impl Into<String>,
+        identity_files: Vec<IdentityFile>,
+        host_extras: Vec<String>,
+        generated_state_dirs: Vec<&'static str>,
+    ) -> Self {
+        self.directories.push(DirectoryEntry {
+            path: path.into(),
+            identity_files,
+            host_extras,
+            generated_state_dirs,
+        });
+        self
+    }
+
+    /// Adds a discovered `SKILL.md` at `path` (POSIX, relative to the
+    /// scan root; its basename must be `SKILL.md`).
+    #[must_use]
+    pub fn skill(mut self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        self.skills.push(SkillFile {
+            path: path.into(),
+            bytes: bytes.into(),
+        });
+        self
+    }
+
+    /// Adds an ancestor above the scan root, nearest first: callers must
+    /// add ancestors in that order themselves, since this builder never
+    /// reorders them.
+    #[must_use]
+    pub fn ancestor(mut self, path: impl Into<String>, identity_files: Vec<String>) -> Self {
+        self.ancestors.push(Ancestor {
+            path: path.into(),
+            identity_files,
+        });
+        self
+    }
+
+    /// The assembled snapshot.
+    #[must_use]
+    pub fn build(self) -> TreeSnapshot {
+        TreeSnapshot {
+            directories: self.directories,
+            skills: self.skills,
+            ancestors: self.ancestors,
+        }
+    }
+}
+
+// -- contract --
+
+/// A path's components, with `"."` (the scan root) represented as none
+/// -- mirrors `omnifrons_domain::nesting`'s own, private convention for
+/// the same shape.
+fn components(path: &str) -> Vec<&str> {
+    if path == "." {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    }
+}
+
+/// `path` is non-empty, never absolute, and carries no `..` or bare `.`
+/// component -- the shape every [`DirectoryEntry`]/[`SkillFile`] path
+/// must have.
+fn assert_clean_relative(path: &str, label: &str) {
+    assert!(!path.is_empty(), "{label} path must not be empty");
+    assert!(
+        !path.starts_with('/'),
+        "{label} path {path} must be relative, not absolute"
+    );
+    assert!(
+        path == "."
+            || path
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "{label} path {path} must be a clean relative path"
+    );
+}
+
+/// `paths` are already in the prototype's own sorted walk order: a
+/// pre-order, depth-first walk visiting each directory's children in
+/// name-sorted order. Comparing each path's own component sequence
+/// lexicographically (a shorter sequence that is a prefix of a longer
+/// one sorts first) reproduces exactly that order, including for a
+/// filtered subset such as "only the directories holding an identity
+/// file": removing entries from a pre-order walk never reorders the ones
+/// that remain, and two fixed entries' relative order under this
+/// comparison never depends on what other entries exist.
+fn assert_sorted_by_walk_order<'a>(paths: impl Iterator<Item = &'a str>, label: &str) {
+    let keys: Vec<Vec<&str>> = paths.map(components).collect();
+    for pair in keys.windows(2) {
+        assert!(
+            pair[0] <= pair[1],
+            "{label} must be in the prototype's sorted walk order"
+        );
+    }
+}
+
+/// Asserts [`DefinitionTree`]'s own contract (`crate::definition_tree`'s
+/// own documentation) on whatever `tree` returns for `root`: every
+/// directory and skill path is clean and relative, a listed directory
+/// always holds at least one identity file, a skill's basename is
+/// `SKILL.md`, directories and skills are in the prototype's sorted walk
+/// order, and ancestors are nearest first.
+///
+/// Checks only the shape a [`TreeSnapshot`] value must have; it cannot
+/// check the walk, pruning, link, or home-boundary rules that only a
+/// filesystem adapter can violate -- see `crate::definition_tree`'s own
+/// documentation.
+///
+/// # Panics
+///
+/// Panics on any contract violation, or if `tree` has no snapshot
+/// prepared for `root`.
+pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoot) {
+    let snapshot = tree
+        .snapshot(root)
+        .expect("a prepared fixture must snapshot its root");
+
+    for directory in &snapshot.directories {
+        assert_clean_relative(&directory.path, "a directory");
+        assert!(
+            !directory.identity_files.is_empty(),
+            "a listed directory must hold at least one identity file: {}",
+            directory.path
+        );
+    }
+    assert_sorted_by_walk_order(
+        snapshot
+            .directories
+            .iter()
+            .map(|directory| directory.path.as_str()),
+        "directories",
+    );
+
+    for skill in &snapshot.skills {
+        assert_clean_relative(&skill.path, "a skill");
+        assert_eq!(
+            skill.path.rsplit('/').next(),
+            Some("SKILL.md"),
+            "a skill path must end in SKILL.md, got {}",
+            skill.path
+        );
+    }
+    assert_sorted_by_walk_order(
+        snapshot.skills.iter().map(|skill| skill.path.as_str()),
+        "skills",
+    );
+
+    let mut previous_depth: Option<usize> = None;
+    for ancestor in &snapshot.ancestors {
+        let depth = ancestor.path.split('/').count();
+        if let Some(previous) = previous_depth {
+            assert!(
+                depth <= previous,
+                "ancestors must be nearest first: {} is not nearer than the previous one",
+                ancestor.path
+            );
+        }
+        previous_depth = Some(depth);
+    }
+}

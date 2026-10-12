@@ -10,6 +10,8 @@ pub mod catalog_repair;
 pub mod catalog_store;
 pub mod clock;
 pub mod content_hasher;
+pub mod definition;
+pub mod definition_tree;
 pub mod executable_prober;
 pub mod guidance;
 pub mod harness_adapter;
