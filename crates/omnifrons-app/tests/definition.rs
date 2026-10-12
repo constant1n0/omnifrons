@@ -618,3 +618,162 @@ fn outside_ancestor_identity_form_controls_the_warning_chain() {
         token_root.warnings
     );
 }
+
+/// A skill owned by a nested root, not the scan root, is reported
+/// relative to that nested root (`relative_within`'s non-root branch,
+/// stripping the owner prefix and its separator): the owning agent's
+/// `discovered` holds the skill's path relative to itself, the scan
+/// root's own `discovered` stays empty, and a link in the owning
+/// agent's own canonical text to that relative path resolves it as
+/// `indexed`, not `missing`.
+#[test]
+fn skill_owned_by_a_nested_root_is_relative_to_that_root() {
+    let project = TempDir::new("nested-root-skill");
+    let workspace = project.workspace();
+    let root_text = b"# Root Agent\n\nYou are Root.\n";
+    let child_text = b"# Child Agent\n\nYou are Child.\n\n[x](skills/x/SKILL.md)\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, root_text)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![identity(IdentityKind::Agents, child_text)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("child/skills/x/SKILL.md", b"---\nname: x\n---\n".to_vec())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let root = report
+        .agents
+        .iter()
+        .find(|agent| agent.path == ".")
+        .expect("root agent");
+    assert!(
+        root.skills.discovered.is_empty(),
+        "the scan root must not own the nested agent's skill, got {:?}",
+        root.skills.discovered
+    );
+
+    let child = report
+        .agents
+        .iter()
+        .find(|agent| agent.path == "child")
+        .expect("child agent");
+    assert_eq!(
+        child.skills.discovered,
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+    assert_eq!(child.skills.indexed, vec!["skills/x/SKILL.md".to_string()]);
+    assert!(
+        child.skills.missing.is_empty(),
+        "expected no missing skills, got {:?}",
+        child.skills.missing
+    );
+}
+
+/// `host_extras` produces an `extra_host_file` warning only for a name
+/// `omnifrons_domain::hosts::EXTRA_READERS` recognizes, naming that
+/// extra's own readers; an unrecognized name is silently dropped
+/// (`agent_warnings`'s own defensive skip), producing no warning at
+/// all.
+#[test]
+fn host_extras_warns_only_for_a_known_extra_and_drops_the_rest() {
+    let project = TempDir::new("host-extras");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n")],
+            vec![
+                "CLAUDE.local.md".to_string(),
+                "not-a-real-extra.txt".to_string(),
+            ],
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(report.agents.len(), 1);
+    let agent = &report.agents[0];
+    let extra_warnings: Vec<_> = agent
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == WarningCode::ExtraHostFile)
+        .collect();
+    assert_eq!(
+        extra_warnings.len(),
+        1,
+        "expected exactly one extra_host_file warning, got {:?}",
+        agent.warnings
+    );
+    assert_eq!(extra_warnings[0].hosts, vec!["Claude Code"]);
+    assert_eq!(
+        extra_warnings[0].detail,
+        "CLAUDE.local.md is read only by Claude Code; it is reported and never changed"
+    );
+}
+
+/// A `omnifrons_domain::hosts::GENERATED_STATE_DIRS` entry present at a
+/// root passes straight through into a `generated_state_dir` warning
+/// naming no host.
+#[test]
+fn generated_state_dir_present_reports_a_hostless_warning() {
+    let project = TempDir::new("generated-state-dir");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n")],
+            Vec::new(),
+            vec![".atl"],
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(report.agents.len(), 1);
+    let agent = &report.agents[0];
+    let state_dir_warnings: Vec<_> = agent
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == WarningCode::GeneratedStateDir)
+        .collect();
+    assert_eq!(
+        state_dir_warnings.len(),
+        1,
+        "expected exactly one generated_state_dir warning, got {:?}",
+        agent.warnings
+    );
+    assert!(state_dir_warnings[0].hosts.is_empty());
+    assert_eq!(
+        state_dir_warnings[0].detail,
+        ".atl/ holds generated tool state, not agent instructions; it is not part of the \
+         portable definition and the adapter never changes it"
+    );
+}
