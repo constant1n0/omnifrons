@@ -209,12 +209,18 @@ fn strip_verbatim_prefix(path: &str) -> Cow<'_, str> {
     }
 }
 
-/// `path` is a bare Windows drive letter component (`"C:"`, any ASCII
-/// letter, either case) -- the shape a drive-rooted path's first
-/// `/`-separated segment takes, never a later one.
-fn is_drive_letter_component(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+/// Whether `path` carries the literal `//?/UNC/` verbatim-UNC marker,
+/// checked on the original, unstripped `path` before anything rewrites
+/// it ([`strip_verbatim_prefix`] rewrites this exact shape into a bare
+/// `//server/share/...` one, indistinguishable by shape alone from a
+/// POSIX path's accidental doubled leading slash). This marker is the
+/// Windows API's own explicit, unambiguous signal that the path names a
+/// UNC root: no real POSIX path can carry it by accident, so [`mount_of`]
+/// trusts it unconditionally, never resolving it against a `root`'s own
+/// mount the way it must for a bare, unmarked `//a/b` shape.
+fn has_verbatim_unc_prefix(path: &str) -> bool {
+    path.strip_prefix("//?/")
+        .is_some_and(|rest| rest.starts_with("UNC/"))
 }
 
 /// `path`, with any leading `//?/` already stripped, starts with a
@@ -274,18 +280,18 @@ fn normalized_absolute_components(path: &str) -> Vec<String> {
 
 /// Which filesystem mount an absolute path belongs to: a bare POSIX
 /// path (`/`-rooted, not UNC), a Windows drive letter (normalized to
-/// lowercase, matching [`is_drive_letter_component`]'s own
-/// case-insensitivity), or a UNC `//server/share` root (its server and
-/// share both normalized to lowercase -- a real UNC root is
-/// case-insensitive the same way a drive letter is). [`relative_to_root`]
-/// relativizes a target only when [`mount_of`] agrees the two paths
-/// share a mount: `ntpath.relpath` itself raises `ValueError` across a
-/// mismatch (its own `splitdrive` plus `normcase`; see
-/// `relative_to_root`'s own unit tests for the oracle's exact error
-/// text), which this port has no error channel to reproduce, so it
-/// falls back to the target unchanged instead -- the same "no
-/// meaningful position to relativize against" policy this function's
-/// own doc comment already documents for a non-absolute root.
+/// lowercase for the mount-identity comparison itself), or a UNC
+/// `//server/share` root (its server and share both normalized to
+/// lowercase -- a real UNC root is case-insensitive the same way a
+/// drive letter is). [`relative_to_root`] relativizes a target only
+/// when [`mount_of`] agrees the two paths share a mount: `ntpath.relpath`
+/// itself raises `ValueError` across a mismatch (its own `splitdrive`
+/// plus `normcase`; see `relative_to_root`'s own unit tests for the
+/// oracle's exact error text), which this port has no error channel to
+/// reproduce, so it falls back to the target unchanged instead -- the
+/// same "no meaningful position to relativize against" policy this
+/// function's own doc comment already documents for a non-absolute
+/// root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mount {
     /// A `/`-rooted path that is not a UNC root.
@@ -301,7 +307,26 @@ enum Mount {
 /// `path` is assumed already [`is_absolute_path`] -- every caller here
 /// checks that before calling this function, so this function never
 /// needs to itself.
-fn mount_of(path: &str) -> Mount {
+///
+/// A bare two-slash prefix (`//a/b`) is lexically ambiguous on its own:
+/// it is either a real UNC root, or a POSIX path carrying an accidental
+/// extra leading slash that `posixpath.relpath` simply collapses away
+/// (its own `split('/')` drops the empty segments either side of it,
+/// exactly as [`normalized_absolute_components`] already does here).
+/// [`has_verbatim_unc_prefix`]'s own marker resolves this on its own,
+/// in `root` or `target` alike, since no real POSIX path can carry it
+/// by accident. Anything else is resolved against `root_mount`: `None`
+/// classifies `root` itself -- the base case, with no outer mount to
+/// resolve its own ambiguity against, so a root's own bare doubled
+/// leading slash is judged UNC exactly as this function judged every
+/// path before this disambiguation existed. `Some(mount)` classifies a
+/// `target` against its already-classified `root`: a bare two-slash
+/// target is POSIX when `root` itself is [`Mount::Posix`], and UNC
+/// otherwise -- a drive-rooted `root` can never share a mount with a
+/// `//`-prefixed `target` anyway, since [`relative_to_root`] already
+/// refuses to relativize one mount against another.
+fn mount_of(path: &str, root_mount: Option<&Mount>) -> Mount {
+    let is_verbatim_unc = has_verbatim_unc_prefix(path);
     let path = strip_verbatim_prefix(path);
     if is_drive_absolute(&path) {
         return Mount::Drive(char::from(path.as_bytes()[0].to_ascii_lowercase()));
@@ -314,22 +339,51 @@ fn mount_of(path: &str) -> Mount {
         let mut parts = rest.splitn(3, '/');
         let server = parts.next().unwrap_or("");
         let share = parts.next().unwrap_or("");
-        if !server.is_empty() && !share.is_empty() {
+        let resolved_as_unc = is_verbatim_unc || !matches!(root_mount, Some(Mount::Posix));
+        if !server.is_empty() && !share.is_empty() && resolved_as_unc {
             return Mount::Unc(server.to_lowercase(), share.to_lowercase());
         }
     }
     Mount::Posix
 }
 
-/// Whether `root`'s and `target`'s components at the same position
-/// match: exact equality, except the very first position (`is_first`)
-/// compares case-insensitively when both components are a Windows
-/// drive letter ([`is_drive_letter_component`]) -- `ntpath.relpath`
-/// itself treats `C:` and `c:` as the same mount. Every other
-/// position, including a UNC host or share name, compares exactly,
-/// like every POSIX component already does.
-fn components_match(a: &str, b: &str, is_first: bool) -> bool {
-    if is_first && is_drive_letter_component(a) && is_drive_letter_component(b) {
+/// How many of `mount`'s own leading components -- the ones that name
+/// the mount itself, never an ordinary directory or file past it --
+/// [`components_match`] compares case-insensitively: none for
+/// [`Mount::Posix`], the one drive-letter component for
+/// [`Mount::Drive`], or the two server/share components for
+/// [`Mount::Unc`]. [`mount_of`] already folds case to decide whether
+/// two paths share the *same* mount; this is the matching fold for
+/// comparing the *rest* of each path's components once
+/// [`relative_to_root`] already knows they do -- without it, a root and
+/// target naming the same UNC share in different case would pass
+/// `mount_of`'s own equality check and then find no common prefix at
+/// all, since every component past it still compared exactly.
+/// Deliberately narrower than a real Windows filesystem: `ntpath`'s own
+/// `normcase` folds an *entire* path, but the `base_omnifrons` prototype
+/// this module ports from is POSIX-only and never folds anything, so
+/// this port folds only as far as it must to keep `mount_of`'s mount
+/// identity and `components_match`'s component identity from
+/// disagreeing -- a component past the mount (an ordinary directory or
+/// file name) still compares exactly, as [`relative_to_root`]'s own doc
+/// comment documents and pins.
+fn fold_through(mount: &Mount) -> usize {
+    match mount {
+        Mount::Posix => 0,
+        Mount::Drive(_) => 1,
+        Mount::Unc(_, _) => 2,
+    }
+}
+
+/// Whether `root`'s and `target`'s components at `position` match:
+/// below `fold_through` -- the count of leading, mount-identifying
+/// components [`fold_through`] computes for the mount `root` and
+/// `target` are already known to share -- the comparison is
+/// case-insensitive; at or past it, every component compares exactly,
+/// including a UNC path's own third-and-later components, like every
+/// POSIX component already does.
+fn components_match(a: &str, b: &str, position: usize, fold_through: usize) -> bool {
+    if position < fold_through {
         a.eq_ignore_ascii_case(b)
     } else {
         a == b
@@ -337,15 +391,21 @@ fn components_match(a: &str, b: &str, is_first: bool) -> bool {
 }
 
 /// The number of `root_components`/`target_components` that match from
-/// the start ([`components_match`]), stopping at the first mismatch or
-/// the shorter list's end.
-fn common_prefix_len(root_components: &[String], target_components: &[String]) -> usize {
+/// the start ([`components_match`], folding case through `fold_through`
+/// positions), stopping at the first mismatch or the shorter list's
+/// end.
+fn common_prefix_len(
+    root_components: &[String],
+    target_components: &[String],
+    fold_through: usize,
+) -> usize {
     let mut common = 0;
     while common < root_components.len() && common < target_components.len() {
         if !components_match(
             &root_components[common],
             &target_components[common],
-            common == 0,
+            common,
+            fold_through,
         ) {
             break;
         }
@@ -385,6 +445,28 @@ fn common_prefix_len(root_components: &[String], target_components: &[String]) -
 /// not a gap, and this function's own unit tests cite the oracle's
 /// exact error text for each mount pairing it refuses to relativize.
 ///
+/// A UNC root's server and share fold case for this mount comparison,
+/// and for comparing the matching leading components once a shared
+/// mount is confirmed ([`fold_through`]) -- the same way a drive
+/// letter already did before this extended to UNC. That fold stops
+/// there: a component past the share compares exactly, even though a
+/// real Windows filesystem's `ntpath.normcase` folds an *entire* path.
+/// This port's narrower, documented scope only goes as far as keeping
+/// `mount_of`'s own mount identity and the component comparison after
+/// it from disagreeing with each other, since the `base_omnifrons`
+/// prototype it otherwise ports from is POSIX-only and never folds
+/// anything; this function's own unit tests pin the resulting
+/// divergence from a full-path fold.
+///
+/// A bare two-slash target (`//a/b`) is lexically ambiguous: it is
+/// either a real UNC root, or a POSIX path carrying an accidental extra
+/// leading slash that collapses away like any other repeated `/`
+/// ([`normalized_absolute_components`]). [`mount_of`] resolves this
+/// against `root`'s own mount -- POSIX when `root` is POSIX, UNC
+/// otherwise -- except for a `target` carrying the unambiguous
+/// `//?/UNC/...` verbatim marker, which is always UNC regardless of
+/// `root`, since no real POSIX path can carry that marker by accident.
+///
 /// When `root` is not itself an absolute path (empty, or a relative
 /// path such as `"workspace"`), there is no meaningful position left
 /// to relativize `target` against: treating an empty `root` as having
@@ -399,12 +481,17 @@ fn relative_to_root(target: &str, root: &str) -> String {
     if !is_absolute_path(root) {
         return target.to_string();
     }
-    if mount_of(target) != mount_of(root) {
+    let root_mount = mount_of(root, None);
+    if mount_of(target, Some(&root_mount)) != root_mount {
         return target.to_string();
     }
     let root_components = normalized_absolute_components(root);
     let target_components = normalized_absolute_components(target);
-    let common = common_prefix_len(&root_components, &target_components);
+    let common = common_prefix_len(
+        &root_components,
+        &target_components,
+        fold_through(&root_mount),
+    );
     let mut out: Vec<&str> =
         Vec::with_capacity((root_components.len() - common) + (target_components.len() - common));
     out.extend(std::iter::repeat_n("..", root_components.len() - common));
@@ -1183,6 +1270,125 @@ mod tests {
         assert_eq!(
             relative_to_root("//?/UNC/server/share/skills/x/SKILL.md", "//server/share"),
             "skills/x/SKILL.md"
+        );
+    }
+
+    /// Review follow-up (behavior change, UNC case folding): `mount_of`
+    /// already lowercases a UNC root's server and share to decide
+    /// whether two paths share a mount, but the component comparison
+    /// that followed it used to compare every component exactly -- so a
+    /// root and target naming the same share in different case passed
+    /// the mount check, then found no common prefix at all, and fell
+    /// back to a fully `../`-prefixed path that walks back out to the
+    /// share and down into it again, spelled in the target's own case.
+    /// Verified with `python3 -c "import ntpath;
+    /// print(ntpath.relpath(r'\\server\share\ws\skills\x\SKILL.md',
+    /// r'\\Server\share\ws'))"`, which prints `skills\x\SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_case_mismatched_unc_pair_relativizes() {
+        assert_eq!(
+            relative_to_root("//server/share/ws/skills/x/SKILL.md", "//Server/share/ws"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The case fold this fix adds is scoped to exactly the two
+    /// mount-identifying components (a UNC root's server and share),
+    /// matching the drive letter's own pre-existing scope of one
+    /// leading component: a real Windows filesystem's `ntpath.normcase`
+    /// folds an *entire* path, but the `base_omnifrons` prototype this
+    /// module ports from is POSIX-only and never folds anything, so
+    /// this port only folds as far as it must to keep `mount_of`'s own
+    /// mount-equality check and the component comparison after it from
+    /// disagreeing with each other. A component past the share still
+    /// compares exactly, so a pair that shares a server and share but
+    /// differs in case further in does not fully relativize the way a
+    /// real Windows filesystem would. Verified with `python3 -c "import
+    /// ntpath;
+    /// print(ntpath.relpath(r'\\server\share\Workspace\skills\x\SKILL.md',
+    /// r'\\server\share\workspace'))"`, which prints `skills\x\SKILL.md`
+    /// -- a full-path case fold this port does not reproduce. This port
+    /// instead keeps the mismatched `Workspace`/`workspace` pair apart,
+    /// pinning `../workspace/skills/x/SKILL.md` as its own, narrower,
+    /// documented answer (see [`relative_to_root`]'s own doc comment
+    /// for why).
+    #[test]
+    fn relative_to_root_keeps_a_case_difference_past_the_unc_share_exact() {
+        assert_eq!(
+            relative_to_root(
+                "//server/share/workspace/skills/x/SKILL.md",
+                "//server/share/Workspace"
+            ),
+            "../workspace/skills/x/SKILL.md"
+        );
+    }
+
+    /// Review follow-up (behavior change, POSIX doubled-slash targets):
+    /// `mount_of` used to classify any `//`-prefixed path with two
+    /// non-empty segments as a UNC root, regardless of what it was
+    /// compared against -- so a POSIX link accidentally written with a
+    /// doubled leading slash was classified as a different mount than
+    /// its plain-spelled POSIX root and passed through unrelativized,
+    /// where `posixpath.relpath` has no UNC concept at all and simply
+    /// collapses the empty components a doubled slash produces, the
+    /// same way `normalized_absolute_components` already drops them
+    /// here. Verified with `python3 -c "import posixpath;
+    /// print(posixpath.relpath('//workspace/skills/x/SKILL.md',
+    /// '/workspace'))"`, which prints `skills/x/SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_posix_doubled_slash_target_relativizes() {
+        assert_eq!(
+            relative_to_root("//workspace/skills/x/SKILL.md", "/workspace"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The disambiguation this fix adds resolves a bare `//a/b` shape
+    /// against `root`'s own mount, never against the target alone: a
+    /// genuinely UNC `root` still recognizes a same-shaped UNC `target`
+    /// under its own share exactly as
+    /// `relative_to_root_of_a_unc_target_inside_the_root` above already
+    /// pins -- this fix changes nothing for the one-mount case.
+    #[test]
+    fn relative_to_root_of_a_unc_target_against_a_unc_root_still_relativizes() {
+        assert_eq!(
+            relative_to_root("//server/share/skills/x/SKILL.md", "//server/share"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// A UNC `root` still tells a same-shaped `target` naming a
+    /// *different* server apart from its own: this fix only changes how
+    /// a bare `//a/b` shape is resolved when it is genuinely ambiguous
+    /// (against a POSIX root); it never makes two distinct UNC mounts
+    /// look alike. Verified with `python3 -c "import ntpath;
+    /// print(ntpath.relpath(r'\\other\share\x\SKILL.md',
+    /// r'\\server\share\workspace'))"`, which raises `ValueError: path
+    /// is on mount '\\\\other\\share', start on mount
+    /// '\\\\server\\share'`.
+    #[test]
+    fn relative_to_root_of_a_different_unc_server_against_a_unc_root_is_unchanged() {
+        assert_eq!(
+            relative_to_root("//other/share/x/SKILL.md", "//server/share/workspace"),
+            "//other/share/x/SKILL.md"
+        );
+    }
+
+    /// A verbatim `//?/UNC/...` target is always UNC, even against a
+    /// plain POSIX `root`: the marker is the Windows API's own explicit,
+    /// unambiguous signal, lexically impossible for a real POSIX path to
+    /// carry by accident, so `mount_of` never resolves it against
+    /// `root`'s own mount the way it resolves a bare doubled slash. A
+    /// POSIX root and a UNC target are on different mounts and the
+    /// target comes back unchanged. Verified with `python3 -c "import
+    /// ntpath; print(ntpath.relpath(r'\\?\UNC\server\share\ws\SKILL.md',
+    /// r'\workspace'))"`, which raises `ValueError: path is on mount
+    /// '\\\\?\\UNC\\server\\share', start on mount ''`.
+    #[test]
+    fn relative_to_root_of_a_verbatim_unc_target_against_a_posix_root_is_unchanged() {
+        assert_eq!(
+            relative_to_root("//?/UNC/server/share/ws/SKILL.md", "/workspace"),
+            "//?/UNC/server/share/ws/SKILL.md"
         );
     }
 }

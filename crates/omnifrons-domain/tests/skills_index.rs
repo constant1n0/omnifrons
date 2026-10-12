@@ -942,3 +942,33 @@ fn indexed_skill_targets_relativizes_a_verbatim_unc_target_against_a_plain_unc_r
         vec!["skills/x/SKILL.md".to_string()]
     );
 }
+
+/// Review follow-up (behavior change, UNC case folding): a scanned
+/// workspace root and an absolute Markdown link naming the same UNC
+/// share in different case now relativize to the same place, exactly as
+/// a mixed-case drive letter already does above --
+/// `relative_to_root`'s own unit tests in `src/skills_index.rs` cite the
+/// `ntpath.relpath` oracle this extends to a UNC server and share.
+#[test]
+fn indexed_skill_targets_relativizes_a_case_mismatched_unc_pair() {
+    let text = b"[a](//server/share/ws/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "//Server/share/ws"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// Review follow-up (behavior change, POSIX doubled-slash targets): an
+/// absolute Markdown link whose target carries an accidental doubled
+/// leading slash still relativizes against a plain POSIX root, exactly
+/// as `posixpath.relpath` collapses the same doubled slash --
+/// `relative_to_root`'s own unit tests in `src/skills_index.rs` cite the
+/// oracle this extends to the public API.
+#[test]
+fn indexed_skill_targets_relativizes_a_posix_doubled_slash_target() {
+    let text = b"[a](//workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "/workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
