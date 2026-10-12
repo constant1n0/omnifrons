@@ -423,6 +423,21 @@ fn indexed_skill_targets_with_an_absolute_root_relativizes_the_same_target() {
     );
 }
 
+/// Review follow-up (behavior change, Windows support): a canonical
+/// workspace root rendered as a Windows drive path (`C:/workspace`) now
+/// relativizes an absolute Markdown link under the same drive, exactly
+/// as a POSIX root already does for a POSIX-rooted link --
+/// `relative_to_root`'s own unit tests in `src/skills_index.rs` cite the
+/// `ntpath.relpath` oracle this extends.
+#[test]
+fn indexed_skill_targets_relativizes_a_windows_drive_absolute_target_inside_a_drive_root() {
+    let text = b"[a](C:/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "C:/workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
 /// An absolute link inside the root names exactly the discovered
 /// relative path: neither missing nor dangling.
 #[test]

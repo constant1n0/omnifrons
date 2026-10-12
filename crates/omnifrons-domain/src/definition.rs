@@ -96,6 +96,17 @@ impl IdentityKind {
     pub fn parse(token: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == token)
     }
+
+    /// Parse a file name produced by [`Self::file_name`] -- the exact
+    /// inverse of that method, and the prototype's own shape for an
+    /// identity kind (for example `"AGENTS.md"`, never the token form
+    /// `"agents"` [`Self::parse`] recognizes). Matches the file name
+    /// exactly: never case-insensitively, and never a bare basename for
+    /// [`Self::ClaudeDir`]'s own `".claude/CLAUDE.md"`.
+    #[must_use]
+    pub fn from_file_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.file_name() == name)
+    }
 }
 
 impl fmt::Display for IdentityKind {

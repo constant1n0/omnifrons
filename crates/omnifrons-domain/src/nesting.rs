@@ -102,8 +102,16 @@ pub enum NestingError {
 pub struct Ancestor {
     /// The ancestor's own location, opaque to this module (see above).
     pub path: String,
-    /// The kinds of identity file found there (for example `AGENTS.md`
-    /// or `CLAUDE.md`), in the port's order.
+    /// The kinds of identity file found there, in the port's order. The
+    /// prototype keys its own `files` mapping by the file-name form
+    /// (`"AGENTS.md"`, `"CLAUDE.md"`, ...), so a value written that way
+    /// is this field's canonical, prototype-shaped form; a consumer may
+    /// also accept the identity kind's token form (for example
+    /// `"agents"`) for the same entry -- `crate::definition`'s own
+    /// warnings composition, in the `omnifrons-app` crate, does both.
+    /// This module itself never parses or validates either form -- it
+    /// carries whatever a port supplies opaquely, exactly like `path`
+    /// above.
     pub identity_files: Vec<String>,
 }
 

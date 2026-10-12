@@ -272,14 +272,16 @@ fn skills_report(text: Option<&[u8]>, discovered: &[String], root_absolute: &str
 /// Each link of `chain`'s own identity-file names, `&'static str` (the
 /// prototype's own `ancestor_files` dict keys): a link inside the scan
 /// reads them straight from that root's own [`DirectoryEntry`]; an
-/// outside ancestor's are parsed from [`Ancestor::identity_files`]
-/// through [`IdentityKind::parse`] -- that parses the *token* form
-/// ([`IdentityKind::as_str`], e.g. `"agents"`), so an ancestor entry
-/// written in file-name form (`"AGENTS.md"`) is dropped as unknown,
-/// exactly like any other string [`IdentityKind::parse`] does not
-/// recognize. Whoever populates [`Ancestor::identity_files`] -- today,
-/// this crate's own tests; later, sub-slice 1f's adapter -- must use the
-/// token form for a link's identity files to survive this step.
+/// outside ancestor's are recognized from [`Ancestor::identity_files`]
+/// by trying [`IdentityKind::from_file_name`] first -- the prototype's
+/// own shape (for example `"AGENTS.md"`) -- then falling back to
+/// [`IdentityKind::parse`] (the token form, for example `"agents"`), so
+/// either spelling survives into the warning chain; an entry neither
+/// function recognizes is dropped, exactly like any other string
+/// neither recognizes. Whoever populates [`Ancestor::identity_files`]
+/// -- today, this crate's own tests; later, sub-slice 1f's adapter --
+/// may use either form; the file-name form is preferred, since it is
+/// the one the prototype itself stores.
 fn chain_identity_files(
     directories: &[DirectoryEntry],
     chain: &[ChainLink],
@@ -301,7 +303,9 @@ fn chain_identity_files(
             ChainLink::Outside(ancestor) => ancestor
                 .identity_files
                 .iter()
-                .filter_map(|token| IdentityKind::parse(token))
+                .filter_map(|entry| {
+                    IdentityKind::from_file_name(entry).or_else(|| IdentityKind::parse(entry))
+                })
                 .map(|kind| kind.file_name())
                 .collect(),
         })

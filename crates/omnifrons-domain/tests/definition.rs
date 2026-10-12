@@ -629,6 +629,21 @@ fn root_state_and_identity_kind_tokens_round_trip() {
     assert_eq!(IdentityKind::parse("not-a-kind"), None);
 }
 
+/// `IdentityKind::from_file_name` is the exact inverse of
+/// `IdentityKind::file_name`: every kind's own file name parses back to
+/// it, and a name neither form recognizes -- including a token-form
+/// spelling such as `"agents"` -- parses to `None`. The file-name form
+/// is the prototype's own shape for an ancestor's identity files (see
+/// `nesting::Ancestor::identity_files`'s own documentation).
+#[test]
+fn identity_kind_file_name_round_trips_through_from_file_name() {
+    for kind in IdentityKind::ALL {
+        assert_eq!(IdentityKind::from_file_name(kind.file_name()), Some(kind));
+    }
+    assert_eq!(IdentityKind::from_file_name("not-a-file-name"), None);
+    assert_eq!(IdentityKind::from_file_name("agents"), None);
+}
+
 /// Review follow-up: construction rejects more than one identity file
 /// of the same kind, rather than leaving `classify`'s kind-keyed
 /// lookups to silently pick whichever happens to be found first (review

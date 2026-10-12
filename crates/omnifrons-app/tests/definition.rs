@@ -554,69 +554,63 @@ fn skill_outside_every_root_is_dropped_from_every_agents_discovered_list() {
     }
 }
 
-/// An outside ancestor's `identity_files` must use the identity kind's
-/// token form (`"agents"`): that form is parsed and feeds the warning
-/// chain, while the file-name form (`"AGENTS.md"`) is silently dropped
-/// as unrecognized, producing no `ancestor_*` warning for that ancestor
-/// at all.
+/// An outside ancestor's `identity_files` entry may be written in
+/// either the identity kind's file-name form (`"AGENTS.md"`, the
+/// prototype's own shape) or its token form (`"agents"`):
+/// `chain_identity_files` accepts both -- trying
+/// `IdentityKind::from_file_name` first, then falling back to
+/// `IdentityKind::parse` -- so either one feeds the warning chain and
+/// produces an `ancestor_shadowing` warning; an entry neither form
+/// recognizes is still dropped silently, producing no `ancestor_*`
+/// warning for that ancestor at all.
 #[test]
 fn outside_ancestor_identity_form_controls_the_warning_chain() {
     let hasher = FakeHasher;
+    let cases = [("AGENTS.md", true), ("agents", true), ("nonsense", false)];
 
-    let file_name_project = TempDir::new("ancestor-file-name-form");
-    let file_name_workspace = file_name_project.workspace();
-    let file_name_snapshot = TreeSnapshotBuilder::new()
-        .directory(
-            ".",
-            vec![identity(IdentityKind::Claude, b"# Root\n\nReal content.\n")],
-            Vec::new(),
-            Vec::new(),
-        )
-        .ancestor("/outside", vec!["AGENTS.md".to_string()])
-        .build();
-    let file_name_tree =
-        InMemoryDefinitionTree::new().with_snapshot(&file_name_workspace, file_name_snapshot);
-    let file_name_ports = DefinitionPorts {
-        tree: &file_name_tree,
-        hasher: &hasher,
-    };
-    let file_name_report = scan(&file_name_ports, &file_name_workspace).expect("scan succeeds");
-    let file_name_root = &file_name_report.agents[0];
-    assert!(
-        !file_name_root.warnings.iter().any(|warning| matches!(
-            warning.code,
-            WarningCode::AncestorShadowing | WarningCode::AncestorExposure
-        )),
-        "a file-name-form ancestor entry must be dropped silently, got {:?}",
-        file_name_root.warnings
-    );
-
-    let token_project = TempDir::new("ancestor-token-form");
-    let token_workspace = token_project.workspace();
-    let token_snapshot = TreeSnapshotBuilder::new()
-        .directory(
-            ".",
-            vec![identity(IdentityKind::Claude, b"# Root\n\nReal content.\n")],
-            Vec::new(),
-            Vec::new(),
-        )
-        .ancestor("/outside", vec!["agents".to_string()])
-        .build();
-    let token_tree = InMemoryDefinitionTree::new().with_snapshot(&token_workspace, token_snapshot);
-    let token_ports = DefinitionPorts {
-        tree: &token_tree,
-        hasher: &hasher,
-    };
-    let token_report = scan(&token_ports, &token_workspace).expect("scan succeeds");
-    let token_root = &token_report.agents[0];
-    assert!(
-        token_root
+    for (entry, expect_shadowing) in cases {
+        let project = TempDir::new(&format!("ancestor-form-{entry}"));
+        let workspace = project.workspace();
+        let snapshot = TreeSnapshotBuilder::new()
+            .directory(
+                ".",
+                vec![identity(IdentityKind::Claude, b"# Root\n\nReal content.\n")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .ancestor("/outside", vec![entry.to_string()])
+            .build();
+        let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+        let ports = DefinitionPorts {
+            tree: &tree,
+            hasher: &hasher,
+        };
+        let report = scan(&ports, &workspace).expect("scan succeeds");
+        let root = &report.agents[0];
+        let has_shadowing = root
             .warnings
             .iter()
-            .any(|warning| warning.code == WarningCode::AncestorShadowing),
-        "a token-form ancestor entry must produce an ancestor_shadowing warning, got {:?}",
-        token_root.warnings
-    );
+            .any(|warning| warning.code == WarningCode::AncestorShadowing);
+        let has_any_ancestor_warning = root.warnings.iter().any(|warning| {
+            matches!(
+                warning.code,
+                WarningCode::AncestorShadowing | WarningCode::AncestorExposure
+            )
+        });
+        if expect_shadowing {
+            assert!(
+                has_shadowing,
+                "{entry}: expected an ancestor_shadowing warning, got {:?}",
+                root.warnings
+            );
+        } else {
+            assert!(
+                !has_any_ancestor_warning,
+                "{entry}: an unrecognized ancestor entry must be dropped silently, got {:?}",
+                root.warnings
+            );
+        }
+    }
 }
 
 /// A skill owned by a nested root, not the scan root, is reported

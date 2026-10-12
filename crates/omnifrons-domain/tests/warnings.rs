@@ -151,6 +151,176 @@ fn opencode_shadowing_fires_once_for_the_nearest_ancestor_only() {
 }
 
 // ---------------------------------------------------------------------
+// Extension beyond the prototype: Claude Code's AGENTS.md fallback when
+// neither this agent nor any ancestor in its chain holds a CLAUDE.md
+// file.
+// ---------------------------------------------------------------------
+
+#[test]
+fn claude_code_falls_back_and_fires_ancestor_exposure_for_an_agents_only_ancestor() {
+    let identity_kinds = [IdentityKind::Agents];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    assert_eq!(exposure.len(), 1, "{warnings:?}");
+    assert!(
+        exposure[0].hosts.contains(&"Claude Code"),
+        "{:?}",
+        exposure[0]
+    );
+}
+
+#[test]
+fn claude_code_falls_back_and_lists_as_a_reader_for_an_agents_only_nested_child() {
+    let identity_kinds = [IdentityKind::Agents];
+    let nested = ["child"];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        text: Some("# Root\n\nNo mention of the nested agent here.\n"),
+        nested: &nested,
+        ..blank_input()
+    });
+
+    let matches = with_code(&warnings, WarningCode::ChildNotMentioned);
+    assert_eq!(matches.len(), 1, "{warnings:?}");
+    assert!(
+        matches[0].hosts.contains(&"Claude Code"),
+        "{:?}",
+        matches[0]
+    );
+}
+
+/// Adding a `CLAUDE.md` on the agent itself disables the fallback --
+/// Claude Code's own primary file is present, so its upward kinds stay
+/// `CLAUDE.md`/`.claude/CLAUDE.md` and an `AGENTS.md`-only ancestor
+/// never matches them.
+#[test]
+fn claude_code_fallback_is_disabled_by_a_claude_md_on_the_agent() {
+    let identity_kinds = [IdentityKind::Claude];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorExposure)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorShadowing)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
+/// A `CLAUDE.md` anywhere else in the chain -- not necessarily on the
+/// `AGENTS.md`-only ancestor being evaluated -- also disables the
+/// fallback for the whole chain, so that `AGENTS.md`-only ancestor goes
+/// back to naming no Claude Code warning at all.
+#[test]
+fn claude_code_fallback_is_disabled_by_a_claude_md_elsewhere_in_the_chain() {
+    let identity_kinds = [IdentityKind::Agents];
+    let chain = [
+        ChainAncestor {
+            display: "near",
+            identity_files: &["AGENTS.md"],
+        },
+        ChainAncestor {
+            display: "far",
+            identity_files: &["CLAUDE.md"],
+        },
+    ];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let near_warnings: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.detail.contains("near"))
+        .collect();
+    assert!(
+        !near_warnings
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{near_warnings:?}"
+    );
+}
+
+/// `CLAUDE.local.md` among the agent's own host extras counts as one of
+/// Claude Code's own files too, disabling the fallback exactly like a
+/// real `CLAUDE.md` would -- the unrelated `extra_host_file` warning
+/// that extra also produces is excluded from this check, since it
+/// legitimately names Claude Code as that file's own reader.
+#[test]
+fn claude_code_fallback_is_disabled_by_claude_local_md_among_the_extras() {
+    let identity_kinds = [IdentityKind::Agents];
+    let host_extras = ["CLAUDE.local.md"];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        host_extras: &host_extras,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.code != WarningCode::ExtraHostFile && w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
+/// The same chain-wide decision is shared with `child_warnings`: a
+/// `CLAUDE.md` anywhere in the chain disables Claude Code as a reader
+/// of an unmentioned nested agent too, not only ancestor warnings.
+#[test]
+fn claude_code_fallback_is_disabled_for_child_warnings_too_once_a_claude_md_exists_in_the_chain() {
+    let identity_kinds = [IdentityKind::Agents];
+    let nested = ["child"];
+    let chain = [ChainAncestor {
+        display: "somewhere",
+        identity_files: &["CLAUDE.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        text: Some("# Root\n\nNo mention of the nested agent here.\n"),
+        nested: &nested,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let matches = with_code(&warnings, WarningCode::ChildNotMentioned);
+    assert_eq!(matches.len(), 1, "{warnings:?}");
+    assert!(
+        !matches[0].hosts.contains(&"Claude Code"),
+        "{:?}",
+        matches[0]
+    );
+}
+
+// ---------------------------------------------------------------------
 // test_warning_child_not_mentioned
 // ---------------------------------------------------------------------
 

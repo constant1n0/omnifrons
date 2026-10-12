@@ -36,9 +36,30 @@
 //!   `UPWARD_LOADERS`), so [`ancestor_exposure`](WarningCode::AncestorExposure)/
 //!   [`ancestor_shadowing`](WarningCode::AncestorShadowing) can never
 //!   name those hosts.
-//! - Claude Code's documented fallback to `AGENTS.md`/`.claude/AGENTS.md`
-//!   depends on a configurable instruction-files mode; this module, like
-//!   [`crate::hosts`], models only the default mode.
+//! - Claude Code's own documented fallback depends on a configurable
+//!   instruction-files mode; [`effective_upward_loaders`] models only
+//!   its default mode, like [`crate::hosts`] itself.
+//!
+//! # Extension beyond the prototype: Claude Code's `AGENTS.md` fallback
+//!
+//! The prototype's own `UPWARD_LOADERS` is fixed: Claude Code always
+//! loads `CLAUDE.md`/`.claude/CLAUDE.md` from every ancestor, never
+//! `AGENTS.md`. The official Claude Code memory documentation (read
+//! 2026-10-12) documents a conditional fallback that table omits: in
+//! its own words, "at session start it loads every `AGENTS.md` and
+//! `.claude/AGENTS.md` in the working directory and the directories
+//! above it" when none of its `CLAUDE.md` files exists there first.
+//! [`effective_upward_loaders`] models that default-mode fallback: when
+//! this agent and every ancestor in its own warning chain hold none of
+//! Claude Code's [`crate::hosts::HostLoader::files`] (`CLAUDE.md`,
+//! `.claude/CLAUDE.md`, or the `CLAUDE.local.md` extra), Claude Code's
+//! upward kinds become its own documented
+//! [`crate::hosts::HostLoader::fallback_files`] for this agent's own
+//! [`ancestor_warnings`] and [`child_warnings`]; otherwise the
+//! prototype's own fixed rule holds unchanged. Like [`crate::hosts`]
+//! itself, this models only the default, non-configurable
+//! instruction-files mode that documentation describes; a project that
+//! configures Claude Code differently is not represented here.
 
 use crate::definition::{IdentityKind, is_import_only};
 use crate::fences::FenceTracker;
@@ -459,21 +480,89 @@ fn mentions(text: &str, relative: &str) -> bool {
     false
 }
 
+/// Whether Claude Code's upward kinds should fall back to its
+/// documented [`crate::hosts::HostLoader::fallback_files`]
+/// (`AGENTS.md`/`.claude/AGENTS.md`) for this agent, instead of its
+/// ordinary [`crate::hosts::HostLoader::upward_kinds`]
+/// (`CLAUDE.md`/`.claude/CLAUDE.md`) -- see the module documentation's
+/// quoted rule. True exactly when neither this agent's own
+/// `identity_kinds`/`host_extras` nor any ancestor in `chain` holds any
+/// of `claude_code`'s own [`crate::hosts::HostLoader::files`]
+/// (`CLAUDE.md`, `.claude/CLAUDE.md`, or the `CLAUDE.local.md` extra).
+fn claude_code_falls_back_to_agents(
+    claude_code: &hosts::HostLoader,
+    identity_kinds: &[IdentityKind],
+    host_extras: &[&str],
+    chain: &[ChainAncestor<'_>],
+) -> bool {
+    let agent_has_a_claude_file = identity_kinds
+        .iter()
+        .any(|kind| claude_code.files.contains(&kind.file_name()))
+        || host_extras
+            .iter()
+            .any(|extra| claude_code.files.contains(extra));
+    if agent_has_a_claude_file {
+        return false;
+    }
+    !chain.iter().any(|ancestor| {
+        ancestor
+            .identity_files
+            .iter()
+            .any(|file| claude_code.files.contains(file))
+    })
+}
+
+/// [`crate::hosts::upward_loaders`], with Claude Code's own kinds
+/// swapped for its `fallback_files` when
+/// [`claude_code_falls_back_to_agents`] says this agent qualifies --
+/// computed once per [`agent_warnings`] call and threaded into both
+/// [`ancestor_warnings`] and [`child_warnings`], so neither one
+/// re-derives the fallback decision or duplicates this loop.
+fn effective_upward_loaders(
+    identity_kinds: &[IdentityKind],
+    host_extras: &[&str],
+    chain: &[ChainAncestor<'_>],
+) -> Vec<(&'static str, &'static [&'static str])> {
+    let Some(claude_code) = hosts::host("Claude Code") else {
+        // Defensive: every host this module names comes from
+        // `hosts::HOSTS`, which always includes Claude Code; this
+        // crate's own table never omits it.
+        return hosts::upward_loaders().collect();
+    };
+    let fallback =
+        claude_code_falls_back_to_agents(claude_code, identity_kinds, host_extras, chain);
+    hosts::upward_loaders()
+        .map(|(host, kinds)| {
+            if fallback && host == "Claude Code" {
+                (host, claude_code.fallback_files)
+            } else {
+                (host, kinds)
+            }
+        })
+        .collect()
+}
+
 /// Exposure and shadowing warnings for every ancestor in `chain` (the
 /// prototype's `ancestor_warnings`): a host that loads one of
-/// [`crate::hosts::upward_loaders`]'s file kinds from an ancestor is
-/// "exposure" when this agent's own root also has that kind, or
-/// "shadowing" when it does not. `OpenCode`'s own upward walk -- the
-/// first unresolved ancestor `AGENTS.md`, not every ancestor's -- is
-/// handled apart, exactly once, matching the prototype's
-/// `opencode_resolved` flag.
-fn ancestor_warnings(identity_kinds: &[IdentityKind], chain: &[ChainAncestor<'_>]) -> Vec<Warning> {
+/// `loaders`' file kinds from an ancestor is "exposure" when this
+/// agent's own root also has that kind, or "shadowing" when it does
+/// not. `loaders` is [`effective_upward_loaders`]'s result, computed
+/// once by [`agent_warnings`] and shared with [`child_warnings`]; this
+/// function never calls [`crate::hosts::upward_loaders`] itself.
+/// `OpenCode`'s own upward walk -- the first unresolved ancestor
+/// `AGENTS.md`, not every ancestor's -- is handled apart, exactly once,
+/// matching the prototype's `opencode_resolved` flag.
+fn ancestor_warnings(
+    identity_kinds: &[IdentityKind],
+    chain: &[ChainAncestor<'_>],
+    loaders: &[(&'static str, &'static [&'static str])],
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
     let mut opencode_resolved = identity_kinds.contains(&IdentityKind::Agents);
     for ancestor in chain {
         let mut exposure: Vec<&'static str> = Vec::new();
         let mut shadowing: Vec<&'static str> = Vec::new();
-        for (host, kinds) in hosts::upward_loaders() {
+        for &(host, kinds) in loaders {
             if kinds
                 .iter()
                 .any(|kind| ancestor.identity_files.contains(kind))
@@ -531,10 +620,17 @@ fn ancestor_warnings(identity_kinds: &[IdentityKind], chain: &[ChainAncestor<'_>
 
 /// `child_not_mentioned` warnings for every nested agent `nested` names
 /// that this agent's own canonical `text` never mentions (the
-/// prototype's `child_warnings`).
-fn child_warnings(identity_kinds: &[IdentityKind], text: &str, nested: &[&str]) -> Vec<Warning> {
+/// prototype's `child_warnings`). `loaders` is
+/// [`effective_upward_loaders`]'s result, shared with
+/// [`ancestor_warnings`]; see that function's own doc comment.
+fn child_warnings(
+    identity_kinds: &[IdentityKind],
+    text: &str,
+    nested: &[&str],
+    loaders: &[(&'static str, &'static [&'static str])],
+) -> Vec<Warning> {
     let mut readers: Vec<&'static str> = Vec::new();
-    for (host, kinds) in hosts::upward_loaders() {
+    for &(host, kinds) in loaders {
         if kinds.iter().any(|kind| {
             identity_kinds
                 .iter()
@@ -730,9 +826,15 @@ fn size_warnings(text: &str) -> Vec<Warning> {
 /// prototype's `agent_warnings`).
 #[must_use]
 pub fn agent_warnings(input: &AgentInput<'_>) -> Vec<Warning> {
-    let mut warnings = ancestor_warnings(input.identity_kinds, input.chain);
+    let loaders = effective_upward_loaders(input.identity_kinds, input.host_extras, input.chain);
+    let mut warnings = ancestor_warnings(input.identity_kinds, input.chain, &loaders);
     if let Some(text) = input.text {
-        warnings.extend(child_warnings(input.identity_kinds, text, input.nested));
+        warnings.extend(child_warnings(
+            input.identity_kinds,
+            text,
+            input.nested,
+            &loaders,
+        ));
     }
     warnings.extend(import_warnings(input.override_bytes, input.text));
     if let Some(text) = input.text {

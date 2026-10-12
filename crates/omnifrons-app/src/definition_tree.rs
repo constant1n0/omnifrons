@@ -45,15 +45,20 @@
 //!   `root.parents`), stopping at the user's home directory boundary --
 //!   the prototype's own `user_home()` guard in `has_identity_files`,
 //!   applied by the adapter, never by this port's caller. Each
-//!   `Ancestor::identity_files` entry the adapter supplies must be that
-//!   file's identity-kind *token* (for example `"agents"`, the form
-//!   [`omnifrons_domain::definition::IdentityKind::as_str`] returns),
-//!   never the file-name form (`"AGENTS.md"`):
-//!   [`crate::definition`]'s own warnings composition parses every
-//!   entry with [`omnifrons_domain::definition::IdentityKind::parse`],
-//!   which only recognizes the token form, so a file-name-form entry is
-//!   silently dropped from that ancestor's warning chain rather than
-//!   reported as an error.
+//!   `Ancestor::identity_files` entry the adapter supplies may be
+//!   either that file's identity-kind file name (for example
+//!   `"AGENTS.md"`, the prototype's own shape -- it keys its own
+//!   `files` mapping this way -- and the form
+//!   [`omnifrons_domain::definition::IdentityKind::file_name`]
+//!   returns) or its token (for example `"agents"`, the form
+//!   [`omnifrons_domain::definition::IdentityKind::as_str`] returns):
+//!   [`crate::definition`]'s own warnings composition tries
+//!   [`omnifrons_domain::definition::IdentityKind::from_file_name`]
+//!   first, then falls back to
+//!   [`omnifrons_domain::definition::IdentityKind::parse`], so either
+//!   form survives into that ancestor's warning chain; an entry
+//!   neither recognizes is silently dropped rather than reported as an
+//!   error.
 //!
 //! This module only declares the shape; sub-slice 1f's filesystem adapter
 //! is the one piece of code that must honor every rule above against a
