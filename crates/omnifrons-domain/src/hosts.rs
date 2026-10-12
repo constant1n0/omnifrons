@@ -343,3 +343,16 @@ pub fn import_blind_readers() -> impl Iterator<Item = &'static str> {
         .filter(|host| host.import_blind)
         .map(|host| host.name)
 }
+
+/// The readers of a host-specific extra file named `file`, from
+/// [`EXTRA_READERS`], or `None` when `file` is not one of its entries.
+/// A small lookup [`crate::warnings`] needs for the `extra_host_file`
+/// warning; added here because [`EXTRA_READERS`] is private data this
+/// module already owns.
+#[must_use]
+pub fn extra_readers(file: &str) -> Option<&'static [&'static str]> {
+    EXTRA_READERS
+        .iter()
+        .find(|(name, _)| *name == file)
+        .map(|(_, readers)| *readers)
+}

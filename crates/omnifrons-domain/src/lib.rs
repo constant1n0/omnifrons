@@ -19,4 +19,5 @@ pub mod scope;
 pub mod skills_index;
 pub mod skills_safety;
 pub mod terminal;
+pub mod warnings;
 pub mod wrong_root;
