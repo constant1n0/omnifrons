@@ -972,3 +972,45 @@ fn indexed_skill_targets_relativizes_a_posix_doubled_slash_target() {
         vec!["skills/x/SKILL.md".to_string()]
     );
 }
+
+/// Review follow-up (behavior change, `..` past a mount): the same
+/// drive-pinning fix in the private `relative_to_root`
+/// (`src/skills_index.rs`) applies through this public API when the
+/// scanned workspace `root` itself carries a `..` that would otherwise
+/// climb past its own drive letter. Verified with
+/// `ntpath.relpath(r'C:\workspace\skills\x\SKILL.md',
+/// r'C:\..\workspace')`, which prints `skills\x\SKILL.md`.
+#[test]
+fn indexed_skill_targets_of_a_dot_dot_past_a_drive_root_pins_the_drive() {
+    let text = b"[a](C:/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "C:/../workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// The same fix for a `..` climbing past a UNC share named in the
+/// Markdown link's own target, through this public API. Verified with
+/// `ntpath.relpath(r'\\server\share\..\x\SKILL.md', r'\\server\share')`,
+/// which prints `x\SKILL.md`.
+#[test]
+fn indexed_skill_targets_of_a_dot_dot_past_a_unc_share_in_the_target_pins_the_share() {
+    let text = b"[a](//server/share/../x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "//server/share"),
+        vec!["x/SKILL.md".to_string()]
+    );
+}
+
+/// The POSIX parity for the same scanned-root `..`, through this
+/// public API. Verified with
+/// `posixpath.relpath('/workspace/skills/x/SKILL.md', '/../workspace')`,
+/// which prints `skills/x/SKILL.md`.
+#[test]
+fn indexed_skill_targets_of_a_dot_dot_past_the_posix_root_pins_the_root() {
+    let text = b"[a](/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "/../workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}

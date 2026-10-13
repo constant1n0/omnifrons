@@ -245,32 +245,52 @@ fn is_absolute_path(path: &str) -> bool {
 
 /// Splits an absolute path (POSIX, Windows drive, or UNC; see
 /// [`is_absolute_path`]) into its normalized components, the way
-/// `posixpath.normpath` normalizes one that is already absolute: a
-/// `.` segment and a repeated `/` are dropped, and a `..` drops the
-/// component before it when there is one, or is itself dropped
-/// silently when there is not -- an absolute path can never retain a
-/// leading `..` the way a relative one does, since there is nothing
-/// above its root to name. A leading `//?/` is normalized first,
-/// exactly as [`is_absolute_path`] normalizes it before judging --
-/// including a verbatim UNC root's own `//?/UNC/server/share/...`
-/// shape, rewritten to the ordinary `//server/share/...` one
-/// ([`strip_verbatim_prefix`]). A UNC path's own doubled leading `/`
-/// collapses the same way any other doubled `/` does, since both its
-/// empty segments are dropped alongside it. Each component is owned
-/// rather than borrowed from `path`: [`strip_verbatim_prefix`]'s own
-/// verbatim-UNC rewrite may need to allocate a new string with no
-/// substring of the original `path` to borrow a component from.
-/// [`normalize_relative_target`] is the relative-path twin of this
-/// helper and keeps an unresolvable leading `..` for exactly that
-/// reason.
-fn normalized_absolute_components(path: &str) -> Vec<String> {
+/// `posixpath.normpath`/`ntpath.normpath` normalize one that is
+/// already absolute: a `.` segment and a repeated `/` are dropped, and
+/// a `..` drops the component before it when there is one to drop --
+/// except the mount itself, which stays pinned. `pinned` is the count
+/// of leading components, once pushed, that name the mount rather than
+/// an ordinary directory or file -- [`fold_through`]'s own count for
+/// the path's [`Mount`] (0 for [`Mount::Posix`], 1 for the drive letter
+/// of [`Mount::Drive`], 2 for the server and share of [`Mount::Unc`]):
+/// a `..` at or below that many components is dropped silently rather
+/// than popping one of them, exactly as `ntpath.normpath` keeps a
+/// drive or UNC share pinned (`ntpath.normpath(r'C:\..\workspace')` is
+/// `C:\workspace`, never a bare `workspace` with the drive popped) and
+/// a POSIX root -- with zero pinned components of its own -- already
+/// stayed pinned on its own, with nothing for an unguarded pop to
+/// remove (`posixpath.normpath('/../x')` is `/x`). Review follow-up
+/// (behavior change, `..` past a mount): before this `pinned` guard
+/// existed, every component was equally poppable, including the ones
+/// that name the mount, so a `..` here could pop a drive letter or a
+/// UNC share right off `out`, leaving the caller to compare what was
+/// left against a target that still carried its own mount component --
+/// sharing no prefix at all, and producing a bogus `../C:/...`-shaped
+/// result instead of a lexically normalized path. A leading `//?/` is
+/// normalized first, exactly as [`is_absolute_path`] normalizes it
+/// before judging -- including a verbatim UNC root's own
+/// `//?/UNC/server/share/...` shape, rewritten to the ordinary
+/// `//server/share/...` one ([`strip_verbatim_prefix`]). A UNC path's
+/// own doubled leading `/` collapses the same way any other doubled
+/// `/` does, since both its empty segments are dropped alongside it,
+/// before the mount's own server and share are ever pushed. Each
+/// component is owned rather than borrowed from `path`:
+/// [`strip_verbatim_prefix`]'s own verbatim-UNC rewrite may need to
+/// allocate a new string with no substring of the original `path` to
+/// borrow a component from. [`normalize_relative_target`] is the
+/// relative-path twin of this helper and keeps an unresolvable leading
+/// `..` for exactly that reason -- there is no mount at all to pin a
+/// relative path against.
+fn normalized_absolute_components(path: &str, pinned: usize) -> Vec<String> {
     let path = strip_verbatim_prefix(path);
     let mut out: Vec<String> = Vec::new();
     for segment in path.split('/') {
         match segment {
             "" | "." => {}
             ".." => {
-                out.pop();
+                if out.len() > pinned {
+                    out.pop();
+                }
             }
             other => out.push(other.to_string()),
         }
@@ -485,13 +505,16 @@ fn relative_to_root(target: &str, root: &str) -> String {
     if mount_of(target, Some(&root_mount)) != root_mount {
         return target.to_string();
     }
-    let root_components = normalized_absolute_components(root);
-    let target_components = normalized_absolute_components(target);
-    let common = common_prefix_len(
-        &root_components,
-        &target_components,
-        fold_through(&root_mount),
-    );
+    // `target` is already confirmed to share `root`'s own `Mount`, so
+    // the same pinned-component count applies to both: `root` and
+    // `target` alike must keep that many of their own leading
+    // components pinned against a `..` that would otherwise climb
+    // past the mount ([`normalized_absolute_components`]'s own
+    // `pinned` guard).
+    let pinned = fold_through(&root_mount);
+    let root_components = normalized_absolute_components(root, pinned);
+    let target_components = normalized_absolute_components(target, pinned);
+    let common = common_prefix_len(&root_components, &target_components, pinned);
     let mut out: Vec<&str> =
         Vec::with_capacity((root_components.len() - common) + (target_components.len() - common));
     out.extend(std::iter::repeat_n("..", root_components.len() - common));
@@ -1389,6 +1412,75 @@ mod tests {
         assert_eq!(
             relative_to_root("//?/UNC/server/share/ws/SKILL.md", "/workspace"),
             "//?/UNC/server/share/ws/SKILL.md"
+        );
+    }
+
+    /// Review follow-up (behavior change, `..` past a mount): a `..`
+    /// immediately past a drive root used to pop the drive letter
+    /// itself off `root`'s own normalized components, since
+    /// [`normalized_absolute_components`] treated every component --
+    /// including the ones that name the mount -- as ordinary and
+    /// poppable; the drive then shared no prefix with the target and
+    /// the result was a bogus `../C:/...`-shaped path.
+    /// `ntpath.normpath` instead keeps the drive pinned, exactly as a
+    /// POSIX `/..` stays `/`. Verified with a Python oracle:
+    /// `ntpath.normpath(r'C:\..\workspace')` prints `C:\workspace`, and
+    /// end to end, `ntpath.relpath(r'C:\workspace\skills\x\SKILL.md',
+    /// r'C:\..\workspace')` prints `skills\x\SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_dot_dot_past_a_drive_root_pins_the_drive() {
+        assert_eq!(
+            relative_to_root("C:/workspace/skills/x/SKILL.md", "C:/../workspace"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The same mount-pinning applies to a UNC share named in the
+    /// `target`, not only a drive named in the `root`: a `..` right
+    /// after `//server/share` must not pop either component. Verified
+    /// with `ntpath.normpath(r'\\server\share\..\x')`, which prints
+    /// `\\server\share\x` (the share stays pinned), and end to end with
+    /// `ntpath.relpath(r'\\server\share\..\x\SKILL.md',
+    /// r'\\server\share')`, which prints `x\SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_dot_dot_past_a_unc_share_in_the_target_pins_the_share() {
+        assert_eq!(
+            relative_to_root("//server/share/../x/SKILL.md", "//server/share"),
+            "x/SKILL.md"
+        );
+    }
+
+    /// A `..` immediately past the POSIX root already behaved
+    /// correctly before this fix -- a POSIX root contributes zero mount
+    /// components to [`normalized_absolute_components`]'s own output,
+    /// so there was nothing there for an unguarded pop to wrongly
+    /// remove -- but this pins that POSIX parity explicitly now that
+    /// the drive and UNC cases are fixed by the same guard. Verified
+    /// with `posixpath.normpath('/../workspace')`, which prints
+    /// `/workspace`, and end to end with
+    /// `posixpath.relpath('/workspace/skills/x/SKILL.md',
+    /// '/../workspace')`, which prints `skills/x/SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_dot_dot_past_the_posix_root_pins_the_root() {
+        assert_eq!(
+            relative_to_root("/workspace/skills/x/SKILL.md", "/../workspace"),
+            "skills/x/SKILL.md"
+        );
+    }
+
+    /// The mount-pinning guard only ever blocks a pop at or below the
+    /// mount's own leading components; a `..` further in, popping an
+    /// ordinary directory component, still resolves exactly as before
+    /// this fix. Verified with
+    /// `ntpath.normpath(r'C:\workspace\skills\x\..\y\SKILL.md')`, which
+    /// prints `C:\workspace\skills\y\SKILL.md`, and end to end with
+    /// `ntpath.relpath(r'C:\workspace\skills\x\..\y\SKILL.md',
+    /// r'C:\workspace')`, which prints `skills\y\SKILL.md`.
+    #[test]
+    fn relative_to_root_of_a_dot_dot_below_the_root_still_resolves_inside() {
+        assert_eq!(
+            relative_to_root("C:/workspace/skills/x/../y/SKILL.md", "C:/workspace"),
+            "skills/y/SKILL.md"
         );
     }
 }
