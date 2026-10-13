@@ -96,12 +96,21 @@ impl TreeSnapshotBuilder {
 
     /// Adds an ancestor above the scan root, nearest first: callers must
     /// add ancestors in that order themselves, since this builder never
-    /// reorders them.
+    /// reorders them. `host_extras` is this ancestor's host-specific
+    /// extra file names (for example `.claude/AGENTS.md`), relevant to
+    /// a host's upward or fallback walk but never an identity file
+    /// itself -- see [`Ancestor::host_extras`]'s own doc comment.
     #[must_use]
-    pub fn ancestor(mut self, path: impl Into<String>, identity_files: Vec<String>) -> Self {
+    pub fn ancestor(
+        mut self,
+        path: impl Into<String>,
+        identity_files: Vec<String>,
+        host_extras: Vec<String>,
+    ) -> Self {
         self.ancestors.push(Ancestor {
             path: path.into(),
             identity_files,
+            host_extras,
         });
         self
     }

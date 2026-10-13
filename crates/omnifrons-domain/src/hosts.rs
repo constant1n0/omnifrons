@@ -283,8 +283,21 @@ pub fn order_index(name: &str) -> Option<usize> {
 }
 
 /// Host-specific files that are reported and never touched, mapped to
-/// their readers; verbatim from the prototype's `EXTRA_READERS`, in its
-/// order.
+/// their readers; the first eight entries are verbatim from the
+/// prototype's `EXTRA_READERS`, in its order.
+///
+/// # Extension beyond the prototype: `.claude/AGENTS.md`
+///
+/// The last entry has no prototype counterpart. `.claude/AGENTS.md` is
+/// one of Claude Code's own documented
+/// [`HostLoader::fallback_files`], per the same official Claude Code
+/// memory documentation that field cites, but it is not one of
+/// [`crate::definition::IdentityKind`]'s six kinds -- so it can never
+/// be discovered as an identity file, and without an entry here the
+/// `extra_host_file` warning could never name Claude Code as its
+/// reader. Modelling it as a host extra instead lets a port report it
+/// exactly like any other host-specific file this table already names:
+/// surfaced, and never touched.
 #[rustfmt::skip]
 pub const EXTRA_READERS: &[(&str, &[&str])] = &[
     ("CLAUDE.local.md", &["Claude Code"]),
@@ -295,6 +308,7 @@ pub const EXTRA_READERS: &[(&str, &[&str])] = &[
     (".cursor/rules", &["Cursor"]),
     (".cursorrules", &["Cursor"]),
     (".github/copilot-instructions.md", &["Copilot"]),
+    (".claude/AGENTS.md", &["Claude Code"]),
 ];
 
 /// Directories the prototype's walk never descends into, verbatim from

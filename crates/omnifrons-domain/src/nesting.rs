@@ -102,17 +102,31 @@ pub enum NestingError {
 pub struct Ancestor {
     /// The ancestor's own location, opaque to this module (see above).
     pub path: String,
-    /// The kinds of identity file found there, in the port's order. The
-    /// prototype keys its own `files` mapping by the file-name form
-    /// (`"AGENTS.md"`, `"CLAUDE.md"`, ...), so a value written that way
-    /// is this field's canonical, prototype-shaped form; a consumer may
-    /// also accept the identity kind's token form (for example
-    /// `"agents"`) for the same entry -- `crate::definition`'s own
-    /// warnings composition, in the `omnifrons-app` crate, does both.
-    /// This module itself never parses or validates either form -- it
-    /// carries whatever a port supplies opaquely, exactly like `path`
-    /// above.
+    /// The kinds of identity file found there, in file-name form, in
+    /// the port's order. The prototype keys its own `files` mapping by
+    /// the file-name form (`"AGENTS.md"`, `"CLAUDE.md"`, ...), so a
+    /// value written that way is this field's canonical,
+    /// prototype-shaped form; a consumer may also accept the identity
+    /// kind's token form (for example `"agents"`) for the same entry --
+    /// `crate::definition`'s own warnings composition, in the
+    /// `omnifrons-app` crate, does both. This module itself never
+    /// parses or validates either form -- it carries whatever a port
+    /// supplies opaquely, exactly like `path` above.
     pub identity_files: Vec<String>,
+    /// The host-specific extra file names relevant to a host's upward
+    /// or fallback walk, found at this ancestor (for example
+    /// `CLAUDE.local.md`, one of Claude Code's own
+    /// `HostLoader::files`, or `.claude/AGENTS.md`, one of its
+    /// `HostLoader::fallback_files`) -- never an identity file itself,
+    /// since neither is one of `IdentityKind`'s own kinds.
+    /// `crate::definition`'s own warnings composition matches a host's
+    /// kinds against this field and [`Self::identity_files`] together,
+    /// the union a real ancestor's relevant files may be split across.
+    /// This module itself never parses, validates, or reads this
+    /// field's entries -- it carries whatever a port supplies opaquely,
+    /// exactly like [`Self::path`] and [`Self::identity_files`] above;
+    /// ADR-0005 sub-slice 1f's filesystem adapter fills both fields.
+    pub host_extras: Vec<String>,
 }
 
 /// Which kind of path became a root's parent in a [`RootRelation`]: one

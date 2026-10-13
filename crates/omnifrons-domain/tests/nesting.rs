@@ -75,6 +75,7 @@ fn relate_makes_the_nearest_outside_ancestor_the_parent() {
     let outer = [Ancestor {
         path: "atlas".to_string(),
         identity_files: vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()],
+        host_extras: Vec::new(),
     }];
     let relations = nesting::relate(&roots, &outer).unwrap();
 
@@ -130,10 +131,12 @@ fn warning_chain_orders_inside_then_outside_ancestors() {
         Ancestor {
             path: "near".to_string(),
             identity_files: vec!["AGENTS.md".to_string()],
+            host_extras: Vec::new(),
         },
         Ancestor {
             path: "far".to_string(),
             identity_files: vec!["CLAUDE.md".to_string()],
+            host_extras: Vec::new(),
         },
     ];
     let chain = nesting::warning_chain(&roots, "child", &outer);
@@ -211,10 +214,12 @@ fn relate_uses_the_nearest_of_two_outside_ancestors_for_every_parentless_root() 
         Ancestor {
             path: "near".to_string(),
             identity_files: vec!["AGENTS.md".to_string()],
+            host_extras: Vec::new(),
         },
         Ancestor {
             path: "far".to_string(),
             identity_files: vec!["CLAUDE.md".to_string()],
+            host_extras: Vec::new(),
         },
     ];
     let relations = nesting::relate(&roots, &outer).unwrap();
@@ -234,6 +239,7 @@ fn relate_gives_a_non_dot_only_root_its_outside_ancestor_as_parent() {
     let outer = [Ancestor {
         path: "atlas".to_string(),
         identity_files: vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()],
+        host_extras: Vec::new(),
     }];
     let relations = nesting::relate(&roots, &outer).unwrap();
 
@@ -293,6 +299,7 @@ fn warning_chain_inherits_the_absolute_path_precondition() {
     let outer = [Ancestor {
         path: "atlas".to_string(),
         identity_files: vec!["AGENTS.md".to_string()],
+        host_extras: Vec::new(),
     }];
     let chain = nesting::warning_chain(&roots, "/etc/passwd", &outer);
     assert_eq!(

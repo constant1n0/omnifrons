@@ -46,6 +46,7 @@ fn ancestor_shadows_kinds_the_child_lacks_and_exposes_the_one_it_has() {
     let chain = [ChainAncestor {
         display: "atlas",
         identity_files: &["CLAUDE.md", "AGENTS.md", "QWEN.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -73,6 +74,7 @@ fn ancestor_exposure_grows_once_the_child_gains_the_missing_kinds() {
     let chain = [ChainAncestor {
         display: "atlas",
         identity_files: &["CLAUDE.md", "AGENTS.md", "QWEN.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -95,6 +97,7 @@ fn a_claude_only_parent_shadows_a_child_with_no_claude_file() {
     let chain = [ChainAncestor {
         display: "p",
         identity_files: &["CLAUDE.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -131,10 +134,12 @@ fn opencode_shadowing_fires_once_for_the_nearest_ancestor_only() {
         ChainAncestor {
             display: "near",
             identity_files: &["AGENTS.md"],
+            host_extras: &[],
         },
         ChainAncestor {
             display: "far",
             identity_files: &["AGENTS.md"],
+            host_extras: &[],
         },
     ];
     let warnings = agent_warnings(&AgentInput {
@@ -162,6 +167,7 @@ fn claude_code_falls_back_and_fires_ancestor_exposure_for_an_agents_only_ancesto
     let chain = [ChainAncestor {
         display: "outside",
         identity_files: &["AGENTS.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -208,6 +214,7 @@ fn claude_code_fallback_is_disabled_by_a_claude_md_on_the_agent() {
     let chain = [ChainAncestor {
         display: "outside",
         identity_files: &["AGENTS.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -240,10 +247,12 @@ fn claude_code_fallback_is_disabled_by_a_claude_md_elsewhere_in_the_chain() {
         ChainAncestor {
             display: "near",
             identity_files: &["AGENTS.md"],
+            host_extras: &[],
         },
         ChainAncestor {
             display: "far",
             identity_files: &["CLAUDE.md"],
+            host_extras: &[],
         },
     ];
     let warnings = agent_warnings(&AgentInput {
@@ -276,6 +285,7 @@ fn claude_code_fallback_is_disabled_by_claude_local_md_among_the_extras() {
     let chain = [ChainAncestor {
         display: "outside",
         identity_files: &["AGENTS.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -302,6 +312,7 @@ fn claude_code_fallback_is_disabled_for_child_warnings_too_once_a_claude_md_exis
     let chain = [ChainAncestor {
         display: "somewhere",
         identity_files: &["CLAUDE.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -345,6 +356,7 @@ fn claude_code_fallback_applies_but_reads_as_shadowing_for_an_agent_with_no_iden
     let chain = [ChainAncestor {
         display: "outside",
         identity_files: &["AGENTS.md"],
+        host_extras: &[],
     }];
     let warnings = agent_warnings(&AgentInput {
         chain: &chain,
@@ -362,6 +374,109 @@ fn claude_code_fallback_applies_but_reads_as_shadowing_for_an_agent_with_no_iden
         !with_code(&warnings, WarningCode::AncestorExposure)
             .iter()
             .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Review findings on the merged 1e-B: the chain-wide fallback check and
+// the per-ancestor "has this kind" check both now match a host's kinds
+// against the UNION of a link's identity files and host extras, not
+// identity files alone.
+// ---------------------------------------------------------------------
+
+/// A link's own host extras count toward the chain-wide fallback check
+/// too, not only its identity files: an ancestor holding `AGENTS.md` as
+/// an identity file and `CLAUDE.local.md` as a host extra holds one of
+/// Claude Code's own `HostLoader::files` through that extra alone,
+/// disabling the fallback for the whole chain exactly as a real
+/// `CLAUDE.md` there would -- so no Claude Code `ancestor_*` warning
+/// fires at all.
+#[test]
+fn claude_code_fallback_is_disabled_by_claude_local_md_among_an_ancestors_host_extras() {
+    let identity_kinds = [IdentityKind::Agents];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+        host_extras: &["CLAUDE.local.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorExposure)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorShadowing)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
+/// The per-ancestor "has this kind" check gets the same union: an
+/// ancestor holding `.claude/AGENTS.md` only as a host extra -- never
+/// an identity file, since it is not one of `IdentityKind`'s six kinds
+/// -- still matches Claude Code's `fallback_files` once the fallback
+/// applies, firing `ancestor_exposure` for an `AGENTS.md`-only agent
+/// exactly as an identity-file match would.
+#[test]
+fn claude_code_fallback_fires_ancestor_exposure_for_an_ancestors_claude_agents_host_extra() {
+    let identity_kinds = [IdentityKind::Agents];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &[],
+        host_extras: &[".claude/AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    assert!(
+        exposure.iter().any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
+/// Pairs with the previous test: the same `.claude/AGENTS.md`-only
+/// ancestor, but this agent's own `host_extras` also holds
+/// `CLAUDE.local.md`, already enough to disable the fallback before
+/// the chain is ever consulted
+/// (`claude_code_falls_back_to_agents`'s own early return). No Claude
+/// Code `ancestor_*` warning fires, even though the ancestor's own
+/// extra would have matched had the fallback stayed enabled; the
+/// unrelated `extra_host_file` warning that this agent's own
+/// `CLAUDE.local.md` produces is excluded from the check, since it
+/// legitimately names Claude Code as that file's own reader.
+#[test]
+fn claude_code_fallback_is_disabled_by_the_agents_own_extra_even_with_a_matching_ancestor_extra() {
+    let identity_kinds = [IdentityKind::Agents];
+    let host_extras = ["CLAUDE.local.md"];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &[],
+        host_extras: &[".claude/AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        host_extras: &host_extras,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.code != WarningCode::ExtraHostFile && w.hosts.contains(&"Claude Code")),
         "{warnings:?}"
     );
 }

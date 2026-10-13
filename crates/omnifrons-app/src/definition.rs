@@ -312,6 +312,41 @@ fn chain_identity_files(
         .collect()
 }
 
+/// Each link of `chain`'s own host-specific extra file names,
+/// `&'static str`, recognized the same way [`warnings_for`] recognizes
+/// this agent's own root -- mapped through [`hosts::EXTRA_READERS`]'s
+/// keys. A link inside the scan reads them from that root's own
+/// [`DirectoryEntry::host_extras`]; an outside ancestor's come from
+/// [`Ancestor::host_extras`]. An entry neither recognizes is dropped,
+/// exactly like [`chain_identity_files`] drops an unrecognized identity
+/// entry.
+fn chain_host_extras(
+    directories: &[DirectoryEntry],
+    chain: &[ChainLink],
+) -> Vec<Vec<&'static str>> {
+    chain
+        .iter()
+        .map(|link| {
+            let names: &[String] = match link {
+                ChainLink::Root(path) => directories
+                    .iter()
+                    .find(|directory| directory.path == *path)
+                    .map_or(&[], |owner| owner.host_extras.as_slice()),
+                ChainLink::Outside(ancestor) => ancestor.host_extras.as_slice(),
+            };
+            names
+                .iter()
+                .filter_map(|name| {
+                    hosts::EXTRA_READERS
+                        .iter()
+                        .find(|(key, _)| key == name)
+                        .map(|&(key, _)| key)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// `directory`'s warnings (the prototype's own `agent_warnings` call in
 /// `scan`): builds the [`AgentInput`] this root needs from
 /// already-computed pieces and asks the domain's pure [`agent_warnings`]
@@ -339,15 +374,18 @@ fn warnings_for(
 
     let chain_links = nesting::warning_chain(roots, &directory.path, ancestors);
     let chain_files = chain_identity_files(directories, &chain_links);
+    let chain_extras = chain_host_extras(directories, &chain_links);
     let chain: Vec<ChainAncestor<'_>> = chain_links
         .iter()
         .zip(chain_files.iter())
-        .map(|(link, files)| ChainAncestor {
+        .zip(chain_extras.iter())
+        .map(|((link, files), extras)| ChainAncestor {
             display: match link {
                 ChainLink::Root(path) => path.as_str(),
                 ChainLink::Outside(ancestor) => ancestor.path.as_str(),
             },
             identity_files: files.as_slice(),
+            host_extras: extras.as_slice(),
         })
         .collect();
 

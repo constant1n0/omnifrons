@@ -58,7 +58,15 @@
 //!   [`omnifrons_domain::definition::IdentityKind::parse`], so either
 //!   form survives into that ancestor's warning chain; an entry
 //!   neither recognizes is silently dropped rather than reported as an
-//!   error.
+//!   error. Each `Ancestor::host_extras` entry is, by contrast, always
+//!   a host-specific extra file name relevant to a host's upward or
+//!   fallback walk (for example `CLAUDE.local.md`, `.claude/AGENTS.md`),
+//!   never an identity file and never parsed through either
+//!   `IdentityKind` lookup -- [`crate::definition`]'s own warnings
+//!   composition matches a host's kinds against `identity_files` and
+//!   `host_extras` together. This port's own contract does not
+//!   constrain which of an ancestor's files land in one field or the
+//!   other beyond that; sub-slice 1f's filesystem adapter fills both.
 //!
 //! This module only declares the shape; sub-slice 1f's filesystem adapter
 //! is the one piece of code that must honor every rule above against a

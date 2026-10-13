@@ -185,7 +185,7 @@ fn nested_pair_with_skill_and_outside_ancestor_populates_every_field() {
             "skills/sample/SKILL.md",
             b"---\nname: sample\n---\n".to_vec(),
         )
-        .ancestor("/outside", vec!["claude".to_string()])
+        .ancestor("/outside", vec!["claude".to_string()], Vec::new())
         .build();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
     let hasher = FakeHasher;
@@ -578,7 +578,7 @@ fn outside_ancestor_identity_form_controls_the_warning_chain() {
                 Vec::new(),
                 Vec::new(),
             )
-            .ancestor("/outside", vec![entry.to_string()])
+            .ancestor("/outside", vec![entry.to_string()], Vec::new())
             .build();
         let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
         let ports = DefinitionPorts {
@@ -769,5 +769,106 @@ fn generated_state_dir_present_reports_a_hostless_warning() {
         state_dir_warnings[0].detail,
         ".atl/ holds generated tool state, not agent instructions; it is not part of the \
          portable definition and the adapter never changes it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Review findings on the merged 1e-B: a chain link's own `host_extras`
+// now reach the warning chain the same way its identity files do
+// (`chain_host_extras`), for both an inside root and an outside
+// ancestor.
+// ---------------------------------------------------------------------
+
+/// An inside root's own `host_extras` disable Claude Code's `AGENTS.md`
+/// fallback for its nested child exactly like a real `CLAUDE.md` there
+/// would: the parent root holds `CLAUDE.local.md` only as a host
+/// extra, never as an identity file, and the `AGENTS.md`-only child
+/// still gets no Claude Code `ancestor_*` warning.
+#[test]
+fn an_inside_ancestors_host_extra_disables_the_claude_code_fallback_for_its_nested_child() {
+    let project = TempDir::new("inside-ancestor-extra");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+            vec!["CLAUDE.local.md".to_string()],
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![identity(
+                IdentityKind::Agents,
+                b"# Child\n\nYou are Child.\n",
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let child = report
+        .agents
+        .iter()
+        .find(|agent| agent.path == "child")
+        .expect("child agent");
+    assert!(
+        !child
+            .warnings
+            .iter()
+            .any(|warning| warning.hosts.contains(&"Claude Code")),
+        "expected no Claude Code warning for the child, got {:?}",
+        child.warnings
+    );
+}
+
+/// An outside ancestor's own `host_extras` reach the warning chain too:
+/// an ancestor holding `.claude/AGENTS.md` only as a host extra -- never
+/// an identity file, since it is not one of `IdentityKind`'s six kinds
+/// -- still fires `ancestor_exposure` naming Claude Code for an
+/// `AGENTS.md`-only root once the fallback applies.
+#[test]
+fn an_outside_ancestors_claude_agents_host_extra_yields_the_claude_code_warning() {
+    let project = TempDir::new("outside-ancestor-extra");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .ancestor(
+            "/outside",
+            Vec::new(),
+            vec![".claude/AGENTS.md".to_string()],
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let root = &report.agents[0];
+    let exposure: Vec<_> = root
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == WarningCode::AncestorExposure)
+        .collect();
+    assert!(
+        exposure.iter().any(|w| w.hosts.contains(&"Claude Code")),
+        "expected an ancestor_exposure warning naming Claude Code, got {:?}",
+        root.warnings
     );
 }

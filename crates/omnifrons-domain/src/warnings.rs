@@ -60,6 +60,17 @@
 //! itself, this models only the default, non-configurable
 //! instruction-files mode that documentation describes; a project that
 //! configures Claude Code differently is not represented here.
+//!
+//! `.claude/AGENTS.md`, one of Claude Code's own `fallback_files`, is
+//! not one of [`IdentityKind`]'s six kinds, so it can never appear in a
+//! [`ChainAncestor::identity_files`] or an agent's own `identity_kinds`
+//! -- [`crate::hosts::EXTRA_READERS`] models it as a host extra
+//! instead, and the private `ancestor_has_any_kind` matches a host's
+//! kinds against a link's identity files and host extras together so
+//! that extra can still reach this fallback's exposure/shadowing
+//! check, and the chain-wide check in the private
+//! `claude_code_falls_back_to_agents`, the same way a real identity
+//! file would.
 
 use crate::definition::{IdentityKind, is_import_only};
 use crate::fences::FenceTracker;
@@ -187,6 +198,20 @@ pub struct ChainAncestor<'a> {
     /// `ancestor_files` dict keys, shown the same way in a warning's
     /// detail.
     pub identity_files: &'a [&'static str],
+    /// The host-specific extra file names relevant to a host's upward
+    /// or fallback walk, found at this ancestor (for example
+    /// `"CLAUDE.local.md"` or `".claude/AGENTS.md"`) -- never an
+    /// identity file itself. The private `claude_code_falls_back_to_agents`
+    /// and `ancestor_warnings` both match a host's kinds against this
+    /// field and [`Self::identity_files`] together: the union a real
+    /// ancestor's relevant files may be split across, since a file
+    /// like `.claude/AGENTS.md` can be one of a host's documented
+    /// [`crate::hosts::HostLoader::fallback_files`] without ever being
+    /// one of [`IdentityKind`]'s own kinds. For every host this
+    /// crate's own table documents an upward or fallback walk for,
+    /// matching against this field changes nothing beyond that one
+    /// case -- see the private `ancestor_warnings`'s own doc comment.
+    pub host_extras: &'a [&'static str],
 }
 
 /// Everything [`agent_warnings`] needs for one agent root, already
@@ -480,6 +505,26 @@ fn mentions(text: &str, relative: &str) -> bool {
     false
 }
 
+/// Whether any of `kinds` names one of `ancestor`'s identity files or
+/// host extras -- the union [`claude_code_falls_back_to_agents`]'s own
+/// chain check and [`ancestor_warnings`]'s own per-ancestor check both
+/// match a host's upward/fallback kinds against, since a host-specific
+/// extra (for example `CLAUDE.local.md` or `.claude/AGENTS.md`) can
+/// name exactly the same file a host's own `files`/`fallback_files`
+/// names, without ever being one of [`IdentityKind`]'s six kinds
+/// itself. For every host [`crate::hosts::upward_loaders`] documents an
+/// upward walk for in its ordinary (non-fallback) mode, every one of
+/// its kinds is already an identity-file name (`CLAUDE.md`,
+/// `.claude/CLAUDE.md`, `QWEN.md`, `AGENTS.md`), so matching against
+/// `host_extras` too changes nothing there -- it starts to matter only
+/// once a kind list, like Claude Code's own `fallback_files`, can name
+/// a file (`.claude/AGENTS.md`) that never doubles as an identity kind.
+fn ancestor_has_any_kind(ancestor: &ChainAncestor<'_>, kinds: &[&'static str]) -> bool {
+    kinds
+        .iter()
+        .any(|kind| ancestor.identity_files.contains(kind) || ancestor.host_extras.contains(kind))
+}
+
 /// Whether Claude Code's upward kinds should fall back to its
 /// documented [`crate::hosts::HostLoader::fallback_files`]
 /// (`AGENTS.md`/`.claude/AGENTS.md`) for this agent, instead of its
@@ -489,6 +534,11 @@ fn mentions(text: &str, relative: &str) -> bool {
 /// `identity_kinds`/`host_extras` nor any ancestor in `chain` holds any
 /// of `claude_code`'s own [`crate::hosts::HostLoader::files`]
 /// (`CLAUDE.md`, `.claude/CLAUDE.md`, or the `CLAUDE.local.md` extra).
+/// Each ancestor's own files are checked through
+/// [`ancestor_has_any_kind`], the union of its identity files and host
+/// extras -- so an ancestor can hold one of `claude_code`'s files
+/// either way, exactly like this agent's own root already can through
+/// its separate `identity_kinds`/`host_extras` check above.
 ///
 /// This checks `chain` as a whole, not only this agent's own root,
 /// because the documented rule is itself chain-wide, not root-specific:
@@ -514,12 +564,9 @@ fn claude_code_falls_back_to_agents(
     if agent_has_a_claude_file {
         return false;
     }
-    !chain.iter().any(|ancestor| {
-        ancestor
-            .identity_files
-            .iter()
-            .any(|file| claude_code.files.contains(file))
-    })
+    !chain
+        .iter()
+        .any(|ancestor| ancestor_has_any_kind(ancestor, claude_code.files))
 }
 
 /// [`crate::hosts::upward_loaders`], with Claude Code's own kinds
@@ -554,14 +601,20 @@ fn effective_upward_loaders(
 
 /// Exposure and shadowing warnings for every ancestor in `chain` (the
 /// prototype's `ancestor_warnings`): a host that loads one of
-/// `loaders`' file kinds from an ancestor is "exposure" when this
-/// agent's own root also has that kind, or "shadowing" when it does
-/// not. `loaders` is [`effective_upward_loaders`]'s result, computed
-/// once by [`agent_warnings`] and shared with [`child_warnings`]; this
-/// function never calls [`crate::hosts::upward_loaders`] itself.
-/// `OpenCode`'s own upward walk -- the first unresolved ancestor
-/// `AGENTS.md`, not every ancestor's -- is handled apart, exactly once,
-/// matching the prototype's `opencode_resolved` flag.
+/// `loaders`' file kinds from an ancestor -- checked through
+/// [`ancestor_has_any_kind`], the union of that ancestor's identity
+/// files and host extras -- is "exposure" when this agent's own root
+/// also has that kind, or "shadowing" when it does not. `loaders` is
+/// [`effective_upward_loaders`]'s result, computed once by
+/// [`agent_warnings`] and shared with [`child_warnings`]; this function
+/// never calls [`crate::hosts::upward_loaders`] itself. `OpenCode`'s own
+/// upward walk -- the first unresolved ancestor `AGENTS.md`, not every
+/// ancestor's -- is handled apart, exactly once, matching the
+/// prototype's `opencode_resolved` flag, and (unlike the loop above)
+/// matched only against `identity_files`: `"AGENTS.md"` is always an
+/// identity-file name, never one of [`crate::hosts::EXTRA_READERS`]'s
+/// own host-extra entries, so there is no host-extras union for this
+/// one literal check to widen.
 fn ancestor_warnings(
     identity_kinds: &[IdentityKind],
     chain: &[ChainAncestor<'_>],
@@ -573,10 +626,7 @@ fn ancestor_warnings(
         let mut exposure: Vec<&'static str> = Vec::new();
         let mut shadowing: Vec<&'static str> = Vec::new();
         for &(host, kinds) in loaders {
-            if kinds
-                .iter()
-                .any(|kind| ancestor.identity_files.contains(kind))
-            {
+            if ancestor_has_any_kind(ancestor, kinds) {
                 let own = kinds.iter().any(|kind| {
                     identity_kinds
                         .iter()

@@ -86,8 +86,13 @@ fn size_caps_are_set_only_for_codex_and_antigravity() {
     }
 }
 
-/// Host-specific files that are reported and never touched, verbatim
-/// from the prototype's `EXTRA_READERS` mapping and in its order.
+/// Host-specific files that are reported and never touched: the first
+/// eight entries verbatim from the prototype's `EXTRA_READERS` mapping
+/// and in its order, plus one entry beyond it -- `.claude/AGENTS.md` is
+/// not one of [`omnifrons_domain::definition::IdentityKind`]'s six
+/// kinds, so modelling it as a host extra here is the only way the
+/// `extra_host_file` warning can ever name Claude Code as its reader
+/// (see `hosts::EXTRA_READERS`'s own doc comment).
 #[test]
 fn extra_readers_maps_each_extra_file_to_its_prototype_host_tuple() {
     let expected: &[(&str, &[&str])] = &[
@@ -99,6 +104,7 @@ fn extra_readers_maps_each_extra_file_to_its_prototype_host_tuple() {
         (".cursor/rules", &["Cursor"]),
         (".cursorrules", &["Cursor"]),
         (".github/copilot-instructions.md", &["Copilot"]),
+        (".claude/AGENTS.md", &["Claude Code"]),
     ];
     assert_eq!(hosts::EXTRA_READERS, expected);
 }
