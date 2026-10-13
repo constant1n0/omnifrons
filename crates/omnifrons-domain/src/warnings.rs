@@ -604,8 +604,16 @@ fn effective_upward_loaders(
 /// `loaders`' file kinds from an ancestor -- checked through
 /// [`ancestor_has_any_kind`], the union of that ancestor's identity
 /// files and host extras -- is "exposure" when this agent's own root
-/// also has that kind, or "shadowing" when it does not. `loaders` is
-/// [`effective_upward_loaders`]'s result, computed once by
+/// also has that kind, checked through the same union of its own
+/// `identity_kinds` and `host_extras`, or "shadowing" when it does not.
+/// Widening the agent's own side to that union changes nothing for a
+/// host whose kinds are all identity-file names -- `host_extras` never
+/// holds one of those, by construction -- and starts to matter only for
+/// a kind list like Claude Code's own `fallback_files`, which can name
+/// a file (`.claude/AGENTS.md`) that never doubles as an identity kind:
+/// an agent that holds it only as a host extra still has Claude Code
+/// read it, so the ancestor reads as exposure, not shadowing. `loaders`
+/// is [`effective_upward_loaders`]'s result, computed once by
 /// [`agent_warnings`] and shared with [`child_warnings`]; this function
 /// never calls [`crate::hosts::upward_loaders`] itself. `OpenCode`'s own
 /// upward walk -- the first unresolved ancestor `AGENTS.md`, not every
@@ -617,6 +625,7 @@ fn effective_upward_loaders(
 /// one literal check to widen.
 fn ancestor_warnings(
     identity_kinds: &[IdentityKind],
+    host_extras: &[&str],
     chain: &[ChainAncestor<'_>],
     loaders: &[(&'static str, &'static [&'static str])],
 ) -> Vec<Warning> {
@@ -631,6 +640,7 @@ fn ancestor_warnings(
                     identity_kinds
                         .iter()
                         .any(|owned| owned.file_name() == *kind)
+                        || host_extras.contains(kind)
                 });
                 if own {
                     exposure.push(host);
@@ -887,7 +897,12 @@ fn size_warnings(text: &str) -> Vec<Warning> {
 #[must_use]
 pub fn agent_warnings(input: &AgentInput<'_>) -> Vec<Warning> {
     let loaders = effective_upward_loaders(input.identity_kinds, input.host_extras, input.chain);
-    let mut warnings = ancestor_warnings(input.identity_kinds, input.chain, &loaders);
+    let mut warnings = ancestor_warnings(
+        input.identity_kinds,
+        input.host_extras,
+        input.chain,
+        &loaders,
+    );
     if let Some(text) = input.text {
         warnings.extend(child_warnings(
             input.identity_kinds,

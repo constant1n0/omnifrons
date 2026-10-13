@@ -872,3 +872,131 @@ fn an_outside_ancestors_claude_agents_host_extra_yields_the_claude_code_warning(
         root.warnings
     );
 }
+
+// ---------------------------------------------------------------------
+// `chain_host_extras` documents that a `host_extras` entry
+// `hosts::EXTRA_READERS` does not recognize is silently dropped, the
+// same way `chain_identity_files` drops an unrecognized identity
+// entry. These two tests pin that for both an inside ancestor root and
+// an outside one.
+// ---------------------------------------------------------------------
+
+/// An unrecognized extra alongside the inside ancestor's real
+/// `CLAUDE.local.md` changes nothing for the nested child: its
+/// warnings are exactly those of the same tree without that extra --
+/// no panic, no extra warning for the unknown name, and the same
+/// disabled Claude Code fallback
+/// `an_inside_ancestors_host_extra_disables_the_claude_code_fallback_for_its_nested_child`
+/// already pins.
+#[test]
+fn an_unrecognized_host_extra_on_an_inside_ancestor_changes_nothing() {
+    let run = |extras: Vec<String>, label: &str| {
+        let project = TempDir::new(label);
+        let workspace = project.workspace();
+        let snapshot = TreeSnapshotBuilder::new()
+            .directory(
+                ".",
+                vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+                extras,
+                Vec::new(),
+            )
+            .directory(
+                "child",
+                vec![identity(
+                    IdentityKind::Agents,
+                    b"# Child\n\nYou are Child.\n",
+                )],
+                Vec::new(),
+                Vec::new(),
+            )
+            .build();
+        let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+        let hasher = FakeHasher;
+        let ports = DefinitionPorts {
+            tree: &tree,
+            hasher: &hasher,
+        };
+        scan(&ports, &workspace)
+            .expect("scan succeeds")
+            .agents
+            .iter()
+            .find(|agent| agent.path == "child")
+            .expect("child agent")
+            .warnings
+            .clone()
+    };
+
+    let baseline = run(vec!["CLAUDE.local.md".to_string()], "inside-extra-baseline");
+    let with_unknown = run(
+        vec![
+            "CLAUDE.local.md".to_string(),
+            "not-a-real-extra.txt".to_string(),
+        ],
+        "inside-extra-unknown",
+    );
+
+    assert_eq!(with_unknown, baseline, "{with_unknown:?}");
+    assert!(
+        !with_unknown
+            .iter()
+            .any(|warning| warning.hosts.contains(&"Claude Code")),
+        "expected no Claude Code warning for the child, got {with_unknown:?}"
+    );
+}
+
+/// An unrecognized extra alongside the outside ancestor's real
+/// `.claude/AGENTS.md` changes nothing for the root it reaches through
+/// the warning chain: its warnings are exactly those of the same tree
+/// without that extra -- no panic, no extra warning for the unknown
+/// name, and the same `ancestor_exposure`
+/// `an_outside_ancestors_claude_agents_host_extra_yields_the_claude_code_warning`
+/// already pins.
+#[test]
+fn an_unrecognized_host_extra_on_an_outside_ancestor_changes_nothing() {
+    let run = |extras: Vec<String>, label: &str| {
+        let project = TempDir::new(label);
+        let workspace = project.workspace();
+        let snapshot = TreeSnapshotBuilder::new()
+            .directory(
+                ".",
+                vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .ancestor("/outside", Vec::new(), extras)
+            .build();
+        let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+        let hasher = FakeHasher;
+        let ports = DefinitionPorts {
+            tree: &tree,
+            hasher: &hasher,
+        };
+        scan(&ports, &workspace)
+            .expect("scan succeeds")
+            .agents
+            .first()
+            .expect("root agent")
+            .warnings
+            .clone()
+    };
+
+    let baseline = run(
+        vec![".claude/AGENTS.md".to_string()],
+        "outside-extra-baseline",
+    );
+    let with_unknown = run(
+        vec![
+            ".claude/AGENTS.md".to_string(),
+            "also-not-a-real-extra.txt".to_string(),
+        ],
+        "outside-extra-unknown",
+    );
+
+    assert_eq!(with_unknown, baseline, "{with_unknown:?}");
+    assert!(
+        with_unknown.iter().any(|warning| {
+            warning.code == WarningCode::AncestorExposure && warning.hosts.contains(&"Claude Code")
+        }),
+        "expected an ancestor_exposure warning naming Claude Code, got {with_unknown:?}"
+    );
+}

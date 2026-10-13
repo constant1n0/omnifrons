@@ -481,6 +481,76 @@ fn claude_code_fallback_is_disabled_by_the_agents_own_extra_even_with_a_matching
     );
 }
 
+/// Finding from review: the per-ancestor "has this kind" check's
+/// ancestor side already matches the union of identity files and host
+/// extras via `ancestor_has_any_kind`, but its `own` side -- whether
+/// this agent also has the matched kind -- checked only
+/// `identity_kinds`, never `host_extras`. An agent whose own root holds
+/// `.claude/AGENTS.md` only as a host extra, with no Claude identity
+/// file of its own, still has Claude Code read that file as its
+/// documented fallback; shadowing a plain `AGENTS.md`-only ancestor for
+/// Claude Code was therefore wrong -- it should be exposure.
+#[test]
+fn claude_code_fallback_reads_as_exposure_for_an_agent_whose_own_extra_matches_the_fallback_kind() {
+    let identity_kinds = [IdentityKind::Qwen];
+    let host_extras = [".claude/AGENTS.md"];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+        host_extras: &[],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        host_extras: &host_extras,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    assert!(
+        exposure.iter().any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorShadowing)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
+/// Pins the rule the previous test does not change: without the
+/// agent's own `.claude/AGENTS.md` extra (or an `AGENTS.md` identity
+/// file of its own), the same `AGENTS.md`-only ancestor still shadows
+/// Claude Code -- this agent holds nothing Claude Code's fallback
+/// would read for itself.
+#[test]
+fn claude_code_fallback_still_shadows_without_the_agents_own_agents_md_or_extra() {
+    let identity_kinds = [IdentityKind::Qwen];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+        host_extras: &[],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let shadowing = with_code(&warnings, WarningCode::AncestorShadowing);
+    assert!(
+        shadowing.iter().any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+    assert!(
+        !with_code(&warnings, WarningCode::AncestorExposure)
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code")),
+        "{warnings:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // test_warning_child_not_mentioned
 // ---------------------------------------------------------------------
@@ -722,6 +792,26 @@ fn a_clean_agent_has_no_extra_or_generated_state_warnings() {
     let warnings = agent_warnings(&blank_input());
     assert!(with_code(&warnings, WarningCode::ExtraHostFile).is_empty());
     assert!(with_code(&warnings, WarningCode::GeneratedStateDir).is_empty());
+}
+
+/// `.claude/AGENTS.md` among `host_extras` is `hosts::EXTRA_READERS`'s
+/// own entry for it: one `extra_host_file` warning naming only Claude
+/// Code, in the prototype's own detail wording.
+#[test]
+fn claude_agents_md_host_extra_yields_one_extra_host_file_warning_for_claude_code() {
+    let host_extras = [".claude/AGENTS.md"];
+    let warnings = agent_warnings(&AgentInput {
+        host_extras: &host_extras,
+        ..blank_input()
+    });
+
+    let extras = with_code(&warnings, WarningCode::ExtraHostFile);
+    assert_eq!(extras.len(), 1, "{warnings:?}");
+    assert_eq!(extras[0].hosts, vec!["Claude Code"]);
+    assert_eq!(
+        extras[0].detail,
+        ".claude/AGENTS.md is read only by Claude Code; it is reported and never changed"
+    );
 }
 
 // ---------------------------------------------------------------------
