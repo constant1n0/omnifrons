@@ -1014,3 +1014,37 @@ fn indexed_skill_targets_of_a_dot_dot_past_the_posix_root_pins_the_root() {
         vec!["skills/x/SKILL.md".to_string()]
     );
 }
+
+/// The mirrored combination (review follow-up, `..` past a mount): the
+/// same drive-pinning fix applies when the `..` sits inside the
+/// Markdown link's own target instead of the scanned `root` -- the
+/// mirror image of
+/// [`indexed_skill_targets_of_a_dot_dot_past_a_drive_root_pins_the_drive`],
+/// which puts the `..` in `root` instead. Verified with
+/// `ntpath.relpath(r'C:\..\workspace\skills\x\SKILL.md', r'C:\workspace')`,
+/// which prints `skills\x\SKILL.md`.
+#[test]
+fn indexed_skill_targets_of_a_dot_dot_past_a_drive_inside_the_target_pins_the_drive() {
+    let text = b"[a](C:/../workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "C:/workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
+
+/// The mirrored combination for a UNC share (review follow-up, `..`
+/// past a mount): the same share-pinning fix applies when the `..` sits
+/// inside the scanned `root` instead of the Markdown link's own target
+/// -- the mirror image of
+/// [`indexed_skill_targets_of_a_dot_dot_past_a_unc_share_in_the_target_pins_the_share`],
+/// which puts the `..` in the target instead. Verified with
+/// `ntpath.relpath(r'\\server\share\workspace\skills\x\SKILL.md',
+/// r'\\server\share\..\workspace')`, which prints `skills\x\SKILL.md`.
+#[test]
+fn indexed_skill_targets_of_a_dot_dot_past_a_unc_share_in_the_root_pins_the_share() {
+    let text = b"[a](//server/share/workspace/skills/x/SKILL.md)\n";
+    assert_eq!(
+        indexed_skill_targets(text, "//server/share/../workspace"),
+        vec!["skills/x/SKILL.md".to_string()]
+    );
+}
