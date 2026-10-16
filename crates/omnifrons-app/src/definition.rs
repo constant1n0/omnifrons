@@ -744,43 +744,63 @@ fn verify_problems_after_state(
     let status = read_skill_index(canonical_text.unwrap_or(&[]), &discovered, &root_absolute);
 
     if let Some(text) = canonical_text {
-        // The prototype's own `plan_block` always finds at most one
-        // block (`find_block`) and always plans exactly one operation
-        // once a block is found (`replace_block`, never `append_block`
-        // too). Mirrored here: the legacy family is checked first, and
-        // its own outcome -- a refusal, a migration pending, or no
-        // legacy marker at all -- replaces whatever
-        // `skills_block_outcome` would otherwise report for this
-        // crate's own sentinel, rather than sitting beside it as a
-        // second, independent skills-block index.
+        // Both families' own outcomes are always computed, never
+        // short-circuited by the other: a hand-edited or malformed
+        // block in *either* family must still refuse on its own,
+        // exactly as the prototype's own `plan_block` raises its one
+        // `EditedBlock` before ever reaching a write. A refusal from
+        // either family outranks any pending operation -- the
+        // prototype's own plan never plans past the first refusal it
+        // raises -- and `legacy_marker_precedes_omnifrons_marker`
+        // below resolves the rare case where both refuse at once, by
+        // preferring whichever family's own begin marker reads first
+        // in the file; that is the block problem a human reading top
+        // to bottom would meet first. Only once *neither* family
+        // refuses does the prototype's own "one block, one operation"
+        // rule apply: a pending legacy migration, when a legacy
+        // marker is present and intact, replaces this crate's own
+        // append/regenerate outright, rather than sitting beside it.
         let needed = block_needed_names(&status);
-        match legacy_block_outcome(ports.hasher, text, &needed) {
-            LegacyBlockOutcome::Refusal(refusal) => return vec![refusal],
-            LegacyBlockOutcome::Pending(migrate) => {
-                let mut problems =
-                    wrapper_problems(classification.state, ports.hasher, identity_files);
-                problems.push(migrate);
-                return problems;
-            }
-            LegacyBlockOutcome::None => {
-                match skills_block_outcome(ports.hasher, text, &status, &rows, &root_absolute) {
-                    BlockOutcome::Refusal(refusal) => return vec![refusal],
-                    BlockOutcome::Pending(pending) => {
-                        let mut problems =
-                            wrapper_problems(classification.state, ports.hasher, identity_files);
-                        problems.push(pending);
-                        return problems;
-                    }
-                    BlockOutcome::None => {
-                        return wrapper_problems(
-                            classification.state,
-                            ports.hasher,
-                            identity_files,
-                        );
-                    }
-                }
-            }
+        let (legacy_refusal, legacy_pending) =
+            match legacy_block_outcome(ports.hasher, text, &needed) {
+                LegacyBlockOutcome::Refusal(refusal) => (Some(refusal), None),
+                LegacyBlockOutcome::Pending(migrate) => (None, Some(migrate)),
+                LegacyBlockOutcome::None => (None, None),
+            };
+        let (omnifrons_refusal, omnifrons_pending) =
+            match skills_block_outcome(ports.hasher, text, &status, &rows, &root_absolute) {
+                BlockOutcome::Refusal(refusal) => (Some(refusal), None),
+                BlockOutcome::Pending(pending) => (None, Some(pending)),
+                BlockOutcome::None => (None, None),
+            };
+
+        if let (Some(legacy_refusal), Some(omnifrons_refusal)) =
+            (&legacy_refusal, &omnifrons_refusal)
+        {
+            let winner = if legacy_marker_precedes_omnifrons_marker(text) {
+                legacy_refusal
+            } else {
+                omnifrons_refusal
+            };
+            return vec![winner.clone()];
         }
+        if let Some(refusal) = legacy_refusal {
+            return vec![refusal];
+        }
+        if let Some(refusal) = omnifrons_refusal {
+            return vec![refusal];
+        }
+        if let Some(migrate) = legacy_pending {
+            let mut problems = wrapper_problems(classification.state, ports.hasher, identity_files);
+            problems.push(migrate);
+            return problems;
+        }
+        if let Some(pending) = omnifrons_pending {
+            let mut problems = wrapper_problems(classification.state, ports.hasher, identity_files);
+            problems.push(pending);
+            return problems;
+        }
+        return wrapper_problems(classification.state, ports.hasher, identity_files);
     }
 
     wrapper_problems(classification.state, ports.hasher, identity_files)
@@ -1150,13 +1170,19 @@ impl LegacyMarkerFence {
 /// found (mirrors [`BlockOutcome`] for the `portable-agent:skills`
 /// family), outside the prototype's own vocabulary, since the
 /// prototype never needs to migrate itself (ADR-0005 sub-slice 1e-D).
-/// [`verify_problems_after_state`] uses this result to *replace*
-/// whatever `skills_block_outcome` would otherwise report for this
-/// crate's own sentinel, never to report both: the prototype's own
-/// `plan_block` only ever plans one skills-block operation once
-/// `find_block` has located a block of any format, and a real legacy
-/// block here means exactly that -- a block already exists, just not
-/// in this crate's own sentinel format.
+/// [`verify_problems_after_state`] gives a [`Self::Refusal`] here the
+/// same standing as a [`BlockOutcome::Refusal`]: either one, on its
+/// own, outranks any pending operation, and the two are resolved
+/// against each other by file order on the rare occasion both refuse
+/// at once. Only once *neither* family refuses does this crate's own
+/// "one block, one operation" rule apply: a [`Self::Pending`]
+/// migration *replaces* whatever `skills_block_outcome` would
+/// otherwise report for this crate's own sentinel, never sitting
+/// beside it, since the prototype's own `plan_block` only ever plans
+/// one skills-block operation once `find_block` has located a block
+/// of any format, and a real legacy block here means exactly that --
+/// a block already exists, just not in this crate's own sentinel
+/// format.
 enum LegacyBlockOutcome {
     /// No legacy begin marker line anywhere in the text.
     None,
@@ -1229,6 +1255,49 @@ fn lines_with_terminators(text: &[u8]) -> Vec<(usize, &[u8])> {
 fn strip_line_ending(raw: &[u8]) -> &[u8] {
     let trimmed = raw.strip_suffix(b"\n").unwrap_or(raw);
     trimmed.strip_suffix(b"\r").unwrap_or(trimmed)
+}
+
+/// This crate's own skills-block begin sentinel's fixed prefix, up to
+/// and including the space before the version -- the same literal
+/// `omnifrons_domain::guidance::ManagedFileKind::Skills`'s own private
+/// `begin_prefix` returns, duplicated here because that method is not
+/// visible outside its own crate. Used only by
+/// [`legacy_marker_precedes_omnifrons_marker`] below, to find where
+/// this family's own block begins for the file-order tie-break; never
+/// emitted by the legacy family -- see [`LEGACY_BEGIN_PREFIX`].
+const OMNIFRONS_SKILLS_BEGIN_PREFIX: &str = "<!-- omnifrons:begin skills ";
+
+/// The byte offset of the first line whose content starts with
+/// `prefix`, scanned over the ORIGINAL bytes exactly as
+/// [`legacy_lines`] is, never a decoded stand-in for them. `None` when
+/// no line starts with it -- including a family's own unpaired-end
+/// malformed shape, which carries no begin line at all.
+fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
+    lines_with_terminators(canonical_text)
+        .into_iter()
+        .find(|&(_, raw)| strip_line_ending(raw).starts_with(prefix.as_bytes()))
+        .map(|(offset, _)| offset)
+}
+
+/// Whether the legacy family's own begin marker sits earlier in
+/// `canonical_text` than this crate's own omnifrons skills-block begin
+/// marker -- [`verify_problems_after_state`]'s own file-order
+/// tie-break, applied only when both families refuse at once. A
+/// family whose own marker cannot be located at all (a family's own
+/// unpaired-end shape, with no begin line) is treated as reading after
+/// the other, since there is no position to prefer it by; when
+/// neither family's marker can be located, the legacy family is
+/// treated as reading after the omnifrons family, consistently with
+/// that same rule, even though this fallback is never expected to be
+/// exercised by a real refusal.
+fn legacy_marker_precedes_omnifrons_marker(canonical_text: &[u8]) -> bool {
+    let legacy = first_marker_offset(canonical_text, LEGACY_BEGIN_PREFIX);
+    let omnifrons = first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX);
+    match (legacy, omnifrons) {
+        (Some(legacy_offset), Some(omnifrons_offset)) => legacy_offset <= omnifrons_offset,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// Classifies every line of `canonical_text` for the legacy scan

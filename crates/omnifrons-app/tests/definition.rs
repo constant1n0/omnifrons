@@ -2720,6 +2720,198 @@ fn verify_refuses_a_legacy_block_placed_before_an_intact_omnifrons_block() {
     );
 }
 
+// -- verify: refusal precedence between the omnifrons and legacy families --
+
+/// An omnifrons skills block edited by hand, with an intact legacy pair
+/// placed after it (the legacy family's own "last thing in the file"
+/// shape, exactly as the "beside an intact omnifrons block" sibling
+/// test above uses): before this fix, the legacy family was checked
+/// first and its own `Pending` migration replaced whatever this
+/// crate's own sentinel could report, hiding the hand-edited block
+/// entirely. `verify` must report the omnifrons refusal alone, never
+/// the migration, since a refusal always outranks a pending operation,
+/// whichever family raises it.
+#[test]
+fn verify_refuses_an_edited_omnifrons_block_even_beside_an_intact_legacy_pair() {
+    let project = TempDir::new("verify-edited-omnifrons-beside-legacy");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    // Empty body between adjacent markers, as in the "beside an intact
+    // omnifrons block" sibling test's own legacy pair: its digest is
+    // the recorded one, so this legacy pair is intact on its own.
+    let legacy_digest_hex = hasher.sha256(b"").to_hex();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={legacy_digest_hex} -->\n<!-- \
+         portable-agent:skills:end -->"
+    );
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample.\n\n{tampered}\n\n{legacy_block}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "an edited omnifrons block must refuse on its own, never outrun by an intact \
+         legacy pair's pending migration"
+    );
+}
+
+/// A broken legacy begin marker (no end marker anywhere after it)
+/// placed beside an already-intact omnifrons block that, on its own,
+/// needs nothing: the legacy family's own `block_layout` refusal is
+/// the only outcome either family reports, so `verify` must still
+/// surface it alone. Pinned rather than newly caused by this fix: a
+/// refusal already returned immediately before either family was ever
+/// weighed against the other, so this shape's result is unchanged.
+#[test]
+fn verify_refuses_a_broken_legacy_block_beside_an_intact_omnifrons_block() {
+    let project = TempDir::new("verify-legacy-broken-beside-intact-omnifrons");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let row = SkillRow {
+        name: "sample".to_string(),
+        description: "A sample skill".to_string(),
+        path: "skills/sample/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\n{rendered}\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\ndescription: A sample skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the begin \
+             marker on line 24 has no end marker after it. Fix the markers by hand or index \
+             the precedence rule by hand"
+                .to_string()
+        ],
+        "a broken legacy block must refuse alone beside an omnifrons block that already \
+         needs nothing on its own"
+    );
+}
+
+/// Both families refuse at once: an omnifrons block edited by hand,
+/// positioned before a broken legacy begin marker (no end marker after
+/// it) -- the legacy family's own marker last in the file, exactly as
+/// every other fixture pairing the two families in this file places
+/// it. `verify` must report exactly one refusal, and it must be the
+/// one whose own marker reads first in the file: the omnifrons block
+/// here, never the legacy marker that follows it.
+#[test]
+fn verify_prefers_the_earlier_refusal_in_file_order_when_both_block_families_refuse() {
+    let project = TempDir::new("verify-both-families-refuse");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n{tampered}\n\n<!-- portable-agent:skills:begin \
+         sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "when both families refuse, the refusal from the family whose own marker reads \
+         first in the file wins; the omnifrons block here precedes the broken legacy marker"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill
