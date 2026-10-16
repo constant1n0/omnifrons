@@ -1,18 +1,29 @@
-//! The read-only `scan` service (ADR-0005 "Agent identity and portable
-//! definition" sub-slice 1e-A): composes the domain's pure
-//! classification, nesting, skills-index, and warnings modules over one
-//! [`crate::definition_tree::DefinitionTree`] snapshot into the
-//! prototype's own `scan()` report, without ever touching a filesystem
-//! itself.
+//! The read-only `scan` and `verify` services (ADR-0005 "Agent identity
+//! and portable definition" sub-slices 1e-A and 1e-D): composes the
+//! domain's pure classification, nesting, skills-index, and warnings
+//! modules over one [`crate::definition_tree::DefinitionTree`] snapshot
+//! into the prototype's own `scan()` and `verify_agent()` reports,
+//! without ever touching a filesystem itself.
 //!
 //! Translated from the prototype's `scan`, `inspect_agent`,
 //! `canonical_bytes`, and `ancestor_chain`: this module's own [`scan`]
 //! walks nothing -- `ports.tree` already decided what exists -- and
 //! instead classifies each discovered directory, attributes skills to
 //! their nearest owning root, and asks the domain's `warnings` module for
-//! each root's warnings, in that order. `verify` (sub-slice 1e-B) is a
-//! separate, later service over the same ports; nothing in this module
-//! anticipates it.
+//! each root's warnings, in that order.
+//!
+//! [`verify`] is translated from the prototype's own `verify_agent`,
+//! which plans a full adapt (`build_plan(agent, PlanOptions(nested=True),
+//! home)`) purely to read its `state`, `refusal`, and `operations` back
+//! off, and never once writes. This module's own [`verify`] folds that
+//! same reading-without-writing boundary one step earlier: it is the
+//! read-only *subset* of `build_plan` -- the state, the refusals, and the
+//! pending operations this crate can already know from one
+//! [`crate::definition_tree::TreeSnapshot`] -- and never plans an actual
+//! write itself. The write path (an eventual `adapt`) is sub-slice 2's
+//! own, later service; see [`verify`]'s own "Deferred to slice 2"
+//! section for exactly which of `build_plan`'s refusals and operations
+//! that boundary leaves out.
 //!
 //! # Seam with sub-slice 1f
 //!
@@ -29,13 +40,21 @@ use omnifrons_domain::definition::{
     Classification, DirectoryIdentity, FileShape, IdentityFile, IdentityKind, RootState, classify,
     title as extract_title,
 };
+use omnifrons_domain::guidance::{ManagedBlock, ManagedFileError, ManagedFileKind};
 use omnifrons_domain::hosts;
 use omnifrons_domain::nesting::{self, Ancestor, ChainLink, NestingError, Parent, RootRelation};
-use omnifrons_domain::skills_index::read_skill_index;
+use omnifrons_domain::skills_index::{
+    SkillIndexStatus, SkillRow, block_needed, read_skill_index, render_body, rows_to_generate,
+};
+use omnifrons_domain::skills_safety::{
+    InvalidUnicodeField, SkillMetadataError, read_skill_metadata, unsafe_row_fields,
+};
 use omnifrons_domain::warnings::{AgentInput, ChainAncestor, Warning, agent_warnings};
 
 use crate::content_hasher::ContentHasher;
-use crate::definition_tree::{DefinitionTree, DefinitionTreeError, DirectoryEntry, SkillFile};
+use crate::definition_tree::{
+    DefinitionTree, DefinitionTreeError, DirectoryEntry, SkillFile, TreeSnapshot,
+};
 use crate::harness_adapter::WorkspaceRoot;
 
 /// The ports [`scan`] runs over.
@@ -165,6 +184,26 @@ pub struct ScanReport {
     /// Every discovered agent, in the prototype's own agent order (the
     /// walk's own order).
     pub agents: Vec<AgentReport>,
+}
+
+/// A full verification of the scan root's own canonical definition (the
+/// prototype's own `verify_agent` return value, minus the `schema` and
+/// `agent` keys this crate's own caller already knows, and minus
+/// `backups`, which belongs to the write path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// The scan root's own classification state (the prototype's own
+    /// `plan.state`).
+    pub state: RootState,
+    /// Whether [`Self::problems`] is empty -- the prototype's own
+    /// `not problems`.
+    pub canonical: bool,
+    /// Every problem found, each in the prototype's own exact wording:
+    /// `"state is <token>"`, `"refused (<code>): <detail>"`, or
+    /// `"pending: <description>"`. See [`verify`]'s own documentation for
+    /// exactly which of the prototype's refusals and pending operations
+    /// this read-only pass can and cannot know.
+    pub problems: Vec<String>,
 }
 
 /// `identity_files`' reports, in [`IdentityKind::ALL`] order (the
@@ -535,5 +574,464 @@ pub fn scan(
     Ok(ScanReport {
         ancestors: snapshot.ancestors,
         agents,
+    })
+}
+
+/// Verifies the scan root's own canonical definition through `ports`
+/// (ADR-0005 sub-slice 1e-D; the prototype's own `verify_agent`, called
+/// with `PlanOptions(nested=True)` -- so the prototype's own
+/// `nested_agent` refusal never fires inside it, and this port never
+/// computes it either). Composed from the same snapshot [`scan`] uses,
+/// sharing its classification helpers ([`classify`] and this module's
+/// own private `canonical_bytes`) rather than re-deriving them: the
+/// verified agent is always the scan root `"."`, and a nested agent
+/// elsewhere in the snapshot is never a problem of its own, exactly as
+/// `PlanOptions(nested=True)` says.
+///
+/// Mirrors `verify_agent`'s own three problem categories, in the
+/// prototype's own order: the root's [`RootState`]
+/// (`"state is <token>"`, when it is not [`RootState::Canonical`] or
+/// [`RootState::HostExtras`]), then the one refusal `build_plan` would
+/// raise before ever planning a write (`"refused (<code>): <detail>"`),
+/// then every pending operation `build_plan` would still carry once no
+/// refusal applies (`"pending: <description>"`). A refusal and a
+/// pending operation never both appear: the prototype's own `build_plan`
+/// returns its refusal before it ever assigns `plan.steps`, so a refused
+/// plan's `operations` list is always empty; this module's own private
+/// `verify_problems_after_state` mirrors that short circuit directly
+/// through its own early returns.
+///
+/// # Deferred to slice 2 (the write path)
+///
+/// This pass can only know what a snapshot already answers; it never
+/// plans a write, so it cannot know:
+///
+/// - the `nested_agent` refusal (excluded structurally, as above);
+/// - the `unresolved_file` refusal (an unmanaged secondary identity file
+///   -- `GEMINI.md`, `QWEN.md`, `.claude/CLAUDE.md`, `AGENTS.override.md`
+///   -- that would still differ from the chosen source once copied) and
+///   the `diverging_copy` refusal (an unmanaged secondary that would
+///   stop matching once the skill index block is written): both need
+///   `plan_operations`'s own secondary-file comparison, not only the
+///   root's classification;
+/// - the `AGENTS.md` copy operation (`ClaudeOnly`/`IdenticalCopies`
+///   states resolve `CLAUDE.md` as the source and would copy it onto
+///   `AGENTS.md`) and the opt-in `GEMINI.md` wrapper write
+///   (`--with-gemini`): this pass only ever reports the `CLAUDE.md`
+///   wrapper, for [`RootState::AgentsOnly`]/[`RootState::NearWrapper`];
+/// - every `backup` operation `build_plan` would plan alongside a write
+///   it is about to make: a mechanical side effect of the write path,
+///   never a problem describing what is wrong with the canonical text
+///   itself.
+///
+/// Within the refusals and pending operations this pass *can* know, two
+/// further simplifications are documented where they are computed: the
+/// `block_layout`/`edited_block` refusal detail never repeats
+/// `build_plan`'s own dynamic list of malformed-marker causes (Rust's
+/// [`ManagedFileError`] does not distinguish them), and the regenerated
+/// block's own precedence-rule need is read from the *whole* canonical
+/// text ([`SkillIndexStatus::precedence`]) rather than only the text
+/// before a located block, as `build_plan`'s own `plan_block` does.
+///
+/// # Errors
+///
+/// Returns [`DefinitionError::Tree`] when the [`DefinitionTree`] port
+/// could not produce a snapshot, or
+/// [`DefinitionError::DuplicateIdentityKind`] when the scan root's
+/// identity files repeat a kind.
+pub fn verify(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+) -> Result<VerifyReport, DefinitionError> {
+    let snapshot = ports
+        .tree
+        .snapshot(workspace)
+        .map_err(DefinitionError::Tree)?;
+    let roots: Vec<&str> = snapshot
+        .directories
+        .iter()
+        .map(|directory| directory.path.as_str())
+        .collect();
+
+    let root_entry = snapshot
+        .directories
+        .iter()
+        .find(|directory| directory.path == ".");
+    let identity_files: Vec<IdentityFile> =
+        root_entry.map_or_else(Vec::new, |directory| directory.identity_files.clone());
+    let host_extras: Vec<String> =
+        root_entry.map_or_else(Vec::new, |directory| directory.host_extras.clone());
+    let identity = DirectoryIdentity::new(identity_files.clone(), host_extras)
+        .map_err(DefinitionError::DuplicateIdentityKind)?;
+    let classification = classify(&identity);
+
+    let mut problems = Vec::new();
+    if !matches!(
+        classification.state,
+        RootState::Canonical | RootState::HostExtras
+    ) {
+        problems.push(format!("state is {}", classification.state.as_str()));
+    }
+    problems.extend(verify_problems_after_state(
+        ports,
+        workspace,
+        &snapshot,
+        &roots,
+        &identity_files,
+        &classification,
+    ));
+
+    Ok(VerifyReport {
+        state: classification.state,
+        canonical: problems.is_empty(),
+        problems,
+    })
+}
+
+/// Every problem after the state check: the prototype's own refusal, or
+/// else its pending operations, directly mirroring `build_plan`'s own
+/// short circuit (see [`verify`]'s own documentation) through this
+/// function's early returns. Every state [`classify`] can produce is
+/// covered: [`RootState::None`] returns nothing (the prototype's own
+/// `if report.state == NONE: return plan`, an unrefused, empty plan),
+/// [`RootState::Unsafe`]/[`RootState::Conflict`] each return their one
+/// refusal, and every other state falls through to the skill-metadata
+/// and skills-block checks below.
+fn verify_problems_after_state(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    snapshot: &TreeSnapshot,
+    roots: &[&str],
+    identity_files: &[IdentityFile],
+    classification: &Classification,
+) -> Vec<String> {
+    match classification.state {
+        RootState::Unsafe => {
+            return vec![format!(
+                "refused ({}): {}",
+                RootState::Unsafe.as_str(),
+                classification.reason
+            )];
+        }
+        RootState::Conflict => {
+            return vec![format!(
+                "refused ({}): {}; choose the canonical file with --canonical-from \
+                 CLAUDE.md or --canonical-from AGENTS.md",
+                RootState::Conflict.as_str(),
+                classification.reason
+            )];
+        }
+        RootState::None => return Vec::new(),
+        _ => {}
+    }
+
+    let root_skills: Vec<&SkillFile> = snapshot
+        .skills
+        .iter()
+        .filter(|skill| nesting::nearest_root(roots, parent_directory(&skill.path)) == Some("."))
+        .collect();
+    let (rows, skill_refusal) = skill_rows(&root_skills);
+    if let Some(refusal) = skill_refusal {
+        return vec![refusal];
+    }
+
+    let discovered: Vec<String> = root_skills.iter().map(|skill| skill.path.clone()).collect();
+    let root_absolute = absolute_posix(workspace, ".");
+    let canonical_text = canonical_bytes(identity_files, classification.source);
+    let status = read_skill_index(canonical_text.unwrap_or(&[]), &discovered, &root_absolute);
+
+    if let Some(text) = canonical_text {
+        match skills_block_outcome(ports.hasher, text, &status, &rows, &root_absolute) {
+            BlockOutcome::Refusal(refusal) => return vec![refusal],
+            BlockOutcome::Pending(pending) => {
+                let mut problems =
+                    wrapper_problems(classification.state, ports.hasher, identity_files);
+                problems.push(pending);
+                if let Some(migrate) = legacy_block_pending(text) {
+                    problems.push(migrate);
+                }
+                return problems;
+            }
+            BlockOutcome::None => {
+                let mut problems =
+                    wrapper_problems(classification.state, ports.hasher, identity_files);
+                if let Some(migrate) = legacy_block_pending(text) {
+                    problems.push(migrate);
+                }
+                return problems;
+            }
+        }
+    }
+
+    wrapper_problems(classification.state, ports.hasher, identity_files)
+}
+
+/// The pending `CLAUDE.md` wrapper write, when `state` is
+/// [`RootState::AgentsOnly`] or [`RootState::NearWrapper`] (the
+/// prototype's own `write_wrapper` operation, read back through
+/// `describe_operation`): empty for every other state, since this pass
+/// never plans the `AGENTS.md` copy or the opt-in `GEMINI.md` wrapper --
+/// see [`verify`]'s own "Deferred to slice 2" section.
+fn wrapper_problems(
+    state: RootState,
+    hasher: &dyn ContentHasher,
+    identity_files: &[IdentityFile],
+) -> Vec<String> {
+    if !matches!(state, RootState::AgentsOnly | RootState::NearWrapper) {
+        return Vec::new();
+    }
+    let claude = identity_files
+        .iter()
+        .find(|file| file.kind == IdentityKind::Claude && matches!(file.shape, FileShape::Regular));
+    let effect = claude.map_or_else(
+        || "creates the file".to_string(),
+        |file| {
+            format!(
+                "replaces sha256 {}",
+                &hasher.sha256(&file.bytes).to_hex()[..12]
+            )
+        },
+    );
+    vec![format!("pending: write the wrapper CLAUDE.md ({effect})")]
+}
+
+/// The stable refusal code the prototype's own `UnsafeSkillMetadata`
+/// exception always carries (`UNSAFE_SKILL_METADATA` in the prototype's
+/// `adapter/portable-agent/scripts/portable_agent.py`), for both of its
+/// causes -- a lone surrogate, or a possible `@` import. Deliberately
+/// not [`omnifrons_domain::skills_safety::SkillSafetyRefusal::as_str`]'s
+/// kebab-case `"unsafe-skill-metadata"`: that is this crate's own house
+/// convention for an IPC-facing reason token, while every string
+/// [`verify`] produces mirrors the prototype's own wire format verbatim,
+/// `snake_case` code included.
+const UNSAFE_SKILL_METADATA_CODE: &str = "unsafe_skill_metadata";
+
+/// Every root skill's row, and the one refusal this pass can raise from
+/// them (the prototype's own `plan_block`): a lone surrogate from
+/// [`read_skill_metadata`] refuses every flagged skill at once, before a
+/// possible `@` import is ever checked for any of them; only when none
+/// is found does [`unsafe_row_fields`] run over the rest. Either way all
+/// of `root_skills` shares the one refusal, never one row at a time.
+fn skill_rows(root_skills: &[&SkillFile]) -> (Vec<SkillRow>, Option<String>) {
+    let mut invalid_problems: Vec<String> = Vec::new();
+    let mut rows: Vec<SkillRow> = Vec::with_capacity(root_skills.len());
+    for skill in root_skills {
+        match read_skill_metadata(&skill.path, &skill.bytes) {
+            Ok(metadata) => rows.push(metadata.into()),
+            Err(SkillMetadataError::InvalidUnicode(fields)) => {
+                invalid_problems.extend(invalid_unicode_problems(&skill.path, &fields));
+            }
+        }
+    }
+    if !invalid_problems.is_empty() {
+        return (
+            rows,
+            Some(format!(
+                "refused ({UNSAFE_SKILL_METADATA_CODE}): {}",
+                invalid_unicode_detail(&invalid_problems)
+            )),
+        );
+    }
+    let unsafe_fields = unsafe_row_fields(&rows);
+    let refusal = (!unsafe_fields.is_empty()).then(|| {
+        format!(
+            "refused ({UNSAFE_SKILL_METADATA_CODE}): {}",
+            unsafe_rows_detail(&unsafe_fields)
+        )
+    });
+    (rows, refusal)
+}
+
+/// One flagged skill's own invalid-Unicode problems, one per indexed
+/// field holding a lone surrogate (the prototype's own
+/// `invalid_unicode_fields`).
+fn invalid_unicode_problems(path: &str, fields: &[InvalidUnicodeField]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| {
+            let points = field
+                .surrogates
+                .iter()
+                .map(|point| format!("U+{point:04X}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let shown = if field.surrogates.len() == 1 {
+                format!("the lone surrogate {points}, an unpaired \\u escape,")
+            } else {
+                format!("the lone surrogates {points}, unpaired \\u escapes,")
+            };
+            format!(
+                "{} (its {} holds invalid Unicode: {shown} cannot be written as UTF-8)",
+                python_repr(path),
+                field.field
+            )
+        })
+        .collect()
+}
+
+/// A minimal Python `repr()` of a plain POSIX path (the prototype's own
+/// `skill!r`): single-quoted, with a backslash or embedded single quote
+/// escaped. A skill path discovered through this crate's own
+/// [`DefinitionTree`] port never holds anything else this pass needs to
+/// escape.
+fn python_repr(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+/// The `unsafe_skill_metadata` detail for a lone surrogate (the
+/// prototype's own `invalid_unicode_detail`).
+fn invalid_unicode_detail(problems: &[String]) -> String {
+    format!(
+        "these local skills cannot be written into the skill index of AGENTS.md: {}. The \
+         index quotes each skill's name and description in AGENTS.md, which is UTF-8 text, \
+         and a lone surrogate has no UTF-8 form. No skill is ever edited for you: in each \
+         SKILL.md named here, edit the `name:` or `description:` named so that no \\u escape \
+         stands alone (write the character itself, or a full pair such as \\ud83d\\ude00), \
+         then run the dry-run again",
+        problems.join("; ")
+    )
+}
+
+/// The `unsafe_skill_metadata` detail for a possible `@` import or a
+/// link-breaking path character (the prototype's own
+/// `unsafe_rows_detail`).
+fn unsafe_rows_detail(problems: &[String]) -> String {
+    format!(
+        "these local skills cannot be written into the skill index of AGENTS.md: {}. The \
+         index writes each skill's name and description as Markdown text outside code and \
+         its path as a link, and Claude Code may load an @ that follows a space, a symbol (a \
+         code span, emphasis, a link or a backslash escape included) or nothing as an import \
+         of another file. The adapter never edits or renames a skill: edit the `name:` or \
+         `description:` named here in that SKILL.md (write \"at\" or rephrase; an @ right \
+         after a letter or digit, as in ops@example.com, is fine; a skill without `name:` is \
+         listed by its folder name), or rename the folder of a path named here, then run the \
+         dry-run again",
+        problems.join("; ")
+    )
+}
+
+/// What [`skills_block_outcome`] found for the canonical text's skills
+/// block.
+enum BlockOutcome {
+    /// Nothing pending and nothing to refuse.
+    None,
+    /// The block is malformed or was edited by hand (the prototype's own
+    /// `EditedBlock`).
+    Refusal(String),
+    /// A write or update is pending (the prototype's own
+    /// `append_block`/`replace_block`).
+    Pending(String),
+}
+
+/// The skills-block refusal or pending operation this pass can know
+/// without planning a write (the prototype's own `plan_block`, called
+/// through `build_plan`): a malformed or hand-edited block always
+/// refuses; otherwise, no block yet and [`block_needed`] saying one is
+/// due appends one, and an already-located block whose body no longer
+/// matches a fresh render of it regenerates one.
+fn skills_block_outcome(
+    hasher: &dyn ContentHasher,
+    canonical_text: &[u8],
+    status: &SkillIndexStatus,
+    rows: &[SkillRow],
+    root_absolute: &str,
+) -> BlockOutcome {
+    let decoded = String::from_utf8_lossy(canonical_text);
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let located = match ManagedBlock::locate(ManagedFileKind::Skills, &decoded, &digest) {
+        Err(ManagedFileError::Malformed) => {
+            return BlockOutcome::Refusal(format!(
+                "refused (block_layout): the skill index block cannot be regenerated: its \
+                 sentinels are not one intact pair. Fix the markers by hand or index {} by \
+                 hand",
+                block_needed_names(status)
+            ));
+        }
+        Err(ManagedFileError::Modified) => {
+            return BlockOutcome::Refusal(format!(
+                "refused (edited_block): the skill index block was edited by hand (its \
+                 recorded sha256 no longer matches) and cannot be regenerated; restore it or \
+                 index {} by hand",
+                block_needed_names(status)
+            ));
+        }
+        Ok(located) => located,
+    };
+
+    let Some(located) = located else {
+        return if block_needed(status) {
+            let fresh_rows = rows_to_generate(canonical_text, rows, root_absolute);
+            BlockOutcome::Pending(skills_block_pending_text(
+                "append",
+                &fresh_rows,
+                !status.precedence,
+            ))
+        } else {
+            BlockOutcome::None
+        };
+    };
+
+    let rule_needed = !status.precedence;
+    let prefix = decoded[..located.span.start].as_bytes();
+    let fresh_rows = rows_to_generate(prefix, rows, root_absolute);
+    let fresh_body = render_body(&fresh_rows, rule_needed);
+    if located.body == fresh_body {
+        BlockOutcome::None
+    } else {
+        BlockOutcome::Pending(skills_block_pending_text(
+            "regenerate",
+            &fresh_rows,
+            rule_needed,
+        ))
+    }
+}
+
+/// The skills `build_plan` would name as still needing an index entry,
+/// joined as the prototype's own `", ".join(status.missing) or "the
+/// precedence rule"` -- used only inside a block refusal's detail text.
+fn block_needed_names(status: &SkillIndexStatus) -> String {
+    if status.missing.is_empty() {
+        "the precedence rule".to_string()
+    } else {
+        status.missing.join(", ")
+    }
+}
+
+/// One skills-block pending operation's description (the prototype's own
+/// `describe_operation`, `append_block`/`replace_block` branch): always
+/// against `AGENTS.md`, the one file [`classify`] ever names as the
+/// canonical source for a state this pass reaches this check from.
+fn skills_block_pending_text(verb: &str, rows: &[SkillRow], rule_needed: bool) -> String {
+    let mut parts = Vec::new();
+    if !rows.is_empty() {
+        parts.push(format!("{} skill rows", rows.len()));
+    }
+    if rule_needed {
+        parts.push("the precedence rule".to_string());
+    }
+    format!(
+        "pending: {verb} the skill index block in AGENTS.md ({})",
+        parts.join(" and ")
+    )
+}
+
+/// The prototype's own skills-block begin marker (`BLOCK_BEGIN` in the
+/// prototype's `adapter/portable-agent/scripts/portable_agent.py`),
+/// never emitted by this crate's own [`ManagedBlock`] (which begins
+/// `<!-- omnifrons:begin skills ` instead): present only in a file the
+/// prototype itself last wrote, or one hand-migrated partway.
+const LEGACY_SKILLS_BLOCK_MARKER: &str = "<!-- portable-agent:skills:begin";
+
+/// A pending migration of a legacy [`LEGACY_SKILLS_BLOCK_MARKER`] block
+/// to this crate's own sentinel format, when the canonical text still
+/// carries one -- outside the prototype's own vocabulary, since the
+/// prototype never needs to migrate itself (ADR-0005 sub-slice 1e-D).
+fn legacy_block_pending(canonical_text: &[u8]) -> Option<String> {
+    let decoded = String::from_utf8_lossy(canonical_text);
+    decoded.contains(LEGACY_SKILLS_BLOCK_MARKER).then(|| {
+        "pending: migrate the portable-agent skill index block in AGENTS.md to the current \
+         omnifrons sentinel format"
+            .to_string()
     })
 }

@@ -18,9 +18,10 @@ use omnifrons_app::contract::definition::{
     InMemoryDefinitionTree, TreeSnapshotBuilder, definition_tree_contract,
 };
 use omnifrons_app::contract::publication::FakeHasher;
-use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan};
+use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
 use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSnapshot};
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, RootState, WRAPPER};
+use omnifrons_domain::guidance::{LineEnding, ManagedBlock};
 use omnifrons_domain::nesting::{NestingError, Parent};
 use omnifrons_domain::warnings::WarningCode;
 
@@ -998,5 +999,307 @@ fn an_unrecognized_host_extra_on_an_outside_ancestor_changes_nothing() {
             warning.code == WarningCode::AncestorExposure && warning.hosts.contains(&"Claude Code")
         }),
         "expected an ancestor_exposure warning naming Claude Code, got {with_unknown:?}"
+    );
+}
+
+// -- verify (ADR-0005 sub-slice 1e-D) --
+
+/// (a) A canonical agent -- `AGENTS.md` holds the text and `CLAUDE.md` is
+/// the exact wrapper, with no skills discovered -- has no problems at
+/// all (the prototype's own `verify_agent`, `canonical` state, empty
+/// `problems`).
+#[test]
+fn verify_reports_canonical_with_no_problems() {
+    let project = TempDir::new("verify-canonical");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
+/// (b) A canonical agent with a host-specific extra file alongside it is
+/// still canonical overall ([`RootState::HostExtras`] is one of the two
+/// states `verify_agent` never reports a `"state is ..."` problem for).
+#[test]
+fn verify_reports_host_extras_state_with_no_problems() {
+    let project = TempDir::new("verify-host-extras");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            vec!["CLAUDE.local.md".to_string()],
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::HostExtras);
+    assert!(report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
+/// (c) `AGENTS.md` with no `CLAUDE.md` at all: `"state is agents_only"`,
+/// plus the pending `write_wrapper` operation `build_plan` would still
+/// carry (`describe_operation`'s own `"creates the file"` wording, since
+/// there is no existing `CLAUDE.md` to replace).
+#[test]
+fn verify_reports_agents_only_state_and_pending_wrapper_write() {
+    let project = TempDir::new("verify-agents-only");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, agents_bytes)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::AgentsOnly);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "state is agents_only".to_string(),
+            "pending: write the wrapper CLAUDE.md (creates the file)".to_string(),
+        ]
+    );
+}
+
+/// (d) A discovered skill the canonical text never links, and no
+/// skills block yet: `verify` reports the pending `append_block`
+/// operation `build_plan`'s own `plan_block` would plan
+/// (`describe_operation`'s own wording: the row count, and the
+/// precedence rule since the text states neither).
+#[test]
+fn verify_reports_pending_skills_block_for_an_unindexed_discovered_skill() {
+    let project = TempDir::new("verify-skills-pending");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
+                .to_string()
+        ]
+    );
+}
+
+/// (e) A discovered skill whose `description:` holds a possible `@`
+/// import: `verify` refuses with the prototype's own
+/// `unsafe_skill_metadata` code, rather than planning a skill-index row
+/// Claude Code could load as a file import ([`unsafe_row_fields`]'s own
+/// finding, read back through `unsafe_rows_detail`).
+///
+/// [`unsafe_row_fields`]: omnifrons_domain::skills_safety::unsafe_row_fields
+#[test]
+fn verify_refuses_a_skill_whose_description_holds_an_unsafe_at_token() {
+    let project = TempDir::new("verify-unsafe-at-token");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/mail/SKILL.md",
+            b"---\nname: mail-helper\ndescription: Contact @support for assistance\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (unsafe_skill_metadata): these local skills cannot be written into the \
+             skill index of AGENTS.md: 'skills/mail/SKILL.md' (its description holds \
+             \"@support\"). The index writes each skill's name and description as Markdown \
+             text outside code and its path as a link, and Claude Code may load an @ that \
+             follows a space, a symbol (a code span, emphasis, a link or a backslash escape \
+             included) or nothing as an import of another file. The adapter never edits or \
+             renames a skill: edit the `name:` or `description:` named here in that SKILL.md \
+             (write \"at\" or rephrase; an @ right after a letter or digit, as in \
+             ops@example.com, is fine; a skill without `name:` is listed by its folder name), \
+             or rename the folder of a path named here, then run the dry-run again"
+                .to_string()
+        ]
+    );
+}
+
+/// (f) A hand-edited skills block: its recorded sha256 no longer
+/// matches its body, so `verify` refuses rather than planning to
+/// regenerate over a human's own edit (the prototype's own
+/// `EditedBlock("edited_block", ...)`, raised by `plan_block` before any
+/// row is ever generated).
+#[test]
+fn verify_refuses_a_hand_edited_skills_block() {
+    let project = TempDir::new("verify-edited-block");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!("# Sample\n\nYou are Sample.\n\n{tampered}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index the \
+             precedence rule by hand"
+                .to_string()
+        ]
+    );
+}
+
+/// (g) `CLAUDE.md` and `AGENTS.md` hold different, content-bearing
+/// text: `"state is conflict"`, plus the `CONFLICT` refusal
+/// `build_plan` raises before `source` can ever be resolved (the
+/// prototype's own `resolve_source` returning `None`, read back as
+/// `plan.refusal`).
+#[test]
+fn verify_reports_conflict_state_and_refusal() {
+    let project = TempDir::new("verify-conflict");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nAgents version of the instructions.\n";
+    let claude_bytes = b"# Sample\n\nClaude version, totally different content.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, claude_bytes),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Conflict);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "state is conflict".to_string(),
+            "refused (conflict): CLAUDE.md and AGENTS.md hold different content; choose the \
+             canonical file with --canonical-from CLAUDE.md or --canonical-from AGENTS.md"
+                .to_string(),
+        ]
     );
 }
