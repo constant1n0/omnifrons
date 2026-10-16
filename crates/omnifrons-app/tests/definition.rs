@@ -2270,6 +2270,144 @@ fn verify_treats_a_prose_legacy_marker_mention_as_content() {
     );
 }
 
+// -- verify: a trailing unclosed fence limits the "quoted" explanation --
+
+/// An unmatched fence opener with a begin-marker example after it,
+/// nothing closing the fence before end of file: the prototype's own
+/// `quoted_markers` (`fences[-1]`, once the fence-line count is odd)
+/// stops looking for a "quoted" marker at that fence's own opening
+/// line, since an unclosed fence runs to the end of the file and the
+/// adapter's own block may follow it there. So this marker, sitting
+/// after the opener, is never described as quoted -- even though, by
+/// the same "found, not hidden" rule
+/// [`verify_refuses_a_fenced_legacy_begin_marker_with_no_end`] pins for
+/// a *closed* fence, it is still found as a real begin marker. Confirmed
+/// against the real prototype: `find_block` on this exact text returns
+/// `layout=('the begin marker on line 8 has no end marker after it',)`
+/// alone, with no fenced-marker sentence. Before the fix, the "quoted"
+/// search had no such cutoff, so it always found this marker fenced and
+/// prepended that sentence anyway.
+#[test]
+fn verify_refuses_a_legacy_begin_marker_after_an_unclosed_fence_with_no_quoted_explanation() {
+    let project = TempDir::new("verify-legacy-unclosed-fence-begin");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\nTo migrate a legacy block by \
+         hand, look for a line like this:\n\n```\n<!-- portable-agent:skills:begin \
+         sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the begin \
+             marker on line 8 has no end marker after it. Fix the markers by hand or index \
+             skills/sample/SKILL.md by hand"
+                .to_string()
+        ],
+        "a marker after a fence that never closes must not read as quoted"
+    );
+}
+
+/// A closed fence quoting a complete fake begin/end pair as a
+/// documentation example, followed by the agent's own real legacy
+/// block: every begin- or end-shaped line still counts wherever it
+/// sits, fenced or not, so the fake begin becomes `first` and the real
+/// begin becomes a second begin marker -- the same "found, not hidden"
+/// rule exercised in
+/// [`verify_refuses_a_fenced_legacy_begin_marker_with_no_end`] for one
+/// marker, here for two pairs at once, plus the "block must be the last
+/// thing in the file" rule once the fake pair's own end marker is
+/// reached first. Confirmed against the real prototype: `find_block` on
+/// this exact text returns three causes, in this order -- the
+/// quoted-marker sentence (naming the fake begin's own line, the first
+/// quoted marker found), the second-begin sentence (naming the real
+/// begin's line), then the trailing-text sentence (naming the fake
+/// end's line). This closed fence never leaves a trailing fence open at
+/// end of file, so the "quoted" search's own cutoff (the fix pinned
+/// above) never shrinks its window here: a pinning test, passing
+/// unchanged before and after that fix.
+#[test]
+fn verify_refuses_a_legacy_block_with_a_closed_fence_quoting_both_markers_before_a_real_one() {
+    let project = TempDir::new("verify-legacy-closed-fence-quotes-both");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let real_digest_hex = hasher.sha256(b"").to_hex();
+    let agents_bytes = format!(
+        "# Sample\n\nHere is what both markers look like when migrating by hand:\n\n```\n\
+         <!-- portable-agent:skills:begin sha256={} -->\n<!-- portable-agent:skills:end \
+         -->\n```\n\n<!-- portable-agent:skills:begin sha256={real_digest_hex} -->\n<!-- \
+         portable-agent:skills:end -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the marker \
+             on line 6 is inside a fenced code block; the adapter matches its markers \
+             anywhere, so a quoted marker reads as a broken block; line 10 holds a second \
+             begin marker; text follows the end marker on line 7; the block must be the last \
+             thing in the file. Fix the markers by hand or index skills/sample/SKILL.md by \
+             hand"
+                .to_string()
+        ],
+        "closed-fence quoting must still only explain a problem found some other way"
+    );
+}
+
 /// A real legacy block beside an already-intact omnifrons block: the
 /// prototype's own `find_block` has no notion of this crate's own
 /// sentinel at all, so it checks the legacy pair exactly as it would
@@ -2471,6 +2609,126 @@ fn verify_refuses_a_legacy_block_whose_non_utf8_body_was_altered_by_one_byte() {
             "refused (edited_block): the skill index block was edited by hand (its recorded \
              sha256 no longer matches) and cannot be regenerated; restore it or index \
              skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+// -- verify: a legacy block split by a lone `\r` or by `\r\n` --
+
+/// A lone `\r` (never `\n`) as every line terminator: the prototype's
+/// own `data.splitlines(keepends=True)` still splits bytes on a lone
+/// `"\r"` -- confirmed by running
+/// `b"a\rb\r\nc\x0bd\n".splitlines(keepends=True)` against a real
+/// `python3`, which answers `[b"a\r", b"b\r\n", b"c\x0bd\n"]`: `"\n"`,
+/// lone `"\r"`, and `"\r\n"` are the only boundaries for bytes, unlike
+/// `str.splitlines`'s wider Unicode set -- so a legacy block written
+/// with only `"\r"` must still be found intact and reported as a
+/// migration. Before the fix, `lines_with_terminators` only split on
+/// `"\n"`, so the whole file read as one single "line" that never
+/// started with the begin marker's own prefix, and no legacy block was
+/// found at all.
+#[test]
+fn verify_reports_migrate_for_a_legacy_block_in_a_cr_only_file() {
+    let project = TempDir::new("verify-legacy-cr-only");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    // The body is one line, "sample\r", its own lone `\r` terminator
+    // included exactly as `find_block`'s own `data[offsets[first + 1]
+    // : offsets[ends[0]]]` slice would keep it -- a non-empty body, so
+    // this also pins the body offset slicing, not only the markers.
+    let digest_hex = hasher.sha256(b"sample\r").to_hex();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={digest_hex} -->\rsample\r<!-- \
+         portable-agent:skills:end -->"
+    );
+    let agents_bytes =
+        format!("# Sample\r\rYou are Sample, a fixture agent.\r\r{legacy_block}\r").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
+                .to_string()
+        ],
+        "a lone \\r must split lines exactly as the prototype's own bytes.splitlines does"
+    );
+}
+
+/// The same shape with every line terminated by `"\r\n"` instead: this
+/// already worked before the fix above (each `"\r\n"`-terminated chunk
+/// still holds the `"\n"` that `lines_with_terminators` already split
+/// on, and `strip_line_ending` already stripped both of its bytes), so
+/// this is a pinning test for behavior the lone-`\r` fix must not
+/// disturb.
+#[test]
+fn verify_reports_migrate_for_a_legacy_block_in_a_crlf_file() {
+    let project = TempDir::new("verify-legacy-crlf");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest_hex = hasher.sha256(b"").to_hex();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={digest_hex} -->\r\n<!-- \
+         portable-agent:skills:end -->"
+    );
+    let agents_bytes =
+        format!("# Sample\r\n\r\nYou are Sample, a fixture agent.\r\n\r\n{legacy_block}\r\n")
+            .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
                 .to_string()
         ]
     );

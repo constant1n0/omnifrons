@@ -1132,15 +1132,22 @@ fn legacy_begin_digest(line: &[u8]) -> Option<&str> {
 #[derive(Default)]
 struct LegacyMarkerFence {
     opener: Option<(char, usize)>,
+    /// The index of the line that opened [`Self::opener`]'s own fence,
+    /// cleared the moment that fence closes again: the prototype's own
+    /// `quoted_markers` scans only lines before `fences[-1]` once a
+    /// trailing fence is still unclosed at end of file, and this is
+    /// that same cutoff line -- read back once the whole file has been
+    /// fed through [`Self::advance`], by [`legacy_lines`].
+    opened_at: Option<usize>,
 }
 
 impl LegacyMarkerFence {
-    /// Feeds one already-trimmed line and reports whether it sits
-    /// inside a fence: a fence-shaped line is always reported as
+    /// Feeds one already-trimmed line at `index` and reports whether it
+    /// sits inside a fence: a fence-shaped line is always reported as
     /// fenced, whether it opens, closes, or -- unable to close what is
     /// already open -- is itself fenced content; a plain line is
     /// fenced exactly when a fence is still open around it.
-    fn advance(&mut self, trimmed_line: &str) -> bool {
+    fn advance(&mut self, index: usize, trimmed_line: &str) -> bool {
         let Some(marker) = trimmed_line
             .chars()
             .next()
@@ -1154,11 +1161,15 @@ impl LegacyMarkerFence {
         }
         let has_info_string = trimmed_line[run..].chars().any(|c| !c.is_whitespace());
         match self.opener {
-            None => self.opener = Some((marker, run)),
+            None => {
+                self.opener = Some((marker, run));
+                self.opened_at = Some(index);
+            }
             Some((open_marker, open_run))
                 if marker == open_marker && run >= open_run && !has_info_string =>
             {
                 self.opener = None;
+                self.opened_at = None;
             }
             Some(_) => {}
         }
@@ -1207,9 +1218,10 @@ struct LegacyLine<'a> {
     /// `offsets[index]`, built the same way alongside
     /// `data.splitlines(keepends=True)`.
     offset: usize,
-    /// This line's bytes with its own trailing `"\r\n"` or `"\n"`
-    /// terminator removed, matched unindented and untrimmed against
-    /// the exact marker bytes, exactly as the prototype's own
+    /// This line's bytes with its own trailing `"\r\n"`, `"\n"`, or
+    /// lone `"\r"` terminator removed, matched unindented and
+    /// untrimmed against the exact marker bytes, exactly as the
+    /// prototype's own
     /// `BLOCK_BEGIN_PATTERN.fullmatch`/`== BLOCK_END` would -- never
     /// trimmed the way a fence line is below: a marker with incidental
     /// leading or trailing whitespace is not this exact sentinel.
@@ -1231,18 +1243,38 @@ struct LegacyLine<'a> {
 }
 
 /// `text` split into lines that each keep their own terminator and know
-/// their own start offset (the prototype's own
-/// `data.splitlines(keepends=True)` paired with its own `offsets`
-/// list, restricted to `"\n"` the way the rest of this scan already
-/// is): no trailing empty line is produced for text ending in a
-/// newline.
+/// their own start offset -- the prototype's own
+/// `data.splitlines(keepends=True)` paired with its own `offsets` list.
+/// For `bytes` (never `str`), that prototype method splits only on
+/// `"\n"`, a lone `"\r"`, or `"\r\n"` (one terminator, not two):
+/// confirmed with a real `python3`, where
+/// `b"a\rb\r\nc\x0bd\n".splitlines(keepends=True)` answers
+/// `[b"a\r", b"b\r\n", b"c\x0bd\n"]` -- `"\x0b"` and the rest of
+/// `str.splitlines`'s wider Unicode line-break set stay plain bytes
+/// here, never boundaries. No trailing empty line is produced for text
+/// ending in a terminator.
 fn lines_with_terminators(text: &[u8]) -> Vec<(usize, &[u8])> {
     let mut lines = Vec::new();
     let mut start = 0;
-    for (index, &byte) in text.iter().enumerate() {
-        if byte == b'\n' {
-            lines.push((start, &text[start..=index]));
-            start = index + 1;
+    let mut index = 0;
+    while index < text.len() {
+        match text[index] {
+            b'\n' => {
+                lines.push((start, &text[start..=index]));
+                index += 1;
+                start = index;
+            }
+            b'\r' => {
+                let end = if text.get(index + 1) == Some(&b'\n') {
+                    index + 1
+                } else {
+                    index
+                };
+                lines.push((start, &text[start..=end]));
+                index = end + 1;
+                start = index;
+            }
+            _ => index += 1,
         }
     }
     if start < text.len() {
@@ -1302,20 +1334,29 @@ fn legacy_marker_precedes_omnifrons_marker(canonical_text: &[u8]) -> bool {
 
 /// Classifies every line of `canonical_text` for the legacy scan
 /// ([`LegacyLine`]), tracking fence state across them with one
-/// [`LegacyMarkerFence`]. Operates on the ORIGINAL bytes throughout --
+/// [`LegacyMarkerFence`], and returns alongside it that fence's own
+/// cutoff for a "quoted" marker explanation: the prototype's own
+/// `quoted_markers` stops looking once a trailing fence is still open
+/// at end of file (`fences[-1]`, for an odd fence-line count), since
+/// that fence then runs to the end of the file and the adapter's own
+/// block may follow it there. Mirrored here as
+/// [`LegacyMarkerFence::opened_at`], read back once every line has been
+/// fed through, defaulting to the line count (no cutoff) once every
+/// fence has closed again. Operates on the ORIGINAL bytes throughout --
 /// nothing here ever runs a whole-buffer lossy decode, so marker
 /// matching and the body a caller later slices out by offset both stay
 /// exact for a body holding non-UTF-8 bytes; only the fence tracker
 /// (comment on [`LegacyLine::fenced`]) sees a decoded view, and only of
 /// one line at a time.
-fn legacy_lines(canonical_text: &[u8]) -> Vec<LegacyLine<'_>> {
+fn legacy_lines(canonical_text: &[u8]) -> (Vec<LegacyLine<'_>>, usize) {
     let mut fence = LegacyMarkerFence::default();
-    lines_with_terminators(canonical_text)
+    let lines: Vec<LegacyLine<'_>> = lines_with_terminators(canonical_text)
         .into_iter()
-        .map(|(offset, raw)| {
+        .enumerate()
+        .map(|(index, (offset, raw))| {
             let text = strip_line_ending(raw);
             let decoded_text = String::from_utf8_lossy(text);
-            let fenced = fence.advance(decoded_text.trim());
+            let fenced = fence.advance(index, decoded_text.trim());
             let begin_digest = legacy_begin_digest(text);
             LegacyLine {
                 offset,
@@ -1326,7 +1367,9 @@ fn legacy_lines(canonical_text: &[u8]) -> Vec<LegacyLine<'_>> {
                 fenced,
             }
         })
-        .collect()
+        .collect();
+    let quoted_limit = fence.opened_at.unwrap_or(lines.len());
+    (lines, quoted_limit)
 }
 
 /// Locates the prototype's own legacy skills-block sentinel
@@ -1358,17 +1401,18 @@ fn legacy_lines(canonical_text: &[u8]) -> Vec<LegacyLine<'_>> {
 /// mismatch alone else -- naming `needed` exactly as
 /// [`block_needed_names`] already does for this crate's own sentinel.
 ///
-/// Simplification: unlike the prototype's own `quoted_markers`, this
-/// scan does not shrink its search window for a trailing, never-closed
-/// fence; none of this crate's own fixtures leave a fence open to end
-/// of file, and [`LegacyMarkerFence`] already tracks open/close state
-/// precisely for every fence that does close.
+/// A trailing, never-closed fence runs to end of file exactly as the
+/// prototype's own `quoted_markers` treats it: a marker sitting after
+/// that fence's own opening line never explains a problem as quoted --
+/// read back from [`legacy_lines`]'s own cutoff, itself
+/// [`LegacyMarkerFence::opened_at`] -- even though, like every marker
+/// here, it is still found as a real one.
 fn legacy_block_outcome(
     hasher: &dyn ContentHasher,
     canonical_text: &[u8],
     needed: &str,
 ) -> LegacyBlockOutcome {
-    let lines = legacy_lines(canonical_text);
+    let (lines, quoted_limit) = legacy_lines(canonical_text);
 
     let begins: Vec<usize> = lines
         .iter()
@@ -1424,7 +1468,11 @@ fn legacy_block_outcome(
 
     if let Some(quoted) = lines
         .iter()
-        .position(|line| line.fenced && (line.is_begin || line.is_end))
+        .enumerate()
+        .find(|(index, line)| {
+            *index < quoted_limit && line.fenced && (line.is_begin || line.is_end)
+        })
+        .map(|(index, _)| index)
         && (!layout.is_empty() || edited)
     {
         layout.insert(
