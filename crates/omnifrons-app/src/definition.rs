@@ -1078,16 +1078,26 @@ const LEGACY_END_LINE: &str = "<!-- portable-agent:skills:end -->";
 /// begin marker, matched in full exactly as its own
 /// `BLOCK_BEGIN_PATTERN.fullmatch` would: [`LEGACY_BEGIN_PREFIX`], then
 /// exactly 64 lowercase hex characters (returned), then
-/// [`LEGACY_BEGIN_SUFFIX`], and nothing else on the line.
-fn legacy_begin_digest(line: &str) -> Option<&str> {
+/// [`LEGACY_BEGIN_SUFFIX`], and nothing else on the line. Matched
+/// bytewise against `line`'s own original bytes, never a decoded
+/// stand-in for them: the prefix, the suffix, and every valid digest
+/// character are themselves ASCII, so a byte-for-byte match is exact,
+/// and a line holding non-UTF-8 bytes simply fails to match -- it can
+/// never be mistaken for a marker.
+fn legacy_begin_digest(line: &[u8]) -> Option<&str> {
     let hex = line
-        .strip_prefix(LEGACY_BEGIN_PREFIX)?
-        .strip_suffix(LEGACY_BEGIN_SUFFIX)?;
-    (hex.len() == 64
+        .strip_prefix(LEGACY_BEGIN_PREFIX.as_bytes())?
+        .strip_suffix(LEGACY_BEGIN_SUFFIX.as_bytes())?;
+    let is_hex_digest = hex.len() == 64
         && hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
-    .then_some(hex)
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    if is_hex_digest {
+        // Every byte just checked is ASCII, so this can never fail.
+        std::str::from_utf8(hex).ok()
+    } else {
+        None
+    }
 }
 
 /// A minimal, line-at-a-time fence open/close toggle for
@@ -1160,21 +1170,24 @@ enum LegacyBlockOutcome {
     Refusal(String),
 }
 
-/// One decoded line of canonical text, classified for the legacy scan
-/// ([`legacy_lines`]).
+/// One line of canonical text, classified for the legacy scan
+/// ([`legacy_lines`]) over the ORIGINAL bytes -- never a decoded
+/// stand-in for them, so a body a caller slices out by [`Self::offset`]
+/// is always the exact bytes the prototype's own `sha256_hex(body)`
+/// would hash, non-UTF-8 or not.
 struct LegacyLine<'a> {
-    /// This line's text exactly as written, including its own
-    /// terminator when it has one -- the prototype's own
-    /// `data[start..end]` span for one line of
+    /// This line's own start offset within the canonical bytes
+    /// (including its own terminator) -- the prototype's own
+    /// `offsets[index]`, built the same way alongside
     /// `data.splitlines(keepends=True)`.
-    raw: &'a str,
-    /// [`Self::raw`] with a trailing `"\r\n"` or `"\n"` removed,
-    /// compared unindented and untrimmed, exactly as the prototype's
-    /// own `BLOCK_BEGIN_PATTERN.fullmatch`/`== BLOCK_END` would --
-    /// never trimmed the way a fence line is below: a marker with
-    /// incidental leading or trailing whitespace is not this exact
-    /// sentinel.
-    text: &'a str,
+    offset: usize,
+    /// This line's bytes with its own trailing `"\r\n"` or `"\n"`
+    /// terminator removed, matched unindented and untrimmed against
+    /// the exact marker bytes, exactly as the prototype's own
+    /// `BLOCK_BEGIN_PATTERN.fullmatch`/`== BLOCK_END` would -- never
+    /// trimmed the way a fence line is below: a marker with incidental
+    /// leading or trailing whitespace is not this exact sentinel.
+    text: &'a [u8],
     /// Whether [`Self::text`] is a begin marker line.
     is_begin: bool,
     /// Whether [`Self::text`] is the end marker line.
@@ -1183,51 +1196,63 @@ struct LegacyLine<'a> {
     begin_digest: Option<&'a str>,
     /// Whether a fenced code block was open around this line, fence
     /// lines themselves included (the prototype's own `fence_flags`,
-    /// read through [`LegacyMarkerFence`]).
+    /// read through [`LegacyMarkerFence`]). Decided from a lossily
+    /// decoded view of this one line alone -- safe because a fence
+    /// delimiter is itself ASCII, so a non-UTF-8 byte elsewhere on the
+    /// line can never turn a fence line into a plain one or back; this
+    /// flag never feeds the digest.
     fenced: bool,
 }
 
-/// `text` split into lines that each keep their own terminator (the
-/// prototype's own `data.splitlines(keepends=True)`, restricted to
-/// `"\n"` the way the rest of this scan already is): no trailing empty
-/// line is produced for text ending in a newline.
-fn lines_with_terminators(text: &str) -> Vec<&str> {
+/// `text` split into lines that each keep their own terminator and know
+/// their own start offset (the prototype's own
+/// `data.splitlines(keepends=True)` paired with its own `offsets`
+/// list, restricted to `"\n"` the way the rest of this scan already
+/// is): no trailing empty line is produced for text ending in a
+/// newline.
+fn lines_with_terminators(text: &[u8]) -> Vec<(usize, &[u8])> {
     let mut lines = Vec::new();
     let mut start = 0;
-    for (index, byte) in text.bytes().enumerate() {
+    for (index, &byte) in text.iter().enumerate() {
         if byte == b'\n' {
-            lines.push(&text[start..=index]);
+            lines.push((start, &text[start..=index]));
             start = index + 1;
         }
     }
     if start < text.len() {
-        lines.push(&text[start..]);
+        lines.push((start, &text[start..]));
     }
     lines
 }
 
-/// `raw`'s own text with one trailing line terminator removed.
-fn strip_line_ending(raw: &str) -> &str {
-    raw.strip_suffix('\n')
-        .map_or(raw, |rest| rest.strip_suffix('\r').unwrap_or(rest))
+/// `raw`'s own bytes with one trailing line terminator removed.
+fn strip_line_ending(raw: &[u8]) -> &[u8] {
+    let trimmed = raw.strip_suffix(b"\n").unwrap_or(raw);
+    trimmed.strip_suffix(b"\r").unwrap_or(trimmed)
 }
 
-/// Classifies every line of `decoded` for the legacy scan
+/// Classifies every line of `canonical_text` for the legacy scan
 /// ([`LegacyLine`]), tracking fence state across them with one
-/// [`LegacyMarkerFence`].
-fn legacy_lines(decoded: &str) -> Vec<LegacyLine<'_>> {
+/// [`LegacyMarkerFence`]. Operates on the ORIGINAL bytes throughout --
+/// nothing here ever runs a whole-buffer lossy decode, so marker
+/// matching and the body a caller later slices out by offset both stay
+/// exact for a body holding non-UTF-8 bytes; only the fence tracker
+/// (comment on [`LegacyLine::fenced`]) sees a decoded view, and only of
+/// one line at a time.
+fn legacy_lines(canonical_text: &[u8]) -> Vec<LegacyLine<'_>> {
     let mut fence = LegacyMarkerFence::default();
-    lines_with_terminators(decoded)
+    lines_with_terminators(canonical_text)
         .into_iter()
-        .map(|raw| {
+        .map(|(offset, raw)| {
             let text = strip_line_ending(raw);
-            let fenced = fence.advance(text.trim());
+            let decoded_text = String::from_utf8_lossy(text);
+            let fenced = fence.advance(decoded_text.trim());
             let begin_digest = legacy_begin_digest(text);
             LegacyLine {
-                raw,
+                offset,
                 text,
                 is_begin: begin_digest.is_some(),
-                is_end: text == LEGACY_END_LINE,
+                is_end: text == LEGACY_END_LINE.as_bytes(),
                 begin_digest,
                 fenced,
             }
@@ -1274,8 +1299,7 @@ fn legacy_block_outcome(
     canonical_text: &[u8],
     needed: &str,
 ) -> LegacyBlockOutcome {
-    let decoded = String::from_utf8_lossy(canonical_text);
-    let lines = legacy_lines(&decoded);
+    let lines = legacy_lines(canonical_text);
 
     let begins: Vec<usize> = lines
         .iter()
@@ -1307,7 +1331,7 @@ fn legacy_block_outcome(
         ));
     } else if lines[(ends[0] + 1)..]
         .iter()
-        .any(|line| !line.text.trim().is_empty())
+        .any(|line| !line.text.iter().all(u8::is_ascii_whitespace))
     {
         layout.push(format!(
             "text follows the end marker on line {}; the block must be the last thing in \
@@ -1319,12 +1343,14 @@ fn legacy_block_outcome(
     let edited = if begins.len() > 1 || ends.is_empty() {
         false
     } else {
-        let body: String = lines[(first + 1)..ends[0]]
-            .iter()
-            .map(|line| line.raw)
-            .collect();
+        // The exact original bytes between the two markers -- the
+        // prototype's own `data[offsets[first + 1] : offsets[ends[0]]]`
+        // -- never a decoded-and-reencoded restatement of them, so a
+        // body holding non-UTF-8 bytes still hashes to the digest the
+        // prototype itself would record.
+        let body = &canonical_text[lines[first + 1].offset..lines[ends[0]].offset];
         let recorded = lines[first].begin_digest.unwrap_or_default();
-        hasher.sha256(body.as_bytes()).to_hex() != recorded
+        hasher.sha256(body).to_hex() != recorded
     };
 
     if let Some(quoted) = lines

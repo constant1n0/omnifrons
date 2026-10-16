@@ -2345,6 +2345,381 @@ fn verify_reports_migrate_for_a_legacy_block_beside_an_intact_omnifrons_block() 
     );
 }
 
+// -- verify: a legacy block's body hashes its own raw bytes --
+
+/// An intact-shaped legacy block whose one-line body holds a raw `0xFF`
+/// byte, not valid UTF-8 on its own: the prototype hashes the exact
+/// body bytes (`sha256_hex(body)` over a `data[...]` slice, never a
+/// decoded-and-reencoded restatement of them), so this must still be
+/// found intact and reported as a migration, never refused. Before the
+/// fix, `legacy_block_outcome` ran the whole file through
+/// `String::from_utf8_lossy` first, so the `0xFF` byte became one
+/// U+FFFD and the rehashed body (now 3 bytes, `EF BF BD`, plus the
+/// line terminator) could never match the digest recorded for the
+/// real 2-byte body -- a spurious `edited_block` refusal for a block
+/// that was never edited.
+///
+/// Real sha256 of the exact 2-byte body `\xff\n`, computed separately
+/// with a `python3` script
+/// (`hashlib.sha256(bytes([0xff, 0x0a])).hexdigest()`), is
+/// `e4688624e5f1ad0629505e6768e3bb36244f2f3e33e751215afa820334a76ed3` --
+/// cited only to confirm which exact bytes the real prototype would
+/// hash. The app's own `FakeHasher` is not real sha256 (it is a
+/// deterministic, non-cryptographic fold -- see
+/// `crates/omnifrons-app/src/contract/publication.rs`), so the fixture
+/// below records whatever digest `FakeHasher` produces for the same
+/// two bytes instead, since that is the hasher `verify` actually calls
+/// here.
+#[test]
+fn verify_reports_migrate_for_a_legacy_block_whose_body_holds_a_non_utf8_byte() {
+    let project = TempDir::new("verify-legacy-non-utf8-intact");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let body: &[u8] = &[0xFF, b'\n'];
+    let digest_hex = hasher.sha256(body).to_hex();
+    let mut agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n\n".to_vec();
+    agents_bytes.extend_from_slice(
+        format!("<!-- portable-agent:skills:begin sha256={digest_hex} -->\n").as_bytes(),
+    );
+    agents_bytes.extend_from_slice(body);
+    agents_bytes.extend_from_slice(b"<!-- portable-agent:skills:end -->\n");
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
+                .to_string()
+        ],
+        "a body holding a non-UTF-8 byte must still be hashed over its own exact bytes, \
+         never a lossy-decoded restatement of them"
+    );
+}
+
+/// The same non-UTF-8 one-line body, but altered by one byte after its
+/// digest was recorded: fixing the lossy-decode bug above must not
+/// stop a genuine edit from being caught -- `verify` still refuses with
+/// `edited_block`, exactly as its plain-ASCII sibling
+/// (`verify_refuses_a_legacy_block_whose_body_no_longer_matches_its_digest`)
+/// already pins for a UTF-8 body.
+#[test]
+fn verify_refuses_a_legacy_block_whose_non_utf8_body_was_altered_by_one_byte() {
+    let project = TempDir::new("verify-legacy-non-utf8-edited");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let recorded_body: &[u8] = &[0xFF, b'\n'];
+    let actual_body: &[u8] = &[0xFE, b'\n'];
+    let digest_hex = hasher.sha256(recorded_body).to_hex();
+    let mut agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n\n".to_vec();
+    agents_bytes.extend_from_slice(
+        format!("<!-- portable-agent:skills:begin sha256={digest_hex} -->\n").as_bytes(),
+    );
+    agents_bytes.extend_from_slice(actual_body);
+    agents_bytes.extend_from_slice(b"<!-- portable-agent:skills:end -->\n");
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index \
+             skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+// -- verify: untested legacy `block_layout` causes, pinned exactly --
+
+/// A second legacy begin marker before the paired end marker: `verify`
+/// refuses with the prototype's own `block_layout` wording naming the
+/// second marker's own line (`find_block`'s own "holds a second begin
+/// marker" cause) -- the digest is never even checked once a second
+/// begin marker makes the body ambiguous, exactly as the prototype's
+/// own `body, edited = data[offsets[first + 1]:], False` branch skips
+/// it.
+#[test]
+fn verify_refuses_a_legacy_block_with_a_second_begin_marker() {
+    let project = TempDir::new("verify-legacy-second-begin");
+    let workspace = project.workspace();
+    let placeholder_digest = "0".repeat(64);
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\n<!-- portable-agent:skills:begin \
+         sha256={placeholder_digest} -->\n<!-- portable-agent:skills:begin \
+         sha256={placeholder_digest} -->\n<!-- portable-agent:skills:end -->\n"
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: line 6 \
+             holds a second begin marker. Fix the markers by hand or index \
+             skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+/// Text after the end marker, with the body otherwise untouched (its
+/// digest still matches): `verify` refuses with the prototype's own
+/// "the block must be the last thing in the file" cause, naming the
+/// end marker's own line, and never also reports the digest mismatch
+/// clause since there is none here.
+#[test]
+fn verify_refuses_a_legacy_block_with_text_after_the_end_marker() {
+    let project = TempDir::new("verify-legacy-trailing-text");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest_hex = hasher.sha256(b"sample\n").to_hex();
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\n<!-- portable-agent:skills:begin \
+         sha256={digest_hex} -->\nsample\n<!-- portable-agent:skills:end -->\nOne more line \
+         that must not follow the block.\n"
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: text \
+             follows the end marker on line 7; the block must be the last thing in the \
+             file. Fix the markers by hand or index skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+/// The same trailing text, this time with a body that was also altered
+/// after its digest was recorded: both an unpaired layout problem and
+/// a digest mismatch apply at once, so `verify` joins the prototype's
+/// own layout cause with its own extra "its recorded sha256 no longer
+/// matches" clause, appended last, exactly as `plan_block` joins them
+/// for a `block.edited` block whose `layout` is also non-empty.
+#[test]
+fn verify_refuses_a_legacy_block_with_trailing_text_and_a_mismatched_digest() {
+    let project = TempDir::new("verify-legacy-trailing-text-edited");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    // Recorded for "sample\n"; the text on disk holds "sbmple\n"
+    // instead, the same one-byte change the plain digest-mismatch
+    // sibling test above uses.
+    let digest_hex = hasher.sha256(b"sample\n").to_hex();
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\n<!-- portable-agent:skills:begin \
+         sha256={digest_hex} -->\nsbmple\n<!-- portable-agent:skills:end -->\nOne more line \
+         that must not follow the block.\n"
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: text \
+             follows the end marker on line 7; the block must be the last thing in the \
+             file; its recorded sha256 no longer matches. Fix the markers by hand or index \
+             skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+/// A legacy pair placed *before* an already-intact omnifrons block --
+/// the reverse of `verify_reports_migrate_for_a_legacy_block_beside_an_intact_omnifrons_block`,
+/// whose own doc comment states the prototype's rule this exercises:
+/// `find_block` reads everything past its own end marker as its own
+/// tail, omnifrons sentinel or not, so a block placed *after* the
+/// legacy pair reads as disqualifying text following the end marker,
+/// not as a second, independent block. The legacy pair itself is still
+/// intact (its own empty body matches its own recorded digest), so the
+/// only cause is the trailing text, and the already-indexed skill
+/// makes `needed` read "the precedence rule" rather than the skill's
+/// own path.
+#[test]
+fn verify_refuses_a_legacy_block_placed_before_an_intact_omnifrons_block() {
+    let project = TempDir::new("verify-legacy-before-intact-omnifrons");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let row = SkillRow {
+        name: "sample".to_string(),
+        description: "A sample skill".to_string(),
+        path: "skills/sample/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    // Empty body between adjacent markers, as in the sibling ordering
+    // test: its digest is the recorded one, so the legacy pair itself
+    // is intact and the only refusal cause is the trailing text.
+    let legacy_digest_hex = hasher.sha256(b"").to_hex();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={legacy_digest_hex} -->\n<!-- \
+         portable-agent:skills:end -->"
+    );
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n\n{rendered}\n")
+            .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\ndescription: A sample skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: text \
+             follows the end marker on line 6; the block must be the last thing in the \
+             file. Fix the markers by hand or index the precedence rule by hand"
+                .to_string()
+        ],
+        "the prototype's own rule: the block must be the last thing in the file, so a \
+         legacy pair placed before another block reads that trailing block as disqualifying \
+         text, never as a second, independent block"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill
