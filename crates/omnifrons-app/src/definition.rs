@@ -44,7 +44,8 @@ use omnifrons_domain::guidance::{ManagedBlock, ManagedFileError, ManagedFileKind
 use omnifrons_domain::hosts;
 use omnifrons_domain::nesting::{self, Ancestor, ChainLink, NestingError, Parent, RootRelation};
 use omnifrons_domain::skills_index::{
-    SkillIndexStatus, SkillRow, block_needed, read_skill_index, render_body, rows_to_generate,
+    SkillIndexStatus, SkillRow, block_needed, has_precedence_phrases, read_skill_index,
+    render_body, rows_to_generate,
 };
 use omnifrons_domain::skills_safety::{
     InvalidUnicodeField, SkillMetadataError, read_skill_metadata, unsafe_row_fields,
@@ -624,14 +625,16 @@ pub fn scan(
 ///   never a problem describing what is wrong with the canonical text
 ///   itself.
 ///
-/// Within the refusals and pending operations this pass *can* know, two
-/// further simplifications are documented where they are computed: the
+/// Within the refusals and pending operations this pass *can* know, one
+/// further simplification is documented where it is computed: the
 /// `block_layout`/`edited_block` refusal detail never repeats
 /// `build_plan`'s own dynamic list of malformed-marker causes (Rust's
-/// [`ManagedFileError`] does not distinguish them), and the regenerated
-/// block's own precedence-rule need is read from the *whole* canonical
-/// text ([`SkillIndexStatus::precedence`]) rather than only the text
-/// before a located block, as `build_plan`'s own `plan_block` does.
+/// [`ManagedFileError`] does not distinguish them). The regenerated
+/// block's own precedence-rule need is read from the text *before* a
+/// located block, exactly as `build_plan`'s own `plan_block` does
+/// (never from the whole canonical text, which a block already stating
+/// the rule would always satisfy on its own) -- see
+/// [`skills_block_outcome`]'s own documentation.
 ///
 /// # Errors
 ///
@@ -741,21 +744,28 @@ fn verify_problems_after_state(
     let status = read_skill_index(canonical_text.unwrap_or(&[]), &discovered, &root_absolute);
 
     if let Some(text) = canonical_text {
+        // Computed once, before the block outcome: a legacy marker
+        // means `plan_block`'s own `find_block` would already have
+        // found *a* block (just not this crate's own sentinel format),
+        // and the prototype's own `plan_block` always plans exactly one
+        // operation once a block is found (`replace_block`, never
+        // `append_block` too). Mirroring that, the migration replaces
+        // whatever ordinary pending `skills_block_outcome` would
+        // otherwise report, rather than sitting beside it as a second,
+        // independent skills-block index.
+        let legacy_pending = legacy_block_pending(text);
         match skills_block_outcome(ports.hasher, text, &status, &rows, &root_absolute) {
             BlockOutcome::Refusal(refusal) => return vec![refusal],
             BlockOutcome::Pending(pending) => {
                 let mut problems =
                     wrapper_problems(classification.state, ports.hasher, identity_files);
-                problems.push(pending);
-                if let Some(migrate) = legacy_block_pending(text) {
-                    problems.push(migrate);
-                }
+                problems.push(legacy_pending.unwrap_or(pending));
                 return problems;
             }
             BlockOutcome::None => {
                 let mut problems =
                     wrapper_problems(classification.state, ports.hasher, identity_files);
-                if let Some(migrate) = legacy_block_pending(text) {
+                if let Some(migrate) = legacy_pending {
                     problems.push(migrate);
                 }
                 return problems;
@@ -929,7 +939,14 @@ enum BlockOutcome {
 /// through `build_plan`): a malformed or hand-edited block always
 /// refuses; otherwise, no block yet and [`block_needed`] saying one is
 /// due appends one, and an already-located block whose body no longer
-/// matches a fresh render of it regenerates one.
+/// matches a fresh render of it regenerates one. For that regenerate
+/// comparison, both the covered-skills lookup and the precedence-rule
+/// need are read only from the text *before* the located block
+/// (`prefix_text`), exactly as the prototype's own `plan_block` reads
+/// `covered` and `rule` from its own `prefix` -- never from `status`,
+/// which was computed over the *whole* canonical text and so would
+/// already count the block's own rows and rule section as already
+/// stated, making a regenerate decision that can never go stable.
 fn skills_block_outcome(
     hasher: &dyn ContentHasher,
     canonical_text: &[u8],
@@ -972,9 +989,19 @@ fn skills_block_outcome(
         };
     };
 
-    let rule_needed = !status.precedence;
-    let prefix = decoded[..located.span.start].as_bytes();
-    let fresh_rows = rows_to_generate(prefix, rows, root_absolute);
+    // The prototype's own `plan_block` reads `rule` from the text
+    // *before* the block (`rule = not has_precedence_phrases(prefix)`),
+    // never from `status.precedence`, which spans the *whole* canonical
+    // text and so is already satisfied by the very rule section this
+    // block carries. Reusing `status.precedence` here would make a
+    // block this crate generated with the rule count as already
+    // stating it outside the block too: the fresh render would then
+    // always omit the rule the existing body carries, never match it,
+    // and `verify` would report `pending: regenerate ...` forever for
+    // an otherwise canonical agent.
+    let prefix_text = &decoded[..located.span.start];
+    let rule_needed = !has_precedence_phrases(prefix_text);
+    let fresh_rows = rows_to_generate(prefix_text.as_bytes(), rows, root_absolute);
     let fresh_body = render_body(&fresh_rows, rule_needed);
     if located.body == fresh_body {
         BlockOutcome::None
@@ -1027,6 +1054,13 @@ const LEGACY_SKILLS_BLOCK_MARKER: &str = "<!-- portable-agent:skills:begin";
 /// to this crate's own sentinel format, when the canonical text still
 /// carries one -- outside the prototype's own vocabulary, since the
 /// prototype never needs to migrate itself (ADR-0005 sub-slice 1e-D).
+/// [`verify_problems_after_state`] uses this result to *replace*
+/// whatever ordinary skills-block pending [`skills_block_outcome`]
+/// would otherwise report, never to report both: the prototype's own
+/// `plan_block` only ever plans one skills-block operation once
+/// `find_block` has located a block of any format, and a legacy marker
+/// here means exactly that -- a block already exists, just not in this
+/// crate's own sentinel format.
 fn legacy_block_pending(canonical_text: &[u8]) -> Option<String> {
     let decoded = String::from_utf8_lossy(canonical_text);
     decoded.contains(LEGACY_SKILLS_BLOCK_MARKER).then(|| {

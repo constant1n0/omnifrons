@@ -23,6 +23,7 @@ use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSn
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, RootState, WRAPPER};
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock};
 use omnifrons_domain::nesting::{NestingError, Parent};
+use omnifrons_domain::skills_index::{PRECEDENCE_RULE, SkillRow, render_body};
 use omnifrons_domain::warnings::WarningCode;
 
 /// A drop-guard temp directory standing in for a scanned workspace.
@@ -1299,6 +1300,570 @@ fn verify_reports_conflict_state_and_refusal() {
             "state is conflict".to_string(),
             "refused (conflict): CLAUDE.md and AGENTS.md hold different content; choose the \
              canonical file with --canonical-from CLAUDE.md or --canonical-from AGENTS.md"
+                .to_string(),
+        ]
+    );
+}
+
+// -- verify: skills-block stability --
+
+/// (h) A skills block this crate already generated for its one
+/// discovered skill, including the precedence rule, reports no problem
+/// at all: `verify` must not regenerate a block that already says
+/// exactly what a fresh render would say. Before the fix, the
+/// regenerate decision read `rule_needed` from
+/// [`omnifrons_domain::skills_index::SkillIndexStatus::precedence`]
+/// over the *whole* canonical text; since the block's own rule section
+/// always satisfies that whole-text check, `rule_needed` was always
+/// `false` once a block existed, so the fresh render always omitted
+/// the rule section this very block carries, never matched
+/// `located.body`, and `verify` reported `pending: regenerate ...`
+/// forever for an otherwise canonical agent. The fix reads it from the
+/// text *before* the block instead, exactly as the prototype's own
+/// `plan_block` does (`rule = not has_precedence_phrases(prefix)`), so
+/// a block already stating the rule renders the same body again.
+#[test]
+fn verify_reports_canonical_for_a_block_this_crate_already_generated() {
+    let project = TempDir::new("verify-stable-block");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let row = SkillRow {
+        name: "sample".to_string(),
+        description: "A sample skill".to_string(),
+        path: "skills/sample/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{rendered}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\ndescription: A sample skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
+/// (i) The same block, but a second skill was discovered since it was
+/// generated: `verify` reports exactly one `pending: regenerate ...`,
+/// naming both rows and the precedence rule -- never the `append`
+/// shape a `None`-located block would report, and never silently
+/// dropping the rule the way the pre-fix whole-text `rule_needed` did
+/// (the previous test). The rule is still needed because the text
+/// before the block never states it on its own; the prototype's own
+/// `plan_block` computes `rule` the same way, over `prefix`, never the
+/// whole file.
+#[test]
+fn verify_reports_one_regenerate_pending_when_a_skill_was_added_since() {
+    let project = TempDir::new("verify-stale-block");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let sample_row = SkillRow {
+        name: "sample".to_string(),
+        description: "A sample skill".to_string(),
+        path: "skills/sample/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[sample_row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{rendered}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\ndescription: A sample skill\n---\n".to_vec(),
+        )
+        .skill(
+            "skills/newer/SKILL.md",
+            b"---\nname: newer\ndescription: A newer skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: regenerate the skill index block in AGENTS.md (2 skill rows and the \
+             precedence rule)"
+                .to_string()
+        ]
+    );
+}
+
+// -- verify: legacy skills-block migration --
+
+/// (j) A legacy `portable-agent:skills:begin` block and a discovered
+/// skill it does not yet link: before the fix, `verify` reported both
+/// the ordinary `pending: append ...` [`skills_block_outcome`] would
+/// plan for a `None`-located block, and a separate
+/// `pending: migrate ...`, naming two indexes beside each other. The
+/// prototype's own `plan_block` always finds at most one block
+/// (`find_block`) and always plans exactly one operation once a block
+/// is found (`replace_block`, never `append_block` too); mirroring
+/// that, the migration is the *only* skills-block operation once a
+/// legacy marker is found, replacing the ordinary pending rather than
+/// sitting beside it.
+#[test]
+fn verify_reports_only_migrate_for_a_legacy_block_with_an_unlinked_skill() {
+    let project = TempDir::new("verify-legacy-append");
+    let workspace = project.workspace();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={} -->\n<!-- portable-agent:skills:end -->",
+        "0".repeat(64)
+    );
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
+                .to_string()
+        ]
+    );
+}
+
+// -- verify: untested branches pinned exactly --
+
+/// (k) A malformed skills-block sentinel pair -- a begin line with no
+/// matching end -- refuses with `block_layout`, naming the skill
+/// `verify` cannot index without one, rather than silently treating
+/// the block as absent: the prototype's own `find_block` never reports
+/// no block once it has seen a begin marker (`begins=1, ends=0` still
+/// returns an `IndexBlock`, just not an intact one), and `plan_block`
+/// raises `EditedBlock("block_layout", ...)` for it.
+#[test]
+fn verify_refuses_a_malformed_skills_block_sentinel_pair() {
+    let project = TempDir::new("verify-block-layout");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let placeholder =
+        ManagedBlock::skills("placeholder", &digest).expect("a non-empty body builds a block");
+    let begin_line = placeholder.begin_sentinel();
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{begin_line}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index \
+             skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+/// (l) A lone, unpaired `\u` escape in a skill's front matter refuses
+/// before any row is generated, wording the singular and plural forms
+/// correctly -- one surrogate in one skill's `description:`, two
+/// (non-adjacent high surrogates, so neither pairs up) in another's --
+/// and quoting each path with the prototype's own `repr()` convention
+/// (the prototype's `invalid_unicode_fields`).
+#[test]
+fn verify_refuses_skills_whose_metadata_holds_lone_surrogates() {
+    let project = TempDir::new("verify-invalid-unicode");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let one_bytes = br#"---
+name: "one"
+description: "x\ud800y"
+---
+"#
+    .to_vec();
+    let two_bytes = br#"---
+name: "two"
+description: "x\ud800y\ud801z"
+---
+"#
+    .to_vec();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("skills/one/SKILL.md", one_bytes)
+        .skill("skills/two/SKILL.md", two_bytes)
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (unsafe_skill_metadata): these local skills cannot be written into the \
+             skill index of AGENTS.md: 'skills/one/SKILL.md' (its description holds invalid \
+             Unicode: the lone surrogate U+D800, an unpaired \\u escape, cannot be written as \
+             UTF-8); 'skills/two/SKILL.md' (its description holds invalid Unicode: the lone \
+             surrogates U+D800, U+D801, unpaired \\u escapes, cannot be written as UTF-8). \
+             The index quotes each skill's name and description in AGENTS.md, which is UTF-8 \
+             text, and a lone surrogate has no UTF-8 form. No skill is ever edited for you: \
+             in each SKILL.md named here, edit the `name:` or `description:` named so that no \
+             \\u escape stands alone (write the character itself, or a full pair such as \
+             \\ud83d\\ude00), then run the dry-run again"
+                .to_string()
+        ]
+    );
+}
+
+/// (m) The same legacy marker, but its rows and precedence rule are
+/// already current: `block_needed` alone would say nothing is pending,
+/// yet `verify` still reports the migration, because the block's
+/// *family* (the prototype's own sentinel, not this crate's) is itself
+/// the problem. Unaffected by the fix above, since this path never
+/// reaches `skills_block_outcome`'s `Pending` branch -- it already
+/// passes before the fix; no RED needed for this shape.
+#[test]
+fn verify_reports_migrate_for_a_legacy_block_whose_rows_are_current() {
+    let project = TempDir::new("verify-legacy-current");
+    let workspace = project.workspace();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={} -->\n\
+         ## Local skill index\n\n\
+         | Skill | Use when | Path |\n\
+         | --- | --- | --- |\n\
+         | sample | x | [sample](skills/sample/SKILL.md) |\n\n\
+         ## Local skill precedence\n\n\
+         {PRECEDENCE_RULE}\n\
+         <!-- portable-agent:skills:end -->",
+        "0".repeat(64)
+    );
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
+                .to_string()
+        ]
+    );
+}
+
+/// (n) `CLAUDE.md` imports `AGENTS.md` but is not byte-exact (missing
+/// its trailing newline): `verify` reports the pending wrapper write
+/// with `describe_operation`'s own `"replaces sha256 ..."` wording,
+/// the first 12 hex characters of the *current* `CLAUDE.md` bytes'
+/// own digest -- never `AGENTS.md`'s, and never the `"creates the
+/// file"` wording [`RootState::AgentsOnly`] gets when there is no
+/// `CLAUDE.md` to replace at all.
+#[test]
+fn verify_reports_near_wrapper_state_and_replaces_sha256_of_claude() {
+    let project = TempDir::new("verify-near-wrapper");
+    let workspace = project.workspace();
+    let claude_bytes = b"@AGENTS.md";
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, claude_bytes),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    let wrapper_pending = format!(
+        "pending: write the wrapper CLAUDE.md (replaces sha256 {})",
+        &hasher.sha256(claude_bytes).to_hex()[..12]
+    );
+    assert_eq!(report.state, RootState::NearWrapper);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec!["state is near_wrapper".to_string(), wrapper_pending]
+    );
+}
+
+/// (o) `CLAUDE.md` is a symlink to something other than `AGENTS.md`,
+/// and no `AGENTS.md` exists to accept it as the one link `classify`
+/// trusts: `"state is unsafe"`, plus the refusal `build_plan` raises
+/// for it (`report.classification.reason`, read back as-is).
+#[test]
+fn verify_reports_unsafe_state_and_refusal_for_a_stray_claude_symlink() {
+    let project = TempDir::new("verify-unsafe");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![symlinked_identity(IdentityKind::Claude, "nowhere.md")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Unsafe);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "state is unsafe".to_string(),
+            "refused (unsafe): CLAUDE.md is a symlink to nowhere.md".to_string(),
+        ]
+    );
+}
+
+/// (p) No identity file at all: [`RootState::None`] yields exactly
+/// `"state is none"`, the prototype's own `if report.state == NONE:
+/// return plan` read back through `verify_agent` -- an unrefused,
+/// empty plan, so no refusal and no pending operation ever joins it.
+#[test]
+fn verify_reports_none_state_with_only_the_state_problem() {
+    let project = TempDir::new("verify-none-state");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new().build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::None);
+    assert!(!report.canonical);
+    assert_eq!(report.problems, vec!["state is none".to_string()]);
+}
+
+/// (q) `CLAUDE.md` holds the instructions and there is no `AGENTS.md`
+/// at all: `classify` names `CLAUDE.md` as the source
+/// ([`RootState::ClaudeOnly`]), so the skills check reads *its* bytes,
+/// not a nonexistent `AGENTS.md` -- a wrong source would make
+/// `canonical_bytes` return `None`, and this pending text would never
+/// appear at all.
+#[test]
+fn verify_reads_claude_md_as_the_source_for_claude_only_state() {
+    let project = TempDir::new("verify-claude-only-source");
+    let workspace = project.workspace();
+    let claude_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Claude, claude_bytes)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::ClaudeOnly);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "state is claude_only".to_string(),
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
+                .to_string(),
+        ]
+    );
+}
+
+/// (r) `CLAUDE.md` and `AGENTS.md` are byte-identical but neither the
+/// wrapper nor an import: [`RootState::IdenticalCopies`] still names
+/// `AGENTS.md` as the source (`classify_pair`'s own
+/// `(RootState::IdenticalCopies, IdentityKind::Agents, ...)`), so the
+/// skills check and its pending text are unaffected by the duplicate
+/// `CLAUDE.md`.
+#[test]
+fn verify_reads_agents_md_as_the_source_for_identical_copies_state() {
+    let project = TempDir::new("verify-identical-copies-source");
+    let workspace = project.workspace();
+    let shared_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, shared_bytes),
+                identity(IdentityKind::Claude, shared_bytes),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::IdenticalCopies);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "state is identical_copies".to_string(),
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
                 .to_string(),
         ]
     );
