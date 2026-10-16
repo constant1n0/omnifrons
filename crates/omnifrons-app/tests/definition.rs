@@ -1211,6 +1211,62 @@ fn verify_refuses_a_skill_whose_description_holds_an_unsafe_at_token() {
     );
 }
 
+/// The lone-surrogate refusal's path is formatted with this crate's own
+/// `python_repr`, which single-quotes a path unless it holds a single
+/// quote and no double quote -- then it switches to double quotes,
+/// exactly like Python's own `repr()` (`python3 -c
+/// "print(repr(\"skills/it's/SKILL.md\"))"` prints
+/// `"skills/it's/SKILL.md"`).
+#[test]
+fn verify_refuses_a_skill_path_holding_an_apostrophe_in_double_quotes() {
+    let project = TempDir::new("verify-apostrophe-path");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let skill_bytes = br#"---
+name: "mail-helper"
+description: "x\ud800y"
+---
+"#
+    .to_vec();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("skills/it's/SKILL.md", skill_bytes)
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (unsafe_skill_metadata): these local skills cannot be written into the \
+             skill index of AGENTS.md: \"skills/it's/SKILL.md\" (its description holds \
+             invalid Unicode: the lone surrogate U+D800, an unpaired \\u escape, cannot be \
+             written as UTF-8). The index quotes each skill's name and description in \
+             AGENTS.md, which is UTF-8 text, and a lone surrogate has no UTF-8 form. No \
+             skill is ever edited for you: in each SKILL.md named here, edit the `name:` or \
+             `description:` named so that no \\u escape stands alone (write the character \
+             itself, or a full pair such as \\ud83d\\ude00), then run the dry-run again"
+                .to_string()
+        ]
+    );
+}
+
 /// (f) A hand-edited skills block: its recorded sha256 no longer
 /// matches its body, so `verify` refuses rather than planning to
 /// regenerate over a human's own edit (the prototype's own
@@ -1430,6 +1486,68 @@ fn verify_reports_one_regenerate_pending_when_a_skill_was_added_since() {
                 .to_string()
         ]
     );
+}
+
+/// A block that already exists, already covers every discovered skill,
+/// and already states the precedence rule -- all from the text
+/// *before* the block -- is left alone exactly as the prototype's own
+/// `plan_block` leaves it: its upfront gate (`if not status.missing and
+/// status.precedence: return None`, read over the *whole* canonical
+/// text, which already counts the block's own rows and rule section as
+/// coverage) returns with nothing pending before the block is ever
+/// compared to a fresh render of it. A stale row the block itself
+/// still carries -- here, for the one skill the prefix text now also
+/// links on its own -- never turns into a `pending: regenerate ... ()`
+/// with an empty parenthetical.
+#[test]
+fn verify_reports_nothing_pending_for_a_stale_block_the_prefix_already_covers() {
+    let project = TempDir::new("verify-stale-block-covered");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let sample_row = SkillRow {
+        name: "sample".to_string(),
+        description: "A sample skill".to_string(),
+        path: "skills/sample/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    // Generated when the skill was not yet linked anywhere else; the
+    // block still carries that row and the rule, even though the text
+    // below now links the skill on its own, before the block.
+    let body = render_body(&[sample_row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent. See [sample](skills/sample/SKILL.md) \
+         for the sample skill.\n\n{PRECEDENCE_RULE}\n\n{rendered}\n"
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\ndescription: A sample skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, Vec::<String>::new());
 }
 
 // -- verify: legacy skills-block migration --
@@ -1862,6 +1980,52 @@ fn verify_reads_agents_md_as_the_source_for_identical_copies_state() {
         report.problems,
         vec![
             "state is identical_copies".to_string(),
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
+                .to_string(),
+        ]
+    );
+}
+
+/// When both the `CLAUDE.md` wrapper write and a skills-block operation
+/// are pending at once, `verify` reports the wrapper first: the
+/// prototype's own `plan_operations` places the wrapper write among
+/// its returned steps, and `with_block_step` always appends the
+/// skill-index block operation last, after every step
+/// `plan_operations` already returned.
+#[test]
+fn verify_reports_the_wrapper_write_before_the_skills_block_pending() {
+    let project = TempDir::new("verify-wrapper-then-block");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, agents_bytes)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::AgentsOnly);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "state is agents_only".to_string(),
+            "pending: write the wrapper CLAUDE.md (creates the file)".to_string(),
             "pending: append the skill index block in AGENTS.md (1 skill rows and the \
              precedence rule)"
                 .to_string(),

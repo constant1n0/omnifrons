@@ -793,7 +793,12 @@ fn quoted_words(words: &[String]) -> String {
 /// `\n`/`\r`/`\t`. Scoped to what a project-relative path or a short
 /// word needs; it does not reproduce Python's escaping of every other
 /// control character or non-printable codepoint.
-fn python_repr(value: &str) -> String {
+///
+/// Public so the app layer's own `verify` (`omnifrons_app::definition`)
+/// can format a skill path the same way, rather than keeping a second,
+/// divergent copy that never learned this quote-switching rule.
+#[must_use]
+pub fn python_repr(value: &str) -> String {
     let quote = if value.contains('\'') && !value.contains('"') {
         '"'
     } else {

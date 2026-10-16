@@ -48,7 +48,7 @@ use omnifrons_domain::skills_index::{
     render_body, rows_to_generate,
 };
 use omnifrons_domain::skills_safety::{
-    InvalidUnicodeField, SkillMetadataError, read_skill_metadata, unsafe_row_fields,
+    InvalidUnicodeField, SkillMetadataError, python_repr, read_skill_metadata, unsafe_row_fields,
 };
 use omnifrons_domain::warnings::{AgentInput, ChainAncestor, Warning, agent_warnings};
 
@@ -879,16 +879,6 @@ fn invalid_unicode_problems(path: &str, fields: &[InvalidUnicodeField]) -> Vec<S
         .collect()
 }
 
-/// A minimal Python `repr()` of a plain POSIX path (the prototype's own
-/// `skill!r`): single-quoted, with a backslash or embedded single quote
-/// escaped. A skill path discovered through this crate's own
-/// [`DefinitionTree`] port never holds anything else this pass needs to
-/// escape.
-fn python_repr(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
-    format!("'{escaped}'")
-}
-
 /// The `unsafe_skill_metadata` detail for a lone surrogate (the
 /// prototype's own `invalid_unicode_detail`).
 fn invalid_unicode_detail(problems: &[String]) -> String {
@@ -938,15 +928,17 @@ enum BlockOutcome {
 /// without planning a write (the prototype's own `plan_block`, called
 /// through `build_plan`): a malformed or hand-edited block always
 /// refuses; otherwise, no block yet and [`block_needed`] saying one is
-/// due appends one, and an already-located block whose body no longer
-/// matches a fresh render of it regenerates one. For that regenerate
-/// comparison, both the covered-skills lookup and the precedence-rule
-/// need are read only from the text *before* the located block
-/// (`prefix_text`), exactly as the prototype's own `plan_block` reads
-/// `covered` and `rule` from its own `prefix` -- never from `status`,
-/// which was computed over the *whole* canonical text and so would
-/// already count the block's own rows and rule section as already
-/// stated, making a regenerate decision that can never go stable.
+/// due appends one, a located block [`block_needed`] says is not due at
+/// all is left alone, and an already-located, still-due block whose
+/// body no longer matches a fresh render of it regenerates one. For
+/// that regenerate comparison, both the covered-skills lookup and the
+/// precedence-rule need are read only from the text *before* the
+/// located block (`prefix_text`), exactly as the prototype's own
+/// `plan_block` reads `covered` and `rule` from its own `prefix` --
+/// never from `status`, which was computed over the *whole* canonical
+/// text and so would already count the block's own rows and rule
+/// section as already stated, making a regenerate decision that can
+/// never go stable.
 fn skills_block_outcome(
     hasher: &dyn ContentHasher,
     canonical_text: &[u8],
@@ -988,6 +980,21 @@ fn skills_block_outcome(
             BlockOutcome::None
         };
     };
+
+    // The prototype's own `plan_block` checks this same gate --
+    // `if not status.missing and status.precedence: return None` --
+    // before it ever looks for a block at all, over `status`, which is
+    // read from the *whole* canonical text and so already counts the
+    // block's own rows and rule section as coverage. Mirrored here for
+    // a block that *is* located: when the whole text already covers
+    // every discovered skill and already states the rule somewhere,
+    // the prototype leaves the block alone outright, even one whose
+    // body a fresh, prefix-only render would no longer match -- it
+    // never reaches a `regenerate` operation, and never describes one
+    // with an empty parenthetical.
+    if !block_needed(status) {
+        return BlockOutcome::None;
+    }
 
     // The prototype's own `plan_block` reads `rule` from the text
     // *before* the block (`rule = not has_precedence_phrases(prefix)`),
