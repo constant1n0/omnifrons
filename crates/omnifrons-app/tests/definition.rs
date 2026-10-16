@@ -2032,3 +2032,239 @@ fn verify_reports_the_wrapper_write_before_the_skills_block_pending() {
         ]
     );
 }
+
+// -- verify: a real legacy block, not merely a mentioned marker --
+
+/// A legacy begin/end marker pair shown inside a fenced code block, as
+/// a hand-migration example in the agent's own prose, is content, not
+/// a governed block: the prototype's own `find_block` matches a marker
+/// line anywhere in the file, fenced or not -- fencing there only ever
+/// *explains* a problem `find_block` already found some other way, it
+/// never changes whether a marker counts. `legacy_block_pending`
+/// instead skips a marker line found inside an open fence outright, so
+/// a documentation example naming the exact format is never read as a
+/// block that must be migrated; the discovered skill still gets its
+/// ordinary `append` pending, exactly as if the example were not
+/// there.
+#[test]
+fn verify_treats_a_fenced_legacy_marker_mention_as_content() {
+    let project = TempDir::new("verify-legacy-fenced-mention");
+    let workspace = project.workspace();
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\nTo migrate a legacy block by \
+         hand, look for a pair of lines like this:\n\n```\n<!-- portable-agent:skills:begin \
+         sha256={} -->\n<!-- portable-agent:skills:end -->\n```\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
+                .to_string()
+        ],
+        "a fenced example of the marker must not read as a real legacy block"
+    );
+}
+
+/// The same marker, mentioned inline in an ordinary sentence rather
+/// than fenced: still never a full, standalone line, so it is content
+/// by the same rule `find_block`'s own full-line regex already applies
+/// -- the whole-text `contains` check this fix replaces could not tell
+/// this apart from a real marker.
+#[test]
+fn verify_treats_a_prose_legacy_marker_mention_as_content() {
+    let project = TempDir::new("verify-legacy-prose-mention");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n\nOlder agents \
+        carried a block starting with `<!-- portable-agent:skills:begin sha256=... -->` \
+        and ending with `<!-- portable-agent:skills:end -->`, a format this project no \
+        longer writes.\n"
+        .to_vec();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
+                .to_string()
+        ],
+        "a marker mentioned in prose must not read as a real legacy block"
+    );
+}
+
+/// A real legacy block beside an already-intact omnifrons block: the
+/// prototype's own `find_block` has no notion of this crate's own
+/// sentinel at all, so it would locate its own legacy pair exactly as
+/// it does alone, independent of whatever else the file holds.
+/// Mirrored here, the legacy scan finds the real legacy pair
+/// regardless of the intact omnifrons block sitting beside it, and the
+/// existing "replace, never both" rule in `verify_problems_after_state`
+/// (unchanged by this fix) then reports the migration alone, even
+/// though the omnifrons block on its own would need nothing.
+#[test]
+fn verify_reports_migrate_for_a_legacy_block_beside_an_intact_omnifrons_block() {
+    let project = TempDir::new("verify-legacy-beside-intact");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let row = SkillRow {
+        name: "sample".to_string(),
+        description: "A sample skill".to_string(),
+        path: "skills/sample/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={} -->\n<!-- portable-agent:skills:end -->",
+        "0".repeat(64)
+    );
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n\n{rendered}\n")
+            .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\ndescription: A sample skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
+                .to_string()
+        ]
+    );
+}
+
+// -- verify: a nested agent's own skill never joins the root's rows --
+
+/// A nested agent directory with its own identity and its own skill
+/// contributes nothing to the scan root's own `verify`: the root here
+/// has none of its own skills, so `verify` must report nothing at all,
+/// not a missing or pending entry for the nested agent's
+/// `skills/x/SKILL.md` -- that skill's nearest root is `child`, never
+/// the scan root, so it never reaches the root's own `discovered` list
+/// or its skill rows.
+#[test]
+fn verify_excludes_a_nested_agents_own_skill_from_the_root_report() {
+    let project = TempDir::new("verify-nested-skill-excluded");
+    let workspace = project.workspace();
+    let root_bytes = b"# Root\n\nYou are Root, a fixture agent.\n";
+    let child_bytes = b"# Child\n\nYou are Child.\n\n[x](skills/x/SKILL.md)\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, root_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![identity(IdentityKind::Agents, child_bytes)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("child/skills/x/SKILL.md", b"---\nname: x\n---\n".to_vec())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(
+        report.problems.is_empty(),
+        "the root must report nothing for a skill the nested agent owns, got {:?}",
+        report.problems
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("skills/x/SKILL.md")),
+        "no problem must name the nested agent's own skill, got {:?}",
+        report.problems
+    );
+}
