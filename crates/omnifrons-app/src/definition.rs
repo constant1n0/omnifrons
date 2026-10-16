@@ -744,31 +744,41 @@ fn verify_problems_after_state(
     let status = read_skill_index(canonical_text.unwrap_or(&[]), &discovered, &root_absolute);
 
     if let Some(text) = canonical_text {
-        // Computed once, before the block outcome: a legacy marker
-        // means `plan_block`'s own `find_block` would already have
-        // found *a* block (just not this crate's own sentinel format),
-        // and the prototype's own `plan_block` always plans exactly one
-        // operation once a block is found (`replace_block`, never
-        // `append_block` too). Mirroring that, the migration replaces
-        // whatever ordinary pending `skills_block_outcome` would
-        // otherwise report, rather than sitting beside it as a second,
-        // independent skills-block index.
-        let legacy_pending = legacy_block_pending(text);
-        match skills_block_outcome(ports.hasher, text, &status, &rows, &root_absolute) {
-            BlockOutcome::Refusal(refusal) => return vec![refusal],
-            BlockOutcome::Pending(pending) => {
+        // The prototype's own `plan_block` always finds at most one
+        // block (`find_block`) and always plans exactly one operation
+        // once a block is found (`replace_block`, never `append_block`
+        // too). Mirrored here: the legacy family is checked first, and
+        // its own outcome -- a refusal, a migration pending, or no
+        // legacy marker at all -- replaces whatever
+        // `skills_block_outcome` would otherwise report for this
+        // crate's own sentinel, rather than sitting beside it as a
+        // second, independent skills-block index.
+        let needed = block_needed_names(&status);
+        match legacy_block_outcome(ports.hasher, text, &needed) {
+            LegacyBlockOutcome::Refusal(refusal) => return vec![refusal],
+            LegacyBlockOutcome::Pending(migrate) => {
                 let mut problems =
                     wrapper_problems(classification.state, ports.hasher, identity_files);
-                problems.push(legacy_pending.unwrap_or(pending));
+                problems.push(migrate);
                 return problems;
             }
-            BlockOutcome::None => {
-                let mut problems =
-                    wrapper_problems(classification.state, ports.hasher, identity_files);
-                if let Some(migrate) = legacy_pending {
-                    problems.push(migrate);
+            LegacyBlockOutcome::None => {
+                match skills_block_outcome(ports.hasher, text, &status, &rows, &root_absolute) {
+                    BlockOutcome::Refusal(refusal) => return vec![refusal],
+                    BlockOutcome::Pending(pending) => {
+                        let mut problems =
+                            wrapper_problems(classification.state, ports.hasher, identity_files);
+                        problems.push(pending);
+                        return problems;
+                    }
+                    BlockOutcome::None => {
+                        return wrapper_problems(
+                            classification.state,
+                            ports.hasher,
+                            identity_files,
+                        );
+                    }
                 }
-                return problems;
             }
         }
     }
@@ -1064,23 +1074,24 @@ const LEGACY_BEGIN_SUFFIX: &str = " -->";
 /// matched as a full line, never a substring.
 const LEGACY_END_LINE: &str = "<!-- portable-agent:skills:end -->";
 
-/// Whether `line` is the prototype's own legacy begin marker, matched
-/// in full exactly as its own `BLOCK_BEGIN_PATTERN.fullmatch` would:
-/// [`LEGACY_BEGIN_PREFIX`], then exactly 64 lowercase hex characters,
-/// then [`LEGACY_BEGIN_SUFFIX`], and nothing else on the line.
-fn is_legacy_begin_line(line: &str) -> bool {
-    line.strip_prefix(LEGACY_BEGIN_PREFIX)
-        .and_then(|rest| rest.strip_suffix(LEGACY_BEGIN_SUFFIX))
-        .is_some_and(|hex| {
-            hex.len() == 64
-                && hex
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        })
+/// `line`'s own recorded digest when it is the prototype's own legacy
+/// begin marker, matched in full exactly as its own
+/// `BLOCK_BEGIN_PATTERN.fullmatch` would: [`LEGACY_BEGIN_PREFIX`], then
+/// exactly 64 lowercase hex characters (returned), then
+/// [`LEGACY_BEGIN_SUFFIX`], and nothing else on the line.
+fn legacy_begin_digest(line: &str) -> Option<&str> {
+    let hex = line
+        .strip_prefix(LEGACY_BEGIN_PREFIX)?
+        .strip_suffix(LEGACY_BEGIN_SUFFIX)?;
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(hex)
 }
 
 /// A minimal, line-at-a-time fence open/close toggle for
-/// [`legacy_block_present`]'s own scan: a trimmed line starting with a
+/// [`legacy_lines`]'s own scan: a trimmed line starting with a
 /// run of three or more backticks or tildes opens a fence; once open,
 /// only a compatible closer -- the same character, a run at least as
 /// long as the opener's, with nothing but whitespace after it -- closes
@@ -1125,67 +1136,232 @@ impl LegacyMarkerFence {
     }
 }
 
-/// Whether `canonical_text` holds a real legacy skills block: its own
-/// begin marker line ([`is_legacy_begin_line`]) followed, somewhere
-/// later in the text, by its own end marker line ([`LEGACY_END_LINE`]),
-/// mirroring the prototype's own `find_block`'s `begins`/`ends` line
-/// scan rather than a substring search over the whole decoded text.
-/// Each line is matched trimmed, the same way fencing is tracked below
-/// (unlike the prototype's own marker regex, which only strips a
-/// trailing `\r`/`\n` and tolerates no other surrounding whitespace) --
-/// a deliberate, documented simplification: this scan's only two
-/// outcomes are "migrate" or silence, with no refusal path to fall
-/// back on, so a harmless leading or trailing space should not turn a
-/// real marker invisible.
-///
-/// Deliberate deviation from the prototype's own `find_block`: that
-/// function matches both marker lines *anywhere* in the file, fenced
-/// or not -- fencing there only ever *explains* a problem it already
-/// found some other way (an unpaired begin, a second begin, or text
-/// after the end), never changes whether a marker counts. This scan
-/// instead skips a marker line found while a fenced code block is
-/// open: a marker shown as a documentation example is content *about*
-/// the format, not a real governed block, and unlike `find_block`'s
-/// own caller `plan_block` -- which has a refusal to fall back on when
-/// a quoted marker coincides with a layout problem -- this function
-/// has no such refusal, so treating a quoted example as real would
-/// misreport a migration that is not actually pending.
-fn legacy_block_present(canonical_text: &[u8]) -> bool {
-    let decoded = String::from_utf8_lossy(canonical_text);
-    let mut fence = LegacyMarkerFence::default();
-    let mut begin_found = false;
-    for raw_line in decoded.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        let trimmed = line.trim();
-        if fence.advance(trimmed) {
-            continue;
-        }
-        if begin_found {
-            if trimmed == LEGACY_END_LINE {
-                return true;
-            }
-        } else if is_legacy_begin_line(trimmed) {
-            begin_found = true;
-        }
-    }
-    false
-}
-
-/// A pending migration of a real legacy skills block
-/// ([`legacy_block_present`]) to this crate's own sentinel format --
-/// outside the prototype's own vocabulary, since the prototype never
-/// needs to migrate itself (ADR-0005 sub-slice 1e-D).
+/// What locating the prototype's own legacy skills-block sentinel
+/// found (mirrors [`BlockOutcome`] for the `portable-agent:skills`
+/// family), outside the prototype's own vocabulary, since the
+/// prototype never needs to migrate itself (ADR-0005 sub-slice 1e-D).
 /// [`verify_problems_after_state`] uses this result to *replace*
-/// whatever ordinary skills-block pending [`skills_block_outcome`]
-/// would otherwise report, never to report both: the prototype's own
+/// whatever `skills_block_outcome` would otherwise report for this
+/// crate's own sentinel, never to report both: the prototype's own
 /// `plan_block` only ever plans one skills-block operation once
 /// `find_block` has located a block of any format, and a real legacy
 /// block here means exactly that -- a block already exists, just not
 /// in this crate's own sentinel format.
-fn legacy_block_pending(canonical_text: &[u8]) -> Option<String> {
-    legacy_block_present(canonical_text).then(|| {
-        "pending: migrate the portable-agent skill index block in AGENTS.md to the current \
-         omnifrons sentinel format"
-            .to_string()
-    })
+enum LegacyBlockOutcome {
+    /// No legacy begin marker line anywhere in the text.
+    None,
+    /// An intact block (the prototype's own `IndexBlock.intact`) whose
+    /// recorded digest matches its body: pending migration to this
+    /// crate's own sentinel format.
+    Pending(String),
+    /// A malformed or hand-edited block (the prototype's own
+    /// `EditedBlock`), already carrying its fixed code token and the
+    /// prototype's own detail wording.
+    Refusal(String),
+}
+
+/// One decoded line of canonical text, classified for the legacy scan
+/// ([`legacy_lines`]).
+struct LegacyLine<'a> {
+    /// This line's text exactly as written, including its own
+    /// terminator when it has one -- the prototype's own
+    /// `data[start..end]` span for one line of
+    /// `data.splitlines(keepends=True)`.
+    raw: &'a str,
+    /// [`Self::raw`] with a trailing `"\r\n"` or `"\n"` removed,
+    /// compared unindented and untrimmed, exactly as the prototype's
+    /// own `BLOCK_BEGIN_PATTERN.fullmatch`/`== BLOCK_END` would --
+    /// never trimmed the way a fence line is below: a marker with
+    /// incidental leading or trailing whitespace is not this exact
+    /// sentinel.
+    text: &'a str,
+    /// Whether [`Self::text`] is a begin marker line.
+    is_begin: bool,
+    /// Whether [`Self::text`] is the end marker line.
+    is_end: bool,
+    /// [`Self::is_begin`]'s own recorded digest.
+    begin_digest: Option<&'a str>,
+    /// Whether a fenced code block was open around this line, fence
+    /// lines themselves included (the prototype's own `fence_flags`,
+    /// read through [`LegacyMarkerFence`]).
+    fenced: bool,
+}
+
+/// `text` split into lines that each keep their own terminator (the
+/// prototype's own `data.splitlines(keepends=True)`, restricted to
+/// `"\n"` the way the rest of this scan already is): no trailing empty
+/// line is produced for text ending in a newline.
+fn lines_with_terminators(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            lines.push(&text[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
+/// `raw`'s own text with one trailing line terminator removed.
+fn strip_line_ending(raw: &str) -> &str {
+    raw.strip_suffix('\n')
+        .map_or(raw, |rest| rest.strip_suffix('\r').unwrap_or(rest))
+}
+
+/// Classifies every line of `decoded` for the legacy scan
+/// ([`LegacyLine`]), tracking fence state across them with one
+/// [`LegacyMarkerFence`].
+fn legacy_lines(decoded: &str) -> Vec<LegacyLine<'_>> {
+    let mut fence = LegacyMarkerFence::default();
+    lines_with_terminators(decoded)
+        .into_iter()
+        .map(|raw| {
+            let text = strip_line_ending(raw);
+            let fenced = fence.advance(text.trim());
+            let begin_digest = legacy_begin_digest(text);
+            LegacyLine {
+                raw,
+                text,
+                is_begin: begin_digest.is_some(),
+                is_end: text == LEGACY_END_LINE,
+                begin_digest,
+                fenced,
+            }
+        })
+        .collect()
+}
+
+/// Locates the prototype's own legacy skills-block sentinel
+/// (`LEGACY_BEGIN_PREFIX`/[`LEGACY_END_LINE`]) by the same full-line
+/// rule its own `find_block` applies: every begin or end marker line
+/// counts wherever it sits in the file, fenced or not -- fencing only
+/// ever *explains* a problem this scan already found some other way
+/// (an unpaired begin, a second begin, or text after the end), the
+/// same role the prototype's own `quoted_markers` plays for
+/// `find_block`; it never hides a marker, unlike the fence-skipping
+/// scan this replaces.
+///
+/// A block is intact exactly as the prototype's own
+/// `IndexBlock.intact` defines it: exactly one begin marker, at least
+/// one end marker after it, nothing but whitespace after the first
+/// such end marker, and -- checked only here, never by the
+/// prototype's own `scan`, only by its `plan_block` -- the recorded
+/// sha256 equal to `hasher.sha256` of the exact body bytes between the
+/// two markers. The digest is never checked when a second begin or a
+/// missing end already makes the body ambiguous, exactly as the
+/// prototype's own `body, edited = data[offsets[first + 1]:], False`
+/// branch skips it.
+///
+/// An intact block with a matching digest reports the migration
+/// pending; anything else raises the same refusal the prototype's own
+/// `plan_block` raises for a hand-edited block -- `block_layout` when
+/// a layout problem exists (the dynamic cause list, with a
+/// fenced-marker explanation prepended when one applies), the digest
+/// mismatch alone else -- naming `needed` exactly as
+/// [`block_needed_names`] already does for this crate's own sentinel.
+///
+/// Simplification: unlike the prototype's own `quoted_markers`, this
+/// scan does not shrink its search window for a trailing, never-closed
+/// fence; none of this crate's own fixtures leave a fence open to end
+/// of file, and [`LegacyMarkerFence`] already tracks open/close state
+/// precisely for every fence that does close.
+fn legacy_block_outcome(
+    hasher: &dyn ContentHasher,
+    canonical_text: &[u8],
+    needed: &str,
+) -> LegacyBlockOutcome {
+    let decoded = String::from_utf8_lossy(canonical_text);
+    let lines = legacy_lines(&decoded);
+
+    let begins: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.is_begin)
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&first) = begins.first() else {
+        return LegacyBlockOutcome::None;
+    };
+    let ends: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| *index > first && line.is_end)
+        .map(|(index, _)| index)
+        .collect();
+
+    let mut layout: Vec<String> = Vec::new();
+    if begins.len() > 1 {
+        layout.push(format!(
+            "line {} holds a second begin marker",
+            begins[1] + 1
+        ));
+    }
+    if ends.is_empty() {
+        layout.push(format!(
+            "the begin marker on line {} has no end marker after it",
+            first + 1
+        ));
+    } else if lines[(ends[0] + 1)..]
+        .iter()
+        .any(|line| !line.text.trim().is_empty())
+    {
+        layout.push(format!(
+            "text follows the end marker on line {}; the block must be the last thing in \
+             the file",
+            ends[0] + 1
+        ));
+    }
+
+    let edited = if begins.len() > 1 || ends.is_empty() {
+        false
+    } else {
+        let body: String = lines[(first + 1)..ends[0]]
+            .iter()
+            .map(|line| line.raw)
+            .collect();
+        let recorded = lines[first].begin_digest.unwrap_or_default();
+        hasher.sha256(body.as_bytes()).to_hex() != recorded
+    };
+
+    if let Some(quoted) = lines
+        .iter()
+        .position(|line| line.fenced && (line.is_begin || line.is_end))
+        && (!layout.is_empty() || edited)
+    {
+        layout.insert(
+            0,
+            format!(
+                "the marker on line {} is inside a fenced code block; the adapter matches \
+                 its markers anywhere, so a quoted marker reads as a broken block",
+                quoted + 1
+            ),
+        );
+    }
+
+    if layout.is_empty() {
+        if edited {
+            return LegacyBlockOutcome::Refusal(format!(
+                "refused (edited_block): the skill index block was edited by hand (its \
+                 recorded sha256 no longer matches) and cannot be regenerated; restore it \
+                 or index {needed} by hand"
+            ));
+        }
+        return LegacyBlockOutcome::Pending(
+            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
+             current omnifrons sentinel format"
+                .to_string(),
+        );
+    }
+    if edited {
+        layout.push("its recorded sha256 no longer matches".to_string());
+    }
+    LegacyBlockOutcome::Refusal(format!(
+        "refused (block_layout): the skill index block cannot be regenerated: {}. Fix the \
+         markers by hand or index {needed} by hand",
+        layout.join("; ")
+    ))
 }

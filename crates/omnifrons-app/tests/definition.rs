@@ -1567,9 +1567,16 @@ fn verify_reports_nothing_pending_for_a_stale_block_the_prefix_already_covers() 
 fn verify_reports_only_migrate_for_a_legacy_block_with_an_unlinked_skill() {
     let project = TempDir::new("verify-legacy-append");
     let workspace = project.workspace();
+    let hasher = FakeHasher;
+    // The body between the markers is empty (they are adjacent lines),
+    // so its digest is the recorded one `verify` now checks: `verify`
+    // must find this block intact, never a `block_layout`/`edited_block`
+    // refusal, for the "migrate replaces append" behavior below to be
+    // the thing actually under test.
+    let digest_hex = hasher.sha256(b"").to_hex();
     let legacy_block = format!(
-        "<!-- portable-agent:skills:begin sha256={} -->\n<!-- portable-agent:skills:end -->",
-        "0".repeat(64)
+        "<!-- portable-agent:skills:begin sha256={digest_hex} -->\n<!-- \
+         portable-agent:skills:end -->"
     );
     let agents_bytes =
         format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n").into_bytes();
@@ -1589,7 +1596,6 @@ fn verify_reports_only_migrate_for_a_legacy_block_with_an_unlinked_skill() {
         )
         .build();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
-    let hasher = FakeHasher;
     let ports = DefinitionPorts {
         tree: &tree,
         hasher: &hasher,
@@ -1741,16 +1747,22 @@ description: "x\ud800y\ud801z"
 fn verify_reports_migrate_for_a_legacy_block_whose_rows_are_current() {
     let project = TempDir::new("verify-legacy-current");
     let workspace = project.workspace();
-    let legacy_block = format!(
-        "<!-- portable-agent:skills:begin sha256={} -->\n\
-         ## Local skill index\n\n\
+    let hasher = FakeHasher;
+    // The recorded digest must equal the hasher's own digest of this
+    // exact body (the prototype's own `sha256_hex(body)`), so it is
+    // computed here instead of a placeholder: `verify` now checks it.
+    let body = format!(
+        "## Local skill index\n\n\
          | Skill | Use when | Path |\n\
          | --- | --- | --- |\n\
          | sample | x | [sample](skills/sample/SKILL.md) |\n\n\
          ## Local skill precedence\n\n\
-         {PRECEDENCE_RULE}\n\
-         <!-- portable-agent:skills:end -->",
-        "0".repeat(64)
+         {PRECEDENCE_RULE}\n"
+    );
+    let digest_hex = hasher.sha256(body.as_bytes()).to_hex();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={digest_hex} -->\n{body}<!-- \
+         portable-agent:skills:end -->"
     );
     let agents_bytes =
         format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n").into_bytes();
@@ -1770,7 +1782,6 @@ fn verify_reports_migrate_for_a_legacy_block_whose_rows_are_current() {
         )
         .build();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
-    let hasher = FakeHasher;
     let ports = DefinitionPorts {
         tree: &tree,
         hasher: &hasher,
@@ -1785,6 +1796,116 @@ fn verify_reports_migrate_for_a_legacy_block_whose_rows_are_current() {
         vec![
             "pending: migrate the portable-agent skill index block in AGENTS.md to the \
              current omnifrons sentinel format"
+                .to_string()
+        ]
+    );
+}
+
+/// An intact-shaped legacy block -- one begin marker, one end marker
+/// right after it, nothing following -- whose body was altered by a
+/// single byte after its digest was recorded: `verify` refuses exactly
+/// as the prototype's own `plan_block` does for `block.edited` alone
+/// (no layout problem), never reporting the migration over a body that
+/// no longer matches what was recorded.
+#[test]
+fn verify_refuses_a_legacy_block_whose_body_no_longer_matches_its_digest() {
+    let project = TempDir::new("verify-legacy-edited");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    // The digest is recorded for "sample\n"; the text on disk holds
+    // "sbmple\n" instead -- one byte changed, so the two no longer
+    // agree.
+    let digest_hex = hasher.sha256(b"sample\n").to_hex();
+    let legacy_block = format!(
+        "<!-- portable-agent:skills:begin sha256={digest_hex} -->\nsbmple\n<!-- \
+         portable-agent:skills:end -->"
+    );
+    let agents_bytes =
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index \
+             skills/sample/SKILL.md by hand"
+                .to_string()
+        ]
+    );
+}
+
+/// A legacy begin marker with no end marker anywhere after it: `verify`
+/// refuses with the prototype's own dynamic `block_layout` wording
+/// (`find_block`'s own "has no end marker after it" cause), never the
+/// simplified text this port's own omnifrons-block refusal uses --
+/// `ManagedFileError` never applies to the legacy family, since there
+/// is no `ManagedBlock` of this crate's own sentinel for it to locate.
+#[test]
+fn verify_refuses_an_unpaired_legacy_begin_marker() {
+    let project = TempDir::new("verify-legacy-unpaired-begin");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample, a fixture agent.\n\n<!-- portable-agent:skills:begin \
+         sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "skills/sample/SKILL.md",
+            b"---\nname: sample\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the begin \
+             marker on line 5 has no end marker after it. Fix the markers by hand or index \
+             skills/sample/SKILL.md by hand"
                 .to_string()
         ]
     );
@@ -2035,25 +2156,26 @@ fn verify_reports_the_wrapper_write_before_the_skills_block_pending() {
 
 // -- verify: a real legacy block, not merely a mentioned marker --
 
-/// A legacy begin/end marker pair shown inside a fenced code block, as
-/// a hand-migration example in the agent's own prose, is content, not
-/// a governed block: the prototype's own `find_block` matches a marker
+/// A legacy begin marker line inside a fenced code block still counts
+/// as a real marker: the prototype's own `find_block` matches a marker
 /// line anywhere in the file, fenced or not -- fencing there only ever
 /// *explains* a problem `find_block` already found some other way, it
-/// never changes whether a marker counts. `legacy_block_pending`
-/// instead skips a marker line found inside an open fence outright, so
-/// a documentation example naming the exact format is never read as a
-/// block that must be migrated; the discovered skill still gets its
-/// ordinary `append` pending, exactly as if the example were not
-/// there.
+/// never changes whether a marker counts, the same role its own
+/// `quoted_markers` plays. Here the fenced begin has no end marker
+/// anywhere in the file, so `verify` refuses with both the
+/// fenced-marker explanation and the unpaired-begin cause, in that
+/// order -- never treating a hand-migration example in the agent's own
+/// prose as harmless content the way the pre-fix fence-skipping scan
+/// did.
 #[test]
-fn verify_treats_a_fenced_legacy_marker_mention_as_content() {
-    let project = TempDir::new("verify-legacy-fenced-mention");
+fn verify_refuses_a_fenced_legacy_begin_marker_with_no_end() {
+    let project = TempDir::new("verify-legacy-fenced-begin");
     let workspace = project.workspace();
+    let hasher = FakeHasher;
     let agents_bytes = format!(
         "# Sample\n\nYou are Sample, a fixture agent.\n\nTo migrate a legacy block by \
-         hand, look for a pair of lines like this:\n\n```\n<!-- portable-agent:skills:begin \
-         sha256={} -->\n<!-- portable-agent:skills:end -->\n```\n",
+         hand, look for a line like this:\n\n```\n<!-- portable-agent:skills:begin \
+         sha256={} -->\n```\n",
         "0".repeat(64)
     )
     .into_bytes();
@@ -2073,7 +2195,6 @@ fn verify_treats_a_fenced_legacy_marker_mention_as_content() {
         )
         .build();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
-    let hasher = FakeHasher;
     let ports = DefinitionPorts {
         tree: &tree,
         hasher: &hasher,
@@ -2086,11 +2207,15 @@ fn verify_treats_a_fenced_legacy_marker_mention_as_content() {
     assert_eq!(
         report.problems,
         vec![
-            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
-             precedence rule)"
+            "refused (block_layout): the skill index block cannot be regenerated: the marker \
+             on line 8 is inside a fenced code block; the adapter matches its markers \
+             anywhere, so a quoted marker reads as a broken block; the begin marker on line \
+             8 has no end marker after it. Fix the markers by hand or index \
+             skills/sample/SKILL.md by hand"
                 .to_string()
         ],
-        "a fenced example of the marker must not read as a real legacy block"
+        "a fenced begin marker must still be found, and the fencing must only explain the \
+         problem, never hide it"
     );
 }
 
@@ -2147,10 +2272,15 @@ fn verify_treats_a_prose_legacy_marker_mention_as_content() {
 
 /// A real legacy block beside an already-intact omnifrons block: the
 /// prototype's own `find_block` has no notion of this crate's own
-/// sentinel at all, so it would locate its own legacy pair exactly as
-/// it does alone, independent of whatever else the file holds.
-/// Mirrored here, the legacy scan finds the real legacy pair
-/// regardless of the intact omnifrons block sitting beside it, and the
+/// sentinel at all, so it checks the legacy pair exactly as it would
+/// alone -- including its own "the block must be the last thing in
+/// the file" rule, which this fixture respects by placing the legacy
+/// pair *after* the omnifrons block, not before: `find_block` reads
+/// everything past the legacy end marker as the legacy block's own
+/// tail, omnifrons sentinel or not, so a trailing omnifrons block
+/// would otherwise read as disqualifying text following the end
+/// marker. With the legacy pair last, the legacy scan finds it intact
+/// regardless of the omnifrons block sitting before it, and the
 /// existing "replace, never both" rule in `verify_problems_after_state`
 /// (unchanged by this fix) then reports the migration alone, even
 /// though the omnifrons block on its own would need nothing.
@@ -2169,12 +2299,16 @@ fn verify_reports_migrate_for_a_legacy_block_beside_an_intact_omnifrons_block() 
     let body = render_body(&[row], true);
     let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
     let rendered = block.render(LineEnding::Lf);
+    // Empty body between adjacent markers again (as in the "unlinked
+    // skill" case above): its digest is the recorded one, so this
+    // legacy block is intact and the migration is reported, unchanged.
+    let legacy_digest_hex = hasher.sha256(b"").to_hex();
     let legacy_block = format!(
-        "<!-- portable-agent:skills:begin sha256={} -->\n<!-- portable-agent:skills:end -->",
-        "0".repeat(64)
+        "<!-- portable-agent:skills:begin sha256={legacy_digest_hex} -->\n<!-- \
+         portable-agent:skills:end -->"
     );
     let agents_bytes =
-        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{legacy_block}\n\n{rendered}\n")
+        format!("# Sample\n\nYou are Sample, a fixture agent.\n\n{rendered}\n\n{legacy_block}\n")
             .into_bytes();
     let snapshot = TreeSnapshotBuilder::new()
         .directory(
