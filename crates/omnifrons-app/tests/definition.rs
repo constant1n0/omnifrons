@@ -3170,6 +3170,132 @@ fn verify_prefers_the_earlier_refusal_in_file_order_when_both_block_families_ref
     );
 }
 
+/// A fenced documentation example of the legacy marker, spelled with a
+/// placeholder instead of a complete sha256 digest so it never matches
+/// `legacy_begin_digest`'s own strict full-line pattern, placed before
+/// an omnifrons block edited by hand and a real, broken legacy begin
+/// marker (no end marker after it) at the end of the file. A naive
+/// prefix search over the whole text -- matching any line merely
+/// starting with the legacy prefix, fenced, complete, or not -- finds
+/// this placeholder first and would wrongly treat the legacy family as
+/// reading before the omnifrons block, even though the legacy block
+/// that is actually refusing sits after it. A reader scanning top to
+/// bottom meets the omnifrons problem first, so that refusal is the one
+/// `verify` must report.
+#[test]
+fn verify_ignores_a_fenced_legacy_marker_example_when_choosing_the_earlier_refusal() {
+    let project = TempDir::new("verify-fenced-legacy-example-precedes-real-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\nTo migrate a legacy block by hand, look for a \
+         line like this:\n\n```\n<!-- portable-agent:skills:begin sha256=... -->\n```\n\n\
+         {tampered}\n\n<!-- portable-agent:skills:begin sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "a fenced documentation example must never stand in for the real legacy marker's \
+         own position in the tie-break; the omnifrons block here precedes the real, broken \
+         legacy marker that actually refuses"
+    );
+}
+
+/// The mirrored ordering: the same broken legacy begin marker (no end
+/// marker after it), now placed *before* the omnifrons block edited by
+/// hand, with no fenced example in the way. `verify` must again report
+/// exactly one refusal, and it must be the one whose own marker reads
+/// first in the file -- the legacy marker here, never the omnifrons
+/// block that follows it. Before this test, the tie-break's other
+/// branch (`legacy_marker_precedes_omnifrons_marker` returning `true`)
+/// had no coverage at all.
+#[test]
+fn verify_prefers_the_earlier_refusal_in_file_order_when_the_legacy_marker_comes_first() {
+    let project = TempDir::new("verify-both-families-refuse-legacy-first");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- portable-agent:skills:begin sha256={} \
+         -->\n\n{tampered}\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the begin \
+             marker on line 5 has no end marker after it. Fix the markers by hand or index \
+             the precedence rule by hand"
+                .to_string()
+        ],
+        "when both families refuse, the refusal from the family whose own marker reads \
+         first in the file wins; the legacy marker here precedes the edited omnifrons block"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill

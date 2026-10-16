@@ -763,7 +763,10 @@ fn verify_problems_after_state(
         let needed = block_needed_names(&status);
         let (legacy_refusal, legacy_pending) =
             match legacy_block_outcome(ports.hasher, text, &needed) {
-                LegacyBlockOutcome::Refusal(refusal) => (Some(refusal), None),
+                LegacyBlockOutcome::Refusal {
+                    message,
+                    marker_offset,
+                } => (Some((message, marker_offset)), None),
                 LegacyBlockOutcome::Pending(migrate) => (None, Some(migrate)),
                 LegacyBlockOutcome::None => (None, None),
             };
@@ -774,18 +777,18 @@ fn verify_problems_after_state(
                 BlockOutcome::None => (None, None),
             };
 
-        if let (Some(legacy_refusal), Some(omnifrons_refusal)) =
+        if let (Some((legacy_message, legacy_offset)), Some(omnifrons_refusal)) =
             (&legacy_refusal, &omnifrons_refusal)
         {
-            let winner = if legacy_marker_precedes_omnifrons_marker(text) {
-                legacy_refusal
+            let winner = if legacy_marker_precedes_omnifrons_marker(text, *legacy_offset) {
+                legacy_message
             } else {
                 omnifrons_refusal
             };
             return vec![winner.clone()];
         }
-        if let Some(refusal) = legacy_refusal {
-            return vec![refusal];
+        if let Some((legacy_message, _)) = legacy_refusal {
+            return vec![legacy_message];
         }
         if let Some(refusal) = omnifrons_refusal {
             return vec![refusal];
@@ -1203,8 +1206,19 @@ enum LegacyBlockOutcome {
     Pending(String),
     /// A malformed or hand-edited block (the prototype's own
     /// `EditedBlock`), already carrying its fixed code token and the
-    /// prototype's own detail wording.
-    Refusal(String),
+    /// prototype's own detail wording, alongside `marker_offset`: the
+    /// byte offset of this refusing block's own first begin marker
+    /// line, exactly as this scan located it (`lines[first].offset`,
+    /// never a fresh, laxer prefix search over the raw text).
+    /// [`verify_problems_after_state`]'s own file-order tie-break reads
+    /// this straight from here instead of recomputing it, so a line
+    /// that only looks like a begin marker -- a fenced documentation
+    /// example with a placeholder instead of a real digest, say --
+    /// never stands in for the block that is actually refusing.
+    Refusal {
+        message: String,
+        marker_offset: usize,
+    },
 }
 
 /// One line of canonical text, classified for the legacy scan
@@ -1311,24 +1325,39 @@ fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
         .map(|(offset, _)| offset)
 }
 
-/// Whether the legacy family's own begin marker sits earlier in
+/// Whether the legacy family's own refusing block sits earlier in
 /// `canonical_text` than this crate's own omnifrons skills-block begin
 /// marker -- [`verify_problems_after_state`]'s own file-order
-/// tie-break, applied only when both families refuse at once. A
-/// family whose own marker cannot be located at all (a family's own
-/// unpaired-end shape, with no begin line) is treated as reading after
-/// the other, since there is no position to prefer it by; when
-/// neither family's marker can be located, the legacy family is
-/// treated as reading after the omnifrons family, consistently with
-/// that same rule, even though this fallback is never expected to be
-/// exercised by a real refusal.
-fn legacy_marker_precedes_omnifrons_marker(canonical_text: &[u8]) -> bool {
-    let legacy = first_marker_offset(canonical_text, LEGACY_BEGIN_PREFIX);
-    let omnifrons = first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX);
-    match (legacy, omnifrons) {
-        (Some(legacy_offset), Some(omnifrons_offset)) => legacy_offset <= omnifrons_offset,
-        (Some(_), None) => true,
-        (None, _) => false,
+/// tie-break, applied only when both families refuse at once.
+///
+/// `legacy_marker_offset` is `legacy_block_outcome`'s own
+/// [`LegacyBlockOutcome::Refusal::marker_offset`], never a fresh
+/// search over `canonical_text` by [`LEGACY_BEGIN_PREFIX`] alone: a
+/// fresh prefix-only search would also match a line that merely starts
+/// with that prefix without being a complete marker -- a fenced
+/// documentation example with a placeholder instead of a real digest,
+/// say -- which [`legacy_begin_digest`]'s own strict full-line match
+/// never counts as a begin marker at all. Using the scan's own located
+/// offset instead means a line like that can never stand in for the
+/// block that is actually refusing.
+///
+/// The omnifrons side carries no equivalent located offset to thread:
+/// [`ManagedBlock::locate`] reports no span on the
+/// [`ManagedFileError`] that produces an omnifrons refusal, so this
+/// side still falls back to the first line starting with
+/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] -- a known, narrower instance of
+/// the same limitation the legacy side no longer has, kept only
+/// because there is nothing more precise available here yet. When even
+/// that fallback finds no line, the omnifrons marker is treated as
+/// reading after the legacy one, since there is no position to prefer
+/// it by.
+fn legacy_marker_precedes_omnifrons_marker(
+    canonical_text: &[u8],
+    legacy_marker_offset: usize,
+) -> bool {
+    match first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX) {
+        Some(omnifrons_offset) => legacy_marker_offset <= omnifrons_offset,
+        None => true,
     }
 }
 
@@ -1423,6 +1452,10 @@ fn legacy_block_outcome(
     let Some(&first) = begins.first() else {
         return LegacyBlockOutcome::None;
     };
+    // Threaded into every `Refusal` below instead of a fresh prefix
+    // search: see `LegacyBlockOutcome::Refusal`'s own doc comment for
+    // why a fresh search over the raw text is not equivalent.
+    let marker_offset = lines[first].offset;
     let ends: Vec<usize> = lines
         .iter()
         .enumerate()
@@ -1487,11 +1520,14 @@ fn legacy_block_outcome(
 
     if layout.is_empty() {
         if edited {
-            return LegacyBlockOutcome::Refusal(format!(
-                "refused (edited_block): the skill index block was edited by hand (its \
-                 recorded sha256 no longer matches) and cannot be regenerated; restore it \
-                 or index {needed} by hand"
-            ));
+            return LegacyBlockOutcome::Refusal {
+                message: format!(
+                    "refused (edited_block): the skill index block was edited by hand (its \
+                     recorded sha256 no longer matches) and cannot be regenerated; restore \
+                     it or index {needed} by hand"
+                ),
+                marker_offset,
+            };
         }
         return LegacyBlockOutcome::Pending(
             "pending: migrate the portable-agent skill index block in AGENTS.md to the \
@@ -1502,9 +1538,46 @@ fn legacy_block_outcome(
     if edited {
         layout.push("its recorded sha256 no longer matches".to_string());
     }
-    LegacyBlockOutcome::Refusal(format!(
-        "refused (block_layout): the skill index block cannot be regenerated: {}. Fix the \
-         markers by hand or index {needed} by hand",
-        layout.join("; ")
-    ))
+    LegacyBlockOutcome::Refusal {
+        message: format!(
+            "refused (block_layout): the skill index block cannot be regenerated: {}. Fix \
+             the markers by hand or index {needed} by hand",
+            layout.join("; ")
+        ),
+        marker_offset,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use omnifrons_domain::executable::Sha256Digest;
+    use omnifrons_domain::guidance::LineEnding;
+
+    use super::{ManagedBlock, OMNIFRONS_SKILLS_BEGIN_PREFIX, render_body};
+
+    /// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`]'s own doc comment explains why
+    /// it duplicates `ManagedFileKind::Skills`'s private `begin_prefix`:
+    /// that method is not visible outside the domain crate. This pins
+    /// the duplication against the domain's own renderer, so a
+    /// sentinel change on that side fails loudly here instead of
+    /// silently disabling [`legacy_marker_precedes_omnifrons_marker`]'s
+    /// own file-order tie-break, which reads this constant to find
+    /// where the omnifrons family's own block begins.
+    #[test]
+    fn omnifrons_skills_begin_prefix_matches_the_domains_own_rendered_sentinel() {
+        let digest = |_: &[u8]| Sha256Digest([0; 32]);
+        let body = render_body(&[], true);
+        let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+        let rendered = block.render(LineEnding::Lf);
+        let first_line = rendered
+            .lines()
+            .next()
+            .expect("a rendered block always has a begin sentinel line");
+
+        assert!(
+            first_line.starts_with(OMNIFRONS_SKILLS_BEGIN_PREFIX),
+            "the domain's own rendered skills sentinel no longer starts with this crate's \
+             own duplicated prefix; got {first_line:?}"
+        );
+    }
 }
