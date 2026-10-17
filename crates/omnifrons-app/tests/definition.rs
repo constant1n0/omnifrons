@@ -3608,6 +3608,73 @@ fn verify_prefers_the_omnifrons_refusal_when_a_malformed_begin_precedes_a_legacy
     );
 }
 
+/// A placeholder omnifrons begin line: its digest hand-edited to 64
+/// characters that are not lowercase hex (`z` throughout) rather than
+/// too few of them, so `is_omnifrons_begin_sentinel_line`'s own
+/// `is_hex_digest` check rejects it for a different reason than the
+/// previous test's too-short digest -- while still opening and closing
+/// the same envelope (starting with `OMNIFRONS_SKILLS_BEGIN_PREFIX`
+/// and ending with `OMNIFRONS_SKILLS_BEGIN_SUFFIX`), positioned above
+/// an intact, standalone omnifrons end sentinel, with a broken legacy
+/// begin marker (no end marker after it) sitting between the two.
+///
+/// `omnifrons_domain::guidance::ManagedBlock::locate` counts this
+/// exact line toward its own begin-marker tally regardless of the
+/// digest: it only checks that the line starts with the kind's begin
+/// prefix, never that the rest of it parses, so this placeholder is
+/// itself what makes the real omnifrons block malformed over there.
+/// Anchoring `first_omnifrons_marker_offset` on it, rather than
+/// skipping past it to the later end sentinel, anchors on the
+/// family's own actual offending line. `verify` must report exactly
+/// one refusal, and it must be the omnifrons one, since this line
+/// precedes the legacy marker.
+#[test]
+fn verify_prefers_the_omnifrons_refusal_when_a_non_hex_digest_begin_precedes_a_legacy_marker() {
+    let project = TempDir::new("verify-omnifrons-non-hex-begin-precedes-legacy-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:begin skills v1 sha256:{} -->\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n\n<!-- omnifrons:end skills -->\n",
+        "z".repeat(64),
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "a begin line whose digest is the right length but not hex still opens and closes \
+         the same envelope, and `ManagedBlock::locate` counts it by prefix alone; this \
+         family's own malformed begin line precedes the legacy marker that follows it"
+    );
+}
+
 /// A stray extra omnifrons end sentinel with no begin anywhere near it,
 /// positioned above a broken legacy begin marker (no end marker after
 /// it), itself positioned above an otherwise valid, intact omnifrons

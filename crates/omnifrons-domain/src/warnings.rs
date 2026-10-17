@@ -624,13 +624,21 @@ fn effective_upward_loaders(
 /// own host-extra entries, so there is no host-extras union for this
 /// one literal check to widen.
 ///
-/// Each ancestor's own `described` text -- shared by its exposure and
-/// shadowing details below -- names [`ChainAncestor::identity_files`]
+/// Each ancestor's own `described` text is built separately for its
+/// exposure and shadowing details below, by the private
+/// `describe_ancestor`: it names [`ChainAncestor::identity_files`]
 /// first, then any of its own [`ChainAncestor::host_extras`] that match
-/// one of `loaders`' own kinds: the file that actually caused this
-/// ancestor's warning when it matched solely through a host extra, such
-/// as `.claude/AGENTS.md`, never through an identity file, which
-/// `identity_files` alone would otherwise silently drop.
+/// one of *that warning's own* `hosts`' kinds in `loaders` -- the file
+/// that actually caused this ancestor's warning when it matched solely
+/// through a host extra, such as `.claude/AGENTS.md`, never through an
+/// identity file, which `identity_files` alone would otherwise silently
+/// drop. Scoping the match to the warning's own hosts, rather than
+/// every host in `loaders`, starts to matter once two different hosts
+/// match two different extras on the same ancestor but land in
+/// different warnings here -- one exposure, one shadowing: an extra
+/// that matched only the *other* warning's host must never be named in
+/// this one, or a reader would be told a host loads a file it was
+/// never shown to read.
 fn ancestor_warnings(
     identity_kinds: &[IdentityKind],
     host_extras: &[&str],
@@ -665,23 +673,8 @@ fn ancestor_warnings(
             shadowing.push("OpenCode");
             opencode_resolved = true;
         }
-        let matched_extras = ancestor
-            .host_extras
-            .iter()
-            .copied()
-            .filter(|extra| loaders.iter().any(|&(_, kinds)| kinds.contains(extra)));
-        let described_files: Vec<&str> = ancestor
-            .identity_files
-            .iter()
-            .copied()
-            .chain(matched_extras)
-            .collect();
-        let described = format!(
-            "the ancestor agent {} ({})",
-            ancestor.display,
-            described_files.join(", ")
-        );
         if !exposure.is_empty() {
+            let described = describe_ancestor(ancestor, &exposure, loaders);
             let detail = format!(
                 "{described} is also loaded here by {}, next to this agent's own instructions ({SOURCE_NOTE})",
                 host_list(&exposure)
@@ -693,6 +686,7 @@ fn ancestor_warnings(
             ));
         }
         if !shadowing.is_empty() {
+            let described = describe_ancestor(ancestor, &shadowing, loaders);
             let detail = format!(
                 "{described} is loaded here by {} instead of this agent's instructions: this folder has no file those hosts read ({SOURCE_NOTE})",
                 host_list(&shadowing)
@@ -705,6 +699,38 @@ fn ancestor_warnings(
         }
     }
     warnings
+}
+
+/// `ancestor`'s own description for one warning naming exactly `hosts`
+/// (the prototype's `ancestor_files` text, scoped to one warning): its
+/// [`ChainAncestor::identity_files`] first, then any of its own
+/// [`ChainAncestor::host_extras`] that match one of `hosts`' own kinds
+/// in `loaders`. `hosts` is always the exact `exposure` or `shadowing`
+/// list [`ancestor_warnings`] is about to build a warning from, never
+/// every host in `loaders` -- an extra that matches some other host's
+/// kinds, one that fired into this same ancestor's *other* warning
+/// instead, is never named here.
+fn describe_ancestor(
+    ancestor: &ChainAncestor<'_>,
+    hosts: &[&'static str],
+    loaders: &[(&'static str, &'static [&'static str])],
+) -> String {
+    let matched_extras = ancestor.host_extras.iter().copied().filter(|extra| {
+        loaders
+            .iter()
+            .any(|&(host, kinds)| hosts.contains(&host) && kinds.contains(extra))
+    });
+    let described_files: Vec<&str> = ancestor
+        .identity_files
+        .iter()
+        .copied()
+        .chain(matched_extras)
+        .collect();
+    format!(
+        "the ancestor agent {} ({})",
+        ancestor.display,
+        described_files.join(", ")
+    )
 }
 
 /// `child_not_mentioned` warnings for every nested agent `nested` names

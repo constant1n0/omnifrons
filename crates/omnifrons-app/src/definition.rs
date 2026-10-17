@@ -1357,13 +1357,27 @@ const OMNIFRONS_SKILLS_END_LINE: &str = "<!-- omnifrons:end skills -->";
 /// Matched bytewise against the original bytes, mirroring
 /// [`legacy_begin_digest`]'s own full-line rule: every fixed byte here
 /// is ASCII, so a line holding non-UTF-8 bytes simply fails to match,
-/// never a false positive. A line that merely starts with the prefix
-/// but does not finish the shape -- a fenced or prose documentation
-/// example carrying a placeholder version or digest, or one that
-/// continues past the closing `-->` with ordinary prose -- never
-/// counts, even though a plain prefix search would still match its
-/// opening bytes; see [`first_omnifrons_marker_offset`], the only
-/// caller.
+/// never a false positive.
+///
+/// Returning `false` here does not mean the line plays no part in
+/// this family's own anchor. A line that still opens and closes the
+/// envelope -- ends with [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- but
+/// carries a placeholder version, a non-hex digest, or one of the
+/// wrong length fails this strict check, yet
+/// [`first_omnifrons_marker_offset`]'s own separate envelope shape
+/// still admits it, deliberately:
+/// `omnifrons_domain::guidance::ManagedBlock::locate` itself counts
+/// ANY line starting with the kind's begin prefix toward its own
+/// begin-marker tally, never checking that the rest of the line
+/// parses, so a line shaped like that is exactly what makes the real
+/// block malformed over there. Anchoring on it, rather than skipping
+/// past it to a later line, anchors on the family's own actual
+/// offending line. Only a line that continues past its own closing
+/// `-->` with ordinary prose -- never closing the envelope at all --
+/// plays no part in any of the three shapes
+/// [`first_omnifrons_marker_offset`] checks, even though a plain
+/// prefix search would still match its opening bytes; see that
+/// function's own doc comment, the only caller.
 fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
     let Some(after_prefix) = line.strip_prefix(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes()) else {
         return false;
@@ -1393,19 +1407,28 @@ fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
 ///
 /// A line counts as this family's own position in any of three shapes:
 /// a complete begin sentinel line, matched in full by
-/// [`is_omnifrons_begin_sentinel_line`]; the complete end sentinel line
-/// ([`OMNIFRONS_SKILLS_END_LINE`], matched the same way, as a whole
-/// line); or a line that opens and closes the same envelope -- starts
-/// with [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] and ends with
-/// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- without the strict match above
-/// accepting it, such as a digest hand-edited past 64 hex characters,
-/// but still recognizably this family's own. A prose or fenced
-/// documentation example that only *starts* like a sentinel and then
-/// continues past its own closing `-->` with ordinary prose never
-/// closes that envelope, so none of the three shapes ever mistakes it
-/// for a real marker, exactly as [`is_omnifrons_begin_sentinel_line`]'s
-/// own doc comment already explains for the strict match alone; a
-/// fenced sentinel that is otherwise complete still counts, exactly as
+/// [`is_omnifrons_begin_sentinel_line`] -- the primary, documented
+/// shape `ManagedBlock::begin_sentinel` itself renders; the complete
+/// end sentinel line ([`OMNIFRONS_SKILLS_END_LINE`], matched the same
+/// way, as a whole line); or a line that opens and closes the same
+/// envelope -- starts with [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] and ends
+/// with [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- without the strict match
+/// above accepting it, such as a digest hand-edited past 64 hex
+/// characters or swapped for non-hex bytes, but still recognizably
+/// this family's own. This third shape exists because
+/// `omnifrons_domain::guidance::ManagedBlock::locate` is exactly this
+/// permissive on its own side: it counts ANY line starting with the
+/// kind's begin prefix toward its own begin-marker tally, never
+/// checking that the rest of the line parses, so a malformed-interior
+/// line like this is itself what that function finds and refuses
+/// over; this shape anchors on that same line instead of skipping
+/// past it to a later one. A prose or fenced documentation example
+/// that only *starts* like a sentinel and then continues past its own
+/// closing `-->` with ordinary prose never closes that envelope, so
+/// none of the three shapes ever mistakes it for a real marker,
+/// exactly as [`is_omnifrons_begin_sentinel_line`]'s own doc comment
+/// already explains for the strict match alone; a fenced sentinel
+/// that is otherwise complete still counts, exactly as
 /// [`legacy_lines`] still counts a fenced legacy marker.
 ///
 /// Of every line matching any of the three shapes, the EARLIEST one in

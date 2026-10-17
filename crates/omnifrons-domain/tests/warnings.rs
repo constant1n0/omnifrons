@@ -592,6 +592,63 @@ fn claude_code_fallback_still_shadows_without_the_agents_own_agents_md_or_extra(
     );
 }
 
+/// An ancestor can hold two different host extras that each match a
+/// different host's kinds at once: `.claude/AGENTS.md` matches only
+/// Claude Code's fallback kind, and `QWEN.md` matches only Qwen Code's
+/// upward kind. This agent's own `.claude/AGENTS.md` extra covers
+/// Claude Code, so it reads as exposure; this agent holds nothing of
+/// its own Qwen Code would read, so Qwen Code reads as shadowing for
+/// the same ancestor instead. The two resulting warnings' own
+/// `described` text must each name only the extra that matched the
+/// host *that warning* names: the exposure warning (`Claude Code`
+/// only) must never cite `QWEN.md`, which only ever matched Qwen Code,
+/// and the shadowing warning (`Qwen Code` only) must never cite
+/// `.claude/AGENTS.md`, which only ever matched Claude Code.
+#[test]
+fn ancestor_warning_details_attribute_each_extra_only_to_the_host_that_matched_it() {
+    let host_extras = [".claude/AGENTS.md"];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &[],
+        host_extras: &[".claude/AGENTS.md", "QWEN.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        host_extras: &host_extras,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    let claude = exposure
+        .iter()
+        .find(|w| w.hosts.contains(&"Claude Code"))
+        .unwrap_or_else(|| panic!("no Claude Code ancestor_exposure warning in {warnings:?}"));
+    assert!(
+        claude.detail.contains(".claude/AGENTS.md"),
+        "the exposure warning must still name the extra that matched Claude Code, got {claude:?}"
+    );
+    assert!(
+        !claude.detail.contains("QWEN.md"),
+        "the exposure warning names `Claude Code` only, so its own detail must never cite \
+         `QWEN.md`, an extra that matched Qwen Code alone, got {claude:?}"
+    );
+
+    let shadowing = with_code(&warnings, WarningCode::AncestorShadowing);
+    let qwen = shadowing
+        .iter()
+        .find(|w| w.hosts.contains(&"Qwen Code"))
+        .unwrap_or_else(|| panic!("no Qwen Code ancestor_shadowing warning in {warnings:?}"));
+    assert!(
+        qwen.detail.contains("QWEN.md"),
+        "the shadowing warning must still name the extra that matched Qwen Code, got {qwen:?}"
+    );
+    assert!(
+        !qwen.detail.contains(".claude/AGENTS.md"),
+        "the shadowing warning names `Qwen Code` only, so its own detail must never cite \
+         `.claude/AGENTS.md`, an extra that matched Claude Code alone, got {qwen:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // test_warning_child_not_mentioned
 // ---------------------------------------------------------------------
