@@ -2183,6 +2183,41 @@ fn verify_reports_none_state_with_only_the_state_problem() {
     assert_eq!(report.problems, vec!["state is none".to_string()]);
 }
 
+/// An extras-only verify target -- no identity file of its own, only a
+/// host extra -- is never an agent (`crate::definition_tree`'s own
+/// documentation), so it must report exactly the same
+/// [`VerifyReport`] as a target with no snapshot entry at all
+/// (`verify_reports_none_state_with_only_the_state_problem` above):
+/// `classify` already returns [`RootState::None`] whenever
+/// `identity_files` is empty, regardless of any host extra, so the
+/// extra never leaks into the state, a refusal, or a pending
+/// operation.
+#[test]
+fn verify_reports_none_state_for_an_extras_only_target() {
+    let project = TempDir::new("verify-extras-only-target");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            Vec::new(),
+            vec!["CLAUDE.local.md".to_string()],
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::None);
+    assert!(!report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, vec!["state is none".to_string()]);
+}
+
 /// (q) `CLAUDE.md` holds the instructions and there is no `AGENTS.md`
 /// at all: `classify` names `CLAUDE.md` as the source
 /// ([`RootState::ClaudeOnly`]), so the skills check reads *its* bytes,

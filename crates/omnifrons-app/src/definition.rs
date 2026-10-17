@@ -577,16 +577,6 @@ pub fn scan(
         .snapshot(workspace)
         .map_err(DefinitionError::Tree)?;
 
-    let mut classifications: Vec<Classification> = Vec::with_capacity(snapshot.directories.len());
-    for directory in &snapshot.directories {
-        let identity = DirectoryIdentity::new(
-            directory.identity_files.clone(),
-            directory.host_extras.clone(),
-        )
-        .map_err(DefinitionError::DuplicateIdentityKind)?;
-        classifications.push(classify(&identity));
-    }
-
     // `roots` is only every directory holding at least one identity
     // file -- never an extras-only entry, which `nesting::relate` must
     // never treat as a root, a nesting parent, or anything needing
@@ -595,6 +585,28 @@ pub fn scan(
     // enclosing agent's own warning chain.
     let roots = agent_root_paths(&snapshot.directories);
     let extras_only = extras_only_paths(&snapshot.directories);
+
+    // Classification never runs on a directory that cannot be an
+    // agent: filtering by membership in `roots` -- rather than
+    // re-testing `directory.identity_files.is_empty()` here too --
+    // keeps `agent_root_paths` the one place that decides which
+    // directories are roots, so `agent_directories` is already in
+    // `roots`' own order.
+    let agent_directories: Vec<&DirectoryEntry> = snapshot
+        .directories
+        .iter()
+        .filter(|directory| roots.contains(&directory.path.as_str()))
+        .collect();
+    let mut classifications: Vec<Classification> = Vec::with_capacity(agent_directories.len());
+    for directory in agent_directories.iter().copied() {
+        let identity = DirectoryIdentity::new(
+            directory.identity_files.clone(),
+            directory.host_extras.clone(),
+        )
+        .map_err(DefinitionError::DuplicateIdentityKind)?;
+        classifications.push(classify(&identity));
+    }
+
     let relations =
         nesting::relate(&roots, &snapshot.ancestors).map_err(DefinitionError::Nesting)?;
 
@@ -609,15 +621,13 @@ pub fn scan(
             ancestors: &snapshot.ancestors,
             discovered_by_root: &discovered_by_root,
         };
-        // Zipping `relations` (one per agent root) against only the
-        // identity-bearing directories keeps every pair aligned: both
-        // sides are filtered from `snapshot.directories` by the exact
-        // same predicate, in the exact same order.
-        snapshot
-            .directories
+        // `agent_directories`, `classifications`, and `relations` are
+        // already exactly one entry per agent root, in the same
+        // order: no second filter is needed to keep them aligned.
+        agent_directories
             .iter()
+            .copied()
             .zip(classifications.iter())
-            .filter(|(directory, _)| !directory.identity_files.is_empty())
             .zip(relations.iter())
             .map(|((directory, classification), relation)| {
                 build_agent_report(&ctx, directory, classification, relation)

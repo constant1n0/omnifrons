@@ -15,9 +15,15 @@
 //!   at least one identity file or at least one host-specific extra
 //!   relevant to some host's upward or fallback walk: the prototype's
 //!   own `agent_roots`, built from `has_identity_files`, widened by this
-//!   port so a directory holding only an extra is not silently dropped
-//!   the way the prototype would drop it. Such a directory is never a
-//!   root in [`crate::definition::scan`]'s own sense -- it never gets an
+//!   module's own contract -- binding every implementation, including
+//!   sub-slice 1f's filesystem walker once it is written -- so a
+//!   directory holding only an extra must never be silently dropped the
+//!   way the prototype drops it. This crate ships no such walker today:
+//!   nothing here walks a real filesystem, so this bullet is a
+//!   requirement this contract places on a future implementation, never
+//!   a description of behavior this crate already performs. Such a
+//!   directory is never a root in [`crate::definition::scan`]'s own
+//!   sense -- it never gets an
 //!   [`crate::definition::AgentReport`] of its own, and it is never a
 //!   nesting parent or anything needing consent -- but it still reaches
 //!   an enclosing agent's own warning chain, as
