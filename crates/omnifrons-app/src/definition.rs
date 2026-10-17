@@ -1372,27 +1372,34 @@ fn strip_line_ending(raw: &[u8]) -> &[u8] {
 /// and including the space before the version -- the same literal
 /// `omnifrons_domain::guidance::ManagedFileKind::Skills`'s own private
 /// `begin_prefix` returns, duplicated here because that method is not
-/// visible outside its own crate. Paired with
-/// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] by
-/// [`is_omnifrons_begin_sentinel_line`] to match a begin sentinel line
-/// in full, and again, on its own terms, by
-/// [`first_omnifrons_marker_offset`]'s own fallback shape: a line that
-/// opens and closes the envelope -- starts with this prefix, ends with
-/// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- without the strict match above
-/// accepting it, such as a digest hand-edited past 64 hex characters.
-/// A line that only starts like this prefix and then continues as
-/// ordinary prose past its own closing `-->` never closes that
-/// envelope, so it is never mistaken for this family's own line
-/// either way. Never emitted by the legacy family -- see
-/// [`LEGACY_BEGIN_PREFIX`].
+/// visible outside its own crate.
+///
+/// [`first_omnifrons_marker_offset`] anchors on any line whose trimmed
+/// content starts with this prefix, nothing stricter and nothing
+/// looser, because that is exactly `ManagedBlock::locate`'s own rule
+/// (`content.starts_with(kind.begin_prefix())`): it counts any line
+/// starting with the kind's begin prefix toward its own begin-marker
+/// tally, never checking that the rest of the line parses. A line that
+/// only starts like this prefix and then continues past where a real
+/// sentinel would close -- a truncated digest with no `-->` at all, or
+/// ordinary prose resuming after a closing `-->` -- still starts with
+/// this prefix, so `locate` still counts it, and so does this anchor;
+/// see [`first_omnifrons_marker_offset`]'s own doc comment. Never
+/// emitted by the legacy family -- see [`LEGACY_BEGIN_PREFIX`].
 const OMNIFRONS_SKILLS_BEGIN_PREFIX: &str = "<!-- omnifrons:begin skills ";
 
 /// This crate's own skills-block begin sentinel's fixed suffix, after
 /// the hex digest -- the same literal
 /// `omnifrons_domain::guidance::ManagedFileKind::Skills`'s own private
-/// `begin_suffix` returns. Paired with
-/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] by
-/// [`is_omnifrons_begin_sentinel_line`] below; never used alone.
+/// `begin_suffix` returns. [`first_omnifrons_marker_offset`] no longer
+/// reads this constant: `locate`'s own begin-marker tally never checks
+/// for a closing suffix either, so anchoring on one would be stricter
+/// than the parser this crate mirrors. `#[cfg(test)]` because the unit
+/// test below -- which pins this crate's duplicated sentinel shape
+/// against the domain's own rendered one, see that test's own doc
+/// comment -- is its only remaining reader; a non-test build has no
+/// production use left for it.
+#[cfg(test)]
 const OMNIFRONS_SKILLS_BEGIN_SUFFIX: &str = " -->";
 
 /// This crate's own skills-block end sentinel, matched as a full line --
@@ -1400,68 +1407,15 @@ const OMNIFRONS_SKILLS_BEGIN_SUFFIX: &str = " -->";
 /// own private `end_sentinel` returns, duplicated here for the same
 /// reason as [`OMNIFRONS_SKILLS_BEGIN_PREFIX`]: that method is not
 /// visible outside its own crate. Used by
-/// [`first_omnifrons_marker_offset`] alongside the begin shapes above,
-/// never behind them: a lone end sentinel -- a malformed pair with no
-/// begin line at all, the shape [`ManagedBlock::locate`] itself raises
-/// [`ManagedFileError::Malformed`] over -- still gives this side a real
-/// position to be scanned at, rather than reading as absent, and a
-/// stray extra end line above an otherwise valid pair must still win
-/// the earliest-line comparison over that pair's own, later begin
+/// [`first_omnifrons_marker_offset`] alongside the begin-prefix shape
+/// above, never behind it: a lone end sentinel -- a malformed pair with
+/// no begin line at all, the shape [`ManagedBlock::locate`] itself
+/// raises [`ManagedFileError::Malformed`] over -- still gives this side
+/// a real position to be scanned at, rather than reading as absent,
+/// and a stray extra end line above an otherwise valid pair must still
+/// win the earliest-line comparison over that pair's own, later begin
 /// line.
 const OMNIFRONS_SKILLS_END_LINE: &str = "<!-- omnifrons:end skills -->";
-
-/// Whether `line` is a complete omnifrons skills-block begin sentinel:
-/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`], then a non-empty version holding
-/// no whitespace, then the literal `" sha256:"`, then exactly 64
-/// lowercase hex characters, then [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] --
-/// and nothing else on the line, the same shape
-/// `ManagedBlock::begin_sentinel` itself renders. `line` is expected
-/// already stripped of its own line terminator, exactly as
-/// [`strip_line_ending`] leaves it.
-///
-/// Matched bytewise against the original bytes, mirroring
-/// [`legacy_begin_digest`]'s own full-line rule: every fixed byte here
-/// is ASCII, so a line holding non-UTF-8 bytes simply fails to match,
-/// never a false positive.
-///
-/// Returning `false` here does not mean the line plays no part in
-/// this family's own anchor. A line that still opens and closes the
-/// envelope -- ends with [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- but
-/// carries a placeholder version, a non-hex digest, or one of the
-/// wrong length fails this strict check, yet
-/// [`first_omnifrons_marker_offset`]'s own separate envelope shape
-/// still admits it, deliberately:
-/// `omnifrons_domain::guidance::ManagedBlock::locate` itself counts
-/// ANY line starting with the kind's begin prefix toward its own
-/// begin-marker tally, never checking that the rest of the line
-/// parses, so a line shaped like that is exactly what makes the real
-/// block malformed over there. Anchoring on it, rather than skipping
-/// past it to a later line, anchors on the family's own actual
-/// offending line. Only a line that continues past its own closing
-/// `-->` with ordinary prose -- never closing the envelope at all --
-/// plays no part in any of the three shapes
-/// [`first_omnifrons_marker_offset`] checks, even though a plain
-/// prefix search would still match its opening bytes; see that
-/// function's own doc comment, the only caller.
-fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
-    let Some(after_prefix) = line.strip_prefix(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes()) else {
-        return false;
-    };
-    let Some(rest) = after_prefix.strip_suffix(OMNIFRONS_SKILLS_BEGIN_SUFFIX.as_bytes()) else {
-        return false;
-    };
-    let Some(hex_start) = rest.len().checked_sub(64) else {
-        return false;
-    };
-    let (head, hex) = rest.split_at(hex_start);
-    let Some(version) = head.strip_suffix(b" sha256:") else {
-        return false;
-    };
-    let is_hex_digest = hex
-        .iter()
-        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
-    !version.is_empty() && !version.iter().any(u8::is_ascii_whitespace) && is_hex_digest
-}
 
 /// `text` split into lines that each keep their own terminator and
 /// know their own start offset, scanned over the ORIGINAL bytes --
@@ -1519,44 +1473,35 @@ fn omnifrons_lines(text: &[u8]) -> Vec<(usize, &[u8])> {
 /// [`omnifrons_lines`]'s own doc comment for why the two splits
 /// cannot be shared.
 ///
-/// A line counts as this family's own position in any of three shapes:
-/// a complete begin sentinel line, matched in full by
-/// [`is_omnifrons_begin_sentinel_line`] -- the primary, documented
-/// shape `ManagedBlock::begin_sentinel` itself renders; the complete
-/// end sentinel line ([`OMNIFRONS_SKILLS_END_LINE`], matched the same
-/// way, as a whole line); or a line that opens and closes the same
-/// envelope -- starts with [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] and ends
-/// with [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- without the strict match
-/// above accepting it, such as a digest hand-edited past 64 hex
-/// characters or swapped for non-hex bytes, but still recognizably
-/// this family's own. This third shape exists because
-/// `omnifrons_domain::guidance::ManagedBlock::locate` is exactly this
-/// permissive on its own side: it counts ANY line starting with the
-/// kind's begin prefix toward its own begin-marker tally, never
-/// checking that the rest of the line parses, so a malformed-interior
-/// line like this is itself what that function finds and refuses
-/// over; this shape anchors on that same line instead of skipping
-/// past it to a later one. A prose or fenced documentation example
-/// that only *starts* like a sentinel and then continues past its own
-/// closing `-->` with ordinary prose never closes that envelope, so
-/// none of the three shapes ever mistakes it for a real marker,
-/// exactly as [`is_omnifrons_begin_sentinel_line`]'s own doc comment
-/// already explains for the strict match alone; a fenced sentinel
-/// that is otherwise complete still counts, exactly as
-/// [`legacy_lines`] still counts a fenced legacy marker.
+/// A line counts as this family's own position in either of two
+/// shapes, and neither is checked any more strictly than `locate`
+/// checks it: a line whose trimmed content starts with
+/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] -- exactly `locate`'s own
+/// `content.starts_with(kind.begin_prefix())` test that increments its
+/// `begins` tally, never checking that anything past the prefix
+/// parses, so a truncated digest, a version with no `-->` at all, or
+/// ordinary prose resuming after a closing `-->` all still count, the
+/// same as they still count toward `locate`'s own tally and so still
+/// contribute to the real refusal it raises -- or the complete end
+/// sentinel line ([`OMNIFRONS_SKILLS_END_LINE`]), exactly `locate`'s
+/// own `content == kind.end_sentinel()` test that increments its
+/// `ends` tally. There is no third, looser shape, and no stricter one
+/// either: a begin-prefixed line that also happens to close cleanly
+/// with `-->` is just one instance of the first shape, not a separate
+/// case, because `locate` itself never distinguishes them.
 ///
-/// Of every line matching any of the three shapes, the EARLIEST one in
-/// the file wins, never a fixed priority among the shapes themselves: a
+/// Of every line matching either shape, the EARLIEST one in the file
+/// wins, never a fixed priority between the two shapes themselves: a
 /// single malformed or refusing pair can carry more than one such line
-/// at once -- a begin line whose hand-edited digest fails the strict
-/// match, sitting above its own intact end sentinel, or a stray extra
-/// end sentinel sitting above an otherwise valid pair's own begin line
-/// -- and this family's own position in the tie-break must always be
-/// the first of them a reader scanning top to bottom would meet, never
-/// whichever shape a fixed check order happened to try first.
+/// at once -- a truncated begin line sitting above its own intact end
+/// sentinel, or a stray extra end sentinel sitting above an otherwise
+/// valid pair's own begin line -- and this family's own position in
+/// the tie-break must always be the first of them a reader scanning
+/// top to bottom would meet, never whichever shape happened to be
+/// checked first.
 ///
-/// `None` only when no line matches any of the three shapes anywhere in
-/// the file: the refusing pair's own markers failed to parse some other
+/// `None` only when no line matches either shape anywhere in the
+/// file: the refusing pair's own markers failed to parse some other
 /// way, so there is nothing here to anchor on; see
 /// [`legacy_marker_precedes_omnifrons_marker`]'s own doc comment.
 fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
@@ -1564,10 +1509,8 @@ fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
         .into_iter()
         .find(|&(_, raw)| {
             let line = strip_line_ending(raw);
-            is_omnifrons_begin_sentinel_line(line)
+            line.starts_with(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes())
                 || line == OMNIFRONS_SKILLS_END_LINE.as_bytes()
-                || (line.starts_with(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes())
-                    && line.ends_with(OMNIFRONS_SKILLS_BEGIN_SUFFIX.as_bytes()))
         })
         .map(|(offset, _)| offset)
 }
@@ -1588,21 +1531,26 @@ fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
 /// offset instead means a line like that can never stand in for the
 /// block that is actually refusing.
 ///
-/// The omnifrons side carries no equivalent located offset to thread --
-/// [`ManagedBlock::locate`] reports no span on the
-/// [`ManagedFileError`] that produces an omnifrons refusal -- so
-/// [`first_omnifrons_marker_offset`] is searched instead: it scans
-/// every line for any of the three shapes a real omnifrons marker can
-/// take and keeps the earliest match, so a fake example -- a fenced or
-/// prose placeholder that only starts like a sentinel -- never stands
-/// in for a real marker, the same guarantee the legacy side has, even
-/// without a located span to thread. Taking the earliest match across
-/// all three shapes, rather than a fixed priority among them, is what
-/// lets a malformed begin line above an intact end, or a stray extra
-/// end above an otherwise valid pair, still anchor on whichever of the
-/// two reads first. When no line matches any of the three shapes at
-/// all, the omnifrons marker is treated as reading after the legacy
-/// one, since there is no position to prefer it by.
+/// The omnifrons side has no equivalent strict recognizer to borrow
+/// from, and deliberately so: `ManagedBlock::locate` itself counts a
+/// begin marker by prefix alone (`content.starts_with`), never a
+/// full-line match, so a fresh prefix-only search over
+/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] is not a looser stand-in here the
+/// way it would be for the legacy side -- it is the same test `locate`
+/// itself runs. [`first_omnifrons_marker_offset`] also carries no
+/// located offset to thread, since [`ManagedBlock::locate`] reports no
+/// span on the [`ManagedFileError`] that produces an omnifrons
+/// refusal; it scans every line for either shape a real omnifrons
+/// marker can take and keeps the earliest match, so the position found
+/// is always a line that itself contributes to `locate`'s own
+/// begin/end tally, and therefore to the real refusal `locate` raises
+/// over the whole file. Taking the earliest match across both shapes,
+/// rather than a fixed priority between them, is what lets a malformed
+/// begin line above an intact end, or a stray extra end above an
+/// otherwise valid pair, still anchor on whichever of the two reads
+/// first. When no line matches either shape at all, the omnifrons
+/// marker is treated as reading after the legacy one, since there is
+/// no position to prefer it by.
 fn legacy_marker_precedes_omnifrons_marker(
     canonical_text: &[u8],
     legacy_marker_offset: usize,
@@ -1817,9 +1765,11 @@ mod tests {
     /// renderer, so a sentinel change on that side fails loudly here
     /// instead of silently disabling
     /// [`legacy_marker_precedes_omnifrons_marker`]'s own file-order
-    /// tie-break, which reads both constants -- through
-    /// [`is_omnifrons_begin_sentinel_line`] -- to find where the
-    /// omnifrons family's own block begins.
+    /// tie-break, which reads [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] --
+    /// through [`first_omnifrons_marker_offset`] -- to find where the
+    /// omnifrons family's own block begins;
+    /// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] itself is no longer part of
+    /// that search, only of this pin.
     #[test]
     fn omnifrons_skills_begin_prefix_matches_the_domains_own_rendered_sentinel() {
         let digest = |_: &[u8]| Sha256Digest([0; 32]);

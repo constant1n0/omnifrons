@@ -3499,21 +3499,35 @@ fn verify_prefers_the_earlier_refusal_in_file_order_when_the_legacy_marker_comes
     );
 }
 
-/// A prose line whose content starts with this crate's own omnifrons
-/// sentinel prefix but continues past the closing `-->` with ordinary
-/// sentence text, positioned before a broken legacy begin marker (no
-/// end marker after it), itself positioned before the agent's own
-/// omnifrons block edited by hand. A plain prefix search still matches
-/// the prose line's opening bytes and would wrongly treat the
-/// omnifrons family as reading before the legacy marker; the prose
-/// line never finishes a complete sentinel, so it must never stand in
-/// for the omnifrons family's own real marker, which is the edited
-/// block's own begin line -- reading *after* the legacy marker here.
-/// The legacy refusal must be the one `verify` reports: a reader
-/// scanning top to bottom meets it first.
+/// A line whose content starts with this crate's own complete
+/// omnifrons sentinel -- prefix, version, `sha256:`, a real 64-hex
+/// digest, and the closing `-->` -- and then keeps going past that
+/// closing `-->` with ordinary prose, positioned before a broken
+/// legacy begin marker (no end marker after it), itself positioned
+/// before the agent's own omnifrons block edited by hand.
+///
+/// `omnifrons_domain::guidance::ManagedBlock::locate` splits the file
+/// on `"\n"` alone and then only checks a line's own *start*
+/// (`content.starts_with(kind.begin_prefix())`) to count it toward its
+/// begin-marker tally; it never requires anything in particular at the
+/// end of the line. So this whole line -- sentinel and trailing prose
+/// together -- is one line to `locate`, and it starts with the begin
+/// prefix, so `locate` counts it: together with the edited block's own
+/// begin line further down, that is two begin markers for one end
+/// marker, itself what makes the real omnifrons block malformed over
+/// there. This line is therefore the omnifrons family's own first
+/// offending line, reading before the legacy marker, and the omnifrons
+/// refusal must be the one `verify` reports.
+///
+/// Only a line that does not *start* with the sentinel -- indented, or
+/// with other text before it on the same line -- is prose rather than
+/// a marker to either `locate` or this crate's own
+/// [`first_omnifrons_marker_offset`]; see
+/// [`verify_treats_an_indented_omnifrons_sentinel_mention_as_content`]
+/// for that case.
 #[test]
-fn verify_ignores_a_prose_omnifrons_sentinel_mention_when_choosing_the_earlier_refusal() {
-    let project = TempDir::new("verify-prose-omnifrons-example-precedes-real-marker");
+fn verify_prefers_the_omnifrons_refusal_when_a_prose_continued_begin_precedes_a_legacy_marker() {
+    let project = TempDir::new("verify-prose-continued-omnifrons-begin-precedes-legacy");
     let workspace = project.workspace();
     let hasher = FakeHasher;
     let digest = |bytes: &[u8]| hasher.sha256(bytes);
@@ -3555,14 +3569,91 @@ fn verify_ignores_a_prose_omnifrons_sentinel_mention_when_choosing_the_earlier_r
     assert_eq!(
         report.problems,
         vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "a line that starts with the complete omnifrons sentinel and then continues as \
+         prose is still a begin marker to `ManagedBlock::locate`, and so still anchors \
+         this family's own tie-break position; it precedes the legacy marker that \
+         follows it"
+    );
+}
+
+/// An indented line whose content, after the indentation, is a
+/// complete omnifrons sentinel -- positioned before a broken legacy
+/// begin marker (no end marker after it), itself positioned before the
+/// agent's own omnifrons block edited by hand -- the same layout as
+/// [`verify_prefers_the_omnifrons_refusal_when_a_prose_continued_begin_precedes_a_legacy_marker`],
+/// with the decoy text moved to the *front* of the line instead of the
+/// back.
+///
+/// `omnifrons_domain::guidance::ManagedBlock::locate` strips only a
+/// line's own terminator before comparing it (`strip_terminator`,
+/// stripping a trailing `"\r\n"` or `"\n"` and nothing else), never
+/// leading whitespace, so an indented line's content does not start
+/// with the begin prefix at all and `locate` never counts it. This
+/// crate's own [`first_omnifrons_marker_offset`] strips a line's own
+/// terminator the same single way ([`strip_line_ending`]) before
+/// testing it, so it agrees: the indentation makes this line ordinary
+/// content for both sides alike, never a marker. The omnifrons
+/// family's own first offending line is therefore the edited block's
+/// own begin line further down, reading *after* the legacy marker, so
+/// the legacy refusal must be the one `verify` reports -- unchanged by
+/// this fix, since neither the old shapes nor the current one ever
+/// matched an indented line.
+#[test]
+fn verify_treats_an_indented_omnifrons_sentinel_mention_as_content() {
+    let project = TempDir::new("verify-indented-omnifrons-mention-is-content");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n  <!-- omnifrons:begin skills v1 sha256:{} \
+         -->\n\n<!-- portable-agent:skills:begin sha256={} -->\n\n{tampered}\n",
+        "a".repeat(64),
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
             "refused (block_layout): the skill index block cannot be regenerated: the begin \
              marker on line 7 has no end marker after it. Fix the markers by hand or index \
              the precedence rule by hand"
                 .to_string()
         ],
-        "a prose line that only starts like the omnifrons sentinel, never closing into a \
-         complete one, must never stand in for the real omnifrons marker; the legacy marker \
-         here precedes the real, later omnifrons block"
+        "an indented line that merely looks like a sentinel is content, not a marker, to \
+         both `ManagedBlock::locate` and this family's own tie-break anchor; the legacy \
+         marker here precedes the real, later omnifrons block"
     );
 }
 
@@ -3875,6 +3966,74 @@ fn verify_prefers_the_omnifrons_refusal_when_a_non_hex_digest_begin_precedes_a_l
         "a begin line whose digest is the right length but not hex still opens and closes \
          the same envelope, and `ManagedBlock::locate` counts it by prefix alone; this \
          family's own malformed begin line precedes the legacy marker that follows it"
+    );
+}
+
+/// A truncated omnifrons begin line -- the prefix, the version, and
+/// the literal `" sha256:"` are all present, but the line stops right
+/// there, with no digest and no closing `-->` at all -- positioned
+/// above a broken legacy begin marker (no end marker after it), itself
+/// positioned above a standalone, intact omnifrons end sentinel with
+/// no begin of its own anywhere near it.
+///
+/// `omnifrons_domain::guidance::ManagedBlock::locate` counts this line
+/// toward its own begin-marker tally the same as any other: it only
+/// checks that the line's content starts with the kind's begin prefix,
+/// never that anything past it parses, so this truncated line is
+/// itself one of the two markers that make the real omnifrons block
+/// malformed over there (this truncated begin, and the standalone end
+/// sentinel below -- one begin, one end, but the begin line itself
+/// does not parse). Before this fix, neither of
+/// [`first_omnifrons_marker_offset`]'s old shapes matched a line like
+/// this -- it is not a complete sentinel, and it does not close its
+/// own envelope with `-->` either -- so the anchor skipped straight to
+/// the standalone end sentinel instead, which reads *after* the legacy
+/// marker, letting the legacy refusal win even though the omnifrons
+/// family's own truncated begin line reads first. `verify` must report
+/// exactly one refusal, and it must be the omnifrons one.
+#[test]
+fn verify_prefers_the_omnifrons_refusal_when_a_truncated_begin_line_precedes_a_legacy_marker() {
+    let project = TempDir::new("verify-omnifrons-truncated-begin-precedes-legacy-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:begin skills v1 sha256:abc\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n\n<!-- omnifrons:end skills -->\n",
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "the omnifrons family's own truncated begin line precedes the legacy marker that \
+         follows it; a later standalone end sentinel must never stand in for this family's \
+         own earliest line when the tie is broken"
     );
 }
 
