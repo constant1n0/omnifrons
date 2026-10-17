@@ -3743,6 +3743,128 @@ fn verify_prefers_the_omnifrons_refusal_when_a_stray_end_precedes_a_legacy_marke
     );
 }
 
+/// A line of prose holding a lone carriage return immediately followed
+/// by text that is itself the complete omnifrons end sentinel
+/// (`"prose\r<!-- omnifrons:end skills -->\n"`), positioned above a
+/// broken legacy begin marker (no end marker after it), itself
+/// positioned above the family's own real offending line: a genuine,
+/// standalone omnifrons end sentinel with no begin anywhere near it.
+///
+/// `ManagedBlock::locate` splits its own input on `"\n"` only, so the
+/// lone carriage return here never starts a new line for it: the
+/// whole `"prose\r<!-- omnifrons:end skills -->"` stretch is one line
+/// whose content is not the end sentinel, and `locate` never finds a
+/// marker there at all. `first_omnifrons_marker_offset` must skip
+/// this phantom line too and anchor on the real end sentinel at the
+/// bottom instead -- which reads *after* the legacy marker. `verify`
+/// must report exactly one refusal, and it must be the legacy one,
+/// since its own marker reads first in the file; before this fix, the
+/// scan used the legacy family's own wider line split, which also
+/// breaks on a lone carriage return, so the phantom line's content,
+/// in isolation, exactly matched the end sentinel and anchored the
+/// omnifrons side earlier than the legacy marker, letting the
+/// omnifrons refusal win wrongly.
+#[test]
+fn verify_prefers_the_legacy_refusal_over_a_phantom_omnifrons_marker_from_a_lone_cr() {
+    let project = TempDir::new("verify-legacy-wins-over-phantom-cr-omnifrons-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\nprose\r<!-- omnifrons:end skills -->\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n\n<!-- omnifrons:end skills -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the \
+             begin marker on line 7 has no end marker after it. Fix the markers by hand \
+             or index the precedence rule by hand"
+                .to_string()
+        ],
+        "a lone carriage return followed by text equal to the omnifrons end sentinel is \
+         one line to ManagedBlock::locate, never a marker; the family's own real end \
+         sentinel reads after the legacy marker, so the legacy refusal must win"
+    );
+}
+
+/// Pinning: the same broken legacy begin marker, now preceded by a
+/// CRLF-terminated omnifrons end sentinel
+/// (`"<!-- omnifrons:end skills -->\r\n"`) instead of an LF-terminated
+/// one. `ManagedBlock::locate` still recognizes a `\r\n`-terminated
+/// line as a complete end sentinel -- `split_inclusive('\n')` keeps
+/// the leading carriage return as part of the same line, and its own
+/// `strip_terminator` removes it along with the `\n` -- so
+/// `first_omnifrons_marker_offset` must keep recognizing it too,
+/// anchoring on this earlier line and letting the omnifrons refusal
+/// win, exactly as it already did before this fix.
+#[test]
+fn verify_prefers_the_omnifrons_refusal_when_a_crlf_end_sentinel_precedes_a_legacy_marker() {
+    let project = TempDir::new("verify-omnifrons-crlf-end-precedes-legacy-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:end skills -->\r\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "a CRLF-terminated omnifrons end sentinel must still anchor this family's own \
+         position and precede the legacy marker that follows it"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill

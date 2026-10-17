@@ -1297,7 +1297,13 @@ fn lines_with_terminators(text: &[u8]) -> Vec<(usize, &[u8])> {
     lines
 }
 
-/// `raw`'s own bytes with one trailing line terminator removed.
+/// `raw`'s own bytes with one trailing line terminator removed:
+/// trailing `"\n"` first, then trailing `"\r"` -- the same two-step
+/// rule `omnifrons_domain::guidance`'s own `strip_terminator` applies,
+/// so a line [`omnifrons_lines`] hands to
+/// [`first_omnifrons_marker_offset`] is trimmed exactly as
+/// `ManagedBlock::locate` itself trims the same line before comparing
+/// it, even though the two sides split their lines differently.
 fn strip_line_ending(raw: &[u8]) -> &[u8] {
     let trimmed = raw.strip_suffix(b"\n").unwrap_or(raw);
     trimmed.strip_suffix(b"\r").unwrap_or(trimmed)
@@ -1398,12 +1404,61 @@ fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
     !version.is_empty() && !version.iter().any(u8::is_ascii_whitespace) && is_hex_digest
 }
 
+/// `text` split into lines that each keep their own terminator and
+/// know their own start offset, scanned over the ORIGINAL bytes --
+/// never a decoded stand-in for them -- exactly as
+/// `omnifrons_domain::guidance::ManagedBlock::locate` itself splits
+/// its own input: `str::split_inclusive('\n')`, `"\n"` only. Never
+/// [`lines_with_terminators`]'s own wider rule, which also splits on
+/// a lone `"\r"` to match the legacy family's own prototype
+/// `splitlines` behavior: the two rules agree on a `"\r\n"` pair
+/// (still one boundary, at the trailing `'\n'` byte) and on plain
+/// `"\n"`, and disagree only on a lone `"\r"` with no `'\n'` after
+/// it, which starts a new line for [`lines_with_terminators`] but
+/// never for `locate`, or here.
+///
+/// No trailing empty line is produced for text ending in `"\n"`,
+/// matching `split_inclusive`'s own behavior.
+///
+/// [`lines_with_terminators`] and this function cannot be merged into
+/// one shared split: [`legacy_lines`] must keep matching the legacy
+/// prototype's own `splitlines(keepends=True)` rule exactly, and
+/// [`first_omnifrons_marker_offset`] must keep matching `locate`'s own
+/// `split_inclusive('\n')` rule exactly, and those two upstream rules
+/// themselves disagree on a lone `"\r"`.
+fn omnifrons_lines(text: &[u8]) -> Vec<(usize, &[u8])> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, &byte) in text.iter().enumerate() {
+        if byte == b'\n' {
+            lines.push((start, &text[start..=index]));
+            start = index + 1;
+        }
+    }
+    if start < text.len() {
+        lines.push((start, &text[start..]));
+    }
+    lines
+}
+
 /// The byte offset of this crate's own omnifrons skills-block marker's
-/// own earliest position in `canonical_text`, scanned over the
-/// ORIGINAL bytes exactly as [`legacy_lines`] is -- never a decoded
-/// stand-in for them -- for
-/// [`legacy_marker_precedes_omnifrons_marker`]'s own file-order
-/// tie-break.
+/// own earliest position in `canonical_text`, scanned line by line
+/// exactly as `omnifrons_domain::guidance::ManagedBlock::locate`
+/// itself would -- through [`omnifrons_lines`], never
+/// [`legacy_lines`]'s own wider [`lines_with_terminators`] split --
+/// and always over the ORIGINAL bytes, never a decoded stand-in for
+/// them, for [`legacy_marker_precedes_omnifrons_marker`]'s own
+/// file-order tie-break.
+///
+/// Following `locate`'s own line boundaries here, rather than
+/// [`lines_with_terminators`]'s wider ones, is what keeps this
+/// family's own anchor honest: a line `locate` would never break at
+/// -- text after a lone `"\r"` that happens to equal the end
+/// sentinel, say -- must never anchor this family's own tie-break
+/// position either, since a line like that plays no part in the real
+/// omnifrons refusal `locate` itself would raise. See
+/// [`omnifrons_lines`]'s own doc comment for why the two splits
+/// cannot be shared.
 ///
 /// A line counts as this family's own position in any of three shapes:
 /// a complete begin sentinel line, matched in full by
@@ -1446,7 +1501,7 @@ fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
 /// way, so there is nothing here to anchor on; see
 /// [`legacy_marker_precedes_omnifrons_marker`]'s own doc comment.
 fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
-    lines_with_terminators(canonical_text)
+    omnifrons_lines(canonical_text)
         .into_iter()
         .find(|&(_, raw)| {
             let line = strip_line_ending(raw);
