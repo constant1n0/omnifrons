@@ -1323,6 +1323,19 @@ const OMNIFRONS_SKILLS_BEGIN_PREFIX: &str = "<!-- omnifrons:begin skills ";
 /// [`is_omnifrons_begin_sentinel_line`] below; never used alone.
 const OMNIFRONS_SKILLS_BEGIN_SUFFIX: &str = " -->";
 
+/// This crate's own skills-block end sentinel, matched as a full line --
+/// the same literal `omnifrons_domain::guidance::ManagedFileKind::Skills`'s
+/// own private `end_sentinel` returns, duplicated here for the same
+/// reason as [`OMNIFRONS_SKILLS_BEGIN_PREFIX`]: that method is not
+/// visible outside its own crate. Used by
+/// [`first_omnifrons_marker_offset`] as its second anchor, after a full
+/// begin sentinel line and before the prefix-only fallback, so a lone
+/// end sentinel -- a malformed pair with no begin line at all, the
+/// shape [`ManagedBlock::locate`] itself raises
+/// [`ManagedFileError::Malformed`] over -- still gives this side a real
+/// position to be scanned at, rather than reading as absent.
+const OMNIFRONS_SKILLS_END_LINE: &str = "<!-- omnifrons:end skills -->";
+
 /// Whether `line` is a complete omnifrons skills-block begin sentinel:
 /// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`], then a non-empty version holding
 /// no whitespace, then the literal `" sha256:"`, then exactly 64
@@ -1374,9 +1387,9 @@ fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
         .map(|(offset, _)| offset)
 }
 
-/// The byte offset of this crate's own omnifrons skills-block begin
-/// marker, scanned over the ORIGINAL bytes exactly as [`legacy_lines`]
-/// is -- never a decoded stand-in for them -- for
+/// The byte offset of this crate's own omnifrons skills-block marker,
+/// scanned over the ORIGINAL bytes exactly as [`legacy_lines`] is --
+/// never a decoded stand-in for them -- for
 /// [`legacy_marker_precedes_omnifrons_marker`]'s own file-order
 /// tie-break.
 ///
@@ -1391,20 +1404,33 @@ fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
 /// [`legacy_lines`] still counts a fenced legacy marker: fencing only
 /// ever explains a problem found some other way, it never hides one.
 ///
+/// When no begin sentinel line matches in full, tries
+/// [`OMNIFRONS_SKILLS_END_LINE`] next, matched the same way as a whole
+/// line: a malformed pair missing its begin line entirely still
+/// refuses from a real position in the file -- its own lone end
+/// sentinel -- rather than from no position at all. Without this
+/// second anchor, such a refusal always read as later than the legacy
+/// family's, even when its one marker sits above the legacy block's
+/// own begin line.
+///
 /// Falls back to [`first_marker_offset`]'s own prefix-only search only
-/// when no full sentinel line exists anywhere: the refusing pair's own
-/// begin line itself failed to parse (an invalid version or digest,
-/// the same shape that makes [`ManagedBlock::locate`] raise
-/// [`ManagedFileError::Malformed`]), so the strict scan has nothing to
-/// anchor on, and this falls back to the best-effort search used
-/// before it existed -- kept only because there is nothing more
-/// precise available here yet; see
+/// when neither full sentinel line exists anywhere: the refusing
+/// pair's own markers failed to parse in full some other way, so the
+/// strict scan has nothing to anchor on, and this falls back to the
+/// best-effort search used before either strict check existed -- kept
+/// only because there is nothing more precise available here yet; see
 /// [`legacy_marker_precedes_omnifrons_marker`]'s own doc comment.
 fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
     lines_with_terminators(canonical_text)
         .into_iter()
         .find(|&(_, raw)| is_omnifrons_begin_sentinel_line(strip_line_ending(raw)))
         .map(|(offset, _)| offset)
+        .or_else(|| {
+            lines_with_terminators(canonical_text)
+                .into_iter()
+                .find(|&(_, raw)| strip_line_ending(raw) == OMNIFRONS_SKILLS_END_LINE.as_bytes())
+                .map(|(offset, _)| offset)
+        })
         .or_else(|| first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX))
 }
 
@@ -1428,14 +1454,15 @@ fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
 /// [`ManagedBlock::locate`] reports no span on the
 /// [`ManagedFileError`] that produces an omnifrons refusal -- so
 /// [`first_omnifrons_marker_offset`] is searched instead: its own
-/// strict full-line match gives this side the same "a fake example
-/// never stands in for a real marker" guarantee the legacy side has,
-/// even without a located span to thread. Only that function's own
-/// last-resort prefix-only fallback keeps the narrower limitation this
-/// side has always had, for the rare case where even the refusing
-/// pair's own begin line cannot be matched in full. When even that
-/// fallback finds no line, the omnifrons marker is treated as reading
-/// after the legacy one, since there is no position to prefer it by.
+/// strict full-line match -- begin sentinel first, then end sentinel --
+/// gives this side the same "a fake example never stands in for a real
+/// marker" guarantee the legacy side has, even without a located span
+/// to thread. Only that function's own last-resort prefix-only
+/// fallback keeps the narrower limitation this side has always had,
+/// for the rare case where neither the refusing pair's own begin line
+/// nor its end line can be matched in full. When even that fallback
+/// finds no line, the omnifrons marker is treated as reading after the
+/// legacy one, since there is no position to prefer it by.
 fn legacy_marker_precedes_omnifrons_marker(
     canonical_text: &[u8],
     legacy_marker_offset: usize,

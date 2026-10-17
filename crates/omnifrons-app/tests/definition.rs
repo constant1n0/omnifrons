@@ -3434,6 +3434,116 @@ fn verify_counts_a_fenced_omnifrons_sentinel_example_when_choosing_the_earlier_r
     );
 }
 
+/// A lone omnifrons end sentinel -- no begin anywhere in the file, the
+/// malformed shape `ManagedBlock::locate` itself raises
+/// `ManagedFileError::Malformed` over, since its own `(begins, ends)`
+/// match only accepts `(0, 0)` or `(1, 1)` -- positioned before a broken
+/// legacy begin marker (no end marker after it) at the end of the file.
+/// Before `first_omnifrons_marker_offset` also searched for a full end
+/// sentinel line, this refusing pair had no begin line to anchor on and
+/// the prefix-only fallback found nothing either, so the omnifrons
+/// refusal always lost the tie-break to the legacy one here, even
+/// though its own lone sentinel sits first. `verify` must report
+/// exactly one refusal, and it must be the omnifrons one, since its
+/// marker reads first in the file.
+#[test]
+fn verify_prefers_the_omnifrons_refusal_when_its_end_sentinel_precedes_a_malformed_legacy_begin() {
+    let project = TempDir::new("verify-omnifrons-lone-end-precedes-legacy-begin");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:end skills -->\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "when both families refuse, the refusal from the family whose own marker reads \
+         first in the file wins; the omnifrons family's lone end sentinel here precedes \
+         the legacy family's own broken begin marker"
+    );
+}
+
+/// The mirrored ordering: the same broken legacy begin marker (no end
+/// marker after it), now placed *before* the lone omnifrons end
+/// sentinel, with no begin of its own anywhere in the file. `verify`
+/// must again report exactly one refusal, and it must be the legacy
+/// one, since its own marker reads first in the file -- never the
+/// omnifrons family's lone end sentinel that follows it.
+#[test]
+fn verify_prefers_the_legacy_refusal_when_its_begin_precedes_an_omnifrons_end_sentinel() {
+    let project = TempDir::new("verify-legacy-begin-precedes-omnifrons-lone-end");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- portable-agent:skills:begin sha256={} \
+         -->\n\n<!-- omnifrons:end skills -->\n",
+        "0".repeat(64)
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the begin \
+             marker on line 5 has no end marker after it. Fix the markers by hand or index \
+             the precedence rule by hand"
+                .to_string()
+        ],
+        "when both families refuse, the refusal from the family whose own marker reads \
+         first in the file wins; the legacy family's own begin marker here precedes the \
+         omnifrons family's lone end sentinel"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill

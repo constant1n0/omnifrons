@@ -623,6 +623,14 @@ fn effective_upward_loaders(
 /// identity-file name, never one of [`crate::hosts::EXTRA_READERS`]'s
 /// own host-extra entries, so there is no host-extras union for this
 /// one literal check to widen.
+///
+/// Each ancestor's own `described` text -- shared by its exposure and
+/// shadowing details below -- names [`ChainAncestor::identity_files`]
+/// first, then any of its own [`ChainAncestor::host_extras`] that match
+/// one of `loaders`' own kinds: the file that actually caused this
+/// ancestor's warning when it matched solely through a host extra, such
+/// as `.claude/AGENTS.md`, never through an identity file, which
+/// `identity_files` alone would otherwise silently drop.
 fn ancestor_warnings(
     identity_kinds: &[IdentityKind],
     host_extras: &[&str],
@@ -657,10 +665,21 @@ fn ancestor_warnings(
             shadowing.push("OpenCode");
             opencode_resolved = true;
         }
+        let matched_extras = ancestor
+            .host_extras
+            .iter()
+            .copied()
+            .filter(|extra| loaders.iter().any(|&(_, kinds)| kinds.contains(extra)));
+        let described_files: Vec<&str> = ancestor
+            .identity_files
+            .iter()
+            .copied()
+            .chain(matched_extras)
+            .collect();
         let described = format!(
             "the ancestor agent {} ({})",
             ancestor.display,
-            ancestor.identity_files.join(", ")
+            described_files.join(", ")
         );
         if !exposure.is_empty() {
             let detail = format!(

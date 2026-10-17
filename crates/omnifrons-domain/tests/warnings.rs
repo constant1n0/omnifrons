@@ -425,7 +425,12 @@ fn claude_code_fallback_is_disabled_by_claude_local_md_among_an_ancestors_host_e
 /// an identity file, since it is not one of `IdentityKind`'s six kinds
 /// -- still matches Claude Code's `fallback_files` once the fallback
 /// applies, firing `ancestor_exposure` for an `AGENTS.md`-only agent
-/// exactly as an identity-file match would.
+/// exactly as an identity-file match would. The warning's own detail
+/// must also name that extra: with no identity file of its own, this
+/// ancestor matched *solely* through `.claude/AGENTS.md`, so a
+/// `described` text built from `identity_files` alone would read "the
+/// ancestor agent outside ()", silently dropping the one file that
+/// caused the warning.
 #[test]
 fn claude_code_fallback_fires_ancestor_exposure_for_an_ancestors_claude_agents_host_extra() {
     let identity_kinds = [IdentityKind::Agents];
@@ -441,13 +446,49 @@ fn claude_code_fallback_fires_ancestor_exposure_for_an_ancestors_claude_agents_h
     });
 
     let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    let claude = exposure
+        .iter()
+        .find(|w| w.hosts.contains(&"Claude Code"))
+        .unwrap_or_else(|| panic!("no Claude Code ancestor_exposure warning in {warnings:?}"));
     assert!(
-        exposure.iter().any(|w| w.hosts.contains(&"Claude Code")),
-        "{warnings:?}"
+        claude.detail.contains(".claude/AGENTS.md"),
+        "an ancestor that matched solely through a host extra must have that extra named in \
+         the warning detail, got {claude:?}"
     );
 }
 
-/// Pairs with the previous test: the same `.claude/AGENTS.md`-only
+/// An ancestor holding both an identity file and a host extra that
+/// matches the same host's kinds: the warning's `described` text must
+/// list the identity file first, then the extra -- mirroring the
+/// prototype's own `ancestor_warnings` (~1019-1046), which joins one
+/// merged `ancestor_files` mapping in discovery order, never the extra
+/// alone and never the extra before the identity file.
+#[test]
+fn ancestor_description_lists_identity_files_before_a_matching_host_extra() {
+    let identity_kinds = [IdentityKind::Agents];
+    let chain = [ChainAncestor {
+        display: "outside",
+        identity_files: &["AGENTS.md"],
+        host_extras: &[".claude/AGENTS.md"],
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    let claude = exposure
+        .iter()
+        .find(|w| w.hosts.contains(&"Claude Code"))
+        .unwrap_or_else(|| panic!("no Claude Code ancestor_exposure warning in {warnings:?}"));
+    assert!(
+        claude.detail.contains("(AGENTS.md, .claude/AGENTS.md)"),
+        "the identity file must be listed before the matching host extra, got {claude:?}"
+    );
+}
+
+/// Pairs with the previous tests: the same `.claude/AGENTS.md`-only
 /// ancestor, but this agent's own `host_extras` also holds
 /// `CLAUDE.local.md`, already enough to disable the fallback before
 /// the chain is ever consulted
