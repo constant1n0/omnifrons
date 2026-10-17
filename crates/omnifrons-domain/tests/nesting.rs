@@ -139,7 +139,7 @@ fn warning_chain_orders_inside_then_outside_ancestors() {
             host_extras: Vec::new(),
         },
     ];
-    let chain = nesting::warning_chain(&roots, "child", &outer);
+    let chain = nesting::warning_chain(&roots, "child", &[], &outer);
     assert_eq!(
         chain,
         [
@@ -148,6 +148,66 @@ fn warning_chain_orders_inside_then_outside_ancestors() {
             ChainLink::Outside(outer[1].clone()),
         ]
     );
+}
+
+/// `warning_chain` folds in an extras-only directory -- one with no
+/// identity file of its own, so [`nesting::relate`] never makes it a
+/// root -- at its own true nesting depth among `roots`, nearest first:
+/// given scan root `"."`, root `"a"`, extras-only `"a/b"`, and root
+/// `"a/b/c"`, the chain for `"a/b/c"` is `"a/b"` (tagged
+/// [`ChainLink::Extras`]) before `"a"` and `"."` (both
+/// [`ChainLink::Root`]), never grouped as all roots then all extras.
+#[test]
+fn warning_chain_places_an_extras_only_directory_at_its_own_depth() {
+    let roots = [".", "a", "a/b/c"];
+    let extras_only = ["a/b"];
+
+    let chain = nesting::warning_chain(&roots, "a/b/c", &extras_only, &[]);
+
+    assert_eq!(
+        chain,
+        [
+            ChainLink::Extras("a/b".to_string()),
+            ChainLink::Root("a".to_string()),
+            ChainLink::Root(".".to_string()),
+        ]
+    );
+}
+
+/// An extras-only directory is never a root: it never appears in
+/// [`nesting::relate`]'s own parent/nested wiring, so it can never
+/// become a nesting parent or need consent on that strength alone --
+/// `relate` does not even accept an `extras_only` argument, and this
+/// pins that `"a/b/c"`'s own `inner_parent` skips straight over `"a/b"`
+/// to `"a"`, exactly as [`nesting::ancestor_chain`] (roots-only,
+/// unchanged) already reports.
+#[test]
+fn extras_only_directories_are_invisible_to_ancestor_chain_and_relate() {
+    let roots = [".", "a", "a/b/c"];
+
+    assert_eq!(nesting::ancestor_chain(&roots, "a/b/c"), ["a", "."]);
+
+    let relations = nesting::relate(&roots, &[]).unwrap();
+    let child = relations.iter().find(|r| r.root == "a/b/c").unwrap();
+    assert_eq!(child.parent, Some(Parent::Root("a".to_string())));
+}
+
+/// An outside [`Ancestor`] with no identity files at all, only a host
+/// extra, still reaches the chain as a [`ChainLink::Outside`] member:
+/// `warning_chain` appends every entry of `outer` unconditionally, never
+/// filtering on whether [`Ancestor::identity_files`] is empty.
+#[test]
+fn warning_chain_keeps_an_identity_less_outside_ancestor_with_a_host_extra() {
+    let roots = ["."];
+    let outer = [Ancestor {
+        path: "/outside".to_string(),
+        identity_files: Vec::new(),
+        host_extras: vec!["CLAUDE.local.md".to_string()],
+    }];
+
+    let chain = nesting::warning_chain(&roots, ".", &[], &outer);
+
+    assert_eq!(chain, [ChainLink::Outside(outer[0].clone())]);
 }
 
 /// `relate` still accepts the scan root `"."` and an ordinary nested
@@ -301,7 +361,7 @@ fn warning_chain_inherits_the_absolute_path_precondition() {
         identity_files: vec!["AGENTS.md".to_string()],
         host_extras: Vec::new(),
     }];
-    let chain = nesting::warning_chain(&roots, "/etc/passwd", &outer);
+    let chain = nesting::warning_chain(&roots, "/etc/passwd", &[], &outer);
     assert_eq!(
         chain,
         [

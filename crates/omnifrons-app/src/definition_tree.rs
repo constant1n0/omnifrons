@@ -12,9 +12,18 @@
 //! and `find_ancestors`:
 //!
 //! - [`TreeSnapshot::directories`] holds exactly the directories that hold
-//!   at least one identity file -- the prototype's `agent_roots`, built
-//!   from `has_identity_files`. A directory that holds none is never
-//!   listed, even when it is walked.
+//!   at least one identity file or at least one host-specific extra
+//!   relevant to some host's upward or fallback walk: the prototype's
+//!   own `agent_roots`, built from `has_identity_files`, widened by this
+//!   port so a directory holding only an extra is not silently dropped
+//!   the way the prototype would drop it. Such a directory is never a
+//!   root in [`crate::definition::scan`]'s own sense -- it never gets an
+//!   [`crate::definition::AgentReport`] of its own, and it is never a
+//!   nesting parent or anything needing consent -- but it still reaches
+//!   an enclosing agent's own warning chain, as
+//!   [`omnifrons_domain::nesting::ChainLink::Extras`]. A directory
+//!   holding neither an identity file nor a host extra is never listed,
+//!   even when it is walked.
 //! - A host configuration directory's identity files (for example
 //!   `.claude/CLAUDE.md`) are attributed to its *parent* directory's
 //!   [`DirectoryEntry`], never listed as a root of their own -- the
@@ -89,8 +98,10 @@ use crate::harness_adapter::WorkspaceRoot;
 /// composes over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeSnapshot {
-    /// The directories holding at least one identity file, in the
-    /// prototype's sorted walk order.
+    /// The directories holding at least one identity file or host
+    /// extra, in the prototype's sorted walk order; see this module's
+    /// own documentation for why a host-extra-only entry is allowed
+    /// here even though it is never a root.
     pub directories: Vec<DirectoryEntry>,
     /// Every discovered `SKILL.md`, in the prototype's sorted walk order.
     pub skills: Vec<SkillFile>,
@@ -100,9 +111,11 @@ pub struct TreeSnapshot {
     pub ancestors: Vec<Ancestor>,
 }
 
-/// One directory the walk found holding at least one identity file (the
-/// prototype's per-directory `read_identity_files` plus
-/// `find_host_extras`, read back as one value).
+/// One directory the walk found holding at least one identity file or
+/// host extra (the prototype's per-directory `read_identity_files` plus
+/// `find_host_extras`, read back as one value, widened to allow an
+/// entry with no identity file at all -- see this module's own
+/// documentation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryEntry {
     /// This directory's path, POSIX-style and relative to the scan root;
@@ -110,7 +123,9 @@ pub struct DirectoryEntry {
     pub path: String,
     /// The identity files found here, including any attributed to this
     /// directory from a host configuration directory beneath it (for
-    /// example `.claude/CLAUDE.md`).
+    /// example `.claude/CLAUDE.md`); empty exactly when
+    /// [`Self::host_extras`] is not, for a directory holding a host
+    /// extra but no identity file of its own.
     pub identity_files: Vec<IdentityFile>,
     /// The host-specific extra file names found alongside the identity
     /// files (for example `CLAUDE.local.md`), never read as identity.

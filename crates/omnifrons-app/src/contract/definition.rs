@@ -204,9 +204,10 @@ fn assert_sorted_by_walk_order<'a>(entries: impl Iterator<Item = (&'a str, &'a s
 /// Asserts [`DefinitionTree`]'s own contract (`crate::definition_tree`'s
 /// own documentation) on whatever `tree` returns for `root`: every
 /// directory and skill path is clean and relative, a listed directory
-/// always holds at least one identity file, a skill's basename is
-/// `SKILL.md`, directories and skills are in the prototype's sorted walk
-/// order, and ancestors are nearest first.
+/// always holds at least one identity file or host extra (never
+/// neither), a skill's basename is `SKILL.md`, directories and skills
+/// are in the prototype's sorted walk order, and ancestors are nearest
+/// first.
 ///
 /// Checks only the shape a [`TreeSnapshot`] value must have; it cannot
 /// check the walk, pruning, link, or home-boundary rules that only a
@@ -225,8 +226,8 @@ pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoo
     for directory in &snapshot.directories {
         assert_clean_relative(&directory.path, "a directory");
         assert!(
-            !directory.identity_files.is_empty(),
-            "a listed directory must hold at least one identity file: {}",
+            !directory.identity_files.is_empty() || !directory.host_extras.is_empty(),
+            "a listed directory must hold at least one identity file or host extra: {}",
             directory.path
         );
     }

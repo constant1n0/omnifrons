@@ -170,12 +170,22 @@ impl RootRelation {
     }
 }
 
-/// One link in a [`warning_chain`]: either a root the same scan also
-/// discovered, or an ancestor outside it.
+/// One link in a [`warning_chain`]: a root the same scan also
+/// discovered, a directory inside the scan that is never a root, or an
+/// ancestor outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainLink {
     /// A root inside the scan, named by its relative path.
     Root(String),
+    /// A directory inside the scan with no identity file of its own --
+    /// so [`relate`] never makes it a root, a nesting parent, or
+    /// anything needing consent -- but that still holds a host-specific
+    /// extra file relevant to some host's upward or fallback walk (for
+    /// example `.claude/AGENTS.md`). Named by its relative path exactly
+    /// like [`Self::Root`]. An extension beyond the prototype, which
+    /// has no concept of a chain member that is not a root at all; see
+    /// [`warning_chain`]'s own doc comment.
+    Extras(String),
     /// An ancestor outside the scan, with its identity files.
     Outside(Ancestor),
 }
@@ -383,17 +393,71 @@ pub fn ancestor_chain<'a>(roots: &[&'a str], root: &str) -> Vec<&'a str> {
     chain
 }
 
-/// The full warning chain for `root`: its [`ancestor_chain`] inside the
-/// scan, followed by `outer`'s ancestors outside it, in `outer`'s own
-/// order -- the prototype composes its own warning chain the same way.
+/// The inside-the-scan portion of a [`warning_chain`]: every root in
+/// `roots` and every extras-only directory in `extras_only` enclosing
+/// `root`, nearest first, each tagged by which set it came from.
+/// Walks the combined set with the same `inner_parent` step
+/// [`ancestor_chain`] uses, but never calls [`ancestor_chain`] itself:
+/// that function's own roots-only contract stays exactly as documented,
+/// for [`relate`]'s own parent/nested wiring, which must never treat an
+/// extras-only directory as a root. The two sets are assumed disjoint --
+/// a directory with any identity file belongs to `roots`, never to
+/// `extras_only` -- and both inherit the same scan-root-relative
+/// precondition as [`relate`]'s own `roots` argument.
+fn inside_chain(roots: &[&str], extras_only: &[&str], root: &str) -> Vec<ChainLink> {
+    let mut combined: Vec<&str> = Vec::with_capacity(roots.len() + extras_only.len());
+    combined.extend_from_slice(roots);
+    combined.extend_from_slice(extras_only);
+
+    let mut chain = Vec::new();
+    let mut current = inner_parent(&combined, root);
+    while let Some(next) = current {
+        chain.push(if roots.contains(&next) {
+            ChainLink::Root(next.to_string())
+        } else {
+            ChainLink::Extras(next.to_string())
+        });
+        current = inner_parent(&combined, next);
+    }
+    chain
+}
+
+/// The full warning chain for `root`: `inside_chain`'s roots and
+/// extras-only directories enclosing it, nearest first, followed by
+/// `outer`'s ancestors outside the scan, in `outer`'s own order -- the
+/// prototype composes its own warning chain the same way, for the
+/// roots-only part alone.
+///
+/// `extras_only` is this function's own extension beyond the prototype,
+/// which has no concept of a chain member that is not a root at all:
+/// the prototype's `walk_workspace` only ever discovers a directory as
+/// an agent root (`has_identity_files`) or not, and both its
+/// `ancestor_chain` and `find_ancestors` walk agent roots exclusively,
+/// so a directory holding only a host-specific extra -- never an
+/// identity file -- is invisible to it everywhere: not a root, not a
+/// parent, not a chain member. `crate::warnings`'s own module
+/// documentation already extends Claude Code's fallback decision to
+/// match a chain ancestor's host extras the same way its identity files
+/// are matched (its own `ancestor_has_any_kind`); `extras_only` is what
+/// lets a directory with no identity file reach that same,
+/// already-extended check too, instead of staying invisible to it the
+/// way the prototype would leave it.
+///
+/// An outside [`Ancestor`] with no identity files but a host extra
+/// already reaches the chain without any help from `extras_only`:
+/// `outer`'s entries are appended unconditionally below, never filtered
+/// on whether [`Ancestor::identity_files`] is empty.
+///
 /// `root` inherits the same scan-root-relative precondition
-/// transitively, through [`ancestor_chain`].
+/// transitively, through `inside_chain`.
 #[must_use]
-pub fn warning_chain(roots: &[&str], root: &str, outer: &[Ancestor]) -> Vec<ChainLink> {
-    let mut chain: Vec<ChainLink> = ancestor_chain(roots, root)
-        .into_iter()
-        .map(|inner| ChainLink::Root(inner.to_string()))
-        .collect();
+pub fn warning_chain(
+    roots: &[&str],
+    root: &str,
+    extras_only: &[&str],
+    outer: &[Ancestor],
+) -> Vec<ChainLink> {
+    let mut chain = inside_chain(roots, extras_only, root);
     chain.extend(outer.iter().cloned().map(ChainLink::Outside));
     chain
 }

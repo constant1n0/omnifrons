@@ -293,6 +293,36 @@ fn attribute_skills<'a>(roots: &[&'a str], skills: &[SkillFile]) -> HashMap<&'a 
     by_root
 }
 
+/// Every directory in `directories` holding at least one identity file
+/// -- the prototype's own `agent_roots`, built by `walk_workspace`'s
+/// `has_identity_files` gate -- in `directories`' own order. Shared by
+/// [`scan`] and [`verify`] so both derive `roots` the identical way: an
+/// extras-only entry (`crate::definition_tree`'s own documentation) is
+/// never one of these, so it can never become an agent, a nesting
+/// parent, or anything needing consent through [`nesting::relate`].
+fn agent_root_paths(directories: &[DirectoryEntry]) -> Vec<&str> {
+    directories
+        .iter()
+        .filter(|directory| !directory.identity_files.is_empty())
+        .map(|directory| directory.path.as_str())
+        .collect()
+}
+
+/// Every directory in `directories` holding no identity file of its own
+/// but at least one host extra, in `directories`' own order --
+/// [`nesting::warning_chain`]'s own `extras_only` argument: never a
+/// root ([`agent_root_paths`] excludes it), but still a chain member
+/// for an enclosing agent.
+fn extras_only_paths(directories: &[DirectoryEntry]) -> Vec<&str> {
+    directories
+        .iter()
+        .filter(|directory| {
+            directory.identity_files.is_empty() && !directory.host_extras.is_empty()
+        })
+        .map(|directory| directory.path.as_str())
+        .collect()
+}
+
 /// The skills report for one agent ([`read_skill_index`] against `text`,
 /// empty when the agent has no canonical text to read -- so every
 /// discovered skill reports `missing` rather than this struct going
@@ -311,8 +341,10 @@ fn skills_report(text: Option<&[u8]>, discovered: &[String], root_absolute: &str
 
 /// Each link of `chain`'s own identity-file names, `&'static str` (the
 /// prototype's own `ancestor_files` dict keys): a link inside the scan
-/// reads them straight from that root's own [`DirectoryEntry`]; an
-/// outside ancestor's are recognized from [`Ancestor::identity_files`]
+/// -- a root or an extras-only directory alike -- reads them straight
+/// from its own [`DirectoryEntry`] (always empty for an extras-only
+/// one, by construction); an outside ancestor's are recognized from
+/// [`Ancestor::identity_files`]
 /// by trying [`IdentityKind::from_file_name`] first -- the prototype's
 /// own shape (for example `"AGENTS.md"`) -- then falling back to
 /// [`IdentityKind::parse`] (the token form, for example `"agents"`), so
@@ -329,7 +361,7 @@ fn chain_identity_files(
     chain
         .iter()
         .map(|link| match link {
-            ChainLink::Root(path) => directories
+            ChainLink::Root(path) | ChainLink::Extras(path) => directories
                 .iter()
                 .find(|directory| directory.path == *path)
                 .map(|owner| {
@@ -355,8 +387,10 @@ fn chain_identity_files(
 /// Each link of `chain`'s own host-specific extra file names,
 /// `&'static str`, recognized the same way [`warnings_for`] recognizes
 /// this agent's own root -- mapped through [`hosts::EXTRA_READERS`]'s
-/// keys. A link inside the scan reads them from that root's own
-/// [`DirectoryEntry::host_extras`]; an outside ancestor's come from
+/// keys. A link inside the scan -- a root or an extras-only directory
+/// alike -- reads them from its own [`DirectoryEntry::host_extras`]
+/// (the whole reason an extras-only directory is a chain member at
+/// all); an outside ancestor's come from
 /// [`Ancestor::host_extras`]. An entry neither recognizes is dropped,
 /// exactly like [`chain_identity_files`] drops an unrecognized identity
 /// entry.
@@ -368,7 +402,7 @@ fn chain_host_extras(
         .iter()
         .map(|link| {
             let names: &[String] = match link {
-                ChainLink::Root(path) => directories
+                ChainLink::Root(path) | ChainLink::Extras(path) => directories
                     .iter()
                     .find(|directory| directory.path == *path)
                     .map_or(&[], |owner| owner.host_extras.as_slice()),
@@ -394,6 +428,7 @@ fn chain_host_extras(
 fn warnings_for(
     directories: &[DirectoryEntry],
     roots: &[&str],
+    extras_only: &[&str],
     ancestors: &[Ancestor],
     directory: &DirectoryEntry,
     relation: &RootRelation,
@@ -412,7 +447,7 @@ fn warnings_for(
         .find(|file| file.kind == IdentityKind::AgentsOverride)
         .map(|file| file.bytes.as_slice());
 
-    let chain_links = nesting::warning_chain(roots, &directory.path, ancestors);
+    let chain_links = nesting::warning_chain(roots, &directory.path, extras_only, ancestors);
     let chain_files = chain_identity_files(directories, &chain_links);
     let chain_extras = chain_host_extras(directories, &chain_links);
     let chain: Vec<ChainAncestor<'_>> = chain_links
@@ -421,7 +456,7 @@ fn warnings_for(
         .zip(chain_extras.iter())
         .map(|((link, files), extras)| ChainAncestor {
             display: match link {
-                ChainLink::Root(path) => path.as_str(),
+                ChainLink::Root(path) | ChainLink::Extras(path) => path.as_str(),
                 ChainLink::Outside(ancestor) => ancestor.path.as_str(),
             },
             identity_files: files.as_slice(),
@@ -467,8 +502,15 @@ struct ScanContext<'a> {
     workspace: &'a WorkspaceRoot,
     /// Every discovered directory, for chain lookups.
     directories: &'a [DirectoryEntry],
-    /// Every discovered directory's path, for [`nesting`] calls.
+    /// Every agent root's own path (a directory holding at least one
+    /// identity file), for `nesting` calls needing roots-only
+    /// semantics: [`nesting::relate`], [`attribute_skills`], and
+    /// [`nesting::warning_chain`]'s own `roots` argument.
     roots: &'a [&'a str],
+    /// Every directory with no identity file of its own but at least
+    /// one host extra -- never a root -- for
+    /// [`nesting::warning_chain`]'s own `extras_only` argument.
+    extras_only: &'a [&'a str],
     /// The agent roots above the scan root, nearest first.
     ancestors: &'a [Ancestor],
     /// Every root's discovered skills, relative to it.
@@ -496,6 +538,7 @@ fn build_agent_report(
     let warnings = warnings_for(
         ctx.directories,
         ctx.roots,
+        ctx.extras_only,
         ctx.ancestors,
         directory,
         relation,
@@ -533,13 +576,6 @@ pub fn scan(
         .tree
         .snapshot(workspace)
         .map_err(DefinitionError::Tree)?;
-    let roots: Vec<&str> = snapshot
-        .directories
-        .iter()
-        .map(|directory| directory.path.as_str())
-        .collect();
-    let relations =
-        nesting::relate(&roots, &snapshot.ancestors).map_err(DefinitionError::Nesting)?;
 
     let mut classifications: Vec<Classification> = Vec::with_capacity(snapshot.directories.len());
     for directory in &snapshot.directories {
@@ -551,6 +587,17 @@ pub fn scan(
         classifications.push(classify(&identity));
     }
 
+    // `roots` is only every directory holding at least one identity
+    // file -- never an extras-only entry, which `nesting::relate` must
+    // never treat as a root, a nesting parent, or anything needing
+    // consent. `extras_only` is the complement that still matters: no
+    // identity file of its own, but a host extra relevant to an
+    // enclosing agent's own warning chain.
+    let roots = agent_root_paths(&snapshot.directories);
+    let extras_only = extras_only_paths(&snapshot.directories);
+    let relations =
+        nesting::relate(&roots, &snapshot.ancestors).map_err(DefinitionError::Nesting)?;
+
     let discovered_by_root = attribute_skills(&roots, &snapshot.skills);
     let agents: Vec<AgentReport> = {
         let ctx = ScanContext {
@@ -558,13 +605,19 @@ pub fn scan(
             workspace,
             directories: &snapshot.directories,
             roots: &roots,
+            extras_only: &extras_only,
             ancestors: &snapshot.ancestors,
             discovered_by_root: &discovered_by_root,
         };
+        // Zipping `relations` (one per agent root) against only the
+        // identity-bearing directories keeps every pair aligned: both
+        // sides are filtered from `snapshot.directories` by the exact
+        // same predicate, in the exact same order.
         snapshot
             .directories
             .iter()
             .zip(classifications.iter())
+            .filter(|(directory, _)| !directory.identity_files.is_empty())
             .zip(relations.iter())
             .map(|((directory, classification), relation)| {
                 build_agent_report(&ctx, directory, classification, relation)
@@ -650,11 +703,7 @@ pub fn verify(
         .tree
         .snapshot(workspace)
         .map_err(DefinitionError::Tree)?;
-    let roots: Vec<&str> = snapshot
-        .directories
-        .iter()
-        .map(|directory| directory.path.as_str())
-        .collect();
+    let roots = agent_root_paths(&snapshot.directories);
 
     let root_entry = snapshot
         .directories

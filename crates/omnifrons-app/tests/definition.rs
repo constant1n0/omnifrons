@@ -358,6 +358,47 @@ fn definition_tree_contract_fails_a_malformed_snapshot() {
     definition_tree_contract(&tree, &workspace);
 }
 
+/// `definition_tree_contract` passes a directory holding a host extra
+/// but no identity file at all: the contract's own rule is "at least
+/// one identity file or host extra", never "at least one identity
+/// file" -- an extras-only entry is exactly the shape
+/// `omnifrons_domain::nesting::ChainLink::Extras` exists for (see
+/// `crate::definition`'s own `scan`, which never treats it as an
+/// agent).
+#[test]
+fn definition_tree_contract_passes_an_extras_only_directory() {
+    let project = TempDir::new("contract-extras-only");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            Vec::new(),
+            vec![".claude/AGENTS.md".to_string()],
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
+/// `definition_tree_contract` fails a directory holding neither an
+/// identity file nor a host extra: the walk never lists a directory
+/// with nothing relevant at all, so a snapshot claiming one is
+/// malformed.
+#[test]
+#[should_panic(expected = "identity file or host extra")]
+fn definition_tree_contract_fails_a_directory_with_neither() {
+    let project = TempDir::new("contract-neither");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(".", Vec::new(), Vec::new(), Vec::new())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
 /// `definition_tree_contract` passes the prototype's real top-down
 /// skill order: the scan root's own `SKILL.md` always precedes every
 /// skill found inside a subdirectory, and subdirectories are visited in
@@ -1000,6 +1041,133 @@ fn an_unrecognized_host_extra_on_an_outside_ancestor_changes_nothing() {
             warning.code == WarningCode::AncestorExposure && warning.hosts.contains(&"Claude Code")
         }),
         "expected an ancestor_exposure warning naming Claude Code, got {with_unknown:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// A directory holding only a host extra, no identity file of its own,
+// is never an agent root (`nesting::relate` never sees it), but still
+// reaches an enclosing agent's own warning chain
+// (`nesting::ChainLink::Extras`), the same way an outside ancestor's
+// extras already do -- extending the Claude Code `AGENTS.md` fallback
+// check to a chain member that is not a root at all.
+// ---------------------------------------------------------------------
+
+/// An inside directory with no identity file of its own but a host
+/// extra -- `.claude/AGENTS.md`, never a root -- still reaches an
+/// enclosing agent's warning chain: with no `CLAUDE.md` variant
+/// anywhere, Claude Code's `AGENTS.md` fallback applies, and the
+/// `AGENTS.md`-only agent below it gets an `ancestor_exposure` warning
+/// naming Claude Code and `.claude/AGENTS.md` -- exposure, not
+/// shadowing, since the agent already has its own `AGENTS.md` too. An
+/// outside ancestor is present alongside it to pin that composition:
+/// the extras-only directory never appears in `ScanReport::agents`.
+#[test]
+fn an_extras_only_directory_reaches_its_descendants_warning_chain() {
+    let project = TempDir::new("extras-only-inside");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            Vec::new(),
+            vec![".claude/AGENTS.md".to_string()],
+            Vec::new(),
+        )
+        .directory(
+            "agent",
+            vec![identity(
+                IdentityKind::Agents,
+                b"# Agent\n\nYou are Agent.\n",
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .ancestor("/outside", Vec::new(), Vec::new())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(
+        report.agents.len(),
+        1,
+        "the extras-only directory must never become an agent, got {:?}",
+        report
+            .agents
+            .iter()
+            .map(|agent| &agent.path)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.agents[0].path, "agent");
+
+    let exposure: Vec<_> = report.agents[0]
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == WarningCode::AncestorExposure)
+        .collect();
+    assert!(
+        exposure
+            .iter()
+            .any(|w| w.hosts.contains(&"Claude Code") && w.detail.contains(".claude/AGENTS.md")),
+        "expected an ancestor_exposure warning naming Claude Code and .claude/AGENTS.md, got {:?}",
+        report.agents[0].warnings
+    );
+}
+
+/// Adding `CLAUDE.local.md` to the very same extras-only directory
+/// disables the Claude Code `AGENTS.md` fallback this chain member
+/// newly reaches -- one `CLAUDE.md` variant anywhere in the chain is
+/// enough, per `omnifrons_domain::warnings`'s own documented rule: the
+/// `ancestor_exposure` warning
+/// `an_extras_only_directory_reaches_its_descendants_warning_chain`
+/// pins disappears once this never-a-root directory also holds a real
+/// `CLAUDE.md` variant.
+#[test]
+fn a_claude_variant_in_the_extras_only_directory_disables_its_own_fallback() {
+    let project = TempDir::new("extras-only-claude-variant");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            Vec::new(),
+            vec![
+                ".claude/AGENTS.md".to_string(),
+                "CLAUDE.local.md".to_string(),
+            ],
+            Vec::new(),
+        )
+        .directory(
+            "agent",
+            vec![identity(
+                IdentityKind::Agents,
+                b"# Agent\n\nYou are Agent.\n",
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(report.agents.len(), 1);
+    assert!(
+        !report.agents[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.hosts.contains(&"Claude Code")),
+        "CLAUDE.local.md anywhere in the chain must disable the AGENTS.md fallback, got {:?}",
+        report.agents[0].warnings
     );
 }
 
