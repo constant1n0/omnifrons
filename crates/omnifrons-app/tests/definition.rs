@@ -3296,6 +3296,144 @@ fn verify_prefers_the_earlier_refusal_in_file_order_when_the_legacy_marker_comes
     );
 }
 
+/// A prose line whose content starts with this crate's own omnifrons
+/// sentinel prefix but continues past the closing `-->` with ordinary
+/// sentence text, positioned before a broken legacy begin marker (no
+/// end marker after it), itself positioned before the agent's own
+/// omnifrons block edited by hand. A plain prefix search still matches
+/// the prose line's opening bytes and would wrongly treat the
+/// omnifrons family as reading before the legacy marker; the prose
+/// line never finishes a complete sentinel, so it must never stand in
+/// for the omnifrons family's own real marker, which is the edited
+/// block's own begin line -- reading *after* the legacy marker here.
+/// The legacy refusal must be the one `verify` reports: a reader
+/// scanning top to bottom meets it first.
+#[test]
+fn verify_ignores_a_prose_omnifrons_sentinel_mention_when_choosing_the_earlier_refusal() {
+    let project = TempDir::new("verify-prose-omnifrons-example-precedes-real-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:begin skills v1 sha256:{} --> is \
+         the shape this crate renders, described here only as a migration note.\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n\n{tampered}\n",
+        "a".repeat(64),
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: the begin \
+             marker on line 7 has no end marker after it. Fix the markers by hand or index \
+             the precedence rule by hand"
+                .to_string()
+        ],
+        "a prose line that only starts like the omnifrons sentinel, never closing into a \
+         complete one, must never stand in for the real omnifrons marker; the legacy marker \
+         here precedes the real, later omnifrons block"
+    );
+}
+
+/// A closed fence quoting the agent's own omnifrons block -- edited by
+/// hand, the same tampering every other fixture pairing the two
+/// families in this file uses -- entirely inside the fence, positioned
+/// before a broken legacy begin marker (no end marker after it) at the
+/// end of the file. The begin sentinel line inside the fence is still
+/// a complete sentinel, so it must still count as this family's own
+/// marker position even though it is fenced -- the same "found, not
+/// hidden" rule [`legacy_lines`] already applies to a fenced legacy
+/// marker: fencing only ever explains a problem found some other way,
+/// it never hides one. `verify` must report exactly one refusal, and
+/// it must be the omnifrons one, since its marker reads first in the
+/// file.
+///
+/// A pinning test: this ordering already won under the previous
+/// prefix-only search too, since that search was never fence-aware
+/// either. Kept here so the stricter full-line match this test suite
+/// now requires never starts excluding a fenced sentinel that is
+/// otherwise complete.
+#[test]
+fn verify_counts_a_fenced_omnifrons_sentinel_example_when_choosing_the_earlier_refusal() {
+    let project = TempDir::new("verify-fenced-omnifrons-example-precedes-legacy-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let tampered = rendered.replace("sample", "sample-edited");
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n```\n{tampered}\n```\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n",
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (edited_block): the skill index block was edited by hand (its recorded \
+             sha256 no longer matches) and cannot be regenerated; restore it or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "a fenced but otherwise complete omnifrons sentinel must still count as this \
+         family's own marker position; it precedes the real, broken legacy marker that \
+         follows the fence"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill

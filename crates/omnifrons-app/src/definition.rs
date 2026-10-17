@@ -1307,11 +1307,60 @@ fn strip_line_ending(raw: &[u8]) -> &[u8] {
 /// and including the space before the version -- the same literal
 /// `omnifrons_domain::guidance::ManagedFileKind::Skills`'s own private
 /// `begin_prefix` returns, duplicated here because that method is not
-/// visible outside its own crate. Used only by
-/// [`legacy_marker_precedes_omnifrons_marker`] below, to find where
-/// this family's own block begins for the file-order tie-break; never
-/// emitted by the legacy family -- see [`LEGACY_BEGIN_PREFIX`].
+/// visible outside its own crate. Paired with
+/// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] by
+/// [`is_omnifrons_begin_sentinel_line`] to match a begin sentinel line
+/// in full; used alone, as a last-resort fallback, by
+/// [`first_omnifrons_marker_offset`]. Never emitted by the legacy
+/// family -- see [`LEGACY_BEGIN_PREFIX`].
 const OMNIFRONS_SKILLS_BEGIN_PREFIX: &str = "<!-- omnifrons:begin skills ";
+
+/// This crate's own skills-block begin sentinel's fixed suffix, after
+/// the hex digest -- the same literal
+/// `omnifrons_domain::guidance::ManagedFileKind::Skills`'s own private
+/// `begin_suffix` returns. Paired with
+/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] by
+/// [`is_omnifrons_begin_sentinel_line`] below; never used alone.
+const OMNIFRONS_SKILLS_BEGIN_SUFFIX: &str = " -->";
+
+/// Whether `line` is a complete omnifrons skills-block begin sentinel:
+/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`], then a non-empty version holding
+/// no whitespace, then the literal `" sha256:"`, then exactly 64
+/// lowercase hex characters, then [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] --
+/// and nothing else on the line, the same shape
+/// `ManagedBlock::begin_sentinel` itself renders. `line` is expected
+/// already stripped of its own line terminator, exactly as
+/// [`strip_line_ending`] leaves it.
+///
+/// Matched bytewise against the original bytes, mirroring
+/// [`legacy_begin_digest`]'s own full-line rule: every fixed byte here
+/// is ASCII, so a line holding non-UTF-8 bytes simply fails to match,
+/// never a false positive. A line that merely starts with the prefix
+/// but does not finish the shape -- a fenced or prose documentation
+/// example carrying a placeholder version or digest, or one that
+/// continues past the closing `-->` with ordinary prose -- never
+/// counts, even though a plain prefix search would still match its
+/// opening bytes; see [`first_omnifrons_marker_offset`], the only
+/// caller.
+fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
+    let Some(after_prefix) = line.strip_prefix(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes()) else {
+        return false;
+    };
+    let Some(rest) = after_prefix.strip_suffix(OMNIFRONS_SKILLS_BEGIN_SUFFIX.as_bytes()) else {
+        return false;
+    };
+    let Some(hex_start) = rest.len().checked_sub(64) else {
+        return false;
+    };
+    let (head, hex) = rest.split_at(hex_start);
+    let Some(version) = head.strip_suffix(b" sha256:") else {
+        return false;
+    };
+    let is_hex_digest = hex
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    !version.is_empty() && !version.iter().any(u8::is_ascii_whitespace) && is_hex_digest
+}
 
 /// The byte offset of the first line whose content starts with
 /// `prefix`, scanned over the ORIGINAL bytes exactly as
@@ -1323,6 +1372,40 @@ fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
         .into_iter()
         .find(|&(_, raw)| strip_line_ending(raw).starts_with(prefix.as_bytes()))
         .map(|(offset, _)| offset)
+}
+
+/// The byte offset of this crate's own omnifrons skills-block begin
+/// marker, scanned over the ORIGINAL bytes exactly as [`legacy_lines`]
+/// is -- never a decoded stand-in for them -- for
+/// [`legacy_marker_precedes_omnifrons_marker`]'s own file-order
+/// tie-break.
+///
+/// Prefers the first line [`is_omnifrons_begin_sentinel_line`] accepts
+/// in full, never [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] alone: a line that
+/// only starts like a sentinel -- a fenced or prose documentation
+/// example with a placeholder version or digest, say -- can never
+/// stand in for a real begin marker, the same guarantee
+/// [`legacy_block_outcome`] already has by threading its own scan's
+/// located offset instead of a fresh prefix search. A fenced sentinel
+/// still counts when it is otherwise complete, exactly as
+/// [`legacy_lines`] still counts a fenced legacy marker: fencing only
+/// ever explains a problem found some other way, it never hides one.
+///
+/// Falls back to [`first_marker_offset`]'s own prefix-only search only
+/// when no full sentinel line exists anywhere: the refusing pair's own
+/// begin line itself failed to parse (an invalid version or digest,
+/// the same shape that makes [`ManagedBlock::locate`] raise
+/// [`ManagedFileError::Malformed`]), so the strict scan has nothing to
+/// anchor on, and this falls back to the best-effort search used
+/// before it existed -- kept only because there is nothing more
+/// precise available here yet; see
+/// [`legacy_marker_precedes_omnifrons_marker`]'s own doc comment.
+fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
+    lines_with_terminators(canonical_text)
+        .into_iter()
+        .find(|&(_, raw)| is_omnifrons_begin_sentinel_line(strip_line_ending(raw)))
+        .map(|(offset, _)| offset)
+        .or_else(|| first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX))
 }
 
 /// Whether the legacy family's own refusing block sits earlier in
@@ -1341,21 +1424,23 @@ fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
 /// offset instead means a line like that can never stand in for the
 /// block that is actually refusing.
 ///
-/// The omnifrons side carries no equivalent located offset to thread:
+/// The omnifrons side carries no equivalent located offset to thread --
 /// [`ManagedBlock::locate`] reports no span on the
-/// [`ManagedFileError`] that produces an omnifrons refusal, so this
-/// side still falls back to the first line starting with
-/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] -- a known, narrower instance of
-/// the same limitation the legacy side no longer has, kept only
-/// because there is nothing more precise available here yet. When even
-/// that fallback finds no line, the omnifrons marker is treated as
-/// reading after the legacy one, since there is no position to prefer
-/// it by.
+/// [`ManagedFileError`] that produces an omnifrons refusal -- so
+/// [`first_omnifrons_marker_offset`] is searched instead: its own
+/// strict full-line match gives this side the same "a fake example
+/// never stands in for a real marker" guarantee the legacy side has,
+/// even without a located span to thread. Only that function's own
+/// last-resort prefix-only fallback keeps the narrower limitation this
+/// side has always had, for the rare case where even the refusing
+/// pair's own begin line cannot be matched in full. When even that
+/// fallback finds no line, the omnifrons marker is treated as reading
+/// after the legacy one, since there is no position to prefer it by.
 fn legacy_marker_precedes_omnifrons_marker(
     canonical_text: &[u8],
     legacy_marker_offset: usize,
 ) -> bool {
-    match first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX) {
+    match first_omnifrons_marker_offset(canonical_text) {
         Some(omnifrons_offset) => legacy_marker_offset <= omnifrons_offset,
         None => true,
     }
@@ -1553,16 +1638,21 @@ mod tests {
     use omnifrons_domain::executable::Sha256Digest;
     use omnifrons_domain::guidance::LineEnding;
 
-    use super::{ManagedBlock, OMNIFRONS_SKILLS_BEGIN_PREFIX, render_body};
+    use super::{
+        ManagedBlock, OMNIFRONS_SKILLS_BEGIN_PREFIX, OMNIFRONS_SKILLS_BEGIN_SUFFIX, render_body,
+    };
 
-    /// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`]'s own doc comment explains why
-    /// it duplicates `ManagedFileKind::Skills`'s private `begin_prefix`:
-    /// that method is not visible outside the domain crate. This pins
-    /// the duplication against the domain's own renderer, so a
-    /// sentinel change on that side fails loudly here instead of
-    /// silently disabling [`legacy_marker_precedes_omnifrons_marker`]'s
-    /// own file-order tie-break, which reads this constant to find
-    /// where the omnifrons family's own block begins.
+    /// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`]'s and
+    /// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`]'s own doc comments explain why
+    /// they duplicate `ManagedFileKind::Skills`'s private `begin_prefix`
+    /// and `begin_suffix`: those methods are not visible outside the
+    /// domain crate. This pins the duplication against the domain's own
+    /// renderer, so a sentinel change on that side fails loudly here
+    /// instead of silently disabling
+    /// [`legacy_marker_precedes_omnifrons_marker`]'s own file-order
+    /// tie-break, which reads both constants -- through
+    /// [`is_omnifrons_begin_sentinel_line`] -- to find where the
+    /// omnifrons family's own block begins.
     #[test]
     fn omnifrons_skills_begin_prefix_matches_the_domains_own_rendered_sentinel() {
         let digest = |_: &[u8]| Sha256Digest([0; 32]);
@@ -1578,6 +1668,11 @@ mod tests {
             first_line.starts_with(OMNIFRONS_SKILLS_BEGIN_PREFIX),
             "the domain's own rendered skills sentinel no longer starts with this crate's \
              own duplicated prefix; got {first_line:?}"
+        );
+        assert!(
+            first_line.ends_with(OMNIFRONS_SKILLS_BEGIN_SUFFIX),
+            "the domain's own rendered skills sentinel no longer ends with this crate's own \
+             duplicated suffix; got {first_line:?}"
         );
     }
 }
