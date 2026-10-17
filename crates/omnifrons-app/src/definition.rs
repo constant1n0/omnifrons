@@ -1310,9 +1310,16 @@ fn strip_line_ending(raw: &[u8]) -> &[u8] {
 /// visible outside its own crate. Paired with
 /// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] by
 /// [`is_omnifrons_begin_sentinel_line`] to match a begin sentinel line
-/// in full; used alone, as a last-resort fallback, by
-/// [`first_omnifrons_marker_offset`]. Never emitted by the legacy
-/// family -- see [`LEGACY_BEGIN_PREFIX`].
+/// in full, and again, on its own terms, by
+/// [`first_omnifrons_marker_offset`]'s own fallback shape: a line that
+/// opens and closes the envelope -- starts with this prefix, ends with
+/// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- without the strict match above
+/// accepting it, such as a digest hand-edited past 64 hex characters.
+/// A line that only starts like this prefix and then continues as
+/// ordinary prose past its own closing `-->` never closes that
+/// envelope, so it is never mistaken for this family's own line
+/// either way. Never emitted by the legacy family -- see
+/// [`LEGACY_BEGIN_PREFIX`].
 const OMNIFRONS_SKILLS_BEGIN_PREFIX: &str = "<!-- omnifrons:begin skills ";
 
 /// This crate's own skills-block begin sentinel's fixed suffix, after
@@ -1328,12 +1335,14 @@ const OMNIFRONS_SKILLS_BEGIN_SUFFIX: &str = " -->";
 /// own private `end_sentinel` returns, duplicated here for the same
 /// reason as [`OMNIFRONS_SKILLS_BEGIN_PREFIX`]: that method is not
 /// visible outside its own crate. Used by
-/// [`first_omnifrons_marker_offset`] as its second anchor, after a full
-/// begin sentinel line and before the prefix-only fallback, so a lone
-/// end sentinel -- a malformed pair with no begin line at all, the
-/// shape [`ManagedBlock::locate`] itself raises
+/// [`first_omnifrons_marker_offset`] alongside the begin shapes above,
+/// never behind them: a lone end sentinel -- a malformed pair with no
+/// begin line at all, the shape [`ManagedBlock::locate`] itself raises
 /// [`ManagedFileError::Malformed`] over -- still gives this side a real
-/// position to be scanned at, rather than reading as absent.
+/// position to be scanned at, rather than reading as absent, and a
+/// stray extra end line above an otherwise valid pair must still win
+/// the earliest-line comparison over that pair's own, later begin
+/// line.
 const OMNIFRONS_SKILLS_END_LINE: &str = "<!-- omnifrons:end skills -->";
 
 /// Whether `line` is a complete omnifrons skills-block begin sentinel:
@@ -1375,63 +1384,55 @@ fn is_omnifrons_begin_sentinel_line(line: &[u8]) -> bool {
     !version.is_empty() && !version.iter().any(u8::is_ascii_whitespace) && is_hex_digest
 }
 
-/// The byte offset of the first line whose content starts with
-/// `prefix`, scanned over the ORIGINAL bytes exactly as
-/// [`legacy_lines`] is, never a decoded stand-in for them. `None` when
-/// no line starts with it -- including a family's own unpaired-end
-/// malformed shape, which carries no begin line at all.
-fn first_marker_offset(canonical_text: &[u8], prefix: &str) -> Option<usize> {
-    lines_with_terminators(canonical_text)
-        .into_iter()
-        .find(|&(_, raw)| strip_line_ending(raw).starts_with(prefix.as_bytes()))
-        .map(|(offset, _)| offset)
-}
-
-/// The byte offset of this crate's own omnifrons skills-block marker,
-/// scanned over the ORIGINAL bytes exactly as [`legacy_lines`] is --
-/// never a decoded stand-in for them -- for
+/// The byte offset of this crate's own omnifrons skills-block marker's
+/// own earliest position in `canonical_text`, scanned over the
+/// ORIGINAL bytes exactly as [`legacy_lines`] is -- never a decoded
+/// stand-in for them -- for
 /// [`legacy_marker_precedes_omnifrons_marker`]'s own file-order
 /// tie-break.
 ///
-/// Prefers the first line [`is_omnifrons_begin_sentinel_line`] accepts
-/// in full, never [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] alone: a line that
-/// only starts like a sentinel -- a fenced or prose documentation
-/// example with a placeholder version or digest, say -- can never
-/// stand in for a real begin marker, the same guarantee
-/// [`legacy_block_outcome`] already has by threading its own scan's
-/// located offset instead of a fresh prefix search. A fenced sentinel
-/// still counts when it is otherwise complete, exactly as
-/// [`legacy_lines`] still counts a fenced legacy marker: fencing only
-/// ever explains a problem found some other way, it never hides one.
+/// A line counts as this family's own position in any of three shapes:
+/// a complete begin sentinel line, matched in full by
+/// [`is_omnifrons_begin_sentinel_line`]; the complete end sentinel line
+/// ([`OMNIFRONS_SKILLS_END_LINE`], matched the same way, as a whole
+/// line); or a line that opens and closes the same envelope -- starts
+/// with [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] and ends with
+/// [`OMNIFRONS_SKILLS_BEGIN_SUFFIX`] -- without the strict match above
+/// accepting it, such as a digest hand-edited past 64 hex characters,
+/// but still recognizably this family's own. A prose or fenced
+/// documentation example that only *starts* like a sentinel and then
+/// continues past its own closing `-->` with ordinary prose never
+/// closes that envelope, so none of the three shapes ever mistakes it
+/// for a real marker, exactly as [`is_omnifrons_begin_sentinel_line`]'s
+/// own doc comment already explains for the strict match alone; a
+/// fenced sentinel that is otherwise complete still counts, exactly as
+/// [`legacy_lines`] still counts a fenced legacy marker.
 ///
-/// When no begin sentinel line matches in full, tries
-/// [`OMNIFRONS_SKILLS_END_LINE`] next, matched the same way as a whole
-/// line: a malformed pair missing its begin line entirely still
-/// refuses from a real position in the file -- its own lone end
-/// sentinel -- rather than from no position at all. Without this
-/// second anchor, such a refusal always read as later than the legacy
-/// family's, even when its one marker sits above the legacy block's
-/// own begin line.
+/// Of every line matching any of the three shapes, the EARLIEST one in
+/// the file wins, never a fixed priority among the shapes themselves: a
+/// single malformed or refusing pair can carry more than one such line
+/// at once -- a begin line whose hand-edited digest fails the strict
+/// match, sitting above its own intact end sentinel, or a stray extra
+/// end sentinel sitting above an otherwise valid pair's own begin line
+/// -- and this family's own position in the tie-break must always be
+/// the first of them a reader scanning top to bottom would meet, never
+/// whichever shape a fixed check order happened to try first.
 ///
-/// Falls back to [`first_marker_offset`]'s own prefix-only search only
-/// when neither full sentinel line exists anywhere: the refusing
-/// pair's own markers failed to parse in full some other way, so the
-/// strict scan has nothing to anchor on, and this falls back to the
-/// best-effort search used before either strict check existed -- kept
-/// only because there is nothing more precise available here yet; see
+/// `None` only when no line matches any of the three shapes anywhere in
+/// the file: the refusing pair's own markers failed to parse some other
+/// way, so there is nothing here to anchor on; see
 /// [`legacy_marker_precedes_omnifrons_marker`]'s own doc comment.
 fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
     lines_with_terminators(canonical_text)
         .into_iter()
-        .find(|&(_, raw)| is_omnifrons_begin_sentinel_line(strip_line_ending(raw)))
-        .map(|(offset, _)| offset)
-        .or_else(|| {
-            lines_with_terminators(canonical_text)
-                .into_iter()
-                .find(|&(_, raw)| strip_line_ending(raw) == OMNIFRONS_SKILLS_END_LINE.as_bytes())
-                .map(|(offset, _)| offset)
+        .find(|&(_, raw)| {
+            let line = strip_line_ending(raw);
+            is_omnifrons_begin_sentinel_line(line)
+                || line == OMNIFRONS_SKILLS_END_LINE.as_bytes()
+                || (line.starts_with(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes())
+                    && line.ends_with(OMNIFRONS_SKILLS_BEGIN_SUFFIX.as_bytes()))
         })
-        .or_else(|| first_marker_offset(canonical_text, OMNIFRONS_SKILLS_BEGIN_PREFIX))
+        .map(|(offset, _)| offset)
 }
 
 /// Whether the legacy family's own refusing block sits earlier in
@@ -1453,16 +1454,18 @@ fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
 /// The omnifrons side carries no equivalent located offset to thread --
 /// [`ManagedBlock::locate`] reports no span on the
 /// [`ManagedFileError`] that produces an omnifrons refusal -- so
-/// [`first_omnifrons_marker_offset`] is searched instead: its own
-/// strict full-line match -- begin sentinel first, then end sentinel --
-/// gives this side the same "a fake example never stands in for a real
-/// marker" guarantee the legacy side has, even without a located span
-/// to thread. Only that function's own last-resort prefix-only
-/// fallback keeps the narrower limitation this side has always had,
-/// for the rare case where neither the refusing pair's own begin line
-/// nor its end line can be matched in full. When even that fallback
-/// finds no line, the omnifrons marker is treated as reading after the
-/// legacy one, since there is no position to prefer it by.
+/// [`first_omnifrons_marker_offset`] is searched instead: it scans
+/// every line for any of the three shapes a real omnifrons marker can
+/// take and keeps the earliest match, so a fake example -- a fenced or
+/// prose placeholder that only starts like a sentinel -- never stands
+/// in for a real marker, the same guarantee the legacy side has, even
+/// without a located span to thread. Taking the earliest match across
+/// all three shapes, rather than a fixed priority among them, is what
+/// lets a malformed begin line above an intact end, or a stray extra
+/// end above an otherwise valid pair, still anchor on whichever of the
+/// two reads first. When no line matches any of the three shapes at
+/// all, the omnifrons marker is treated as reading after the legacy
+/// one, since there is no position to prefer it by.
 fn legacy_marker_precedes_omnifrons_marker(
     canonical_text: &[u8],
     legacy_marker_offset: usize,

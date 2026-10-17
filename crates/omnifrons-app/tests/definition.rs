@@ -3544,6 +3544,138 @@ fn verify_prefers_the_legacy_refusal_when_its_begin_precedes_an_omnifrons_end_se
     );
 }
 
+/// A malformed omnifrons begin line -- its digest hand-edited down to
+/// 60 hex characters, so neither the strict full-line match
+/// (`is_omnifrons_begin_sentinel_line`'s own length check) nor
+/// `ManagedBlock::locate`'s own `parse_begin` (`Sha256Digest::from_hex`
+/// requires exactly 64) accepts it -- positioned above an intact,
+/// standalone omnifrons end sentinel, with a broken legacy begin marker
+/// (no end marker after it) sitting between the two. Before this fix,
+/// `first_omnifrons_marker_offset` tried a full begin sentinel line
+/// first (none here), then the full end sentinel (found, but *after*
+/// the legacy marker), and only then the prefix-only fallback that
+/// would have found the malformed begin line -- never reached, because
+/// the end-sentinel step had already returned. So the omnifrons side
+/// read as later than the legacy marker, even though its own malformed
+/// begin line -- a real line belonging to this family -- precedes it.
+/// `verify` must report exactly one refusal, and it must be the
+/// omnifrons one, since a line belonging to its family reads first in
+/// the file.
+#[test]
+fn verify_prefers_the_omnifrons_refusal_when_a_malformed_begin_precedes_a_legacy_marker() {
+    let project = TempDir::new("verify-omnifrons-malformed-begin-precedes-legacy-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:begin skills v1 sha256:{} -->\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n\n<!-- omnifrons:end skills -->\n",
+        "a".repeat(60),
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "the omnifrons family's own malformed begin line precedes the legacy marker that \
+         follows it; a later intact end sentinel must never stand in for this family's own \
+         earliest line when the tie is broken"
+    );
+}
+
+/// A stray extra omnifrons end sentinel with no begin anywhere near it,
+/// positioned above a broken legacy begin marker (no end marker after
+/// it), itself positioned above an otherwise valid, intact omnifrons
+/// begin/end pair. Two end sentinels and one begin sentinel is itself a
+/// malformed layout (`ManagedBlock::locate` only accepts `(0, 0)` or
+/// `(1, 1)` begin/end counts), so the omnifrons side still refuses here
+/// even though the pair at the bottom is, in isolation, intact. Before
+/// this fix, `first_omnifrons_marker_offset` found the valid pair's own
+/// full begin sentinel line first -- the only full begin sentinel
+/// anywhere in the file -- and returned straight away, never reaching
+/// the stray end sentinel that reads earlier. So the omnifrons side
+/// read as later than the legacy marker, even though its own stray end
+/// sentinel -- a real line belonging to this family -- precedes it.
+/// `verify` must report exactly one refusal, and it must be the
+/// omnifrons one, since a line belonging to its family reads first in
+/// the file.
+#[test]
+fn verify_prefers_the_omnifrons_refusal_when_a_stray_end_precedes_a_legacy_marker() {
+    let project = TempDir::new("verify-omnifrons-stray-end-precedes-legacy-marker");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let body = "## Local skill index\n\n| Skill | Use when | Path |\n| --- | --- | --- |\n\
+                | sample | x | [sample](skills/sample/SKILL.md) |"
+        .to_string();
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let agents_bytes = format!(
+        "# Sample\n\nYou are Sample.\n\n<!-- omnifrons:end skills -->\n\n<!-- \
+         portable-agent:skills:begin sha256={} -->\n\n{rendered}\n",
+        "0".repeat(64),
+    )
+    .into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, &agents_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace).expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(!report.canonical);
+    assert_eq!(
+        report.problems,
+        vec![
+            "refused (block_layout): the skill index block cannot be regenerated: its \
+             sentinels are not one intact pair. Fix the markers by hand or index the \
+             precedence rule by hand"
+                .to_string()
+        ],
+        "the omnifrons family's own stray end sentinel precedes the legacy marker that \
+         follows it; the valid pair's own, later begin sentinel must never stand in for \
+         this family's own earliest line when the tie is broken"
+    );
+}
+
 // -- verify: a nested agent's own skill never joins the root's rows --
 
 /// A nested agent directory with its own identity and its own skill
