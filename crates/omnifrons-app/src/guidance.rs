@@ -542,7 +542,11 @@ fn target_of(manifest: &SnapshotManifest) -> Result<ManagedTarget, GuidanceError
 /// snapshot taken. Lets a caller refuse early -- before [`restore`]
 /// would otherwise write -- when it cannot act on that kind (the IPC
 /// layer's DTO boundary, for instance, which does not expose every
-/// domain kind).
+/// domain kind). Reads the snapshot's bytes as well as its manifest
+/// ([`SnapshotStore::read`]), because [`restore`] needs the bytes
+/// anyway; a caller fronting a write that never touches the payload
+/// should use [`snapshot_kind`] instead, so a snapshot with a missing
+/// or unreadable payload does not refuse that write too.
 ///
 /// # Errors
 ///
@@ -561,6 +565,38 @@ pub fn restore_target_kind(
         .read(&project, id)
         .map_err(GuidanceError::Snapshot)?;
     Ok(manifest.kind)
+}
+
+/// The kind of the snapshot `id` for the workspace's project, read-only
+/// and manifest-only: searches each kind's own listing ([`snapshots`],
+/// backed by [`SnapshotStore::list`]) for a manifest naming `id`, and
+/// never reads the snapshot's payload bytes the way
+/// [`restore_target_kind`] ([`SnapshotStore::read`]) does. Lets a caller
+/// refuse a kind it cannot act on before a write that itself never
+/// touches the payload either, such as [`pin`] ([`SnapshotStore::pin`]
+/// only ever rewrites the manifest) -- so a snapshot whose manifest is
+/// intact but whose payload file is missing or unreadable can still be
+/// pinned or unpinned.
+///
+/// # Errors
+///
+/// Returns [`GuidanceError::WorkAreaInvalid`], [`GuidanceError::Snapshot`]
+/// with a listing's own error, or with [`SnapshotStoreError::Unknown`]
+/// when no kind's listing holds a manifest naming `id`.
+pub fn snapshot_kind(
+    ports: &mut GuidancePorts<'_>,
+    workspace: &WorkspaceRoot,
+    id: SnapshotId,
+) -> Result<ManagedFileKind, GuidanceError> {
+    for kind in ManagedFileKind::ALL {
+        if snapshots(ports, workspace, kind)?
+            .iter()
+            .any(|manifest| manifest.id == id)
+        {
+            return Ok(kind);
+        }
+    }
+    Err(GuidanceError::Snapshot(SnapshotStoreError::Unknown))
 }
 
 /// Restore the snapshot `id`, bound to `expected_file_sha256`: the state
@@ -641,7 +677,11 @@ pub fn snapshots(
 }
 
 /// Pin or unpin the snapshot `id` of the workspace's project: a pinned
-/// snapshot is never pruned.
+/// snapshot is never pruned. Rewrites only the manifest
+/// ([`SnapshotStore::pin`]); never reads or requires the snapshot's
+/// payload bytes, so a caller checking the kind first should use
+/// [`snapshot_kind`] rather than [`restore_target_kind`] to keep that
+/// property.
 ///
 /// # Errors
 ///

@@ -19,7 +19,7 @@ use omnifrons_adapters::{FsProjectTextFile, FsSnapshotStore, Sha2Hasher};
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::guidance::{
     GuidanceError, GuidancePorts, apply, pin, preview, remove, restore, restore_target_kind,
-    snapshots, status,
+    snapshot_kind, snapshots, status,
 };
 use omnifrons_app::managed_file::ProjectTextFileError;
 use omnifrons_app::outbox_policy::OutboxPolicyStore as _;
@@ -397,13 +397,21 @@ pub fn guidance_pin_for(
     let _surface = publication.lock_surface();
     let id = parse_snapshot_id(id)?;
     let mut installer = Installer::open(publication, workspace)?;
-    // Read-only: find out what kind this id names, and refuse a kind
-    // this wire cannot represent, before `pin` gets a chance to rewrite
-    // anything (correction pass, mirroring `guidance_restore_for`'s own
-    // fix -- this used to be discovered only after the write, from the
-    // found manifest's own kind, so a skills snapshot ended up pinned
-    // although the call returned an error).
-    let found_kind = restore_target_kind(&mut installer.ports(&[workspace]), workspace, id)?;
+    // Read-only and manifest-only: find out what kind this id names,
+    // and refuse a kind this wire cannot represent, before `pin` gets a
+    // chance to rewrite anything (correction pass, mirroring
+    // `guidance_restore_for`'s own fix -- this used to be discovered
+    // only after the write, from the found manifest's own kind, so a
+    // skills snapshot ended up pinned although the call returned an
+    // error). `snapshot_kind`, not `restore_target_kind`: `pin` itself
+    // (`SnapshotStore::pin`) only ever rewrites the manifest, so
+    // requiring the payload bytes here -- as `restore_target_kind`
+    // (`SnapshotStore::read`) does -- refused a snapshot with a missing
+    // or unreadable `.bytes` file even though pinning or unpinning it
+    // needs no payload at all (correction pass: such a snapshot, once
+    // pinned by some other means, would have stayed exempt from
+    // pruning forever).
+    let found_kind = snapshot_kind(&mut installer.ports(&[workspace]), workspace, id)?;
     ManagedFileKindDto::try_from(found_kind)?;
     pin(&mut installer.ports(&[workspace]), workspace, id, pinned)?;
     // The manifest as rewritten: the store knows the id, not its kind, so
@@ -883,6 +891,21 @@ mod tests {
                     .sum()
             })
         }
+
+        /// The on-disk path of the snapshot `id`'s payload file:
+        /// `FsSnapshotStore` names it `<id-hex>.bytes`, beside the
+        /// `<id-hex>.json` manifest, under the project's own directory
+        /// inside the snapshots root.
+        fn snapshot_bytes_path(&self, id: &str) -> PathBuf {
+            let snapshots_dir = self.device.path().join("work-area/snapshots");
+            let project_dir = std::fs::read_dir(&snapshots_dir)
+                .expect("the snapshots directory exists")
+                .next()
+                .expect("one project directory")
+                .expect("a readable directory entry")
+                .path();
+            project_dir.join(format!("{id}.bytes"))
+        }
     }
 
     /// Record a snapshot of [`ManagedFileKind::Skills`] directly through
@@ -1338,6 +1361,51 @@ mod tests {
             .find(|manifest| manifest.id == id)
             .expect("the planted snapshot is still there");
         assert!(!still_there.pinned, "nothing was written");
+    }
+
+    /// Review follow-up (correction pass): `guidance_pin_for` used to
+    /// resolve the snapshot's kind through `restore_target_kind`, which
+    /// reads the snapshot's recorded bytes as well as its manifest
+    /// (`SnapshotStore::read`). A snapshot whose manifest is intact but
+    /// whose `.bytes` payload file is missing or unreadable is still
+    /// listed (`guidance_snapshots_for`, manifest-only), and the
+    /// store's own `pin` (`SnapshotStore::pin`) still only ever
+    /// rewrites the manifest -- so the payload read in front of it was
+    /// the only thing standing in the way, and a snapshot like this
+    /// pinned by some other means would have stayed exempt from
+    /// pruning forever. Confirms pinning and unpinning both succeed
+    /// once the kind check goes through a manifest-only listing
+    /// instead, and that the pinned flag the DTO reports matches a
+    /// fresh listing.
+    #[test]
+    fn pin_and_unpin_succeed_when_the_snapshots_payload_file_is_missing() {
+        let fixture = Fixture::new("pin-missing-payload");
+        let applied = fixture.apply(&Fixture::agents(), None).expect("applied");
+        let id = applied.snapshot_id.expect("a snapshot of the absence");
+        std::fs::remove_file(fixture.snapshot_bytes_path(&id)).expect("remove the payload");
+
+        let pinned = guidance_pin_for(&fixture.workspace(), &fixture.publication, &id, true)
+            .expect("pin succeeds although the payload is gone");
+        assert!(pinned.pinned);
+        assert_eq!(pinned.id, id);
+        let listed = guidance_snapshots_for(
+            &fixture.workspace(),
+            &fixture.publication,
+            ManagedFileKind::Guidance,
+        )
+        .expect("list");
+        assert!(
+            listed
+                .iter()
+                .find(|manifest| manifest.id == id)
+                .expect("still listed")
+                .pinned,
+            "the listing reflects the pin"
+        );
+
+        let unpinned = guidance_pin_for(&fixture.workspace(), &fixture.publication, &id, false)
+            .expect("unpin succeeds although the payload is gone");
+        assert!(!unpinned.pinned);
     }
 
     /// Review follow-up: `guidance_restore_for` already checks the

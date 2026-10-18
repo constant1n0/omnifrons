@@ -22,7 +22,8 @@ use omnifrons_app::contract::guidance::{
 };
 use omnifrons_app::contract::publication::FakeHasher;
 use omnifrons_app::guidance::{
-    GuidanceError, GuidancePorts, apply, pin, preview, remove, restore, snapshots, status,
+    GuidanceError, GuidancePorts, apply, pin, preview, remove, restore, restore_target_kind,
+    snapshot_kind, snapshots, status,
 };
 use omnifrons_app::managed_file::ProjectTextFileError;
 use omnifrons_app::snapshot_store::SnapshotStoreError;
@@ -1116,6 +1117,46 @@ fn snapshots_list_newest_first_and_pins_are_counted() {
             true,
         ),
         Err(GuidanceError::Snapshot(SnapshotStoreError::Unknown))
+    );
+}
+
+/// `snapshot_kind` -- the manifest-only sibling of `restore_target_kind`
+/// (correction pass: a caller fronting a write that never touches the
+/// payload, such as `pin`, should not have to satisfy a payload read
+/// just to learn the kind) -- resolves the same kind
+/// `restore_target_kind` does for a healthy snapshot, and refuses an id
+/// no kind's listing holds exactly the same way.
+#[test]
+fn snapshot_kind_resolves_existing_snapshots_and_refuses_unknown_ids() {
+    let mut fixture = Fixture::new("snapshot-kind");
+    let workspace = fixture.workspace();
+    let applied = apply(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        &agents(),
+        &outbox(),
+        None,
+    )
+    .expect("applied");
+    let id = applied.snapshot_id.expect("a snapshot of the absence");
+
+    let via_listing = snapshot_kind(&mut fixture.ports(&[&workspace]), &workspace, id);
+    assert_eq!(via_listing, Ok(ManagedFileKind::Guidance));
+    let via_read = restore_target_kind(&mut fixture.ports(&[&workspace]), &workspace, id);
+    assert_eq!(
+        via_read, via_listing,
+        "the same kind as the payload-reading lookup, when the payload is there"
+    );
+
+    let unknown = snapshot_kind(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        omnifrons_app::snapshot_store::SnapshotId(99),
+    );
+    assert_eq!(
+        unknown,
+        Err(GuidanceError::Snapshot(SnapshotStoreError::Unknown)),
+        "an id no kind's listing holds"
     );
 }
 
