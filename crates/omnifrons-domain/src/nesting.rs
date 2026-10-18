@@ -91,13 +91,19 @@ pub enum NestingError {
     DuplicateRoot(String),
 }
 
-/// An agent root above the scan root, outside every root [`relate`] was
-/// given -- the prototype's `Ancestor`. Unlike `roots`/`path`
-/// arguments, `path` here is not constrained to a clean,
-/// scan-root-relative form: the prototype stores and serializes it as a
-/// plain `str(Path)` (an absolute filesystem path in practice), so this
-/// module carries it the same way, opaquely, and places no shape
-/// requirement on it -- it may be absolute or `../`-relative.
+/// A directory above the scan root holding an identity file or a host
+/// extra, outside every root [`relate`] was given -- the prototype's
+/// `Ancestor`. An extras-only ancestor (empty
+/// [`Self::identity_files`]) is never an agent, exactly as an
+/// extras-only directory inside the scan is never a root for
+/// [`relate`]'s own purposes; see [`ChainLink::Extras`] and
+/// [`warning_chain`]'s own doc comment for the inside-the-scan
+/// counterpart. Unlike `roots`/`path` arguments, `path` here is not
+/// constrained to a clean, scan-root-relative form: the prototype
+/// stores and serializes it as a plain `str(Path)` (an absolute
+/// filesystem path in practice), so this module carries it the same
+/// way, opaquely, and places no shape requirement on it -- it may be
+/// absolute or `../`-relative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ancestor {
     /// The ancestor's own location, opaque to this module (see above).

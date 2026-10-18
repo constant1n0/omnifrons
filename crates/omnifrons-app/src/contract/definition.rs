@@ -5,7 +5,7 @@
 //! `definition_tree_contract`, which any implementation -- this fake
 //! today, sub-slice 1f's filesystem adapter later -- must pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use omnifrons_domain::definition::IdentityFile;
@@ -66,6 +66,14 @@ impl TreeSnapshotBuilder {
 
     /// Adds a directory holding `identity_files`, found at `path` (POSIX,
     /// relative to the scan root; `"."` for the scan root itself).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path` was already added by an earlier call: this
+    /// builder never merges or reorders entries, so a fixture needing
+    /// two directories sharing one path -- `scan`'s own contract makes
+    /// that a malformed snapshot, never a legitimate fixture -- must
+    /// build its [`TreeSnapshot`] directly instead.
     #[must_use]
     pub fn directory(
         mut self,
@@ -74,8 +82,17 @@ impl TreeSnapshotBuilder {
         host_extras: Vec<String>,
         generated_state_dirs: Vec<&'static str>,
     ) -> Self {
+        let path = path.into();
+        assert!(
+            !self
+                .directories
+                .iter()
+                .any(|existing| existing.path == path),
+            "TreeSnapshotBuilder::directory: {path} was already added; build a TreeSnapshot \
+             directly for a fixture needing a duplicate directory path"
+        );
         self.directories.push(DirectoryEntry {
-            path: path.into(),
+            path,
             identity_files,
             host_extras,
             generated_state_dirs,
@@ -100,6 +117,13 @@ impl TreeSnapshotBuilder {
     /// extra file names (for example `.claude/AGENTS.md`), relevant to
     /// a host's upward or fallback walk but never an identity file
     /// itself -- see [`Ancestor::host_extras`]'s own doc comment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path` was already added by an earlier call, for the
+    /// same reason as [`Self::directory`]: this builder never merges
+    /// or reorders entries, so a fixture needing a duplicate ancestor
+    /// path must build its [`TreeSnapshot`] directly instead.
     #[must_use]
     pub fn ancestor(
         mut self,
@@ -107,8 +131,14 @@ impl TreeSnapshotBuilder {
         identity_files: Vec<String>,
         host_extras: Vec<String>,
     ) -> Self {
+        let path = path.into();
+        assert!(
+            !self.ancestors.iter().any(|existing| existing.path == path),
+            "TreeSnapshotBuilder::ancestor: {path} was already added; build a TreeSnapshot \
+             directly for a fixture needing a duplicate ancestor path"
+        );
         self.ancestors.push(Ancestor {
-            path: path.into(),
+            path,
             identity_files,
             host_extras,
         });
@@ -201,13 +231,30 @@ fn assert_sorted_by_walk_order<'a>(entries: impl Iterator<Item = (&'a str, &'a s
     }
 }
 
+/// Every path `entries` yields is distinct from every other: a
+/// [`TreeSnapshot`]'s own `directories` or `ancestors` listing the same
+/// path twice is malformed, since a caller that assumes each one names
+/// a single, unambiguous entry -- `crate::definition::scan`'s own
+/// `agent_directories`/`roots` pairing, for directories; `nesting::relate`'s
+/// own `roots` precondition, downstream of the same snapshot -- would
+/// otherwise have to guess which entry is the real one.
+fn assert_unique_paths<'a>(paths: impl Iterator<Item = &'a str>, label: &str) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for path in paths {
+        assert!(
+            seen.insert(path),
+            "{label} paths must be unique: {path} is listed more than once"
+        );
+    }
+}
+
 /// Asserts [`DefinitionTree`]'s own contract (`crate::definition_tree`'s
 /// own documentation) on whatever `tree` returns for `root`: every
 /// directory and skill path is clean and relative, a listed directory
 /// always holds at least one identity file or host extra (never
 /// neither), a skill's basename is `SKILL.md`, directories and skills
-/// are in the prototype's sorted walk order, and ancestors are nearest
-/// first.
+/// are in the prototype's sorted walk order, directory paths are
+/// unique, ancestors are nearest first, and ancestor paths are unique.
 ///
 /// Checks only the shape a [`TreeSnapshot`] value must have; it cannot
 /// check the walk, pruning, link, or home-boundary rules that only a
@@ -238,6 +285,13 @@ pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoo
             .map(|directory| (directory.path.as_str(), directory.path.as_str())),
         "directories",
     );
+    assert_unique_paths(
+        snapshot
+            .directories
+            .iter()
+            .map(|directory| directory.path.as_str()),
+        "directories",
+    );
 
     for skill in &snapshot.skills {
         assert_clean_relative(&skill.path, "a skill");
@@ -256,6 +310,13 @@ pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoo
         "skills",
     );
 
+    assert_unique_paths(
+        snapshot
+            .ancestors
+            .iter()
+            .map(|ancestor| ancestor.path.as_str()),
+        "ancestors",
+    );
     let mut previous_depth: Option<usize> = None;
     for ancestor in &snapshot.ancestors {
         let depth = ancestor.path.split('/').count();

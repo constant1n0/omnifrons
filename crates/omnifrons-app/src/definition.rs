@@ -295,11 +295,14 @@ fn attribute_skills<'a>(roots: &[&'a str], skills: &[SkillFile]) -> HashMap<&'a 
 
 /// Every directory in `directories` holding at least one identity file
 /// -- the prototype's own `agent_roots`, built by `walk_workspace`'s
-/// `has_identity_files` gate -- in `directories`' own order. Shared by
-/// [`scan`] and [`verify`] so both derive `roots` the identical way: an
-/// extras-only entry (`crate::definition_tree`'s own documentation) is
-/// never one of these, so it can never become an agent, a nesting
-/// parent, or anything needing consent through [`nesting::relate`].
+/// `has_identity_files` gate -- in `directories`' own order. Used by
+/// [`verify`]; [`scan`] applies this exact predicate itself, mapping
+/// `roots` straight from its own `agent_directories` rather than
+/// calling this function a second, independent way -- see `scan`'s
+/// own comment for why. An extras-only entry
+/// (`crate::definition_tree`'s own documentation) is never one of
+/// these, so it can never become an agent, a nesting parent, or
+/// anything needing consent through [`nesting::relate`].
 fn agent_root_paths(directories: &[DirectoryEntry]) -> Vec<&str> {
     directories
         .iter()
@@ -577,26 +580,32 @@ pub fn scan(
         .snapshot(workspace)
         .map_err(DefinitionError::Tree)?;
 
-    // `roots` is only every directory holding at least one identity
-    // file -- never an extras-only entry, which `nesting::relate` must
-    // never treat as a root, a nesting parent, or anything needing
-    // consent. `extras_only` is the complement that still matters: no
-    // identity file of its own, but a host extra relevant to an
-    // enclosing agent's own warning chain.
-    let roots = agent_root_paths(&snapshot.directories);
-    let extras_only = extras_only_paths(&snapshot.directories);
-
-    // Classification never runs on a directory that cannot be an
-    // agent: filtering by membership in `roots` -- rather than
-    // re-testing `directory.identity_files.is_empty()` here too --
-    // keeps `agent_root_paths` the one place that decides which
-    // directories are roots, so `agent_directories` is already in
-    // `roots`' own order.
+    // `agent_directories` is every directory holding at least one
+    // identity file -- never an extras-only entry, which
+    // `nesting::relate` must never treat as a root, a nesting parent,
+    // or anything needing consent. `roots` is mapped from
+    // `agent_directories` itself, never computed as a second,
+    // independent filter over `snapshot.directories`: a snapshot
+    // listing the same path twice, once with an identity file and once
+    // extras-only, would otherwise let the extras-only entry ride
+    // along into `agent_directories` through a `roots.contains(path)`
+    // membership check it has no business satisfying, outnumbering the
+    // single, deduplicated `roots` entry `relations` below is built
+    // from and silently misaligning the final zip by one entry instead
+    // of ever reaching `nesting::relate`'s own refusal. `extras_only`
+    // is the complement that still matters: no identity file of its
+    // own, but a host extra relevant to an enclosing agent's own
+    // warning chain.
     let agent_directories: Vec<&DirectoryEntry> = snapshot
         .directories
         .iter()
-        .filter(|directory| roots.contains(&directory.path.as_str()))
+        .filter(|directory| !directory.identity_files.is_empty())
         .collect();
+    let roots: Vec<&str> = agent_directories
+        .iter()
+        .map(|directory| directory.path.as_str())
+        .collect();
+    let extras_only = extras_only_paths(&snapshot.directories);
     let mut classifications: Vec<Classification> = Vec::with_capacity(agent_directories.len());
     for directory in agent_directories.iter().copied() {
         let identity = DirectoryIdentity::new(
@@ -1374,9 +1383,10 @@ fn strip_line_ending(raw: &[u8]) -> &[u8] {
 /// `begin_prefix` returns, duplicated here because that method is not
 /// visible outside its own crate.
 ///
-/// [`first_omnifrons_marker_offset`] anchors on any line whose trimmed
-/// content starts with this prefix, nothing stricter and nothing
-/// looser, because that is exactly `ManagedBlock::locate`'s own rule
+/// [`first_omnifrons_marker_offset`] anchors on any line whose
+/// terminator-stripped content starts with this prefix, nothing
+/// stricter and nothing looser, because that is exactly
+/// `ManagedBlock::locate`'s own rule
 /// (`content.starts_with(kind.begin_prefix())`): it counts any line
 /// starting with the kind's begin prefix toward its own begin-marker
 /// tally, never checking that the rest of the line parses. A line that
@@ -1475,7 +1485,7 @@ fn omnifrons_lines(text: &[u8]) -> Vec<(usize, &[u8])> {
 ///
 /// A line counts as this family's own position in either of two
 /// shapes, and neither is checked any more strictly than `locate`
-/// checks it: a line whose trimmed content starts with
+/// checks it: a line whose terminator-stripped content starts with
 /// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] -- exactly `locate`'s own
 /// `content.starts_with(kind.begin_prefix())` test that increments its
 /// `begins` tally, never checking that anything past the prefix

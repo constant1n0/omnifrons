@@ -55,11 +55,29 @@
 //!   siblings at the same level.
 //!   [`crate::contract::definition::definition_tree_contract`] asserts
 //!   this order mechanically.
-//! - [`TreeSnapshot::ancestors`] holds the agent roots above the scan
-//!   root, nearest first (the prototype's `find_ancestors`, walking
-//!   `root.parents`), stopping at the user's home directory boundary --
-//!   the prototype's own `user_home()` guard in `has_identity_files`,
-//!   applied by the adapter, never by this port's caller. Each
+//! - [`TreeSnapshot::ancestors`] holds every directory above the scan
+//!   root holding at least one identity file or at least one host
+//!   extra, nearest first (the prototype's `find_ancestors`, walking
+//!   `root.parents`, widened by this module's own contract exactly as
+//!   [`TreeSnapshot::directories`] is above -- binding every
+//!   implementation, including sub-slice 1f's filesystem walker once
+//!   it is written -- so an ancestor holding only an extra must never
+//!   be silently dropped the way a reader of the prototype's own
+//!   agent-roots-only `find_ancestors` would drop it). This crate ships
+//!   no such walker today: nothing here walks a real filesystem, so
+//!   this bullet, like the one above, is a requirement this contract
+//!   places on a future implementation, never a description of
+//!   behavior this crate already performs. Such an ancestor's own
+//!   [`Ancestor::identity_files`] is empty -- it is never an agent,
+//!   exactly as an extras-only [`DirectoryEntry`] is never a root --
+//!   but it still reaches the scan's own warning chain regardless:
+//!   [`omnifrons_domain::nesting::warning_chain`] appends every entry
+//!   of its `outer` argument unconditionally, as
+//!   [`omnifrons_domain::nesting::ChainLink::Outside`], never filtered
+//!   on whether [`Ancestor::identity_files`] is empty. The walk stops
+//!   at the user's home directory boundary -- the prototype's own
+//!   `user_home()` guard in `has_identity_files`, applied by the
+//!   adapter, never by this port's caller. Each
 //!   `Ancestor::identity_files` entry the adapter supplies may be
 //!   either that file's identity-kind file name (for example
 //!   `"AGENTS.md"`, the prototype's own shape -- it keys its own

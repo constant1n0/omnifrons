@@ -19,7 +19,9 @@ use omnifrons_app::contract::definition::{
 };
 use omnifrons_app::contract::publication::FakeHasher;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
-use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSnapshot};
+use omnifrons_app::definition_tree::{
+    DefinitionTree, DefinitionTreeError, DirectoryEntry, TreeSnapshot,
+};
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, RootState, WRAPPER};
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock};
 use omnifrons_domain::nesting::{NestingError, Parent};
@@ -305,6 +307,66 @@ fn duplicate_identity_kind_from_the_port_is_refused() {
     assert_eq!(error.reason(), "duplicate-identity-kind");
 }
 
+/// The malformed shape `scan`'s own fixed defect let through: a
+/// snapshot listing one path twice, once extras-only and once with an
+/// identity file, with the extras-only entry sorted first. Before the
+/// fix, `scan` derived `roots` from `snapshot.directories` through a
+/// filter independent of `agent_directories`'s own, so the extras-only
+/// entry's path still matched `roots.contains(...)` and rode along
+/// into `agent_directories`, outnumbering the single, deduplicated
+/// `roots` entry `relations` was built from; the final zip silently
+/// dropped to the shorter length and kept index 0 of each -- the
+/// extras-only entry's own empty `identity_files` and
+/// [`RootState::None`] -- discarding the real root entirely rather
+/// than ever reaching [`NestingError::DuplicateRoot`] or any other
+/// refusal. After the fix, `roots` is mapped directly from
+/// `agent_directories`, so the extras-only duplicate never enters
+/// either one.
+#[test]
+fn extras_only_duplicate_of_an_agent_root_path_never_shadows_it() {
+    let project = TempDir::new("extras-only-duplicate-root");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshot {
+        directories: vec![
+            DirectoryEntry {
+                path: ".".to_string(),
+                identity_files: Vec::new(),
+                host_extras: vec![".claude/AGENTS.md".to_string()],
+                generated_state_dirs: Vec::new(),
+            },
+            DirectoryEntry {
+                path: ".".to_string(),
+                identity_files: vec![identity(IdentityKind::Agents, agents_bytes)],
+                host_extras: Vec::new(),
+                generated_state_dirs: Vec::new(),
+            },
+        ],
+        skills: Vec::new(),
+        ancestors: Vec::new(),
+    };
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    assert_eq!(report.agents.len(), 1);
+    let agent = &report.agents[0];
+    assert_eq!(agent.path, ".");
+    assert_ne!(agent.state, RootState::None);
+    assert!(
+        agent
+            .identity_files
+            .iter()
+            .any(|file| file.kind == IdentityKind::Agents),
+        "the real root's own AGENTS.md must survive, not the extras-only duplicate's empty list"
+    );
+}
+
 /// `definition_tree_contract` passes a well-formed snapshot: clean
 /// relative paths, a `SKILL.md` basename, and the prototype's own
 /// sorted walk order.
@@ -399,6 +461,31 @@ fn definition_tree_contract_fails_a_directory_with_neither() {
     definition_tree_contract(&tree, &workspace);
 }
 
+/// `definition_tree_contract` passes an ancestor holding a host extra
+/// but no identity file at all: the same "at least one identity file
+/// or host extra" allowance
+/// [`definition_tree_contract_passes_an_extras_only_directory`]
+/// exercises for a directory inside the scan applies to an ancestor
+/// outside it too -- see `crate::definition_tree`'s own widened
+/// `TreeSnapshot::ancestors` documentation. `TreeSnapshotBuilder::ancestor`
+/// already accepts an empty `identity_files` list, and the in-memory
+/// tree returns the ancestor back in place, unchanged.
+#[test]
+fn definition_tree_contract_passes_an_extras_only_ancestor() {
+    let project = TempDir::new("contract-extras-only-ancestor");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .ancestor(
+            "/outside",
+            Vec::new(),
+            vec![".claude/AGENTS.md".to_string()],
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
 /// `definition_tree_contract` passes the prototype's real top-down
 /// skill order: the scan root's own `SKILL.md` always precedes every
 /// skill found inside a subdirectory, and subdirectories are visited in
@@ -469,25 +556,34 @@ fn tree_port_failure_maps_to_definition_error_tree_with_its_reason() {
 
 /// A root path repeated in the port's own snapshot is refused by
 /// `nesting::relate` and surfaced as `DefinitionError::Nesting`,
-/// carrying that error's own delegated `reason()` token.
+/// carrying that error's own delegated `reason()` token. Built
+/// directly as a [`TreeSnapshot`] rather than through
+/// `TreeSnapshotBuilder`, whose own duplicate-path guard refuses to
+/// construct one by accident: this is the one malformed shape that
+/// guard exists to catch, so a test proving `scan` itself still
+/// refuses it must still be able to build it.
 #[test]
 fn duplicate_root_from_the_port_maps_to_definition_error_nesting_with_its_reason() {
     let project = TempDir::new("duplicate-root");
     let workspace = project.workspace();
-    let snapshot = TreeSnapshotBuilder::new()
-        .directory(
-            "dup",
-            vec![identity(IdentityKind::Agents, b"# One\n")],
-            Vec::new(),
-            Vec::new(),
-        )
-        .directory(
-            "dup",
-            vec![identity(IdentityKind::Claude, b"# Two\n")],
-            Vec::new(),
-            Vec::new(),
-        )
-        .build();
+    let snapshot = TreeSnapshot {
+        directories: vec![
+            DirectoryEntry {
+                path: "dup".to_string(),
+                identity_files: vec![identity(IdentityKind::Agents, b"# One\n")],
+                host_extras: Vec::new(),
+                generated_state_dirs: Vec::new(),
+            },
+            DirectoryEntry {
+                path: "dup".to_string(),
+                identity_files: vec![identity(IdentityKind::Claude, b"# Two\n")],
+                host_extras: Vec::new(),
+                generated_state_dirs: Vec::new(),
+            },
+        ],
+        skills: Vec::new(),
+        ancestors: Vec::new(),
+    };
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
     let hasher = FakeHasher;
     let ports = DefinitionPorts {
