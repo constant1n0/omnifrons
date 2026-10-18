@@ -210,6 +210,86 @@ fn project_of(fixture: &Fixture) -> omnifrons_domain::publication::ProjectIdenti
     omnifrons_app::content_hasher::derive_project_identity(&fixture.hasher, &fixture.workspace())
 }
 
+// -- the skills kind has no status/preview/apply path yet (its block is
+// owned by the definition module): `ManagedBlock::for_kind` always refuses it, so all three
+// commands refuse it too, before ever looking at the file or outbox --
+
+/// `status` calls `ManagedBlock::for_kind` before
+/// reporting anything meaningful about the file, so a skills target is
+/// refused the same way whether the file is absent or already holds
+/// one -- there is no "unmanaged" status for skills yet, only
+/// `GuidanceError::SkillsUnsupported`.
+#[test]
+fn status_of_a_skills_target_is_unsupported() {
+    let mut fixture = Fixture::new("status-skills");
+    let workspace = fixture.workspace();
+    let absent = status(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        &ManagedTarget::skills(),
+        &outbox(),
+    )
+    .expect_err("the skills kind has no status path yet");
+    assert!(matches!(absent, GuidanceError::SkillsUnsupported));
+
+    // Not conditional on the file's state either: an existing file is
+    // refused the same way, before anything about it is inspected.
+    fixture.files.plant("AGENTS.md", b"## Local skill index\n");
+    let existing = status(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        &ManagedTarget::skills(),
+        &outbox(),
+    )
+    .expect_err("the skills kind has no status path yet, even for an existing file");
+    assert!(matches!(existing, GuidanceError::SkillsUnsupported));
+}
+
+/// As above, for `preview`: refused before a block is rendered, so
+/// there is no proposed block to show for the skills kind yet.
+#[test]
+fn preview_of_a_skills_target_is_unsupported() {
+    let mut fixture = Fixture::new("preview-skills");
+    let workspace = fixture.workspace();
+    let error = preview(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        &ManagedTarget::skills(),
+        &outbox(),
+    )
+    .expect_err("the skills kind has no preview path yet");
+    assert!(matches!(error, GuidanceError::SkillsUnsupported));
+}
+
+/// As above, for `apply`: refused before a plan is ever built, so
+/// nothing is written and nothing is snapshotted.
+#[test]
+fn apply_of_a_skills_target_is_unsupported_and_writes_nothing() {
+    let mut fixture = Fixture::new("apply-skills");
+    let workspace = fixture.workspace();
+    let error = apply(
+        &mut fixture.ports(&[&workspace]),
+        &workspace,
+        &ManagedTarget::skills(),
+        &outbox(),
+        None,
+    )
+    .expect_err("the skills kind has no apply path yet");
+    assert!(matches!(error, GuidanceError::SkillsUnsupported));
+    assert_eq!(
+        fixture.text(ManagedTarget::skills().file_name()),
+        None,
+        "nothing written"
+    );
+    assert!(
+        fixture
+            .snapshots
+            .manifests(&project_of(&fixture))
+            .is_empty(),
+        "nothing snapshotted"
+    );
+}
+
 // -- apply --
 
 #[test]

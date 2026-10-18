@@ -378,12 +378,16 @@ pub fn guidance_snapshots_for(
 }
 
 /// Pin or unpin the snapshot `id` (`guidance_pin`); a pinned snapshot is
-/// never pruned. Returns the snapshot as it now stands.
+/// never pruned. Returns the snapshot as it now stands. The id's kind is
+/// checked against the wire contract before `pin` writes anything, so a
+/// recorded snapshot of a kind the wire cannot represent (today, only
+/// [`ManagedFileKind::Skills`]) is refused with nothing changed.
 ///
 /// # Errors
 ///
-/// `invalid-request` for a malformed id; `guidance-unmanaged` for an id
-/// this project does not hold; `work-area-invalid`; `snapshot-unavailable`.
+/// `invalid-request` for a malformed id or one naming a kind the wire
+/// cannot represent; `guidance-unmanaged` for an id this project does not
+/// hold; `work-area-invalid`; `snapshot-unavailable`.
 pub fn guidance_pin_for(
     workspace: &WorkspaceRoot,
     publication: &PublicationState,
@@ -393,6 +397,14 @@ pub fn guidance_pin_for(
     let _surface = publication.lock_surface();
     let id = parse_snapshot_id(id)?;
     let mut installer = Installer::open(publication, workspace)?;
+    // Read-only: find out what kind this id names, and refuse a kind
+    // this wire cannot represent, before `pin` gets a chance to rewrite
+    // anything (correction pass, mirroring `guidance_restore_for`'s own
+    // fix -- this used to be discovered only after the write, from the
+    // found manifest's own kind, so a skills snapshot ended up pinned
+    // although the call returned an error).
+    let found_kind = restore_target_kind(&mut installer.ports(&[workspace]), workspace, id)?;
+    ManagedFileKindDto::try_from(found_kind)?;
     pin(&mut installer.ports(&[workspace]), workspace, id, pinned)?;
     // The manifest as rewritten: the store knows the id, not its kind, so
     // both kinds' listings are searched.
@@ -661,8 +673,9 @@ mod tests {
     use omnifrons_domain::outbox::OutboxPath;
 
     use super::{
-        GuidanceRequest, guidance_apply_for, guidance_pin_for, guidance_preview_for,
+        GuidanceRequest, Installer, guidance_apply_for, guidance_pin_for, guidance_preview_for,
         guidance_remove_for, guidance_restore_for, guidance_snapshots_for, guidance_status_for,
+        snapshots,
     };
     use crate::ipc::dto::{
         GuidanceActionTag, ManagedFileKindDto, ManagedStatusTag, ShellError, ShellErrorCode,
@@ -870,6 +883,58 @@ mod tests {
                     .sum()
             })
         }
+    }
+
+    /// Record a snapshot of [`ManagedFileKind::Skills`] directly through
+    /// the store: `ManagedBlock::for_kind` always refuses that kind
+    /// (ADR-0005 sub-slice 1e is not done), so no command -- including
+    /// `Fixture::apply` -- can ever record one. Plants a manifest the
+    /// way the store itself would hold one, mirroring how
+    /// `omnifrons-app`'s own
+    /// `restore_resolves_a_skills_snapshot_to_the_default_guidance_file_only`
+    /// fixture does it.
+    fn record_skills_snapshot(fixture: &Fixture) -> omnifrons_app::snapshot_store::SnapshotId {
+        let workspace = fixture.workspace();
+        let mut installer =
+            Installer::open(&fixture.publication, &workspace).expect("installer opens");
+        let workspaces = [&workspace];
+        let ports = installer.ports(&workspaces);
+        let project =
+            omnifrons_app::content_hasher::derive_project_identity(ports.hasher, &workspace);
+        let manifest = omnifrons_app::snapshot_store::SnapshotManifest {
+            schema: omnifrons_app::snapshot_store::SNAPSHOT_SCHEMA_VERSION,
+            id: omnifrons_app::snapshot_store::SnapshotId(1),
+            kind: ManagedFileKind::Skills,
+            file: ManagedTarget::skills().file_name().to_string(),
+            existed: false,
+            sha256: ports.hasher.sha256(b""),
+            size: 0,
+            taken_at: std::time::SystemTime::now(),
+            pinned: false,
+        };
+        let id = manifest.id;
+        omnifrons_app::snapshot_store::SnapshotStore::record(
+            ports.snapshots,
+            &project,
+            manifest,
+            b"",
+        )
+        .expect("skills snapshot recorded directly through the store");
+        id
+    }
+
+    /// Every snapshot of `kind` the store holds, through the app's own
+    /// kind-agnostic listing -- never the IPC wrapper
+    /// `guidance_snapshots_for`, which cannot build a `SnapshotDto` for a
+    /// skills manifest.
+    fn app_snapshots(
+        fixture: &Fixture,
+        kind: ManagedFileKind,
+    ) -> Vec<omnifrons_app::snapshot_store::SnapshotManifest> {
+        let workspace = fixture.workspace();
+        let mut installer =
+            Installer::open(&fixture.publication, &workspace).expect("installer opens");
+        snapshots(&mut installer.ports(&[&workspace]), &workspace, kind).expect("list")
     }
 
     // -- status and preview (D18: the system proposes) --
@@ -1196,6 +1261,77 @@ mod tests {
         )
         .expect_err("no such snapshot");
         assert_eq!(error.code, ShellErrorCode::GuidanceUnmanaged);
+    }
+
+    /// Review follow-up (correction pass): `guidance_pin_for` used to
+    /// call `pin` -- which rewrites the manifest's pinned flag -- before
+    /// checking whether the wire can represent the snapshot's kind,
+    /// discovered only afterwards by searching both kinds' listings.
+    /// For a skills snapshot (no command can record one through
+    /// `Fixture::apply`; `record_skills_snapshot` plants it directly
+    /// through the store, as `omnifrons-app`'s own fixtures do) that
+    /// meant the manifest ended up pinned although the call returned an
+    /// error. Mirrors `guidance_restore_for`'s own correction: the kind
+    /// is checked, read-only, before any write.
+    #[test]
+    fn pin_refuses_a_recorded_skills_snapshot_before_writing() {
+        let fixture = Fixture::new("pin-skills");
+        let id = record_skills_snapshot(&fixture);
+
+        let error = guidance_pin_for(
+            &fixture.workspace(),
+            &fixture.publication,
+            &id.to_hex(),
+            true,
+        )
+        .expect_err("the skills kind is not exposed over IPC yet");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+
+        let still_there = app_snapshots(&fixture, ManagedFileKind::Skills)
+            .into_iter()
+            .find(|manifest| manifest.id == id)
+            .expect("the planted snapshot is still there");
+        assert!(!still_there.pinned, "nothing was written");
+    }
+
+    /// Review follow-up: `guidance_restore_for` already checks the
+    /// restored snapshot's kind (`restore_target_kind`, then
+    /// `ManagedFileKindDto::try_from`) before writing anything, but no
+    /// test exercised it against a skills snapshot -- the one kind the
+    /// wire cannot represent. Confirms the refusal happens before the
+    /// "state before it is snapshotted first" step records anything,
+    /// for either managed kind, and before the file is touched.
+    #[test]
+    fn restore_refuses_a_recorded_skills_snapshot_before_writing() {
+        let fixture = Fixture::new("restore-skills");
+        fixture
+            .apply(&Fixture::agents(), None)
+            .expect("applied guidance");
+        let before_text = fixture.text("AGENTS.md").expect("guidance note written");
+        let id = record_skills_snapshot(&fixture);
+        let before_skills = app_snapshots(&fixture, ManagedFileKind::Skills).len();
+        let before_guidance = app_snapshots(&fixture, ManagedFileKind::Guidance).len();
+
+        let error = fixture
+            .restore(&id.to_hex(), None)
+            .expect_err("the skills kind is not exposed over IPC yet");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+
+        assert_eq!(
+            app_snapshots(&fixture, ManagedFileKind::Skills).len(),
+            before_skills,
+            "the pre-restore state was never snapshotted"
+        );
+        assert_eq!(
+            app_snapshots(&fixture, ManagedFileKind::Guidance).len(),
+            before_guidance,
+            "the pre-restore state was never snapshotted"
+        );
+        assert_eq!(
+            fixture.text("AGENTS.md"),
+            Some(before_text),
+            "the file is untouched"
+        );
     }
 
     /// A block edited inside its sentinels, or with a sentinel missing, is
