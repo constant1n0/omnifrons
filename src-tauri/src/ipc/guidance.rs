@@ -893,6 +893,24 @@ mod tests {
     /// `omnifrons-app`'s own
     /// `restore_resolves_a_skills_snapshot_to_the_default_guidance_file_only`
     /// fixture does it.
+    ///
+    /// `SnapshotStore` never allocates an id itself: `record` takes
+    /// whatever id the manifest already carries, and production code
+    /// derives that id by hashing the project, the file's digest and the
+    /// instant (`derive_snapshot_id`) -- there is no store-side "next
+    /// id" this fixture could read instead. A fixed literal is not safe
+    /// to assume free: a caller running after `Fixture::apply` already
+    /// recorded a real guidance snapshot cannot assume a small id is
+    /// unused, because an id is scoped to the whole project rather than
+    /// to one kind (`FsSnapshotStore` names a manifest's files after the
+    /// id alone, not the kind), and reusing one already held by another
+    /// kind would let this plant silently overwrite that snapshot's
+    /// manifest and bytes on disk -- `record`'s dedup only matches the
+    /// same kind and file, and its write is a rename-into-place that
+    /// replaces whatever already sits at the destination rather than
+    /// refusing it. So this reads every kind's own listing, picks the
+    /// smallest id none of them hold, and asserts that again immediately
+    /// before recording.
     fn record_skills_snapshot(fixture: &Fixture) -> omnifrons_app::snapshot_store::SnapshotId {
         let workspace = fixture.workspace();
         let mut installer =
@@ -901,9 +919,38 @@ mod tests {
         let ports = installer.ports(&workspaces);
         let project =
             omnifrons_app::content_hasher::derive_project_identity(ports.hasher, &workspace);
+        let used_ids = || -> std::collections::HashSet<u64> {
+            ManagedFileKind::ALL
+                .into_iter()
+                .flat_map(|kind| {
+                    ports
+                        .snapshots
+                        .list(&project, kind)
+                        .expect("listing a kind while choosing a free id")
+                })
+                .map(|manifest| manifest.id.0)
+                .collect()
+        };
+        let used = used_ids();
+        // Bounded, not `1u64..`: `used.len() + 1` distinct candidates
+        // against at most `used.len()` used ids guarantees a free one by
+        // the pigeonhole principle, and keeps the range finite for
+        // clippy's `maybe_infinite_iter`. `try_from` instead of `as`
+        // keeps `cast_possible_truncation` quiet about `usize` vs `u64`.
+        let upper_bound = u64::try_from(used.len())
+            .expect("the number of recorded snapshots fits in a u64")
+            .saturating_add(1);
+        let candidate = (1..=upper_bound)
+            .find(|id| !used.contains(id))
+            .expect("more candidates than used ids guarantees one is free");
+        assert!(
+            !used_ids().contains(&candidate),
+            "the chosen id must be unused across every kind's listing"
+        );
+        let id = omnifrons_app::snapshot_store::SnapshotId(candidate);
         let manifest = omnifrons_app::snapshot_store::SnapshotManifest {
             schema: omnifrons_app::snapshot_store::SNAPSHOT_SCHEMA_VERSION,
-            id: omnifrons_app::snapshot_store::SnapshotId(1),
+            id,
             kind: ManagedFileKind::Skills,
             file: ManagedTarget::skills().file_name().to_string(),
             existed: false,
@@ -912,7 +959,6 @@ mod tests {
             taken_at: std::time::SystemTime::now(),
             pinned: false,
         };
-        let id = manifest.id;
         omnifrons_app::snapshot_store::SnapshotStore::record(
             ports.snapshots,
             &project,
