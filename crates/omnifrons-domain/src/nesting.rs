@@ -143,9 +143,10 @@ pub enum Parent {
     /// (one entry of its `roots` argument).
     Root(String),
     /// An ancestor above the scan root and outside every discovered
-    /// root, named by its own path (the nearest entry of [`relate`]'s
-    /// `outer` argument; see [`relate`]'s documentation for why nearest
-    /// and not outermost).
+    /// root, named by its own path (the nearest identity-bearing entry
+    /// of [`relate`]'s `outer` argument; see [`relate`]'s documentation
+    /// for why nearest and identity-bearing, rather than the outermost
+    /// or an extras-only ancestor).
     Outside(String),
 }
 
@@ -158,7 +159,7 @@ pub struct RootRelation {
     /// argument).
     pub root: String,
     /// This root's parent, or `None` when it has none inside the scan
-    /// or outside it.
+    /// and no identity-bearing ancestor outside it either.
     pub parent: Option<Parent>,
     /// The roots whose nearest enclosing root is this one, in the order
     /// [`relate`] was given them.
@@ -306,20 +307,35 @@ pub fn nearest_root<'a>(roots: &[&'a str], path: &str) -> Option<&'a str> {
 /// Every root's parent, including `"."` (the scan root itself), is
 /// the deepest *other* root in `roots` enclosing its own parent
 /// directory, if one exists ("inner"); otherwise the parent is the
-/// *nearest* ancestor outside the scan -- `outer`'s first entry. The
-/// prototype computes this the same way: `outer_parent` is the first of
-/// its nearest-first `ancestors`, and a root's parent falls back to
-/// `outer_parent` only when it has no inner one. Because
-/// `find_ancestors` returns its ancestors nearest first, the nearest
-/// outside ancestor becomes the parent -- never the outermost one.
+/// *nearest identity-bearing* ancestor outside the scan -- the first
+/// entry of `outer` whose [`Ancestor::identity_files`] is non-empty, or
+/// no parent at all when `outer` holds no such entry.
+///
+/// The prototype computes the inner/outer fallback the same way, but
+/// never needed this identity filter itself: its own `find_ancestors`
+/// only ever records a directory that `has_identity_files`, so its
+/// nearest-first `ancestors` list is identity-bearing by construction,
+/// and `outer_parent = ancestors[0].path` is already the nearest
+/// identity-bearing ancestor, unconditionally. This module's own
+/// `outer` argument carries a wider contract than that: an [`Ancestor`]
+/// may be extras-only (see its own doc comment), since a port may now
+/// report one above the scan root the same way it reports one inside
+/// it. The filter above restores, for such a possibly extras-only
+/// `outer`, the exact invariant the prototype's `find_ancestors`
+/// already gave it for free: an extras-only directory is never an
+/// agent, so it can never become a root's parent either. Because
+/// `outer` is still nearest first, skipping any leading extras-only
+/// entries still reaches the nearest identity-bearing one before any
+/// farther one -- never the outermost.
 ///
 /// `"."` never has an inner parent of its own -- `parent_of` returns
-/// `None` for `"."`, so its only possible parent is the
-/// `outer_parent` fallback above. That means `"."` gets `parent:
-/// None` only when `outer` is empty; given a non-empty `outer`,
-/// scanning a nested root alone (`roots = ["."]`) reports `"."`
-/// itself as needing that nearest outside ancestor's consent, exactly
-/// like any other root with no inner parent.
+/// `None` for `"."`, so its only possible parent is the outer fallback
+/// above. That means `"."` gets `parent: None` whenever `outer` holds
+/// no identity-bearing entry (including when it is empty); given at
+/// least one, scanning a nested root alone (`roots = ["."]`) reports
+/// `"."` itself as needing that nearest identity-bearing outside
+/// ancestor's consent, exactly like any other root with no inner
+/// parent.
 ///
 /// `nested` lists, for each root, every other root whose own inner
 /// parent (as just defined) is this one, in the order `roots` was
@@ -342,7 +358,10 @@ pub fn relate(roots: &[&str], outer: &[Ancestor]) -> Result<Vec<RootRelation>, N
         }
     }
 
-    let outer_parent = outer.first().map(|ancestor| ancestor.path.as_str());
+    let outer_parent = outer
+        .iter()
+        .find(|ancestor| !ancestor.identity_files.is_empty())
+        .map(|ancestor| ancestor.path.as_str());
     let parents: Vec<Option<Parent>> = roots
         .iter()
         .map(|&root| {

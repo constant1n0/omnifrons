@@ -371,6 +371,52 @@ fn warning_chain_inherits_the_absolute_path_precondition() {
     );
 }
 
+/// An extras-only nearest outside ancestor is never a root's parent:
+/// `relate` skips it and falls back to the nearest ancestor that does
+/// hold an identity file, even though it sits farther away. Pins the
+/// fix for the bug an extras-only `outer` entry used to trigger: taking
+/// `outer`'s first entry unconditionally reported the extras-only one
+/// as the parent instead.
+#[test]
+fn relate_skips_an_extras_only_outside_ancestor_for_a_farther_identity_bearing_one() {
+    let roots = ["."];
+    let outer = [
+        Ancestor {
+            path: "near".to_string(),
+            identity_files: Vec::new(),
+            host_extras: vec![".claude/AGENTS.md".to_string()],
+        },
+        Ancestor {
+            path: "far".to_string(),
+            identity_files: vec!["AGENTS.md".to_string()],
+            host_extras: Vec::new(),
+        },
+    ];
+    let relations = nesting::relate(&roots, &outer).unwrap();
+
+    let root = relations.iter().find(|r| r.root == ".").unwrap();
+    assert_eq!(root.parent, Some(Parent::Outside("far".to_string())));
+    assert!(root.consent_required());
+}
+
+/// When every outside ancestor is extras-only, there is no
+/// identity-bearing one to fall back to, so the root has no outside
+/// parent at all -- never the extras-only ancestor by default.
+#[test]
+fn relate_gives_no_outside_parent_when_every_outer_ancestor_is_extras_only() {
+    let roots = ["."];
+    let outer = [Ancestor {
+        path: "near".to_string(),
+        identity_files: Vec::new(),
+        host_extras: vec![".claude/AGENTS.md".to_string()],
+    }];
+    let relations = nesting::relate(&roots, &outer).unwrap();
+
+    let root = relations.iter().find(|r| r.root == ".").unwrap();
+    assert_eq!(root.parent, None);
+    assert!(!root.consent_required());
+}
+
 /// `relate` lists a parent's `nested` children in the exact order
 /// `roots` was given, not sorted -- a parent with three children given
 /// out of alphabetical order still reports them back in that same,

@@ -1199,6 +1199,91 @@ fn an_outside_ancestors_claude_agents_host_extra_yields_the_claude_code_warning(
     );
 }
 
+/// An extras-only nearest outside ancestor is never an agent's parent:
+/// `nesting::relate` now skips it and reaches the farther,
+/// identity-bearing ancestor instead, so the root's own `parent` names
+/// that farther one -- not the nearer extras-only directory the old
+/// unconditional `outer.first()` fallback used to report.
+/// `consent_required` follows that farther ancestor's presence, the
+/// same way it follows any other outside parent
+/// (`RootRelation::consent_required` derives it from `parent.is_some()`
+/// alone).
+#[test]
+fn extras_only_nearest_ancestor_is_skipped_for_a_farther_identity_bearing_one() {
+    let project = TempDir::new("extras-only-nearest-ancestor");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .ancestor("/near", Vec::new(), vec![".claude/AGENTS.md".to_string()])
+        .ancestor("/far", vec!["AGENTS.md".to_string()], Vec::new())
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let root = &report.agents[0];
+    assert_eq!(root.parent, Some(Parent::Outside("/far".to_string())));
+    assert!(root.consent_required);
+}
+
+/// When every outside ancestor is extras-only, the agent has no
+/// outside parent at all and needs no consent on that strength -- but
+/// the extras-only ancestor's own host extra still reaches the warning
+/// chain exactly as
+/// `an_outside_ancestors_claude_agents_host_extra_yields_the_claude_code_warning`
+/// already pins: `nesting::warning_chain` appends every entry of
+/// `outer` unconditionally, independent of `nesting::relate`'s own
+/// parent assignment.
+#[test]
+fn extras_only_only_ancestor_yields_no_parent_but_still_warns() {
+    let project = TempDir::new("extras-only-only-ancestor");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .ancestor(
+            "/outside",
+            Vec::new(),
+            vec![".claude/AGENTS.md".to_string()],
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let root = &report.agents[0];
+    assert_eq!(root.parent, None);
+    assert!(!root.consent_required);
+
+    let exposure = root.warnings.iter().find(|warning| {
+        warning.code == WarningCode::AncestorExposure && warning.hosts.contains(&"Claude Code")
+    });
+    assert!(
+        exposure.is_some(),
+        "expected the extras-only ancestor to still reach the warning chain, got {:?}",
+        root.warnings
+    );
+}
+
 // ---------------------------------------------------------------------
 // `chain_host_extras` documents that a `host_extras` entry
 // `hosts::EXTRA_READERS` does not recognize is silently dropped, the
