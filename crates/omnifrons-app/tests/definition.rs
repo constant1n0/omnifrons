@@ -24,7 +24,7 @@ use omnifrons_app::definition_tree::{
 };
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, RootState, WRAPPER};
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock};
-use omnifrons_domain::nesting::{NestingError, Parent};
+use omnifrons_domain::nesting::{Ancestor, Parent};
 use omnifrons_domain::skills_index::{PRECEDENCE_RULE, SkillRow, render_body};
 use omnifrons_domain::warnings::WarningCode;
 
@@ -307,23 +307,28 @@ fn duplicate_identity_kind_from_the_port_is_refused() {
     assert_eq!(error.reason(), "duplicate-identity-kind");
 }
 
-/// The malformed shape `scan`'s own fixed defect let through: a
-/// snapshot listing one path twice, once extras-only and once with an
-/// identity file, with the extras-only entry sorted first. Before the
-/// fix, `scan` derived `roots` from `snapshot.directories` through a
-/// filter independent of `agent_directories`'s own, so the extras-only
-/// entry's path still matched `roots.contains(...)` and rode along
-/// into `agent_directories`, outnumbering the single, deduplicated
-/// `roots` entry `relations` was built from; the final zip silently
-/// dropped to the shorter length and kept index 0 of each -- the
-/// extras-only entry's own empty `identity_files` and
-/// [`RootState::None`] -- discarding the real root entirely rather
-/// than ever reaching [`NestingError::DuplicateRoot`] or any other
-/// refusal. After the fix, `roots` is mapped directly from
-/// `agent_directories`, so the extras-only duplicate never enters
-/// either one.
+/// The malformed shape `scan` used to let through: a snapshot listing
+/// one path twice, once extras-only and once with an identity file,
+/// with the extras-only entry sorted first. A prior fix already moved
+/// `roots` off a second, independent filter over `snapshot.directories`
+/// and onto `agent_directories` directly, so this exact fixture no
+/// longer misaligned the final zip -- it instead made `scan` succeed
+/// outright, the real identity-bearing entry winning and the
+/// extras-only duplicate silently dropped, which is what this test
+/// (formerly `extras_only_duplicate_of_an_agent_root_path_never_shadows_it`)
+/// used to assert as the fix. That silent drop is itself still a bug
+/// this change closes: a snapshot repeating a path is
+/// self-contradictory -- a path cannot, at once, both carry an
+/// identity file and carry none -- and must be refused outright, never
+/// resolved by whichever copy happens to win. RED here was asserting
+/// `scan` returns `DefinitionError::DuplicateSnapshotPath` and
+/// observing instead `Ok` with one agent, state `AgentsOnly` (the
+/// lone `AGENTS.md`, no `CLAUDE.md`), and the identity entry having
+/// won exactly as the old test name promised. After the fix, a
+/// snapshot repeating any path -- mixed or not -- is refused before
+/// `roots`/`extras_only` are ever derived from it.
 #[test]
-fn extras_only_duplicate_of_an_agent_root_path_never_shadows_it() {
+fn extras_only_duplicate_of_an_agent_root_path_is_refused() {
     let project = TempDir::new("extras-only-duplicate-root");
     let workspace = project.workspace();
     let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
@@ -352,19 +357,13 @@ fn extras_only_duplicate_of_an_agent_root_path_never_shadows_it() {
         hasher: &hasher,
     };
 
-    let report = scan(&ports, &workspace).expect("scan succeeds");
+    let error = scan(&ports, &workspace).expect_err("a mixed duplicate path is refused");
 
-    assert_eq!(report.agents.len(), 1);
-    let agent = &report.agents[0];
-    assert_eq!(agent.path, ".");
-    assert_ne!(agent.state, RootState::None);
-    assert!(
-        agent
-            .identity_files
-            .iter()
-            .any(|file| file.kind == IdentityKind::Agents),
-        "the real root's own AGENTS.md must survive, not the extras-only duplicate's empty list"
-    );
+    assert!(matches!(
+        &error,
+        DefinitionError::DuplicateSnapshotPath { list, path } if *list == "directory" && path == "."
+    ));
+    assert_eq!(error.reason(), "duplicate-snapshot-path");
 }
 
 /// `definition_tree_contract` passes a well-formed snapshot: clean
@@ -554,16 +553,25 @@ fn tree_port_failure_maps_to_definition_error_tree_with_its_reason() {
     assert_eq!(error.reason(), "tree(entry-too-large)");
 }
 
-/// A root path repeated in the port's own snapshot is refused by
-/// `nesting::relate` and surfaced as `DefinitionError::Nesting`,
-/// carrying that error's own delegated `reason()` token. Built
-/// directly as a [`TreeSnapshot`] rather than through
+/// A root path repeated in the port's own snapshot -- two
+/// identity-bearing copies of `"dup"` -- is now refused by the upfront
+/// `DefinitionError::DuplicateSnapshotPath` guard, never reaching
+/// `nesting::relate`'s own `NestingError::DuplicateRoot` at all: that
+/// guard checks `snapshot.directories`' raw path list for any repeat,
+/// mixed or not, before `scan` ever derives `agent_directories`/`roots`
+/// from it, so by the time `roots` would reach `nesting::relate` it is
+/// already guaranteed unique, one rule ("a snapshot never lists a path
+/// twice") replacing what used to be two different refusals for two
+/// different shapes of the same underlying defect. This test used to
+/// name and assert the `Nesting(DuplicateRoot)` observed error; it
+/// still exercises the exact same fixture, now citing the new error
+/// instead. Built directly as a [`TreeSnapshot`] rather than through
 /// `TreeSnapshotBuilder`, whose own duplicate-path guard refuses to
-/// construct one by accident: this is the one malformed shape that
+/// construct one by accident: this is one of the malformed shapes that
 /// guard exists to catch, so a test proving `scan` itself still
 /// refuses it must still be able to build it.
 #[test]
-fn duplicate_root_from_the_port_maps_to_definition_error_nesting_with_its_reason() {
+fn duplicate_root_path_from_the_port_maps_to_definition_error_duplicate_snapshot_path() {
     let project = TempDir::new("duplicate-root");
     let workspace = project.workspace();
     let snapshot = TreeSnapshot {
@@ -594,10 +602,68 @@ fn duplicate_root_from_the_port_maps_to_definition_error_nesting_with_its_reason
     let error = scan(&ports, &workspace).expect_err("a duplicate root path is refused");
 
     assert!(matches!(
-        error,
-        DefinitionError::Nesting(NestingError::DuplicateRoot(_))
+        &error,
+        DefinitionError::DuplicateSnapshotPath { list, path } if *list == "directory" && path == "dup"
     ));
-    assert_eq!(error.reason(), "nesting(duplicate-root)");
+    assert_eq!(error.reason(), "duplicate-snapshot-path");
+}
+
+/// The same `DefinitionError::DuplicateSnapshotPath` guard catches a
+/// repeated *ancestor* path too, not only a repeated directory path:
+/// two `Ancestor` entries both naming `"/outside"`. Nothing before
+/// this fix checked `snapshot.ancestors` for uniqueness at all -- only
+/// `crate::contract::definition::definition_tree_contract`'s own
+/// `assert_unique_paths` did, and only for a fixture built through
+/// that contract check, never for a `scan` call itself. RED here was
+/// asserting `scan` returns `DefinitionError::DuplicateSnapshotPath`
+/// with `list == "ancestor"` and observing instead that it returns
+/// `Ok`, the duplicated ancestor riding along twice into
+/// [`ScanReport::ancestors`] and, worse, into the lone agent's own
+/// warning chain: its `warnings` carried the exact same
+/// `AncestorExposure` warning for `"/outside"` twice over, since
+/// `nesting::warning_chain` appends every entry of its own `outer`
+/// argument unconditionally -- precisely the duplicate-ancestor-warning
+/// shape this guard exists to refuse outright instead.
+#[test]
+fn duplicate_ancestor_path_from_the_port_is_refused() {
+    let project = TempDir::new("duplicate-ancestor");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshot {
+        directories: vec![DirectoryEntry {
+            path: ".".to_string(),
+            identity_files: vec![identity(IdentityKind::Agents, b"# One\n")],
+            host_extras: Vec::new(),
+            generated_state_dirs: Vec::new(),
+        }],
+        skills: Vec::new(),
+        ancestors: vec![
+            Ancestor {
+                path: "/outside".to_string(),
+                identity_files: vec!["AGENTS.md".to_string()],
+                host_extras: Vec::new(),
+            },
+            Ancestor {
+                path: "/outside".to_string(),
+                identity_files: vec!["AGENTS.md".to_string()],
+                host_extras: Vec::new(),
+            },
+        ],
+    };
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let error = scan(&ports, &workspace).expect_err("a duplicate ancestor path is refused");
+
+    assert!(matches!(
+        &error,
+        DefinitionError::DuplicateSnapshotPath { list, path }
+            if *list == "ancestor" && path == "/outside"
+    ));
+    assert_eq!(error.reason(), "duplicate-snapshot-path");
 }
 
 /// A symlinked identity file and an irregular one both report no
@@ -2336,6 +2402,63 @@ fn verify_reports_none_state_for_an_extras_only_target() {
     assert_eq!(report.state, RootState::None);
     assert!(!report.canonical, "{:?}", report.problems);
     assert_eq!(report.problems, vec!["state is none".to_string()]);
+}
+
+/// The same mixed-duplicate shape
+/// `extras_only_duplicate_of_an_agent_root_path_is_refused` exercises
+/// for `scan` (`"."` listed twice: once extras-only and sorted first,
+/// once with the real `AGENTS.md`), aimed at `verify` instead. Before
+/// this fix, `verify`'s own `root_entry` lookup was a plain
+/// `.find(|directory| directory.path == ".")` over the raw
+/// `snapshot.directories`, with no equivalent to `scan`'s own
+/// `agent_directories` derivation to protect it, so it simply returned
+/// whichever copy came first -- here, the extras-only one -- and
+/// `verify` reported exactly
+/// `verify_reports_none_state_for_an_extras_only_target`'s own
+/// `state: None, problems: ["state is none"]`: the real `AGENTS.md`
+/// identity was silently discarded, never refused. RED here was
+/// asserting `verify` returns `DefinitionError::DuplicateSnapshotPath`
+/// and observing that `Ok(VerifyReport { state: None, canonical:
+/// false, problems: ["state is none"] })` instead. After the fix, the
+/// shared guard refuses the snapshot before `root_entry` is ever
+/// looked up.
+#[test]
+fn mixed_duplicate_of_the_scan_root_path_is_refused_by_verify() {
+    let project = TempDir::new("verify-mixed-duplicate-root");
+    let workspace = project.workspace();
+    let agents_bytes = b"# Sample\n\nYou are Sample, a fixture agent.\n";
+    let snapshot = TreeSnapshot {
+        directories: vec![
+            DirectoryEntry {
+                path: ".".to_string(),
+                identity_files: Vec::new(),
+                host_extras: vec![".claude/AGENTS.md".to_string()],
+                generated_state_dirs: Vec::new(),
+            },
+            DirectoryEntry {
+                path: ".".to_string(),
+                identity_files: vec![identity(IdentityKind::Agents, agents_bytes)],
+                host_extras: Vec::new(),
+                generated_state_dirs: Vec::new(),
+            },
+        ],
+        skills: Vec::new(),
+        ancestors: Vec::new(),
+    };
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let error = verify(&ports, &workspace).expect_err("a mixed duplicate root path is refused");
+
+    assert!(matches!(
+        &error,
+        DefinitionError::DuplicateSnapshotPath { list, path } if *list == "directory" && path == "."
+    ));
+    assert_eq!(error.reason(), "duplicate-snapshot-path");
 }
 
 /// (q) `CLAUDE.md` holds the instructions and there is no `AGENTS.md`

@@ -34,7 +34,7 @@
 //! (`crate::definition_tree`'s module documentation). Nothing in this
 //! module changes once that adapter exists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use omnifrons_domain::definition::{
     Classification, DirectoryIdentity, FileShape, IdentityFile, IdentityKind, RootState, classify,
@@ -83,6 +83,29 @@ pub enum DefinitionError {
     /// ([`DirectoryIdentity::new`]).
     #[error("{0}")]
     DuplicateIdentityKind(omnifrons_domain::definition::DuplicateIdentityKindError),
+    /// A [`TreeSnapshot`] repeated a path in its own `directories` or
+    /// `ancestors` list -- the same uniqueness
+    /// `crate::contract::definition::definition_tree_contract`'s own
+    /// `assert_unique_paths` enforces for a fixture, checked here
+    /// against every snapshot a port actually returns, which has no
+    /// such test-only guard protecting it. [`scan`] and [`verify`] both
+    /// check this immediately after reading the snapshot, before
+    /// deriving `roots`, `extras_only`, or a `root_entry` from it: a
+    /// path cannot, at once, both carry an identity file and carry
+    /// none, so a repeated path is already self-contradictory, and a
+    /// malformed port (today, a hand-built [`TreeSnapshot`]; later,
+    /// sub-slice 1f's own filesystem adapter) must fail loudly here
+    /// rather than let a later lookup silently pick whichever copy it
+    /// happens to find first.
+    #[error("the snapshot repeated a {list} path: {path}")]
+    DuplicateSnapshotPath {
+        /// Which list repeated `path`: `"directory"`
+        /// ([`TreeSnapshot::directories`]) or `"ancestor"`
+        /// ([`TreeSnapshot::ancestors`]).
+        list: &'static str,
+        /// The repeated path itself.
+        path: String,
+    },
 }
 
 impl DefinitionError {
@@ -114,6 +137,7 @@ impl DefinitionError {
                 NestingError::DuplicateRoot(_) => "nesting(duplicate-root)",
             },
             Self::DuplicateIdentityKind(_) => "duplicate-identity-kind",
+            Self::DuplicateSnapshotPath { .. } => "duplicate-snapshot-path",
         }
     }
 }
@@ -326,6 +350,54 @@ fn extras_only_paths(directories: &[DirectoryEntry]) -> Vec<&str> {
         })
         .map(|directory| directory.path.as_str())
         .collect()
+}
+
+/// The first path that repeats in `paths`, in the order given --
+/// `None` when every path is unique (mirrors
+/// `crate::contract::definition::definition_tree_contract`'s own
+/// `assert_unique_paths`, which panics instead of returning).
+fn first_duplicate_path<'a>(mut paths: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    paths.find(|&path| !seen.insert(path))
+}
+
+/// Rejects `snapshot` outright when its own `directories` or
+/// `ancestors` list repeats a path, before [`scan`] or [`verify`]
+/// derive `roots`, `extras_only`, or a `root_entry` from it -- see
+/// [`DefinitionError::DuplicateSnapshotPath`]'s own doc comment for
+/// why a repeated path is already self-contradictory and must fail
+/// loudly here rather than let a later lookup silently pick whichever
+/// copy it happens to find first. Checks `directories` before
+/// `ancestors`, and within each list stops at the first repeated path
+/// found -- never collects every one at once -- matching every other
+/// [`DefinitionError`] variant's own "first problem found" shape
+/// ([`omnifrons_domain::definition::DuplicateIdentityKindError`]
+/// itself names only the first kind that repeats, in
+/// [`IdentityKind::ALL`] order).
+fn reject_duplicate_snapshot_paths(snapshot: &TreeSnapshot) -> Result<(), DefinitionError> {
+    if let Some(path) = first_duplicate_path(
+        snapshot
+            .directories
+            .iter()
+            .map(|directory| directory.path.as_str()),
+    ) {
+        return Err(DefinitionError::DuplicateSnapshotPath {
+            list: "directory",
+            path: path.to_string(),
+        });
+    }
+    if let Some(path) = first_duplicate_path(
+        snapshot
+            .ancestors
+            .iter()
+            .map(|ancestor| ancestor.path.as_str()),
+    ) {
+        return Err(DefinitionError::DuplicateSnapshotPath {
+            list: "ancestor",
+            path: path.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The skills report for one agent ([`read_skill_index`] against `text`,
@@ -580,10 +652,14 @@ fn build_agent_report(
 /// # Errors
 ///
 /// Returns [`DefinitionError::Tree`] when the [`DefinitionTree`] port
-/// could not produce a snapshot, [`DefinitionError::Nesting`] when the
-/// discovered roots cannot be related (a malformed or duplicated root
-/// path), or [`DefinitionError::DuplicateIdentityKind`] when a
-/// directory's identity files repeat a kind.
+/// could not produce a snapshot, [`DefinitionError::DuplicateSnapshotPath`]
+/// when the snapshot repeats a directory or ancestor path,
+/// [`DefinitionError::DuplicateIdentityKind`] when a directory's
+/// identity files repeat a kind, or [`DefinitionError::Nesting`] when
+/// the discovered roots cannot be related -- a malformed root path
+/// *shape*, never a duplicated one, which
+/// [`DefinitionError::DuplicateSnapshotPath`] above always catches
+/// first.
 pub fn scan(
     ports: &DefinitionPorts<'_>,
     workspace: &WorkspaceRoot,
@@ -592,6 +668,7 @@ pub fn scan(
         .tree
         .snapshot(workspace)
         .map_err(DefinitionError::Tree)?;
+    reject_duplicate_snapshot_paths(&snapshot)?;
 
     // `agent_directories` is every directory holding at least one
     // identity file -- never an extras-only entry, which
@@ -608,7 +685,12 @@ pub fn scan(
     // of ever reaching `nesting::relate`'s own refusal. `extras_only`
     // is the complement that still matters: no identity file of its
     // own, but a host extra relevant to an enclosing agent's own
-    // warning chain.
+    // warning chain. `reject_duplicate_snapshot_paths` above already
+    // refuses a snapshot shaped like that outright, before this
+    // derivation ever runs; this comment's own reasoning stays
+    // relevant regardless, since `roots` must still never be computed
+    // as a second, independent filter even once the snapshot itself is
+    // known to repeat no path.
     let agent_directories: Vec<&DirectoryEntry> = snapshot
         .directories
         .iter()
@@ -724,7 +806,8 @@ pub fn scan(
 /// # Errors
 ///
 /// Returns [`DefinitionError::Tree`] when the [`DefinitionTree`] port
-/// could not produce a snapshot, or
+/// could not produce a snapshot, [`DefinitionError::DuplicateSnapshotPath`]
+/// when the snapshot repeats a directory or ancestor path, or
 /// [`DefinitionError::DuplicateIdentityKind`] when the scan root's
 /// identity files repeat a kind.
 pub fn verify(
@@ -735,8 +818,12 @@ pub fn verify(
         .tree
         .snapshot(workspace)
         .map_err(DefinitionError::Tree)?;
+    reject_duplicate_snapshot_paths(&snapshot)?;
     let roots = agent_root_paths(&snapshot.directories);
 
+    // A repeated path is already refused above, so this lookup never
+    // has to guess which of two same-path copies is the real one the
+    // way it silently did before that guard existed.
     let root_entry = snapshot
         .directories
         .iter()
