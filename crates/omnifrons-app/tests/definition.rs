@@ -1005,10 +1005,22 @@ fn an_outside_ancestors_claude_agents_host_extra_yields_the_claude_code_warning(
         .iter()
         .filter(|warning| warning.code == WarningCode::AncestorExposure)
         .collect();
+    let claude = exposure
+        .iter()
+        .find(|w| w.hosts.contains(&"Claude Code"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an ancestor_exposure warning naming Claude Code, got {:?}",
+                root.warnings
+            )
+        });
     assert!(
-        exposure.iter().any(|w| w.hosts.contains(&"Claude Code")),
-        "expected an ancestor_exposure warning naming Claude Code, got {:?}",
-        root.warnings
+        claude.detail.contains("the ancestor directory"),
+        "an outside ancestor with no identity file of its own is never an agent, got {claude:?}"
+    );
+    assert!(
+        !claude.detail.contains("the ancestor agent"),
+        "got {claude:?}"
     );
 }
 
@@ -1206,12 +1218,24 @@ fn an_extras_only_directory_reaches_its_descendants_warning_chain() {
         .iter()
         .filter(|warning| warning.code == WarningCode::AncestorExposure)
         .collect();
+    let claude = exposure
+        .iter()
+        .find(|w| w.hosts.contains(&"Claude Code") && w.detail.contains(".claude/AGENTS.md"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an ancestor_exposure warning naming Claude Code and \
+                 .claude/AGENTS.md, got {:?}",
+                report.agents[0].warnings
+            )
+        });
     assert!(
-        exposure
-            .iter()
-            .any(|w| w.hosts.contains(&"Claude Code") && w.detail.contains(".claude/AGENTS.md")),
-        "expected an ancestor_exposure warning naming Claude Code and .claude/AGENTS.md, got {:?}",
-        report.agents[0].warnings
+        claude.detail.contains("the ancestor directory"),
+        "the extras-only directory holds no identity file of its own, so it is never an \
+         agent, got {claude:?}"
+    );
+    assert!(
+        !claude.detail.contains("the ancestor agent"),
+        "got {claude:?}"
     );
 }
 

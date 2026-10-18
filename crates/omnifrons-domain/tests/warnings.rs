@@ -14,7 +14,9 @@
 //! never through a filesystem.
 
 use omnifrons_domain::definition::IdentityKind;
-use omnifrons_domain::warnings::{AgentInput, ChainAncestor, Warning, WarningCode, agent_warnings};
+use omnifrons_domain::warnings::{
+    AgentInput, ChainAncestor, ChainMemberKind, Warning, WarningCode, agent_warnings,
+};
 
 /// An [`AgentInput`] with every field empty, for tests that only need
 /// to fill in a few.
@@ -47,6 +49,7 @@ fn ancestor_shadows_kinds_the_child_lacks_and_exposes_the_one_it_has() {
         display: "atlas",
         identity_files: &["CLAUDE.md", "AGENTS.md", "QWEN.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -75,6 +78,7 @@ fn ancestor_exposure_grows_once_the_child_gains_the_missing_kinds() {
         display: "atlas",
         identity_files: &["CLAUDE.md", "AGENTS.md", "QWEN.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -98,6 +102,7 @@ fn a_claude_only_parent_shadows_a_child_with_no_claude_file() {
         display: "p",
         identity_files: &["CLAUDE.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -135,11 +140,13 @@ fn opencode_shadowing_fires_once_for_the_nearest_ancestor_only() {
             display: "near",
             identity_files: &["AGENTS.md"],
             host_extras: &[],
+            kind: ChainMemberKind::Agent,
         },
         ChainAncestor {
             display: "far",
             identity_files: &["AGENTS.md"],
             host_extras: &[],
+            kind: ChainMemberKind::Agent,
         },
     ];
     let warnings = agent_warnings(&AgentInput {
@@ -168,6 +175,7 @@ fn claude_code_falls_back_and_fires_ancestor_exposure_for_an_agents_only_ancesto
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -215,6 +223,7 @@ fn claude_code_fallback_is_disabled_by_a_claude_md_on_the_agent() {
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -248,11 +257,13 @@ fn claude_code_fallback_is_disabled_by_a_claude_md_elsewhere_in_the_chain() {
             display: "near",
             identity_files: &["AGENTS.md"],
             host_extras: &[],
+            kind: ChainMemberKind::Agent,
         },
         ChainAncestor {
             display: "far",
             identity_files: &["CLAUDE.md"],
             host_extras: &[],
+            kind: ChainMemberKind::Agent,
         },
     ];
     let warnings = agent_warnings(&AgentInput {
@@ -286,6 +297,7 @@ fn claude_code_fallback_is_disabled_by_claude_local_md_among_the_extras() {
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -313,6 +325,7 @@ fn claude_code_fallback_is_disabled_for_child_warnings_too_once_a_claude_md_exis
         display: "somewhere",
         identity_files: &["CLAUDE.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -357,6 +370,7 @@ fn claude_code_fallback_applies_but_reads_as_shadowing_for_an_agent_with_no_iden
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         chain: &chain,
@@ -399,6 +413,7 @@ fn claude_code_fallback_is_disabled_by_claude_local_md_among_an_ancestors_host_e
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &["CLAUDE.local.md"],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -438,6 +453,7 @@ fn claude_code_fallback_fires_ancestor_exposure_for_an_ancestors_claude_agents_h
         display: "outside",
         identity_files: &[],
         host_extras: &[".claude/AGENTS.md"],
+        kind: ChainMemberKind::Directory,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -470,6 +486,7 @@ fn ancestor_description_lists_identity_files_before_a_matching_host_extra() {
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[".claude/AGENTS.md"],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -506,6 +523,7 @@ fn claude_code_fallback_is_disabled_by_the_agents_own_extra_even_with_a_matching
         display: "outside",
         identity_files: &[],
         host_extras: &[".claude/AGENTS.md"],
+        kind: ChainMemberKind::Directory,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -539,6 +557,7 @@ fn claude_code_fallback_reads_as_exposure_for_an_agent_whose_own_extra_matches_t
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -572,6 +591,7 @@ fn claude_code_fallback_still_shadows_without_the_agents_own_agents_md_or_extra(
         display: "outside",
         identity_files: &["AGENTS.md"],
         host_extras: &[],
+        kind: ChainMemberKind::Agent,
     }];
     let warnings = agent_warnings(&AgentInput {
         identity_kinds: &identity_kinds,
@@ -611,6 +631,7 @@ fn ancestor_warning_details_attribute_each_extra_only_to_the_host_that_matched_i
         display: "outside",
         identity_files: &[],
         host_extras: &[".claude/AGENTS.md", "QWEN.md"],
+        kind: ChainMemberKind::Directory,
     }];
     let warnings = agent_warnings(&AgentInput {
         host_extras: &host_extras,
@@ -646,6 +667,95 @@ fn ancestor_warning_details_attribute_each_extra_only_to_the_host_that_matched_i
         !qwen.detail.contains(".claude/AGENTS.md"),
         "the shadowing warning names `Qwen Code` only, so its own detail must never cite \
          `.claude/AGENTS.md`, an extra that matched Claude Code alone, got {qwen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Extension beyond the prototype: a chain member's own `ChainMemberKind`
+// -- an extras-only directory, whether it stands in for one inside the
+// scan or an ancestor outside it, is never an agent, and
+// `describe_ancestor` must say so instead of calling every chain member
+// "the ancestor agent" regardless of what it actually is.
+// ---------------------------------------------------------------------
+
+/// An extras-only member is described as "the ancestor directory ...",
+/// never "the ancestor agent ...": [`ChainAncestor`] itself carries no
+/// inside/outside distinction, only [`ChainMemberKind`], so this covers
+/// both a `display` that looks like an inside-the-scan path (`"."`) and
+/// one that looks like an outside ancestor's (`"outside"`) -- an
+/// extras-only directory or ancestor is never an agent, so the wording
+/// must not call it one either way.
+#[test]
+fn an_extras_only_member_is_described_as_a_directory_never_an_agent() {
+    let identity_kinds = [IdentityKind::Agents];
+    let chain = [
+        ChainAncestor {
+            display: ".",
+            identity_files: &[],
+            host_extras: &[".claude/AGENTS.md"],
+            kind: ChainMemberKind::Directory,
+        },
+        ChainAncestor {
+            display: "outside",
+            identity_files: &[],
+            host_extras: &[".claude/AGENTS.md"],
+            kind: ChainMemberKind::Directory,
+        },
+    ];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let claude: Vec<_> = with_code(&warnings, WarningCode::AncestorExposure)
+        .into_iter()
+        .filter(|w| w.hosts.contains(&"Claude Code"))
+        .collect();
+    assert_eq!(claude.len(), 2, "{warnings:?}");
+    for warning in &claude {
+        assert!(
+            warning.detail.contains("the ancestor directory"),
+            "an extras-only member -- inside the scan (\".\") or outside \
+             it (\"outside\") -- is never an agent, got {warning:?}"
+        );
+        assert!(
+            !warning.detail.contains("the ancestor agent"),
+            "got {warning:?}"
+        );
+    }
+}
+
+/// Pin: an agent member's own wording is unchanged by
+/// [`ChainMemberKind`] -- it still reads "the ancestor agent ...", the
+/// same text `describe_ancestor` always produced before a chain member
+/// could ever be anything else.
+#[test]
+fn an_agent_member_is_still_described_as_an_agent() {
+    let identity_kinds = [IdentityKind::Claude];
+    let chain = [ChainAncestor {
+        display: "atlas",
+        identity_files: &["CLAUDE.md", "AGENTS.md", "QWEN.md"],
+        host_extras: &[],
+        kind: ChainMemberKind::Agent,
+    }];
+    let warnings = agent_warnings(&AgentInput {
+        identity_kinds: &identity_kinds,
+        chain: &chain,
+        ..blank_input()
+    });
+
+    let exposure = with_code(&warnings, WarningCode::AncestorExposure);
+    assert_eq!(exposure.len(), 1, "{warnings:?}");
+    assert!(
+        exposure[0].detail.contains("the ancestor agent atlas"),
+        "an agent member's wording must stay unchanged, got {:?}",
+        exposure[0]
+    );
+    assert!(
+        !exposure[0].detail.contains("the ancestor directory"),
+        "{:?}",
+        exposure[0]
     );
 }
 

@@ -50,7 +50,9 @@ use omnifrons_domain::skills_index::{
 use omnifrons_domain::skills_safety::{
     InvalidUnicodeField, SkillMetadataError, python_repr, read_skill_metadata, unsafe_row_fields,
 };
-use omnifrons_domain::warnings::{AgentInput, ChainAncestor, Warning, agent_warnings};
+use omnifrons_domain::warnings::{
+    AgentInput, ChainAncestor, ChainMemberKind, Warning, agent_warnings,
+};
 
 use crate::content_hasher::ContentHasher;
 use crate::definition_tree::{
@@ -464,6 +466,17 @@ fn warnings_for(
             },
             identity_files: files.as_slice(),
             host_extras: extras.as_slice(),
+            kind: match link {
+                ChainLink::Root(_) => ChainMemberKind::Agent,
+                ChainLink::Extras(_) => ChainMemberKind::Directory,
+                ChainLink::Outside(ancestor) => {
+                    if ancestor.identity_files.is_empty() {
+                        ChainMemberKind::Directory
+                    } else {
+                        ChainMemberKind::Agent
+                    }
+                }
+            },
         })
         .collect();
 

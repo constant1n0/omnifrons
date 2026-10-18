@@ -177,11 +177,30 @@ pub struct Warning {
     pub detail: String,
 }
 
+/// Whether one [`ChainAncestor`] member is itself an agent, or merely a
+/// directory holding only host-specific extra files and never an agent
+/// ([`crate::nesting::ChainLink::Extras`], or an outside ancestor whose
+/// own identity files are empty). The private `describe_ancestor`
+/// matches on this to word a warning's detail as "the ancestor agent
+/// ..." or "the ancestor directory ...", instead of calling every chain
+/// member an agent regardless of what it actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainMemberKind {
+    /// This member has an identity file of its own.
+    Agent,
+    /// This member holds only host-specific extra files -- never an
+    /// agent.
+    Directory,
+}
+
 /// One ancestor in an agent's warning chain (the prototype's
-/// `AncestorChain` entries, nearest first): either a root the same scan
-/// also discovered, or an ancestor outside it entirely. Mirrors
-/// [`crate::nesting::ChainLink`]/[`crate::nesting::Ancestor`], but
-/// additionally carries the identity file names found there --
+/// `AncestorChain` entries, nearest first): a root the same scan also
+/// discovered, a directory inside the scan holding only host extras, or
+/// an ancestor outside the scan entirely -- itself an agent or, just
+/// like inside the scan, merely a directory, depending on whether it
+/// has an identity file of its own; [`Self::kind`] records which.
+/// Mirrors [`crate::nesting::ChainLink`]/[`crate::nesting::Ancestor`],
+/// but additionally carries the identity file names found there --
 /// [`crate::nesting::ChainLink::Root`] names only a path, with no
 /// identity information, and `nesting.rs` is outside this task's
 /// allowed edit surface, so this module carries its own, self-contained
@@ -212,6 +231,10 @@ pub struct ChainAncestor<'a> {
     /// matching against this field changes nothing beyond that one
     /// case -- see the private `ancestor_warnings`'s own doc comment.
     pub host_extras: &'a [&'static str],
+    /// Whether this ancestor is itself an agent or merely a directory
+    /// holding only host extras -- never an agent either way. The
+    /// private `describe_ancestor` reads this to choose its wording.
+    pub kind: ChainMemberKind,
 }
 
 /// Everything [`agent_warnings`] needs for one agent root, already
@@ -709,7 +732,10 @@ fn ancestor_warnings(
 /// list [`ancestor_warnings`] is about to build a warning from, never
 /// every host in `loaders` -- an extra that matches some other host's
 /// kinds, one that fired into this same ancestor's *other* warning
-/// instead, is never named here.
+/// instead, is never named here. Worded "the ancestor agent ..." or
+/// "the ancestor directory ..." depending on [`ChainAncestor::kind`]:
+/// never "agent" for a directory holding only host extras, which is
+/// never one.
 fn describe_ancestor(
     ancestor: &ChainAncestor<'_>,
     hosts: &[&'static str],
@@ -726,8 +752,12 @@ fn describe_ancestor(
         .copied()
         .chain(matched_extras)
         .collect();
+    let noun = match ancestor.kind {
+        ChainMemberKind::Agent => "agent",
+        ChainMemberKind::Directory => "directory",
+    };
     format!(
-        "the ancestor agent {} ({})",
+        "the ancestor {noun} {} ({})",
         ancestor.display,
         described_files.join(", ")
     )
