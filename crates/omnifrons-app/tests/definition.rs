@@ -460,6 +460,115 @@ fn definition_tree_contract_fails_a_directory_with_neither() {
     definition_tree_contract(&tree, &workspace);
 }
 
+/// `definition_tree_contract` fails a snapshot with two directories
+/// sharing one path: `TreeSnapshotBuilder::directory`'s own duplicate
+/// guard refuses to construct this fixture, so it is assembled directly
+/// as a `TreeSnapshot`, the same way
+/// `duplicate_root_path_from_the_port_maps_to_definition_error_duplicate_snapshot_path`
+/// builds its own malformed fixture for `scan`.
+#[test]
+#[should_panic(expected = "directories paths must be unique")]
+fn definition_tree_contract_fails_a_snapshot_with_a_duplicate_directory_path() {
+    let project = TempDir::new("contract-duplicate-directory");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshot {
+        directories: vec![
+            DirectoryEntry {
+                path: "dup".to_string(),
+                identity_files: vec![identity(IdentityKind::Agents, b"# One\n")],
+                host_extras: Vec::new(),
+                generated_state_dirs: Vec::new(),
+            },
+            DirectoryEntry {
+                path: "dup".to_string(),
+                identity_files: vec![identity(IdentityKind::Claude, b"# Two\n")],
+                host_extras: Vec::new(),
+                generated_state_dirs: Vec::new(),
+            },
+        ],
+        skills: Vec::new(),
+        ancestors: Vec::new(),
+    };
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
+/// The same `assert_unique_paths` guard fails a snapshot with two
+/// ancestors sharing one path too, reporting the `"ancestors"` label
+/// instead of `"directories"`: built directly for the same reason as
+/// `definition_tree_contract_fails_a_snapshot_with_a_duplicate_directory_path`
+/// above, mirroring how `duplicate_ancestor_path_from_the_port_is_refused`
+/// builds its own duplicate-ancestor fixture for `scan`.
+#[test]
+#[should_panic(expected = "ancestors paths must be unique")]
+fn definition_tree_contract_fails_a_snapshot_with_a_duplicate_ancestor_path() {
+    let project = TempDir::new("contract-duplicate-ancestor");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshot {
+        directories: Vec::new(),
+        skills: Vec::new(),
+        ancestors: vec![
+            Ancestor {
+                path: "/outside".to_string(),
+                identity_files: vec!["AGENTS.md".to_string()],
+                host_extras: Vec::new(),
+            },
+            Ancestor {
+                path: "/outside".to_string(),
+                identity_files: vec!["AGENTS.md".to_string()],
+                host_extras: Vec::new(),
+            },
+        ],
+    };
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+
+    definition_tree_contract(&tree, &workspace);
+}
+
+/// `TreeSnapshotBuilder::directory` panics outright on a duplicate path
+/// instead of silently overwriting or merging the earlier entry: the
+/// exact malformed shape
+/// `definition_tree_contract_fails_a_snapshot_with_a_duplicate_directory_path`
+/// above has to build its `TreeSnapshot` directly instead of through this
+/// builder.
+#[test]
+#[should_panic(
+    expected = "was already added; build a TreeSnapshot directly for a fixture needing a duplicate directory path"
+)]
+fn tree_snapshot_builder_directory_panics_on_a_duplicate_path() {
+    let _ = TreeSnapshotBuilder::new()
+        .directory(
+            "dup",
+            vec![identity(IdentityKind::Agents, b"# One\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "dup",
+            vec![identity(IdentityKind::Claude, b"# Two\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+}
+
+/// `TreeSnapshotBuilder::ancestor` panics on a duplicate path for the
+/// same reason as `TreeSnapshotBuilder::directory` above: this builder
+/// never merges or reorders entries, so
+/// `definition_tree_contract_fails_a_snapshot_with_a_duplicate_ancestor_path`
+/// above has to build its `TreeSnapshot` directly instead.
+#[test]
+#[should_panic(
+    expected = "was already added; build a TreeSnapshot directly for a fixture needing a duplicate ancestor path"
+)]
+fn tree_snapshot_builder_ancestor_panics_on_a_duplicate_path() {
+    let _ = TreeSnapshotBuilder::new()
+        .ancestor("/outside", vec!["AGENTS.md".to_string()], Vec::new())
+        .ancestor("/outside", vec!["AGENTS.md".to_string()], Vec::new())
+        .build();
+}
+
 /// `definition_tree_contract` passes an ancestor holding a host extra
 /// but no identity file at all: the same "at least one identity file
 /// or host extra" allowance
@@ -2457,6 +2566,56 @@ fn mixed_duplicate_of_the_scan_root_path_is_refused_by_verify() {
     assert!(matches!(
         &error,
         DefinitionError::DuplicateSnapshotPath { list, path } if *list == "directory" && path == "."
+    ));
+    assert_eq!(error.reason(), "duplicate-snapshot-path");
+}
+
+/// The same ancestor-uniqueness branch of `reject_duplicate_snapshot_paths`
+/// that `duplicate_ancestor_path_from_the_port_is_refused` exercises
+/// through `scan` is reached through `verify` too: both call the shared
+/// guard immediately after fetching the snapshot from the tree port,
+/// before `verify`'s own `root_entry` lookup. A clean, non-duplicated
+/// root directory keeps the directory branch from firing first, so the
+/// duplicate `"/outside"` ancestor pair is what `verify` actually
+/// refuses on.
+#[test]
+fn ancestor_duplicate_from_the_port_is_refused_by_verify() {
+    let project = TempDir::new("verify-duplicate-ancestor");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshot {
+        directories: vec![DirectoryEntry {
+            path: ".".to_string(),
+            identity_files: vec![identity(IdentityKind::Agents, b"# One\n")],
+            host_extras: Vec::new(),
+            generated_state_dirs: Vec::new(),
+        }],
+        skills: Vec::new(),
+        ancestors: vec![
+            Ancestor {
+                path: "/outside".to_string(),
+                identity_files: vec!["AGENTS.md".to_string()],
+                host_extras: Vec::new(),
+            },
+            Ancestor {
+                path: "/outside".to_string(),
+                identity_files: vec!["AGENTS.md".to_string()],
+                host_extras: Vec::new(),
+            },
+        ],
+    };
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let error = verify(&ports, &workspace).expect_err("a duplicate ancestor path is refused");
+
+    assert!(matches!(
+        &error,
+        DefinitionError::DuplicateSnapshotPath { list, path }
+            if *list == "ancestor" && path == "/outside"
     ));
     assert_eq!(error.reason(), "duplicate-snapshot-path");
 }
