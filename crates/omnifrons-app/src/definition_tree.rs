@@ -74,10 +74,21 @@
 //!   [`omnifrons_domain::nesting::warning_chain`] appends every entry
 //!   of its `outer` argument unconditionally, as
 //!   [`omnifrons_domain::nesting::ChainLink::Outside`], never filtered
-//!   on whether [`Ancestor::identity_files`] is empty. The walk stops
-//!   at the user's home directory boundary -- the prototype's own
-//!   `user_home()` guard in `has_identity_files`, applied by the
-//!   adapter, never by this port's caller. Each
+//!   on whether [`Ancestor::identity_files`] is empty. The walk never
+//!   stops at the user's home directory boundary at all -- the
+//!   prototype's own `find_ancestors` walks every one of
+//!   `root.parents`, all the way up to the filesystem root, with no
+//!   home check of its own. Home instead narrows what counts as an
+//!   identity file at the single ancestor directory equal to home
+//!   itself: the prototype's own `identity_kinds_for` drops `DOT_CLAUDE`
+//!   (`.claude/CLAUDE.md`,
+//!   [`omnifrons_domain::definition::IdentityKind::ClaudeDir`]) from
+//!   that one directory's own kinds, because it is the user's own
+//!   Claude Code memory file, never a project file. So home is listed
+//!   as an ancestor only when some other kind or a host extra is
+//!   present there -- a bare `.claude/CLAUDE.md` at home never makes it
+//!   one, but an `AGENTS.md` there does -- applied by the adapter,
+//!   never by this port's caller. Each
 //!   `Ancestor::identity_files` entry the adapter supplies may be
 //!   either that file's identity-kind file name (for example
 //!   `"AGENTS.md"`, the prototype's own shape -- it keys its own
@@ -170,6 +181,14 @@ pub struct SkillFile {
     pub bytes: Vec<u8>,
 }
 
+/// The largest identity file or `SKILL.md` a [`DefinitionTree`] reads in
+/// full before refusing with [`DefinitionTreeError::EntryTooLarge`]: 1
+/// MiB, matching `omnifrons_app::managed_file::MAX_MANAGED_FILE_BYTES`,
+/// this crate's existing cap for a workspace text file read whole --
+/// reused rather than inventing a second, differently sized limit with
+/// no documented reason to differ.
+pub const MAX_DEFINITION_ENTRY_BYTES: u64 = 1024 * 1024;
+
 /// Why a [`DefinitionTree`] could not produce a [`TreeSnapshot`]. A
 /// minimal, documented set: every variant has a fixed reason token
 /// ([`Self::reason`]); no message carries a path.
@@ -183,8 +202,8 @@ pub enum DefinitionTreeError {
     /// error on a subdirectory the walk could not skip).
     #[error("the directory walk failed")]
     WalkFailed,
-    /// A discovered identity file or `SKILL.md` exceeds the adapter's
-    /// size cap.
+    /// A discovered identity file or `SKILL.md` exceeds
+    /// [`MAX_DEFINITION_ENTRY_BYTES`].
     #[error("a discovered entry exceeds the size limit")]
     EntryTooLarge,
 }

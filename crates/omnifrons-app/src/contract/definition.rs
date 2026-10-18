@@ -254,7 +254,9 @@ fn assert_unique_paths<'a>(paths: impl Iterator<Item = &'a str>, label: &str) {
 /// always holds at least one identity file or host extra (never
 /// neither), a skill's basename is `SKILL.md`, directories and skills
 /// are in the prototype's sorted walk order, directory paths are
-/// unique, ancestors are nearest first, and ancestor paths are unique.
+/// unique, ancestors are nearest first, ancestor paths are unique, and
+/// a listed ancestor likewise always holds at least one identity file
+/// or host extra (never neither).
 ///
 /// Checks only the shape a [`TreeSnapshot`] value must have; it cannot
 /// check the walk, pruning, link, or home-boundary rules that only a
@@ -319,6 +321,11 @@ pub fn definition_tree_contract<T: DefinitionTree>(tree: &T, root: &WorkspaceRoo
     );
     let mut previous_depth: Option<usize> = None;
     for ancestor in &snapshot.ancestors {
+        assert!(
+            !ancestor.identity_files.is_empty() || !ancestor.host_extras.is_empty(),
+            "a listed ancestor must hold at least one identity file or host extra: {}",
+            ancestor.path
+        );
         let depth = ancestor.path.split('/').count();
         if let Some(previous) = previous_depth {
             assert!(

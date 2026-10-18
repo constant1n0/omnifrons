@@ -54,9 +54,16 @@
 //! and [`FsSnapshotStore`] (`omnifrons_app::snapshot_store::SnapshotStore`;
 //! the work area's `snapshots/<project hex>/<id>.json` and `<id>.bytes`).
 //! Dependency tables unchanged.
+//!
+//! As of ADR-0005 sub-slice 1f this crate also implements
+//! [`FsDefinitionTree`] (`omnifrons_app::definition_tree::DefinitionTree`;
+//! a real, plain-`std::fs` walk of a workspace's agent-identity files
+//! and discovered skills, never through a symlink). Dependency tables
+//! unchanged.
 
 mod catalog_record_dto;
 pub mod fs_candidate_prober;
+pub mod fs_definition_tree;
 pub mod fs_outbox_entry_ops;
 pub mod fs_outbox_inventory;
 pub mod fs_prober;
@@ -82,6 +89,7 @@ pub mod pty_cli;
 pub mod sha2_hasher;
 
 pub use fs_candidate_prober::FsCandidateProber;
+pub use fs_definition_tree::FsDefinitionTree;
 pub use fs_outbox_entry_ops::FsOutboxEntryOps;
 pub use fs_outbox_inventory::FsOutboxInventory;
 pub use fs_prober::FsExecutableProber;
