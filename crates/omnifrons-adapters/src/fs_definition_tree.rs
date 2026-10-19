@@ -556,6 +556,50 @@ fn posix_absolute(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Whether identity `kind` is present at `directory`, checking its
+/// presence and shape only -- never reading or size-capping its bytes.
+/// Walks every intermediate path segment of [`IdentityKind::file_name`]
+/// exactly as [`read_identity_file`] does: an intermediate segment that
+/// does not exist, or exists but is not a directory, means the kind is
+/// absent, and one that is itself a symlink counts the kind present
+/// exactly when the full nested path still resolves through it --
+/// matching [`read_identity_file`]'s own intermediate-symlink rule,
+/// without reading that symlink's own target text, since no caller of
+/// this function needs it. At the final path, a regular file, a
+/// symlink, or an irregular entry all count as present, exactly as
+/// [`read_identity_at`] treats them at the entry level -- just without
+/// ever calling [`read_capped`]. [`find_ancestors`] is this function's
+/// only caller; see its own documentation for why an ancestor check
+/// never needs an identity file's content.
+fn identity_file_present(
+    directory: &Path,
+    kind: IdentityKind,
+    is_root: bool,
+) -> Result<bool, DefinitionTreeError> {
+    let relative = Path::new(kind.file_name());
+    let mut current = directory.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            // The final component is the file itself; handled below,
+            // outside this segment-walking loop.
+            break;
+        }
+        current.push(component);
+        let Some(metadata) = symlink_metadata_or_absent(&current, is_root)? else {
+            return Ok(false);
+        };
+        if metadata.file_type().is_symlink() {
+            let full_path = directory.join(relative);
+            return Ok(symlink_metadata_or_absent(&full_path, is_root)?.is_some());
+        }
+        if !metadata.is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(symlink_metadata_or_absent(&directory.join(relative), is_root)?.is_some())
+}
+
 /// Every ancestor above `root` holding at least one identity file or
 /// host extra, nearest first -- the prototype's own `find_ancestors`
 /// walking every one of `root.parents`, all the way to the filesystem
@@ -564,6 +608,17 @@ fn posix_absolute(path: &Path) -> String {
 /// stop. No ancestor here is ever the scan root itself, so every
 /// failure below always reports [`DefinitionTreeError::WalkFailed`],
 /// never [`DefinitionTreeError::RootUnreadable`].
+///
+/// Each kind is checked with [`identity_file_present`] -- presence and
+/// shape alone, never [`read_identity_file`] -- because an [`Ancestor`]
+/// carries only [`Ancestor::identity_files`] file names, never bytes.
+/// The prototype's own `find_ancestors` does read every ancestor
+/// identity file's bytes, through its own `read_identity_files`, but
+/// only ever keeps the resulting names; this port reads nothing an
+/// ancestor check does not need, so an ancestor identity file this
+/// process cannot read the content of, or one over
+/// [`MAX_DEFINITION_ENTRY_BYTES`], never fails an otherwise-healthy
+/// scan.
 fn find_ancestors(
     root: &Path,
     ctx: &WalkContext<'_>,
@@ -574,7 +629,7 @@ fn find_ancestors(
         let kinds = identity_kinds_for(parent, ctx.home);
         let mut identity_files = Vec::new();
         for &kind in kinds {
-            if read_identity_file(parent, kind, false)?.is_some() {
+            if identity_file_present(parent, kind, false)? {
                 identity_files.push(kind.file_name().to_string());
             }
         }

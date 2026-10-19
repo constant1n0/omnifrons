@@ -17,7 +17,7 @@ use omnifrons_app::definition_tree::{
     DefinitionTree, DefinitionTreeError, MAX_DEFINITION_ENTRY_BYTES,
 };
 use omnifrons_domain::definition::{FileShape, IdentityKind, RootState};
-use omnifrons_domain::nesting::Parent;
+use omnifrons_domain::nesting::{Ancestor, Parent};
 
 const SIMPLE_BODY: &[u8] = b"# Simple\n\nYou are Simple, a fixture agent.\n";
 const OTHER_BODY: &[u8] = b"# Simple\n\nYou are Simple, a different fixture agent.\n";
@@ -75,6 +75,21 @@ fn canonical_posix(path: &Path) -> String {
         .expect("canonicalize")
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// The entries of `ancestors` at or under `root_posix` (`canonical_posix`'s
+/// own `/`-separated absolute form): every ancestor assertion in this
+/// file filters through this helper first, so it only ever covers the
+/// test's own temp tree, never whatever identity file or host extra
+/// already happens to sit above it on the host actually running the
+/// test -- the adapter's ancestor walk always climbs all the way to
+/// the real filesystem root, so an assertion on the raw, unfiltered
+/// list would be hostage to that host's own directory tree.
+fn ancestors_under<'a>(ancestors: &'a [Ancestor], root_posix: &str) -> Vec<&'a Ancestor> {
+    ancestors
+        .iter()
+        .filter(|ancestor| ancestor.path.starts_with(root_posix))
+        .collect()
 }
 
 /// The agent at `path` in `report`, or a panic naming every path that
@@ -232,13 +247,13 @@ fn ancestors_outside_the_scan_root_are_recorded_nearest_first() {
         .map(|agent| agent.path.as_str())
         .collect();
     assert_eq!(paths, vec!["."]);
-    let ancestor_paths: Vec<&str> = report
-        .ancestors
+    let ancestors = ancestors_under(&report.ancestors, &outer_posix);
+    let ancestor_paths: Vec<&str> = ancestors
         .iter()
         .map(|ancestor| ancestor.path.as_str())
         .collect();
     assert_eq!(ancestor_paths, vec![outer_posix.as_str()]);
-    let mut kinds = report.ancestors[0].identity_files.clone();
+    let mut kinds = ancestors[0].identity_files.clone();
     kinds.sort();
     assert_eq!(
         kinds,
@@ -251,8 +266,8 @@ fn ancestors_outside_the_scan_root_are_recorded_nearest_first() {
     let deeper_workspace = WorkspaceRoot::new(base.path().join("skills")).expect("workspace");
     let deeper_report = scan(&ports, &deeper_workspace).expect("scan succeeds");
     assert!(deeper_report.agents.is_empty());
-    let deeper_ancestor_paths: Vec<&str> = deeper_report
-        .ancestors
+    let deeper_ancestors = ancestors_under(&deeper_report.ancestors, &outer_posix);
+    let deeper_ancestor_paths: Vec<&str> = deeper_ancestors
         .iter()
         .map(|ancestor| ancestor.path.as_str())
         .collect();
@@ -395,21 +410,24 @@ fn home_level_claude_memory_is_not_an_ancestor_but_a_home_level_agents_md_is() {
     write(base.path(), "home/.claude/CLAUDE.md", b"User memory.\n");
     write(base.path(), "home/work/CLAUDE.md", SIMPLE_BODY);
     let home_path = base.path().join("home");
+    let base_posix = canonical_posix(base.path());
     let work_workspace = WorkspaceRoot::new(home_path.join("work")).expect("workspace");
     let fs_tree = FsDefinitionTree::new(Some(home_path.clone()));
 
     let snapshot = fs_tree.snapshot(&work_workspace).expect("snapshot");
-    assert!(snapshot.ancestors.is_empty(), "{:?}", snapshot.ancestors);
+    assert!(
+        ancestors_under(&snapshot.ancestors, &base_posix).is_empty(),
+        "{:?}",
+        snapshot.ancestors
+    );
 
     write(base.path(), "home/AGENTS.md", b"Home-level agent.\n");
     let snapshot = fs_tree.snapshot(&work_workspace).expect("snapshot");
     let home_posix = canonical_posix(&home_path);
-    assert_eq!(snapshot.ancestors.len(), 1);
-    assert_eq!(snapshot.ancestors[0].path, home_posix);
-    assert_eq!(
-        snapshot.ancestors[0].identity_files,
-        vec!["AGENTS.md".to_string()]
-    );
+    let ancestors = ancestors_under(&snapshot.ancestors, &base_posix);
+    assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
+    assert_eq!(ancestors[0].path, home_posix);
+    assert_eq!(ancestors[0].identity_files, vec!["AGENTS.md".to_string()]);
 }
 
 // -- adapter-level cases --
@@ -428,6 +446,7 @@ fn extras_only_directories_and_ancestors_both_appear_in_the_snapshot() {
         "root/extras-inside/CLAUDE.local.md",
         b"inner local notes\n",
     );
+    let outer_posix = canonical_posix(outer.path());
     let workspace = WorkspaceRoot::new(outer.path().join("root")).expect("workspace");
     let fs_tree = FsDefinitionTree::new(None);
 
@@ -441,10 +460,11 @@ fn extras_only_directories_and_ancestors_both_appear_in_the_snapshot() {
     assert!(inside.identity_files.is_empty());
     assert_eq!(inside.host_extras, vec!["CLAUDE.local.md".to_string()]);
 
-    assert_eq!(snapshot.ancestors.len(), 1);
-    assert!(snapshot.ancestors[0].identity_files.is_empty());
+    let ancestors = ancestors_under(&snapshot.ancestors, &outer_posix);
+    assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
+    assert!(ancestors[0].identity_files.is_empty());
     assert_eq!(
-        snapshot.ancestors[0].host_extras,
+        ancestors[0].host_extras,
         vec!["CLAUDE.local.md".to_string()]
     );
 }
@@ -495,6 +515,33 @@ fn an_identity_file_over_the_cap_is_refused() {
         fs_tree.snapshot(&workspace),
         Err(DefinitionTreeError::EntryTooLarge)
     );
+}
+
+/// An oversized `AGENTS.md` *above* the scan root is only a presence
+/// check, never a content read: unlike
+/// `an_identity_file_over_the_cap_is_refused` above, whose oversized
+/// file sits *at* the scan root and is read in full, an ancestor
+/// identity file's bytes are never needed -- see `FsDefinitionTree`'s
+/// own `find_ancestors` documentation -- so the snapshot succeeds and
+/// still lists that ancestor.
+#[test]
+fn an_oversized_ancestor_identity_file_does_not_fail_the_scan() {
+    let base = TempDir::new("ancestor-too-large");
+    let oversized = vec![b'a'; usize::try_from(MAX_DEFINITION_ENTRY_BYTES).expect("fits") + 1];
+    write(base.path(), "AGENTS.md", &oversized);
+    std::fs::create_dir_all(base.path().join("nested")).expect("mkdir nested");
+    let base_posix = canonical_posix(base.path());
+    let workspace = WorkspaceRoot::new(base.path().join("nested")).expect("workspace");
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let snapshot = fs_tree
+        .snapshot(&workspace)
+        .expect("snapshot succeeds despite the oversized ancestor");
+
+    let ancestors = ancestors_under(&snapshot.ancestors, &base_posix);
+    assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
+    assert_eq!(ancestors[0].path, base_posix);
+    assert_eq!(ancestors[0].identity_files, vec!["AGENTS.md".to_string()]);
 }
 
 /// A `SKILL.md` over the cap is refused the same way an oversized
@@ -664,6 +711,48 @@ fn an_unreadable_identity_file_still_aborts_the_walk() {
     std::fs::set_permissions(&identity_file, std::fs::Permissions::from_mode(0o600))
         .expect("restore permissions before cleanup");
     assert_eq!(result, Err(DefinitionTreeError::WalkFailed));
+}
+
+/// An ancestor `AGENTS.md` this process cannot read (unix mode
+/// `0o000`) is only a presence check, never a content read: unlike
+/// `an_unreadable_identity_file_still_aborts_the_walk` above, whose
+/// unreadable file sits inside the scan root and is read in full, the
+/// snapshot succeeds and still lists that ancestor -- `symlink_metadata`
+/// never needs read permission on the file itself, only search
+/// permission on its parent directory, which this test never revokes.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_ancestor_identity_file_does_not_fail_the_scan() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping an_unreadable_ancestor_identity_file_does_not_fail_the_scan: running \
+             as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let base = TempDir::new("ancestor-unreadable");
+    write(base.path(), "AGENTS.md", SIMPLE_BODY);
+    std::fs::create_dir_all(base.path().join("nested")).expect("mkdir nested");
+    let ancestor_file = base.path().join("AGENTS.md");
+    std::fs::set_permissions(&ancestor_file, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0o000");
+    let base_posix = canonical_posix(base.path());
+    let workspace = WorkspaceRoot::new(base.path().join("nested")).expect("workspace");
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&ancestor_file, std::fs::Permissions::from_mode(0o600))
+        .expect("restore permissions before cleanup");
+    let snapshot = result.expect("snapshot succeeds despite the unreadable ancestor");
+    let ancestors = ancestors_under(&snapshot.ancestors, &base_posix);
+    assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
+    assert_eq!(ancestors[0].identity_files, vec!["AGENTS.md".to_string()]);
 }
 
 /// A `SKILL.md` this process cannot read (unix mode `0o000`) still
