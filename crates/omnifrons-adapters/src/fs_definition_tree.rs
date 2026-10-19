@@ -39,11 +39,35 @@
 //! on any unexpected failure; the identical failure anywhere *below*
 //! the root reports
 //! [`omnifrons_app::definition_tree::DefinitionTreeError::WalkFailed`]
-//! instead. A root directory a caller cannot search at all (unix mode
-//! `0o000`) fails every one of those root-level operations the same
-//! way, for the same underlying reason, so this split reports it
-//! uniformly as "the scan root cannot be read" regardless of which
-//! specific check happens to hit the permission error first.
+//! instead -- except a below-root directory *listing* failure, which
+//! the next paragraph carves out. A root directory a caller cannot
+//! search at all (unix mode `0o000`) fails every one of those
+//! root-level operations the same way, for the same underlying reason,
+//! so this split reports it uniformly as "the scan root cannot be
+//! read" regardless of which specific check happens to hit the
+//! permission error first.
+//!
+//! **A below-root listing failure is skipped, not fatal.** When this
+//! module's own recursive walk cannot even list a directory's own
+//! entries -- `std::fs::read_dir` itself failing, or failing partway
+//! through iterating what it returned -- *below* the scan root, this
+//! mirrors the prototype's own `os.walk(root, followlinks=False)`
+//! under its default `onerror=None`: that directory's own tuple is never
+//! produced, so the directory is neither recorded as a
+//! [`DirectoryEntry`] nor inspected for its own `SKILL.md`, the walk
+//! never descends into it, and the walk continues with its siblings
+//! rather than failing outright. A directory removed between being
+//! listed by its parent and being visited itself falls into this same
+//! case, indistinguishable from any other listing failure. This is
+//! narrower than classifying one already-listed entry's own file
+//! type: a failed `FileType` check on a single entry (the prototype's
+//! own `entry.is_dir()` raising) only drops that one entry from
+//! consideration, exactly as if it were not a directory, and never
+//! skips the rest of the listing. None of this touches a *content*
+//! read -- an identity file or `SKILL.md` that fails to read still
+//! reports `WalkFailed`, per the paragraph above -- and the scan
+//! root's own listing failure is unaffected by any of this: it still
+//! reports `RootUnreadable`, like every other root-level check above.
 //!
 //! **Lossy, not refusing, non-UTF-8 names.** `TreeSnapshot`'s paths are
 //! plain `String`s; an entry name that is not valid UTF-8 is carried
@@ -198,15 +222,22 @@ fn join_relative(parent: &str, name: &str) -> String {
     }
 }
 
-/// Visits one directory, pre-order: records it (`record_directory`), its
-/// own `SKILL.md` (`record_skill`), then recurses into every real,
-/// non-pruned subdirectory in sorted name order -- the prototype's own
-/// `os.walk(root, followlinks=False)` plus its `SKIP_DIRS` prune,
-/// translated one level of recursion at a time.
+/// Visits one directory, pre-order: lists its real, non-pruned
+/// subdirectories first ([`list_subdirectories`]). When that listing
+/// itself fails anywhere below the scan root, this directory is
+/// skipped entirely -- never recorded, never descended into -- the
+/// prototype's own `os.walk(root, followlinks=False)` under its
+/// default `onerror=None`; see [`list_subdirectories`] for why.
+/// Otherwise, it records this directory (`record_directory`), its own
+/// `SKILL.md` (`record_skill`), then recurses into every listed
+/// subdirectory in sorted name order -- the prototype's own walk plus
+/// its `SKIP_DIRS` prune, translated one level of recursion at a time.
 ///
-/// `is_root` is `true` for exactly the call on the scan root itself; see
-/// [`io_error`] for why every failure at that one level reports
-/// differently from every failure below it.
+/// `is_root` is `true` for exactly the call on the scan root itself: a
+/// listing failure there is never skipped, and still reports
+/// [`DefinitionTreeError::RootUnreadable`]; see [`io_error`] and
+/// [`list_subdirectories`] for why every failure at that one level
+/// reports differently from a below-root listing failure.
 fn visit(
     absolute: &Path,
     relative_display: &str,
@@ -214,6 +245,10 @@ fn visit(
     ctx: &WalkContext<'_>,
     collected: &mut Collected,
 ) -> Result<(), DefinitionTreeError> {
+    let Some(candidates) = list_subdirectories(absolute, is_root)? else {
+        return Ok(());
+    };
+
     record_directory(
         absolute,
         relative_display,
@@ -223,16 +258,54 @@ fn visit(
     )?;
     record_skill(absolute, relative_display, is_root, &mut collected.skills)?;
 
+    for name in candidates {
+        let child_absolute = absolute.join(&name);
+        let child_relative = join_relative(relative_display, &name.to_string_lossy());
+        visit(&child_absolute, &child_relative, false, ctx, collected)?;
+    }
+    Ok(())
+}
+
+/// Lists `absolute`'s immediate real, non-pruned subdirectories eligible
+/// for recursion, in sorted name order -- or `None` when the listing
+/// itself fails *below* the scan root.
+///
+/// Mirrors `os.walk`'s own default `onerror=None`: a directory this
+/// process cannot even open for listing, or whose entry iteration fails
+/// partway through (for example because an entry vanished), is simply
+/// skipped -- as if it held no entries of interest at all -- rather
+/// than aborting the whole walk; see this module's own documentation
+/// for the full rule and why it never touches a content read. A failure
+/// classifying one specific entry's own file type is narrower still:
+/// that one entry alone is treated as "not a directory" (the
+/// prototype's own `entry.is_dir()` fallback), which never forces this
+/// wider, whole-directory skip.
+///
+/// At the scan root itself (`is_root`), any such failure instead
+/// becomes `Err(DefinitionTreeError::RootUnreadable)`, matching every
+/// other root-level check in this module.
+fn list_subdirectories(
+    absolute: &Path,
+    is_root: bool,
+) -> Result<Option<Vec<OsString>>, DefinitionTreeError> {
+    let Ok(read_dir) = std::fs::read_dir(absolute) else {
+        return listing_failed(is_root);
+    };
     let mut candidates: Vec<OsString> = Vec::new();
-    for entry in std::fs::read_dir(absolute).map_err(|_| io_error(is_root))? {
-        let entry = entry.map_err(|_| io_error(is_root))?;
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            return listing_failed(is_root);
+        };
         // Not following a symlink at this name: a symlink is never a
         // recursion candidate regardless of what it points to, so
         // `FileType::is_dir` here -- which, like `symlink_metadata`,
         // never follows -- already excludes every symlink, whether it
-        // targets a file or a directory.
-        let file_type = entry.file_type().map_err(|_| io_error(is_root))?;
-        if !file_type.is_dir() {
+        // targets a file or a directory. A failure classifying this
+        // one entry is treated as "not a directory" rather than a
+        // reason to abandon the rest of this listing -- see this
+        // function's own documentation.
+        let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if !is_dir {
             continue;
         }
         let name = entry.file_name();
@@ -242,13 +315,20 @@ fn visit(
         candidates.push(name);
     }
     candidates.sort();
+    Ok(Some(candidates))
+}
 
-    for name in candidates {
-        let child_absolute = absolute.join(&name);
-        let child_relative = join_relative(relative_display, &name.to_string_lossy());
-        visit(&child_absolute, &child_relative, false, ctx, collected)?;
+/// [`list_subdirectories`]'s own failure convention: `Err` at the scan
+/// root (`RootUnreadable`, matching every other root-level check),
+/// `Ok(None)` -- "skip, do not descend" -- everywhere else, so a caller
+/// never repeats the `is_root` branch at each of that listing's two
+/// failure points (opening the directory, and iterating its entries).
+const fn listing_failed(is_root: bool) -> Result<Option<Vec<OsString>>, DefinitionTreeError> {
+    if is_root {
+        Err(DefinitionTreeError::RootUnreadable)
+    } else {
+        Ok(None)
     }
-    Ok(())
 }
 
 /// Records `absolute` as a [`DirectoryEntry`] iff it holds at least one

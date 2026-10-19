@@ -198,8 +198,13 @@ pub enum DefinitionTreeError {
     /// directory.
     #[error("the scan root cannot be read")]
     RootUnreadable,
-    /// The walk failed below the scan root (for example a permission
-    /// error on a subdirectory the walk could not skip).
+    /// A discovered identity file or `SKILL.md` below the scan root
+    /// could not be read (for example a permission error on the file
+    /// itself). A directory *listing* failure below the scan root is
+    /// never reported this way: mirroring the prototype's own
+    /// `os.walk`'s default `onerror=None`, such a directory -- and
+    /// everything beneath it -- is silently skipped instead, and the
+    /// walk continues with its siblings rather than failing.
     #[error("the directory walk failed")]
     WalkFailed,
     /// A discovered identity file or `SKILL.md` exceeds

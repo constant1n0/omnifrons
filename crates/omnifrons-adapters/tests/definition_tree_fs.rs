@@ -557,3 +557,149 @@ fn an_unreadable_root_reports_root_unreadable() {
         .expect("restore permissions before cleanup");
     assert_eq!(result, Err(DefinitionTreeError::RootUnreadable));
 }
+
+/// A subdirectory this process cannot even list (unix mode `0o000`)
+/// below the scan root is skipped entirely, along with everything it
+/// holds -- mirroring the prototype's own
+/// `os.walk(root, followlinks=False)` under its default
+/// `onerror=None` -- while a readable sibling agent is still found:
+/// the snapshot succeeds, the blocked directory never appears in
+/// `directories` or `skills`, and the sibling does.
+///
+/// A directory removed between being listed by its parent and being
+/// visited itself would hit this same listing-failure path, but is
+/// not exercised here: nothing in `std::fs` lets a test
+/// deterministically remove a directory in the narrow window between
+/// `FsDefinitionTree` listing its parent and recursing into it.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely (mirrors the same skip in
+/// `an_unreadable_root_reports_root_unreadable` above).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_subdirectory_below_the_root_is_skipped() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping an_unreadable_subdirectory_below_the_root_is_skipped: running as \
+             root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("unreadable-subdirectory");
+    write(project.path(), "blocked/AGENTS.md", SIMPLE_BODY);
+    write(
+        project.path(),
+        "blocked/SKILL.md",
+        b"---\nname: blocked\n---\n",
+    );
+    write(project.path(), "sibling/AGENTS.md", SIMPLE_BODY);
+    let blocked = project.path().join("blocked");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0o000");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    let snapshot = result.expect("snapshot succeeds despite the blocked subdirectory");
+    let directory_paths: Vec<&str> = snapshot
+        .directories
+        .iter()
+        .map(|directory| directory.path.as_str())
+        .collect();
+    assert!(
+        !directory_paths
+            .iter()
+            .any(|path| path.starts_with("blocked")),
+        "{directory_paths:?}"
+    );
+    assert!(directory_paths.contains(&"sibling"), "{directory_paths:?}");
+    assert!(
+        !snapshot
+            .skills
+            .iter()
+            .any(|skill| skill.path.starts_with("blocked")),
+        "{:?}",
+        snapshot.skills
+    );
+}
+
+/// An identity file this process cannot read (unix mode `0o000`)
+/// inside an otherwise fully readable subdirectory still aborts the
+/// whole scan with `WalkFailed`: unlike a directory *listing* failure
+/// (`an_unreadable_subdirectory_below_the_root_is_skipped` above), a
+/// content-read failure on an already-discovered identity file is
+/// never skipped, matching the prototype's own `read_identity`, which
+/// raises on exactly this failure rather than silently omitting the
+/// file.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_identity_file_still_aborts_the_walk() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping an_unreadable_identity_file_still_aborts_the_walk: running as root, \
+             which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("unreadable-identity-file");
+    write(project.path(), "nested/AGENTS.md", SIMPLE_BODY);
+    let identity_file = project.path().join("nested").join("AGENTS.md");
+    std::fs::set_permissions(&identity_file, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0o000");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&identity_file, std::fs::Permissions::from_mode(0o600))
+        .expect("restore permissions before cleanup");
+    assert_eq!(result, Err(DefinitionTreeError::WalkFailed));
+}
+
+/// A `SKILL.md` this process cannot read (unix mode `0o000`) still
+/// aborts the whole scan with `WalkFailed`, exactly like an unreadable
+/// identity file above: a content-read failure, never a directory
+/// listing failure, so it is never skipped.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_skill_file_still_aborts_the_walk() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping an_unreadable_skill_file_still_aborts_the_walk: running as root, \
+             which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("unreadable-skill-file");
+    write(
+        project.path(),
+        "nested/SKILL.md",
+        b"---\nname: nested\n---\n",
+    );
+    let skill_file = project.path().join("nested").join("SKILL.md");
+    std::fs::set_permissions(&skill_file, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0o000");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&skill_file, std::fs::Permissions::from_mode(0o600))
+        .expect("restore permissions before cleanup");
+    assert_eq!(result, Err(DefinitionTreeError::WalkFailed));
+}
