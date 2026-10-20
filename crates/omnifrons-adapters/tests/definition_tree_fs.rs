@@ -16,7 +16,9 @@ use omnifrons_app::definition::{AgentReport, DefinitionPorts, ScanReport, scan};
 use omnifrons_app::definition_tree::{
     DefinitionTree, DefinitionTreeError, MAX_DEFINITION_ENTRY_BYTES,
 };
-use omnifrons_domain::definition::{FileShape, IdentityKind, RootState};
+use omnifrons_domain::definition::RootState;
+#[cfg(unix)]
+use omnifrons_domain::definition::{FileShape, IdentityKind};
 use omnifrons_domain::nesting::{Ancestor, Parent};
 
 const SIMPLE_BODY: &[u8] = b"# Simple\n\nYou are Simple, a fixture agent.\n";
