@@ -14,14 +14,19 @@
 //!
 //! This module never touches a filesystem and never decides which
 //! directories count as roots in the first place. Walking the
-//! directory tree, pruning skip and host-config directories (this
-//! crate's [`crate::hosts`] already holds `SKIP_DIRS`,
-//! `HOST_CONFIG_DIRS`, and `GENERATED_STATE_DIRS` for that),
-//! attributing a host-config directory's identity files to its parent
-//! root, and stopping the ancestor walk at the user's home directory
-//! all belong to the `DefinitionTree` port and its adapter (sub-slices
-//! 1e/1f). Two of the prototype's own tests stay there for exactly that
-//! reason: its `test_scan_prunes_ignored_and_host_config_dirs` and
+//! directory tree and pruning a [`crate::hosts::SKIP_DIRS`] entry
+//! whole -- never descending into one at all -- belongs to the
+//! `DefinitionTree` port and its adapter (sub-slices 1e/1f), as does
+//! stopping the ancestor walk at the user's home directory. A
+//! [`crate::hosts::HOST_CONFIG_DIRS`] entry (for example `.claude`) is
+//! never pruned this way: the prototype's own walk still descends into
+//! it exactly like any other directory, and only
+//! `identity_kinds_for`'s own, separate rule keeps it from ever
+//! becoming a root of its own, attributing its identity files to its
+//! *parent* root instead -- the port and adapter's own responsibility
+//! too, like [`crate::hosts::GENERATED_STATE_DIRS`] detection. Two of
+//! the prototype's own tests stay there for exactly that reason: its
+//! `test_scan_prunes_ignored_and_host_config_dirs` and
 //! `test_home_user_memory_is_not_an_ancestor` assert on the walk and the
 //! home boundary, not on the relation this module computes.
 //!

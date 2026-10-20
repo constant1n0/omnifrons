@@ -211,6 +211,18 @@ pub enum DefinitionTreeError {
     /// [`MAX_DEFINITION_ENTRY_BYTES`].
     #[error("a discovered entry exceeds the size limit")]
     EntryTooLarge,
+    /// A path this [`DefinitionTree`] must report -- a
+    /// [`DirectoryEntry::path`], a [`SkillFile::path`], or an
+    /// [`omnifrons_domain::nesting::Ancestor::path`] -- is not valid
+    /// Unicode. The prototype never refuses over this alone: it escapes
+    /// an undecodable byte (Python's own surrogate-escape handling of
+    /// `os.fsdecode`) rather than failing, but this port's paths are
+    /// plain `String`s with no such escape to carry, and folding two
+    /// distinct non-Unicode names onto the same lossy replacement text
+    /// could silently misattribute one directory's files to another's
+    /// displayed path.
+    #[error("a reported path is not valid Unicode")]
+    PathNotUnicode,
 }
 
 impl DefinitionTreeError {
@@ -221,6 +233,7 @@ impl DefinitionTreeError {
             Self::RootUnreadable => "root-unreadable",
             Self::WalkFailed => "walk-failed",
             Self::EntryTooLarge => "entry-too-large",
+            Self::PathNotUnicode => "path-not-unicode",
         }
     }
 }

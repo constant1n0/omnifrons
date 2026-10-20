@@ -32,20 +32,60 @@
 //! a new one.
 //!
 //! **`RootUnreadable` versus `WalkFailed`.** Every filesystem operation
-//! this module performs *for the scan root's own directory* -- its own
-//! identity files, host extras, generated-state directories, `SKILL.md`,
-//! and its own listing -- reports
+//! this module performs *for the scan root's own directory* that can
+//! still fail at all -- an identity file's intermediate path segments
+//! and final content, `SKILL.md`, and the root's own listing -- reports
 //! [`omnifrons_app::definition_tree::DefinitionTreeError::RootUnreadable`]
 //! on any unexpected failure; the identical failure anywhere *below*
 //! the root reports
 //! [`omnifrons_app::definition_tree::DefinitionTreeError::WalkFailed`]
 //! instead -- except a below-root directory *listing* failure, which
-//! the next paragraph carves out. A root directory a caller cannot
-//! search at all (unix mode `0o000`) fails every one of those
-//! root-level operations the same way, for the same underlying reason,
-//! so this split reports it uniformly as "the scan root cannot be
-//! read" regardless of which specific check happens to hit the
-//! permission error first.
+//! the next paragraph carves out. Host extras, generated-state
+//! directories, and every `lexists`-shaped presence check the next
+//! section below describes are outside this split entirely: each of
+//! them only ever asks "is anything there", so a permission error there
+//! is never `RootUnreadable` or `WalkFailed` -- it is simply "absent",
+//! at the scan root exactly like everywhere else. A root directory a
+//! caller cannot search at all (unix mode `0o000`) still fails every
+//! operation that remains part of this split the same way, for the
+//! same underlying reason, so that subset reports it uniformly as "the
+//! scan root cannot be read" regardless of which specific check
+//! happens to hit the permission error first.
+//!
+//! **Lenient, not strict, a `lexists`-shaped presence check.** The
+//! prototype's own presence checks are not one uniform rule. A handful
+//! of them -- `find_host_extras`, `has_identity_files` (`find_ancestors`'s
+//! own filter, read back here through `identity_file_present`), and
+//! the generated-state check inside its warnings composition -- ask a
+//! blanket `os.path.lexists`/`os.path.exists` whether anything at all
+//! sits at a path, and both of those stdlib calls catch *every*
+//! `OSError` a stat can raise, a permission error included, and simply
+//! answer "not there". `read_identity`'s own walk down an identity
+//! kind's intermediate path segments (`.claude` before
+//! `.claude/CLAUDE.md`, for instance) is not one of those calls: it
+//! checks each segment with its own, unwrapped directory check instead,
+//! so this module mirrors that split by call site rather than
+//! flattening every presence check to one rule. `find_host_extras`,
+//! `find_generated_state_dirs`, and `identity_file_present` all answer
+//! the blanket-`lexists` question, so every one of their own checks
+//! goes through `lexists_or_absent` below, never failing the whole
+//! scan over a permission error alone -- and neither does
+//! `find_ancestors`, which calls `identity_file_present` and
+//! `find_host_extras` for exactly this reason.
+//! `read_identity_file`'s own intermediate-segment walk is the other
+//! shape: it keeps going through `symlink_metadata_or_absent` and
+//! still aborts on an unexpected error there, exactly as before. Only
+//! the one check that comes *after* that walk -- the full identity
+//! path's own existence, which the prototype's `read_identity` always
+//! asks through `os.path.lexists` once every intermediate segment is
+//! confirmed to be a real directory -- goes through
+//! `lexists_or_absent` too, both in `read_identity_file`'s own
+//! symlinked-intermediate branch and in `read_identity_at`.
+//! `record_skill` is a fifth site discovered the same way, by this
+//! adapter's own tests rather than by reading the prototype: see its
+//! own doc comment for why it is deliberately more lenient than a
+//! literal reading of the prototype's `SKILL_FILE in filenames` check
+//! would be.
 //!
 //! **A below-root listing failure is skipped, not fatal.** When this
 //! module's own recursive walk cannot even list a directory's own
@@ -69,11 +109,23 @@
 //! root's own listing failure is unaffected by any of this: it still
 //! reports `RootUnreadable`, like every other root-level check above.
 //!
-//! **Lossy, not refusing, non-UTF-8 names.** `TreeSnapshot`'s paths are
-//! plain `String`s; an entry name that is not valid UTF-8 is carried
-//! through `to_string_lossy` rather than failing the walk, matching
-//! this crate's existing `fs_outbox_inventory` precedent for a
-//! best-effort name rather than a hard refusal over encoding alone.
+//! **Refusing, not lossy, a *reported* non-UTF-8 name.** A directory
+//! this walk only passes through on the way to somewhere else never
+//! needs a `String` built from its own name at all, so a non-UTF-8
+//! name costs nothing there -- it is walked through silently, exactly
+//! like one holding nothing of interest. The moment a path must be
+//! *reported* instead -- a [`DirectoryEntry::path`], a
+//! [`SkillFile::path`], or an
+//! [`omnifrons_domain::nesting::Ancestor::path`] -- and some component
+//! of it is not valid Unicode, this adapter refuses the whole snapshot
+//! with
+//! [`omnifrons_app::definition_tree::DefinitionTreeError::PathNotUnicode`]
+//! rather than folding two distinct names onto the same lossy
+//! replacement text, which could silently misattribute one directory's
+//! files to another's displayed path. The prototype takes the
+//! opposite, always-succeeds choice: it escapes an undecodable byte
+//! (Python's own surrogate-escape handling of `os.fsdecode`) rather
+//! than ever refusing over encoding alone.
 
 use std::ffi::OsString;
 use std::fs::Metadata;
@@ -169,7 +221,7 @@ impl DefinitionTree for FsDefinitionTree {
             directories: Vec::new(),
             skills: Vec::new(),
         };
-        visit(root_path, ".", true, &ctx, &mut collected)?;
+        visit(root_path, ".", false, true, &ctx, &mut collected)?;
         let ancestors = find_ancestors(root_path, &ctx)?;
         Ok(TreeSnapshot {
             directories: collected.directories,
@@ -193,13 +245,14 @@ const fn io_error(is_root: bool) -> DefinitionTreeError {
 }
 
 /// `path`'s metadata without following a symlink at its final
-/// component, or `None` when nothing is there at all -- the shared
-/// primitive every existence and shape check in this module goes
-/// through, so "absent" (an `io::ErrorKind::NotFound`) and "present but
-/// unreadable for some other reason" are never confused: the first
-/// means "not found" everywhere this adapter's own prototype
-/// counterpart would use `os.path.lexists`, and the second always
-/// becomes [`io_error`].
+/// component, or `None` when nothing is there at all -- the *strict*
+/// of this module's two presence primitives, for a call site that
+/// still must fail the scan on anything other than not-found: "absent"
+/// (an `io::ErrorKind::NotFound`) and "present but unreadable for some
+/// other reason" are never confused here, the first always `None` and
+/// the second always [`io_error`]. See [`lexists_or_absent`] for the
+/// lenient counterpart a `lexists`-shaped call site needs instead, and
+/// this module's own documentation for which sites need which.
 fn symlink_metadata_or_absent(
     path: &Path,
     is_root: bool,
@@ -209,6 +262,20 @@ fn symlink_metadata_or_absent(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(io_error(is_root)),
     }
+}
+
+/// `path`'s metadata without following a symlink at its final
+/// component, or `None` when *anything at all* keeps it from being
+/// read -- not just an `io::ErrorKind::NotFound`, but a permission
+/// error or any other unexpected failure too. The *lenient* of this
+/// module's two presence primitives: it never fails the scan, mirroring
+/// the prototype's own `os.path.lexists`/`os.path.exists`, which both
+/// catch every `OSError` a stat can raise and simply answer "not
+/// there". This module's own documentation names exactly which call
+/// sites need this lenient check instead of
+/// [`symlink_metadata_or_absent`]'s stricter one.
+fn lexists_or_absent(path: &Path) -> Option<Metadata> {
+    std::fs::symlink_metadata(path).ok()
 }
 
 /// `parent`'s own POSIX-relative display path, with `name` appended --
@@ -238,9 +305,20 @@ fn join_relative(parent: &str, name: &str) -> String {
 /// [`DefinitionTreeError::RootUnreadable`]; see [`io_error`] and
 /// [`list_subdirectories`] for why every failure at that one level
 /// reports differently from a below-root listing failure.
+///
+/// `relative_display_is_lossy` is `true` once `relative_display` itself
+/// -- or any ancestor segment folded into it on the way down from the
+/// scan root -- lost information to `to_string_lossy`; `false`
+/// for the scan root itself, whose own display path is always the
+/// literal `"."`. [`record_directory`] and [`record_skill`] are the
+/// only two places this flag ever matters, and only once each has
+/// already decided this directory holds something worth reporting; see
+/// this module's own documentation for why a directory that is only
+/// ever walked through never needs to check it at all.
 fn visit(
     absolute: &Path,
     relative_display: &str,
+    relative_display_is_lossy: bool,
     is_root: bool,
     ctx: &WalkContext<'_>,
     collected: &mut Collected,
@@ -252,16 +330,31 @@ fn visit(
     record_directory(
         absolute,
         relative_display,
+        relative_display_is_lossy,
         is_root,
         ctx,
         &mut collected.directories,
     )?;
-    record_skill(absolute, relative_display, is_root, &mut collected.skills)?;
+    record_skill(
+        absolute,
+        relative_display,
+        relative_display_is_lossy,
+        is_root,
+        &mut collected.skills,
+    )?;
 
     for name in candidates {
         let child_absolute = absolute.join(&name);
+        let child_is_lossy = relative_display_is_lossy || name.to_str().is_none();
         let child_relative = join_relative(relative_display, &name.to_string_lossy());
-        visit(&child_absolute, &child_relative, false, ctx, collected)?;
+        visit(
+            &child_absolute,
+            &child_relative,
+            child_is_lossy,
+            false,
+            ctx,
+            collected,
+        )?;
     }
     Ok(())
 }
@@ -336,9 +429,17 @@ const fn listing_failed(is_root: bool) -> Result<Option<Vec<OsString>>, Definiti
 /// `omnifrons_app::definition_tree`'s module documentation) -- never for
 /// an empty directory, and never twice for the same path, since each
 /// directory is visited exactly once by [`visit`].
+///
+/// Refuses with [`DefinitionTreeError::PathNotUnicode`] when
+/// `relative_display_is_lossy` and this directory turns out to hold
+/// something to report: see this module's own "Refusing, not lossy"
+/// documentation for why the check happens here, after deciding there
+/// is something to report, rather than the moment a non-Unicode name is
+/// first seen in [`visit`].
 fn record_directory(
     absolute: &Path,
     relative_display: &str,
+    relative_display_is_lossy: bool,
     is_root: bool,
     ctx: &WalkContext<'_>,
     out: &mut Vec<DirectoryEntry>,
@@ -350,11 +451,14 @@ fn record_directory(
             identity_files.push(file);
         }
     }
-    let host_extras = find_host_extras(absolute, is_root)?;
+    let host_extras = find_host_extras(absolute);
     if identity_files.is_empty() && host_extras.is_empty() {
         return Ok(());
     }
-    let generated_state_dirs = find_generated_state_dirs(absolute, is_root)?;
+    if relative_display_is_lossy {
+        return Err(DefinitionTreeError::PathNotUnicode);
+    }
+    let generated_state_dirs = find_generated_state_dirs(absolute);
     out.push(DirectoryEntry {
         path: relative_display.to_string(),
         identity_files,
@@ -368,18 +472,46 @@ fn record_directory(
 /// file -- never a symlink, whatever it targets, and never a directory
 /// (the prototype's own `lstat`-based `stat.S_ISREG` check on the
 /// walk's `filenames` entry).
+///
+/// The presence check is deliberately lenient, through
+/// [`lexists_or_absent`] rather than [`symlink_metadata_or_absent`]:
+/// this is a discovered fifth presence-probe site beyond this module's
+/// own "Lenient, not strict" documentation's four, found by this
+/// adapter's own test for a listable-but-unsearchable directory, which
+/// this blind probe -- attempted unconditionally, win or lose, for
+/// every visited directory -- would otherwise abort the whole scan on,
+/// exactly like [`find_host_extras`] before its own fix, even when no
+/// `SKILL.md` is there at all. The prototype's own walk never pays this
+/// cost: `SKILL_FILE in filenames` is a free check against a listing
+/// already in hand (needing only read permission on the directory,
+/// never search permission into it), so it only ever attempts its own
+/// `skill.lstat()` -- raised uncaught, matching
+/// [`symlink_metadata_or_absent`]'s own strictness -- once a `SKILL.md`
+/// is already known to be there. This function does not reconstruct
+/// that same listing-reuse structure; it is deliberately more lenient
+/// than the prototype for the narrow case the prototype itself never
+/// reliably handles either: a real `SKILL.md` sitting in a directory
+/// this process can list but not search.
+///
+/// Refuses with [`DefinitionTreeError::PathNotUnicode`] when
+/// `relative_display_is_lossy` and a reportable `SKILL.md` is actually
+/// there, for the same reason [`record_directory`] does.
 fn record_skill(
     absolute: &Path,
     relative_display: &str,
+    relative_display_is_lossy: bool,
     is_root: bool,
     out: &mut Vec<SkillFile>,
 ) -> Result<(), DefinitionTreeError> {
     let path = absolute.join(SKILL_FILE_NAME);
-    let Some(metadata) = symlink_metadata_or_absent(&path, is_root)? else {
+    let Some(metadata) = lexists_or_absent(&path) else {
         return Ok(());
     };
     if !metadata.is_file() {
         return Ok(());
+    }
+    if relative_display_is_lossy {
+        return Err(DefinitionTreeError::PathNotUnicode);
     }
     let bytes = read_capped(&path, &metadata, is_root)?;
     out.push(SkillFile {
@@ -428,7 +560,15 @@ fn read_link_text(path: &Path, is_root: bool) -> Result<String, DefinitionTreeEr
 /// a symlink (for example a symlinked `.claude`) reports the kind as
 /// [`FileShape::Symlink`] -- carrying that intermediate symlink's own
 /// target, never the final file's -- when the full nested path still
-/// resolves through it, absent otherwise.
+/// resolves through it, absent otherwise. "Resolves through it" is
+/// deliberately lenient, through [`lexists_or_absent`]: a permission
+/// error reaching the full path from a symlinked intermediate -- or,
+/// once every intermediate is confirmed a real directory,
+/// [`read_identity_at`]'s own first check -- means absent too, never a
+/// reason to fail the scan, matching the prototype's own
+/// `os.path.lexists` there. An intermediate segment's *own* check stays
+/// strict, through [`symlink_metadata_or_absent`]: this module's own
+/// documentation explains why the two differ.
 fn read_identity_file(
     directory: &Path,
     kind: IdentityKind,
@@ -449,7 +589,7 @@ fn read_identity_file(
         };
         if metadata.file_type().is_symlink() {
             let full_path = directory.join(relative);
-            if symlink_metadata_or_absent(&full_path, is_root)?.is_none() {
+            if lexists_or_absent(&full_path).is_none() {
                 return Ok(None);
             }
             let target = read_link_text(&current, is_root)?;
@@ -468,13 +608,20 @@ fn read_identity_file(
 
 /// Classifies and, when it is a regular file, reads `full_path` -- the
 /// final-component half of [`read_identity_file`]'s own walk, once every
-/// intermediate segment is known to be a real directory.
+/// intermediate segment is known to be a real directory. The initial
+/// existence check is deliberately lenient, through
+/// [`lexists_or_absent`] rather than [`symlink_metadata_or_absent`]:
+/// the prototype's own `read_identity` asks `os.path.lexists` this
+/// exact question once its own segment walk reaches this point, so a
+/// permission error here -- for example an intermediate directory that
+/// exists but cannot be searched -- means absent too, never a reason to
+/// fail the scan.
 fn read_identity_at(
     full_path: &Path,
     kind: IdentityKind,
     is_root: bool,
 ) -> Result<Option<IdentityFile>, DefinitionTreeError> {
-    let Some(metadata) = symlink_metadata_or_absent(full_path, is_root)? else {
+    let Some(metadata) = lexists_or_absent(full_path) else {
         return Ok(None);
     };
     if metadata.file_type().is_symlink() {
@@ -501,31 +648,38 @@ fn read_identity_at(
 }
 
 /// The [`EXTRA_READERS`] keys that exist at `directory`, in their table
-/// order -- existence only (the prototype's own `os.path.lexists`),
-/// never read, matching `find_host_extras`'s own documented behaviour.
-fn find_host_extras(directory: &Path, is_root: bool) -> Result<Vec<String>, DefinitionTreeError> {
+/// order -- existence only (the prototype's own `os.path.lexists`,
+/// through [`lexists_or_absent`]), never read, matching
+/// `find_host_extras`'s own documented behaviour. A key such as
+/// `".claude/AGENTS.md"` joins into a multi-segment path exactly like
+/// an identity kind's own [`IdentityKind::file_name`] does, but this
+/// function never walks it segment by segment the way
+/// [`read_identity_file`] does: the prototype's own `find_host_extras`
+/// asks `os.path.lexists` the question in one combined call, so a
+/// permission error anywhere along that path -- not just a missing
+/// final component -- is this function's own "not there" too, never a
+/// reason to fail the scan.
+fn find_host_extras(directory: &Path) -> Vec<String> {
     let mut extras = Vec::new();
     for (key, _readers) in EXTRA_READERS {
-        if symlink_metadata_or_absent(&directory.join(key), is_root)?.is_some() {
+        if lexists_or_absent(&directory.join(key)).is_some() {
             extras.push((*key).to_string());
         }
     }
-    Ok(extras)
+    extras
 }
 
 /// The [`GENERATED_STATE_DIRS`] entries that exist directly under
-/// `directory`, existence only, in their table order.
-fn find_generated_state_dirs(
-    directory: &Path,
-    is_root: bool,
-) -> Result<Vec<&'static str>, DefinitionTreeError> {
+/// `directory`, existence only (through [`lexists_or_absent`], for the
+/// same reason [`find_host_extras`] uses it), in their table order.
+fn find_generated_state_dirs(directory: &Path) -> Vec<&'static str> {
     let mut found = Vec::new();
     for name in GENERATED_STATE_DIRS {
-        if symlink_metadata_or_absent(&directory.join(name), is_root)?.is_some() {
+        if lexists_or_absent(&directory.join(name)).is_some() {
             found.push(*name);
         }
     }
-    Ok(found)
+    found
 }
 
 /// The identity kinds that make `directory` an agent root, exactly like
@@ -551,31 +705,46 @@ fn identity_kinds_for(directory: &Path, home: Option<&Path>) -> &'static [Identi
 /// `path`'s absolute form, written with `/` separators on every
 /// platform -- [`Ancestor::path`]'s own documented shape, mirroring
 /// `omnifrons_app::definition`'s own private `absolute_posix` convention
-/// for the same need.
-fn posix_absolute(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+/// for the same need. Refuses with
+/// [`DefinitionTreeError::PathNotUnicode`] when `path` is not valid
+/// Unicode, rather than lossily replacing an unrepresentable byte: see
+/// this module's own "Refusing, not lossy" documentation.
+/// [`find_ancestors`] is this function's only caller, and only once it
+/// has already decided `path` is worth reporting as an [`Ancestor`] at
+/// all, so a `path` this process only ever walks through, never
+/// reports, never reaches this check.
+fn posix_absolute(path: &Path) -> Result<String, DefinitionTreeError> {
+    let text = path.to_str().ok_or(DefinitionTreeError::PathNotUnicode)?;
+    Ok(text.replace('\\', "/"))
 }
 
 /// Whether identity `kind` is present at `directory`, checking its
-/// presence and shape only -- never reading or size-capping its bytes.
-/// Walks every intermediate path segment of [`IdentityKind::file_name`]
-/// exactly as [`read_identity_file`] does: an intermediate segment that
-/// does not exist, or exists but is not a directory, means the kind is
-/// absent, and one that is itself a symlink counts the kind present
-/// exactly when the full nested path still resolves through it --
-/// matching [`read_identity_file`]'s own intermediate-symlink rule,
-/// without reading that symlink's own target text, since no caller of
-/// this function needs it. At the final path, a regular file, a
-/// symlink, or an irregular entry all count as present, exactly as
+/// presence and shape only -- never reading or size-capping its bytes,
+/// and never failing: this function mirrors the prototype's own
+/// `has_identity_files`, which asks a single blanket
+/// `os.path.lexists(directory / kind)` and so already answers "absent"
+/// for a permission error anywhere along that path, never raising.
+/// This function reaches the same answer by walking
+/// [`IdentityKind::file_name`] one segment at a time instead -- the
+/// same shape [`read_identity_file`] walks -- but every one of its own
+/// checks goes through [`lexists_or_absent`], so an intermediate
+/// segment that cannot be read is absent here too, not a hard failure:
+/// see this module's own "Lenient, not strict" documentation for why
+/// this function's segment walk still reaches `has_identity_files`'s
+/// lenient answer despite looking like [`read_identity_file`]'s
+/// stricter one. An intermediate segment that does not exist, or
+/// exists but is not a directory, means the kind is absent, and one
+/// that is itself a symlink counts the kind present exactly when the
+/// full nested path still resolves through it -- matching
+/// [`read_identity_file`]'s own intermediate-symlink rule, without
+/// reading that symlink's own target text, since no caller of this
+/// function needs it. At the final path, a regular file, a symlink, or
+/// an irregular entry all count as present, exactly as
 /// [`read_identity_at`] treats them at the entry level -- just without
 /// ever calling [`read_capped`]. [`find_ancestors`] is this function's
 /// only caller; see its own documentation for why an ancestor check
 /// never needs an identity file's content.
-fn identity_file_present(
-    directory: &Path,
-    kind: IdentityKind,
-    is_root: bool,
-) -> Result<bool, DefinitionTreeError> {
+fn identity_file_present(directory: &Path, kind: IdentityKind) -> bool {
     let relative = Path::new(kind.file_name());
     let mut current = directory.to_path_buf();
     let mut components = relative.components().peekable();
@@ -586,18 +755,18 @@ fn identity_file_present(
             break;
         }
         current.push(component);
-        let Some(metadata) = symlink_metadata_or_absent(&current, is_root)? else {
-            return Ok(false);
+        let Some(metadata) = lexists_or_absent(&current) else {
+            return false;
         };
         if metadata.file_type().is_symlink() {
             let full_path = directory.join(relative);
-            return Ok(symlink_metadata_or_absent(&full_path, is_root)?.is_some());
+            return lexists_or_absent(&full_path).is_some();
         }
         if !metadata.is_dir() {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(symlink_metadata_or_absent(&directory.join(relative), is_root)?.is_some())
+    lexists_or_absent(&directory.join(relative)).is_some()
 }
 
 /// Every ancestor above `root` holding at least one identity file or
@@ -605,9 +774,16 @@ fn identity_file_present(
 /// walking every one of `root.parents`, all the way to the filesystem
 /// root; see this module's corrected documentation in
 /// `omnifrons_app::definition_tree` for why there is no home-boundary
-/// stop. No ancestor here is ever the scan root itself, so every
-/// failure below always reports [`DefinitionTreeError::WalkFailed`],
-/// never [`DefinitionTreeError::RootUnreadable`].
+/// stop. [`identity_file_present`] and [`find_host_extras`] never fail
+/// at all -- both are lenient, `lexists`-shaped checks, per this
+/// module's own "Lenient, not strict" documentation -- so the only way
+/// this function itself can fail is [`posix_absolute`] refusing a
+/// non-Unicode ancestor path with
+/// [`DefinitionTreeError::PathNotUnicode`]; no ancestor here is ever
+/// the scan root itself, but that refusal is not an `is_root` split the
+/// way [`DefinitionTreeError::RootUnreadable`] and
+/// [`DefinitionTreeError::WalkFailed`] are, since it never depends on
+/// which directory is scanned, only on what its own path contains.
 ///
 /// Each kind is checked with [`identity_file_present`] -- presence and
 /// shape alone, never [`read_identity_file`] -- because an [`Ancestor`]
@@ -629,14 +805,14 @@ fn find_ancestors(
         let kinds = identity_kinds_for(parent, ctx.home);
         let mut identity_files = Vec::new();
         for &kind in kinds {
-            if identity_file_present(parent, kind, false)? {
+            if identity_file_present(parent, kind) {
                 identity_files.push(kind.file_name().to_string());
             }
         }
-        let host_extras = find_host_extras(parent, false)?;
+        let host_extras = find_host_extras(parent);
         if !identity_files.is_empty() || !host_extras.is_empty() {
             ancestors.push(Ancestor {
-                path: posix_absolute(parent),
+                path: posix_absolute(parent)?,
                 identity_files,
                 host_extras,
             });
@@ -644,4 +820,94 @@ fn find_ancestors(
         current = parent;
     }
     Ok(ancestors)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use omnifrons_app::definition_tree::DefinitionTreeError;
+    use omnifrons_domain::definition::IdentityKind;
+
+    use super::read_identity_file;
+
+    /// A drop-guard temp directory (mirrors
+    /// `crate::fs_wrong_root_scanner`'s own inline unit-test helper).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "omnifrons-definition-tree-unit-{}-{label}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Isolates [`read_identity_file`]'s own split, in a directory this
+    /// process can list but not search (unix mode `0o400`, `r--`),
+    /// apart from `record_directory`'s unconditional sweep over every
+    /// [`IdentityKind`] -- `crates/omnifrons-adapters/tests/definition_tree_fs.rs`'s
+    /// own integration test for this same directory shows that combined,
+    /// whole-directory outcome (`WalkFailed`, because of
+    /// `IdentityKind::ClaudeDir` below) and explains why the two differ.
+    /// A single-segment kind (`IdentityKind::Agents`) hits only the
+    /// lenient final check this item's fix added, and resolves to
+    /// absent (`Ok(None)`); a multi-segment kind
+    /// (`IdentityKind::ClaudeDir`) hits its own intermediate segment's
+    /// strict check first, and still aborts (`Err(WalkFailed)`),
+    /// exactly as before this item's fix.
+    ///
+    /// Skipped when running as `root`, which bypasses unix permission
+    /// bits entirely.
+    #[test]
+    fn a_single_segment_kind_is_absent_but_a_multi_segment_kind_still_aborts() {
+        if nix::unistd::Uid::effective().is_root() {
+            eprintln!(
+                "skipping a_single_segment_kind_is_absent_but_a_multi_segment_kind_still_aborts: \
+                 running as root, which bypasses unix permission bits entirely"
+            );
+            return;
+        }
+        let project = TempDir::new("read-identity-file-split");
+        let blocked = project.path().join("blocked");
+        std::fs::create_dir_all(&blocked).expect("mkdir blocked");
+        std::fs::write(blocked.join("AGENTS.md"), b"irrelevant").expect("write AGENTS.md");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o400))
+            .expect("chmod 0o400 (r--: listable, not searchable)");
+
+        let agents_result = read_identity_file(&blocked, IdentityKind::Agents, false);
+        let claude_dir_result = read_identity_file(&blocked, IdentityKind::ClaudeDir, false);
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions before cleanup");
+        assert_eq!(
+            agents_result,
+            Ok(None),
+            "AGENTS.md has no intermediate segment, so it hits only read_identity_at's \
+             own lenient final check: absent, never a hard failure"
+        );
+        assert_eq!(
+            claude_dir_result,
+            Err(DefinitionTreeError::WalkFailed),
+            ".claude/CLAUDE.md's own .claude intermediate segment still goes through \
+             the strict symlink_metadata_or_absent, unaffected by this item's fix"
+        );
+    }
 }

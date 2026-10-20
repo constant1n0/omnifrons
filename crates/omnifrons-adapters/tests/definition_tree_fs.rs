@@ -339,6 +339,94 @@ fn pruned_and_host_config_directories_never_become_agents_or_skills() {
     );
 }
 
+/// A host-config directory (`.claude`) is walked but never pruned the
+/// way a `SKIP_DIRS` member is: `.claude/skills/x/SKILL.md` inside the
+/// scan root is still discovered, and attributed to the *root* agent --
+/// `.claude` itself is never a root to attribute it to -- exactly as
+/// the prototype's own `walk_workspace` would discover it too, since
+/// its own pruning touches only `SKIP_DIRS`
+/// (`crates/omnifrons-domain/src/nesting.rs`'s own module documentation
+/// states this rule).
+#[test]
+fn a_skill_inside_a_host_config_directory_is_attributed_to_the_enclosing_root() {
+    let project = TempDir::new("skill-inside-host-config-dir");
+    write(project.path(), "AGENTS.md", SIMPLE_BODY);
+    write(
+        project.path(),
+        ".claude/skills/x/SKILL.md",
+        b"---\nname: x\n---\n",
+    );
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+    let hasher = Sha2Hasher::new();
+    let ports = DefinitionPorts {
+        tree: &fs_tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let paths: Vec<&str> = report
+        .agents
+        .iter()
+        .map(|agent| agent.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["."],
+        "a host-config directory never becomes its own agent root"
+    );
+    let root = agent_at(&report, ".");
+    assert!(
+        root.skills
+            .discovered
+            .contains(&".claude/skills/x/SKILL.md".to_string()),
+        "{:?}",
+        root.skills.discovered
+    );
+}
+
+/// A regular directory nested *inside* a host-config directory
+/// (`.claude/sub`) is still a bona fide agent root when it holds its
+/// own identity file -- `.claude/sub` is not itself named `.claude`,
+/// `.kimi`, or `.agents`, so `identity_kinds_for` does not exempt it --
+/// nested under the enclosing root, while `.claude` itself is walked
+/// through and never becomes an agent of its own. Pins the prototype's
+/// own rule documented in `crates/omnifrons-domain/src/nesting.rs`:
+/// pruning touches only `SKIP_DIRS`, never a host-config directory.
+#[test]
+fn a_directory_nested_inside_a_host_config_directory_is_a_nested_agent_while_the_host_config_directory_itself_never_is()
+ {
+    let base = TempDir::new("nested-inside-host-config-dir");
+    write(base.path(), "AGENTS.md", SIMPLE_BODY);
+    write(base.path(), ".claude/sub/AGENTS.md", SIMPLE_BODY);
+    let workspace = base.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+    let hasher = Sha2Hasher::new();
+    let ports = DefinitionPorts {
+        tree: &fs_tree,
+        hasher: &hasher,
+    };
+
+    let report = scan(&ports, &workspace).expect("scan succeeds");
+
+    let paths: Vec<&str> = report
+        .agents
+        .iter()
+        .map(|agent| agent.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![".", ".claude/sub"],
+        ".claude/sub is a nested agent; .claude itself is never one"
+    );
+    let parent = agent_at(&report, ".");
+    let child = agent_at(&report, ".claude/sub");
+    assert_eq!(parent.nested, vec![".claude/sub".to_string()]);
+    assert_eq!(child.parent, Some(Parent::Root(".".to_string())));
+    assert!(child.consent_required);
+}
+
 /// The prototype's `test_scan_prunes_ignored_and_host_config_dirs`
 /// symlink half: a symlinked directory is never descended into,
 /// whether it points at another real agent or at an in-scope skill
@@ -793,4 +881,222 @@ fn an_unreadable_skill_file_still_aborts_the_walk() {
     std::fs::set_permissions(&skill_file, std::fs::Permissions::from_mode(0o600))
         .expect("restore permissions before cleanup");
     assert_eq!(result, Err(DefinitionTreeError::WalkFailed));
+}
+
+// -- lenient, `lexists`-shaped presence checks under a permission error --
+
+/// An ancestor's own `.claude` directory this process cannot search at
+/// all (unix mode `0o000`) makes both the `.claude/CLAUDE.md` identity
+/// kind and the `.claude/AGENTS.md` host extra absent at that ancestor,
+/// never a hard failure: the prototype's own `has_identity_files` and
+/// `find_host_extras` ask a blanket `os.path.lexists`, which answers
+/// "not there" for a permission error exactly like a missing file. The
+/// ancestor's own plain `AGENTS.md` is unaffected by `.claude`'s own
+/// permissions and is still reported.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn an_unsearchable_dot_claude_at_an_ancestor_makes_its_identity_and_extra_absent_not_fatal() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping an_unsearchable_dot_claude_at_an_ancestor_makes_its_identity_and_extra_absent_not_fatal: \
+             running as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let base = TempDir::new("ancestor-dot-claude-unsearchable");
+    write(base.path(), "AGENTS.md", SIMPLE_BODY);
+    std::fs::create_dir_all(base.path().join(".claude")).expect("mkdir .claude");
+    std::fs::create_dir_all(base.path().join("nested")).expect("mkdir nested");
+    let dot_claude = base.path().join(".claude");
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0o000");
+    let base_posix = canonical_posix(base.path());
+    let workspace = WorkspaceRoot::new(base.path().join("nested")).expect("workspace");
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    let snapshot = result.expect("snapshot succeeds despite the unsearchable .claude");
+    let ancestors = ancestors_under(&snapshot.ancestors, &base_posix);
+    assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
+    assert_eq!(
+        ancestors[0].identity_files,
+        vec!["AGENTS.md".to_string()],
+        "the unsearchable .claude/CLAUDE.md must be absent, not a hard failure: {:?}",
+        ancestors[0]
+    );
+    assert!(
+        ancestors[0].host_extras.is_empty(),
+        "the unsearchable .claude/AGENTS.md host extra must be absent too: {:?}",
+        ancestors[0]
+    );
+}
+
+/// A host extra whose own path sits behind an unsearchable `.claude`
+/// *inside* the scan root (as opposed to the previous test's ancestor)
+/// is absent, not a reason to fail the whole scan: the root's own
+/// `AGENTS.md` still makes it a reported agent, and `find_host_extras`
+/// answers "not there" for `.claude/AGENTS.md` through the same
+/// `lexists`-shaped leniency.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn a_host_extra_behind_an_unsearchable_dot_claude_inside_the_scan_is_absent_not_fatal() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping a_host_extra_behind_an_unsearchable_dot_claude_inside_the_scan_is_absent_not_fatal: \
+             running as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("root-dot-claude-unsearchable");
+    write(project.path(), "AGENTS.md", SIMPLE_BODY);
+    std::fs::create_dir_all(project.path().join(".claude")).expect("mkdir .claude");
+    let dot_claude = project.path().join(".claude");
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0o000");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    let snapshot = result.expect(
+        "find_host_extras asks a blanket lexists-shaped question, so an unsearchable \
+         .claude makes the .claude/AGENTS.md extra absent, never a hard failure",
+    );
+    let root = snapshot
+        .directories
+        .iter()
+        .find(|directory| directory.path == ".")
+        .expect("the root must still be listed, via its own AGENTS.md");
+    assert!(
+        !root.host_extras.contains(&".claude/AGENTS.md".to_string()),
+        "{:?}",
+        root.host_extras
+    );
+}
+
+/// A below-root directory this process can list but not search (unix
+/// mode `0o400`, `r--`) still aborts the whole scan with `WalkFailed`,
+/// pinning the *other* half of this adapter's split: `record_directory`
+/// checks every one of [`IdentityKind::ALL`] unconditionally, and
+/// `.claude/CLAUDE.md`'s own intermediate segment (`.claude`) goes
+/// through the strict, raising-equivalent
+/// `symlink_metadata_or_absent`, which still aborts on the same
+/// permission error that makes a single-segment kind like `AGENTS.md`
+/// merely absent -- see `fs_definition_tree`'s own inline `#[cfg(test)]`
+/// unit tests for `AGENTS.md`'s lenient resolution in isolation, and
+/// this module's own documentation for why a directory
+/// visited through the *full* walk cannot show that lenient resolution
+/// on its own: a listing failure is skipped per-directory, but an
+/// identity-kind check is not.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kind() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kind: \
+             running as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("subdirectory-listable-not-searchable");
+    write(project.path(), "blocked/AGENTS.md", SIMPLE_BODY);
+    let blocked = project.path().join("blocked");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o400))
+        .expect("chmod 0o400 (r--: listable, not searchable)");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    assert_eq!(
+        result,
+        Err(DefinitionTreeError::WalkFailed),
+        "the .claude/CLAUDE.md intermediate segment check stays strict even though \
+         AGENTS.md's own check, for the same directory, is now lenient"
+    );
+}
+
+// -- refusing, not folding, a *reported* non-Unicode path --
+
+/// Two sibling directories whose names are each a single invalid UTF-8
+/// byte (`0xff` and `0xfe`) both lossily collapse to the same `U+FFFD`
+/// replacement text; once both hold an `AGENTS.md`, reporting either
+/// one's path at all would either silently misattribute one
+/// directory's files to the other's displayed path, or collide as a
+/// duplicate `DirectoryEntry::path`. This adapter refuses the whole
+/// snapshot with `PathNotUnicode` instead of ever reaching that
+/// choice.
+#[cfg(unix)]
+#[test]
+fn two_non_unicode_sibling_names_refuse_the_snapshot_instead_of_colliding() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let project = TempDir::new("non-unicode-siblings");
+    let first = OsStr::from_bytes(&[0xff]);
+    let second = OsStr::from_bytes(&[0xfe]);
+    std::fs::create_dir(project.path().join(first)).expect("mkdir 0xff");
+    std::fs::create_dir(project.path().join(second)).expect("mkdir 0xfe");
+    std::fs::write(project.path().join(first).join("AGENTS.md"), SIMPLE_BODY)
+        .expect("write AGENTS.md under 0xff");
+    std::fs::write(project.path().join(second).join("AGENTS.md"), SIMPLE_BODY)
+        .expect("write AGENTS.md under 0xfe");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    assert_eq!(result, Err(DefinitionTreeError::PathNotUnicode));
+}
+
+/// A non-Unicode directory name that holds nothing reportable -- no
+/// identity file, no host extra, no `SKILL.md` -- never needs a
+/// `String` built from it at all, so it is walked through silently,
+/// exactly like any other directory with nothing of interest; the
+/// root's own, perfectly ordinary `AGENTS.md` is unaffected.
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let project = TempDir::new("non-unicode-empty");
+    write(project.path(), "AGENTS.md", SIMPLE_BODY);
+    let name = OsStr::from_bytes(&[0xff]);
+    std::fs::create_dir(project.path().join(name)).expect("mkdir 0xff");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let snapshot = fs_tree
+        .snapshot(&workspace)
+        .expect("a non-Unicode directory holding nothing reportable never needs a String");
+
+    let directory_paths: Vec<&str> = snapshot
+        .directories
+        .iter()
+        .map(|directory| directory.path.as_str())
+        .collect();
+    assert_eq!(directory_paths, vec!["."]);
 }

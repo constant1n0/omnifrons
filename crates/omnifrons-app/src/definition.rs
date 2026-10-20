@@ -125,6 +125,7 @@ impl DefinitionError {
                 DefinitionTreeError::RootUnreadable => "tree(root-unreadable)",
                 DefinitionTreeError::WalkFailed => "tree(walk-failed)",
                 DefinitionTreeError::EntryTooLarge => "tree(entry-too-large)",
+                DefinitionTreeError::PathNotUnicode => "tree(path-not-unicode)",
             },
             Self::Nesting(error) => match error {
                 NestingError::AbsolutePath(_) => "nesting(absolute-path)",
