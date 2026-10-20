@@ -2161,10 +2161,13 @@ impl From<&omnifrons_domain::warnings::Warning> for WarningDto {
 /// [`omnifrons_domain::definition::IdentityKind::file_name`] -- never the
 /// shorter token form [`omnifrons_domain::definition::IdentityKind::as_str`]
 /// returns. `symlink` is the link's own target when this file is a
-/// symlink, and `null` otherwise; for an irregular file (neither a
-/// regular file nor a symlink), `sha256`, `bytes`, and `symlink` all read
-/// exactly as they would for a symlink, and only a non-`null` `sha256`
-/// tells the two apart -- mirroring
+/// symlink, and `null` otherwise -- `null` for an irregular file
+/// (neither a regular file nor a symlink) too, exactly like a regular
+/// file's own `symlink`, never like an actual symlink's. `sha256` is
+/// `null` for an irregular file as well, since only a regular file's
+/// content is ever hashed; an irregular file's wire shape is therefore a
+/// regular file's with no content and no digest (`sha256: null`,
+/// `bytes: 0`, `symlink: null`), never a symlink's -- mirroring
 /// [`omnifrons_app::definition::IdentityFileReport`]'s own `bytes: u64`
 /// (never `null`, unlike the prototype's own `Optional[int]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4363,8 +4366,11 @@ mod tests {
         );
     }
 
-    /// A symlink and an irregular file both read `sha256: null`; only the
-    /// symlink also carries a non-null `symlink` target.
+    /// A symlink reads `sha256: null` -- only a regular file's content is
+    /// ever hashed -- and carries its link target in `symlink`. See
+    /// `identity_file_dto_json_shape_for_an_irregular_file` below for the
+    /// other shape that also reads `sha256: null`, whose `symlink` reads
+    /// `null` instead, like a regular file's.
     #[test]
     fn identity_file_dto_json_shape_for_a_symlink_has_no_digest() {
         use omnifrons_domain::definition::{FileShape, IdentityKind};
@@ -4384,6 +4390,32 @@ mod tests {
                 "sha256": null,
                 "bytes": 0,
                 "symlink": "AGENTS.md",
+            })
+        );
+    }
+
+    /// An irregular file reads `sha256: null` and `symlink: null`, like
+    /// `identity_file_dto_json_shape_for_a_symlink_has_no_digest` above for
+    /// the digest but the regular-file test for the symlink target: this is
+    /// the wire shape of a regular file with no content and no digest,
+    /// never a symlink's -- see `IdentityFileDto`'s own doc comment for why.
+    #[test]
+    fn identity_file_dto_json_shape_for_an_irregular_file() {
+        use omnifrons_domain::definition::{FileShape, IdentityKind};
+        let report = omnifrons_app::definition::IdentityFileReport {
+            kind: IdentityKind::Gemini,
+            bytes: 0,
+            sha256: None,
+            shape: FileShape::Irregular,
+        };
+        let dto: super::IdentityFileDto = (&report).into();
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "kind": "GEMINI.md",
+                "sha256": null,
+                "bytes": 0,
+                "symlink": null,
             })
         );
     }

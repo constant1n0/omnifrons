@@ -1154,6 +1154,120 @@ fn a_listable_but_unsearchable_dot_claude_directory_without_a_skill_md_still_suc
     );
 }
 
+/// A scan root this process can list but not search (unix mode `0o400`,
+/// `r--`) holding a real, listed `SKILL.md` reports `RootUnreadable`,
+/// never silently omitting a skill its own listing already discovered:
+/// `WorkspaceRoot::new` only needs to resolve the root's own *parent*
+/// (exactly like `an_unreadable_root_reports_root_unreadable`'s `0o000`
+/// case above), so it still succeeds here too, and `list_subdirectories`
+/// itself only needs *read* permission to enumerate `AGENTS.md` and
+/// `SKILL.md` by name -- `0o400` grants that -- so the listing succeeds
+/// and marks `SKILL.md` listed. Only the *next* step, `record_skill`'s
+/// own strict `symlink_metadata_or_absent` stat on `root/SKILL.md`,
+/// needs *search* permission on `root` to resolve that name at all;
+/// `0o400` denies it, and this adapter reports that failure as
+/// `RootUnreadable` (`is_root` is `true` for the scan root itself, unlike
+/// every `WalkFailed` sibling test in this file).
+///
+/// `home` is set to this same root so `identity_kinds_for` hands
+/// `record_directory` every kind except `ClaudeDir`'s two-segment
+/// `.claude/CLAUDE.md`: every remaining, single-segment kind's check is
+/// the *lenient* `read_identity_at`, which this same permission error
+/// turns into "absent" rather than a failure, exactly like `AGENTS.md`
+/// itself. Without `home` set this way, `ClaudeDir`'s own strict
+/// intermediate-segment check would hit the identical permission error
+/// first and report `RootUnreadable` from `record_directory` instead,
+/// before `record_skill` is ever reached -- still the right *result*,
+/// but not the specific check this test means to pin, the same reason
+/// the `.claude`-based sibling tests below lean on `HOST_CONFIG_DIRS` to
+/// skip `record_directory`'s own per-kind loop entirely.
+///
+/// Skipped when running as `root`, which bypasses unix permission bits
+/// entirely.
+#[cfg(unix)]
+#[test]
+fn a_listable_but_unsearchable_scan_root_with_a_listed_skill_md_reports_root_unreadable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping a_listable_but_unsearchable_scan_root_with_a_listed_skill_md_reports_root_unreadable: \
+             running as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("root-skill-listable-not-searchable");
+    write(project.path(), "AGENTS.md", SIMPLE_BODY);
+    write(project.path(), "SKILL.md", b"---\nname: own\n---\n");
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o400))
+        .expect("chmod 0o400 (r--: listable, not searchable)");
+
+    let workspace = WorkspaceRoot::new(project.path()).expect(
+        "WorkspaceRoot::new only resolves the root's own parent, so a 0o400 root still \
+         canonicalizes",
+    );
+    let fs_tree = FsDefinitionTree::new(Some(project.path().to_path_buf()));
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    assert_eq!(
+        result,
+        Err(DefinitionTreeError::RootUnreadable),
+        "a SKILL.md the root's own listing already discovered must fail the scan when it \
+         cannot then be stat'd, never be silently treated as absent"
+    );
+}
+
+/// The listing gate that discovers `SKILL.md` -- `list_subdirectories`'s
+/// own `name == SKILL_FILE_NAME` check, read back by `record_skill`'s
+/// `skill_listed` gate -- compares an entry's name byte-for-byte with the
+/// literal `"SKILL.md"`, the same `SKILL_FILE in filenames` membership
+/// test the prototype's own walk makes against its listing, translated
+/// verbatim rather than loosened into a case-insensitive comparison. A
+/// directory holding a differently-cased `skill.md` is therefore never
+/// discovered as a skill, and this holds on every platform this crate
+/// ships for, not just a case-sensitive one: `list_subdirectories` only
+/// ever compares the *enumerated* entry name `std::fs::read_dir` itself
+/// returns, never re-resolves that name through a fresh, potentially
+/// case-folding path lookup. On a case-sensitive filesystem (ext4, say)
+/// `skill.md` and `SKILL.md` simply name two different files, so the
+/// comparison is exact by construction. On a case-insensitive *but
+/// case-preserving* filesystem (APFS's default mode on macOS, NTFS on
+/// Windows) a file created as `skill.md` is still *listed* with that
+/// exact lower-case spelling -- case-insensitivity there governs path
+/// *lookup* (opening `"SKILL.md"` would still find it), never what
+/// `read_dir` enumerates back -- so the byte-for-byte gate still sees
+/// `skill.md` and still rejects it. Both kinds of filesystem therefore
+/// agree: `skills` stays empty. No `#[cfg]` here, deliberately: this must
+/// hold on every platform, not just unix.
+#[test]
+fn a_differently_cased_skill_md_is_never_discovered() {
+    let project = TempDir::new("case-exact-skill-name");
+    write(project.path(), "skill.md", b"---\nname: lowercase\n---\n");
+    write(project.path(), "AGENTS.md", SIMPLE_BODY);
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let snapshot = fs_tree.snapshot(&workspace).expect("snapshot succeeds");
+
+    assert!(
+        snapshot.skills.is_empty(),
+        "a lower-case skill.md must never satisfy the byte-exact SKILL.md gate: {:?}",
+        snapshot.skills
+    );
+    assert_eq!(
+        snapshot
+            .directories
+            .iter()
+            .map(|directory| directory.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["."],
+        "the root must still be reported for its own AGENTS.md"
+    );
+}
+
 // -- refusing, not folding, a *reported* non-Unicode path --
 
 /// Treats `result` -- the outcome of a fixture's own `create_dir` or

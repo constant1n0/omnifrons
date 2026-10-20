@@ -398,7 +398,12 @@ export type ShellErrorCode =
   /**
    * The wrong-root scan could not walk the active workspace root, so no
    * verdict is claimed for it (spike slice 5d) -- never a claim that
-   * nothing was misplaced.
+   * nothing was misplaced; carries no detail. Also, since ADR-0005
+   * sub-slice 1h, `definition_status`/`definition_verify`'s own
+   * definition-tree read failure, which carries
+   * {@link DefinitionReasonDetail} exactly like `definition-invalid` does
+   * -- the two sources share this one code, so a narrowed `detail` here
+   * is always optional.
    */
   | 'scan-failed'
   /**
@@ -436,8 +441,8 @@ export type ShellErrorCode =
    * The agent definition scan or verify met a shape the filesystem port
    * must never produce: an invalid nesting relation, a directory whose
    * identity files repeat a kind, or a snapshot repeating a path. Never
-   * reached from an ordinary workspace; the shell's detail carries the
-   * reason token (ADR-0005 sub-slice 1h).
+   * reached from an ordinary workspace; carries the reason token in
+   * {@link DefinitionReasonDetail} (ADR-0005 sub-slice 1h).
    */
   | 'definition-invalid'
 
@@ -459,28 +464,54 @@ export interface DuplicatePublicationDetail {
 }
 
 /**
+ * `definition-invalid`'s detail, and `scan-failed`'s when it comes from a
+ * definition-tree read failure rather than the wrong-root scanner: the
+ * wrapped `DefinitionError`'s own fixed reason token (ADR-0005 sub-slice
+ * 1h; never a path -- see its own `reason` method).
+ */
+export interface DefinitionReasonDetail {
+  reason: string
+}
+
+/**
  * Structured detail for a {@link ShellError}, carrying values a fixed
  * catalogue `message` must not. Mirrors `dto.rs`'s untagged
  * `ShellErrorDetail`: one field set per carrying code, and the wire shape
  * of the slice-2 `changed-since-approval` detail is unchanged.
  */
-export type ShellErrorDetail = ChangedSinceApprovalDetail | DuplicatePublicationDetail
+export type ShellErrorDetail =
+  | ChangedSinceApprovalDetail
+  | DuplicatePublicationDetail
+  | DefinitionReasonDetail
 
 /**
  * A failed IPC command's error payload. `detail` is present only for the
- * two codes that carry structured, non-path data alongside the message,
- * each with its own shape -- discriminated on `code` here, so a banner
- * that narrows on the code sees the matching detail type and no other;
- * every other code carries none.
+ * codes that carry structured, non-path data alongside the message, each
+ * with its own shape -- discriminated on `code` here, so a banner that
+ * narrows on the code sees the matching detail type and no other; every
+ * other code carries none.
+ *
+ * `scan-failed` is split from the other three carrying codes: a
+ * definition-tree read failure attaches `DefinitionReasonDetail` exactly
+ * like `definition-invalid` does, but the wrong-root scanner's own
+ * `scan-failed` (`ScanError::Unreadable`) never attaches any detail at
+ * all. The two call sites genuinely disagree, so `scan-failed`'s detail
+ * stays optional for a stronger reason than the wire's own blanket
+ * `Option` every carrying code already has.
  */
 export type ShellError =
   | {
-      code: Exclude<ShellErrorCode, 'changed-since-approval' | 'duplicate-publication'>
+      code: Exclude<
+        ShellErrorCode,
+        'changed-since-approval' | 'duplicate-publication' | 'definition-invalid' | 'scan-failed'
+      >
       message: string
       detail?: undefined
     }
   | { code: 'changed-since-approval'; message: string; detail?: ChangedSinceApprovalDetail }
   | { code: 'duplicate-publication'; message: string; detail?: DuplicatePublicationDetail }
+  | { code: 'definition-invalid'; message: string; detail?: DefinitionReasonDetail }
+  | { code: 'scan-failed'; message: string; detail?: DefinitionReasonDetail }
 
 /** Type guard for a rejected `invoke`'s error value being a {@link ShellError}. */
 export function isShellError(error: unknown): error is ShellError {

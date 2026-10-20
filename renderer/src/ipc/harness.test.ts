@@ -1088,6 +1088,50 @@ describe('isShellError', () => {
   })
 })
 
+describe('ShellErrorDetail DefinitionReason (ADR-0005 sub-slice 1h)', () => {
+  it('parses a definition-invalid ShellError exactly as the shell serializes it, narrowing detail to DefinitionReasonDetail through the code discriminant', () => {
+    const parsed: unknown = JSON.parse(
+      '{"code":"definition-invalid","message":"a directory reported the same identity file more than once","detail":{"reason":"duplicate-identity-kind"}}',
+    )
+
+    expect(parsed).toEqual({
+      code: 'definition-invalid',
+      message: 'a directory reported the same identity file more than once',
+      detail: { reason: 'duplicate-identity-kind' },
+    })
+    if (!isShellError(parsed)) throw new Error('expected a ShellError-shaped value')
+    if (parsed.code !== 'definition-invalid') {
+      throw new Error(`expected code 'definition-invalid', got ${parsed.code}`)
+    }
+    // Reaches `.reason` only because the `definition-invalid` arm types
+    // `detail` as `DefinitionReasonDetail | undefined`, not `undefined`.
+    expect(parsed.detail).toEqual({ reason: 'duplicate-identity-kind' })
+  })
+
+  it("parses a scan-failed ShellError carrying the same DefinitionReason detail a definition-tree read failure attaches -- unlike the wrong-root scanner's bare scan-failed, which carries none -- narrowing detail the same way", () => {
+    const parsed: unknown = JSON.parse(
+      '{"code":"scan-failed","message":"the workspace could not be scanned","detail":{"reason":"tree(root-unreadable)"}}',
+    )
+
+    expect(parsed).toEqual({
+      code: 'scan-failed',
+      message: 'the workspace could not be scanned',
+      detail: { reason: 'tree(root-unreadable)' },
+    })
+    if (!isShellError(parsed)) throw new Error('expected a ShellError-shaped value')
+    if (parsed.code !== 'scan-failed') {
+      throw new Error(`expected code 'scan-failed', got ${parsed.code}`)
+    }
+    expect(parsed.detail).toEqual({ reason: 'tree(root-unreadable)' })
+  })
+
+  it('still types scan-failed with no detail at all, for the wrong-root scanner source that attaches none', () => {
+    const bare: ShellError = { code: 'scan-failed', message: 'the project could not be scanned' }
+    expect(isShellError(bare)).toBe(true)
+    expect(bare.detail).toBeUndefined()
+  })
+})
+
 // -- Slice 5b: approval, publication, and the Catalog listing --
 
 const PUBLICATION_ID = '2a91ea59fc5047831d97dbaebd763a3de37a5b382b683be59d10d6bdcdd92d4e'
