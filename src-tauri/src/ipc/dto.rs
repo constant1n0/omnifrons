@@ -1737,8 +1737,12 @@ pub enum ShellErrorCode {
     /// file stays exactly where it was found (spike slice 5d,
     /// RCS-001-R10).
     QuarantineUnavailable,
-    /// The wrong-root scan could not walk the active workspace root, so no
-    /// verdict is claimed for it (spike slice 5d).
+    /// A scan could not walk its root at all: the wrong-root scan's own
+    /// active workspace root (spike slice 5d), or
+    /// `definition_status`/`definition_verify`'s
+    /// [`omnifrons_app::definition::DefinitionError::Tree`] (ADR-0005
+    /// sub-slice 1h). The latter carries
+    /// [`ShellErrorDetail::DefinitionReason`].
     ScanFailed,
     /// The project's Catalog is corrupt: it has lines this version cannot
     /// read, and `catalog_repair_preview` says which. Distinct from
@@ -1760,6 +1764,18 @@ pub enum ShellErrorCode {
     /// device's journal carries, or whose entry is no longer a usable
     /// regular file (HAP-001-R18; spike slice 5e).
     RecoveryUnknown,
+    /// `definition_status` or `definition_verify`'s own composed scan
+    /// result is internally inconsistent: the discovered roots could not
+    /// be related
+    /// ([`omnifrons_app::definition::DefinitionError::Nesting`]), a
+    /// directory's identity files repeated a kind
+    /// ([`omnifrons_app::definition::DefinitionError::DuplicateIdentityKind`]),
+    /// or the snapshot repeated a path
+    /// ([`omnifrons_app::definition::DefinitionError::DuplicateSnapshotPath`]).
+    /// Reachable only if the filesystem port itself is malformed, never
+    /// from an ordinary workspace (ADR-0005 sub-slice 1h). Carries
+    /// [`ShellErrorDetail::DefinitionReason`].
+    DefinitionInvalid,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -1782,6 +1798,12 @@ pub enum ShellErrorDetail {
         publication_id: String,
         catalog_id: String,
     },
+    /// [`ShellErrorCode::ScanFailed`] from a definition-tree read failure,
+    /// or [`ShellErrorCode::DefinitionInvalid`]: the wrapped
+    /// [`omnifrons_app::definition::DefinitionError`]'s own fixed reason
+    /// token (ADR-0005 sub-slice 1h; never a path -- see its own `reason`
+    /// method).
+    DefinitionReason { reason: String },
 }
 
 /// A failed IPC command's error payload. `message` is always a catalogue
@@ -2031,6 +2053,307 @@ impl ApprovalDto {
             approved_at: system_time_to_millis(record.approved_at),
             status,
             revoked_at,
+        }
+    }
+}
+
+// -- ADR-0005 sub-slice 1h: agent-definition scan and verify --
+
+/// [`omnifrons_domain::definition::RootState`], as it crosses IPC: the
+/// same nine states, same [`omnifrons_domain::definition::RootState::ALL`]
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootStateTag {
+    Canonical,
+    ClaudeOnly,
+    AgentsOnly,
+    IdenticalCopies,
+    NearWrapper,
+    HostExtras,
+    Conflict,
+    Unsafe,
+    None,
+}
+
+impl From<omnifrons_domain::definition::RootState> for RootStateTag {
+    fn from(state: omnifrons_domain::definition::RootState) -> Self {
+        use omnifrons_domain::definition::RootState;
+        match state {
+            RootState::Canonical => Self::Canonical,
+            RootState::ClaudeOnly => Self::ClaudeOnly,
+            RootState::AgentsOnly => Self::AgentsOnly,
+            RootState::IdenticalCopies => Self::IdenticalCopies,
+            RootState::NearWrapper => Self::NearWrapper,
+            RootState::HostExtras => Self::HostExtras,
+            RootState::Conflict => Self::Conflict,
+            RootState::Unsafe => Self::Unsafe,
+            RootState::None => Self::None,
+        }
+    }
+}
+
+/// [`omnifrons_domain::warnings::WarningCode`], as it crosses IPC: the
+/// same nine tokens in the same `WARNING_ORDER`, spelled with hyphens
+/// instead of underscores (for example
+/// [`omnifrons_domain::warnings::WarningCode::AncestorExposure`]'s own
+/// `"ancestor_exposure"` becomes `"ancestor-exposure"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WarningCodeTag {
+    AncestorExposure,
+    AncestorShadowing,
+    ChildNotMentioned,
+    HostImports,
+    HostImportsBoundary,
+    ExtraHostFile,
+    SizeCodex,
+    SizeAntigravity,
+    GeneratedStateDir,
+}
+
+impl From<omnifrons_domain::warnings::WarningCode> for WarningCodeTag {
+    fn from(code: omnifrons_domain::warnings::WarningCode) -> Self {
+        use omnifrons_domain::warnings::WarningCode;
+        match code {
+            WarningCode::AncestorExposure => Self::AncestorExposure,
+            WarningCode::AncestorShadowing => Self::AncestorShadowing,
+            WarningCode::ChildNotMentioned => Self::ChildNotMentioned,
+            WarningCode::HostImports => Self::HostImports,
+            WarningCode::HostImportsBoundary => Self::HostImportsBoundary,
+            WarningCode::ExtraHostFile => Self::ExtraHostFile,
+            WarningCode::SizeCodex => Self::SizeCodex,
+            WarningCode::SizeAntigravity => Self::SizeAntigravity,
+            WarningCode::GeneratedStateDir => Self::GeneratedStateDir,
+        }
+    }
+}
+
+/// One warning on an agent root, as it crosses IPC
+/// ([`omnifrons_domain::warnings::Warning`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarningDto {
+    pub code: WarningCodeTag,
+    pub hosts: Vec<String>,
+    pub detail: String,
+}
+
+impl From<&omnifrons_domain::warnings::Warning> for WarningDto {
+    fn from(warning: &omnifrons_domain::warnings::Warning) -> Self {
+        Self {
+            code: warning.code.into(),
+            hosts: warning
+                .hosts
+                .iter()
+                .map(|host| (*host).to_string())
+                .collect(),
+            detail: warning.detail.clone(),
+        }
+    }
+}
+
+/// One identity file found at an agent root, as it crosses IPC (the
+/// prototype's own `IdentityFile.to_json`: `{kind, sha256, bytes,
+/// symlink}`). `kind` is the identity file's own file name (for example
+/// `"AGENTS.md"`, `".claude/CLAUDE.md"`) -- the prototype's own value for
+/// this key, via
+/// [`omnifrons_domain::definition::IdentityKind::file_name`] -- never the
+/// shorter token form [`omnifrons_domain::definition::IdentityKind::as_str`]
+/// returns. `symlink` is the link's own target when this file is a
+/// symlink, and `null` otherwise; for an irregular file (neither a
+/// regular file nor a symlink), `sha256`, `bytes`, and `symlink` all read
+/// exactly as they would for a symlink, and only a non-`null` `sha256`
+/// tells the two apart -- mirroring
+/// [`omnifrons_app::definition::IdentityFileReport`]'s own `bytes: u64`
+/// (never `null`, unlike the prototype's own `Optional[int]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityFileDto {
+    pub kind: String,
+    pub sha256: Option<String>,
+    pub bytes: u64,
+    pub symlink: Option<String>,
+}
+
+impl From<&omnifrons_app::definition::IdentityFileReport> for IdentityFileDto {
+    fn from(report: &omnifrons_app::definition::IdentityFileReport) -> Self {
+        use omnifrons_domain::definition::FileShape;
+        let symlink = match &report.shape {
+            FileShape::Symlink { target } => Some(target.clone()),
+            FileShape::Regular | FileShape::Irregular => None,
+        };
+        Self {
+            kind: report.kind.file_name().to_string(),
+            sha256: report.sha256.clone(),
+            bytes: report.bytes,
+            symlink,
+        }
+    }
+}
+
+/// One agent's skills-index status, as it crosses IPC
+/// ([`omnifrons_app::definition::SkillsReport`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsDto {
+    pub discovered: Vec<String>,
+    pub indexed: Vec<String>,
+    pub missing: Vec<String>,
+    pub dangling: Vec<String>,
+    pub precedence: bool,
+}
+
+impl From<&omnifrons_app::definition::SkillsReport> for SkillsDto {
+    fn from(report: &omnifrons_app::definition::SkillsReport) -> Self {
+        Self {
+            discovered: report.discovered.clone(),
+            indexed: report.indexed.clone(),
+            missing: report.missing.clone(),
+            dangling: report.dangling.clone(),
+            precedence: report.precedence,
+        }
+    }
+}
+
+/// [`omnifrons_domain::nesting::Parent`], as it crosses IPC: an
+/// internally tagged `{"kind": "root", "path": ...}` or `{"kind":
+/// "outside", "path": ...}` -- the same shape [`AttributionDto`] already
+/// uses for a closed, path-carrying enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ParentDto {
+    Root { path: String },
+    Outside { path: String },
+}
+
+impl From<&omnifrons_domain::nesting::Parent> for ParentDto {
+    fn from(parent: &omnifrons_domain::nesting::Parent) -> Self {
+        use omnifrons_domain::nesting::Parent;
+        match parent {
+            Parent::Root(path) => Self::Root { path: path.clone() },
+            Parent::Outside(path) => Self::Outside { path: path.clone() },
+        }
+    }
+}
+
+/// One discovered agent root, as it crosses IPC (the prototype's own
+/// `AgentReport.to_json`; [`omnifrons_app::definition::AgentReport`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDto {
+    pub path: String,
+    pub state: RootStateTag,
+    pub identity_files: Vec<IdentityFileDto>,
+    pub title: Option<String>,
+    pub parent: Option<ParentDto>,
+    pub nested: Vec<String>,
+    pub consent_required: bool,
+    pub skills: SkillsDto,
+    pub warnings: Vec<WarningDto>,
+}
+
+impl From<&omnifrons_app::definition::AgentReport> for AgentDto {
+    fn from(report: &omnifrons_app::definition::AgentReport) -> Self {
+        Self {
+            path: report.path.clone(),
+            state: report.state.into(),
+            identity_files: report.identity_files.iter().map(Into::into).collect(),
+            title: report.title.clone(),
+            parent: report.parent.as_ref().map(Into::into),
+            nested: report.nested.clone(),
+            consent_required: report.consent_required,
+            skills: (&report.skills).into(),
+            warnings: report.warnings.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// An agent root above the scan root, as it crosses IPC (the prototype's
+/// own `Ancestor.to_json`; mirrors
+/// [`omnifrons_domain::nesting::Ancestor`]). `host_extras` is this
+/// port's own extension: the prototype's `ANCESTOR` key set has no such
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AncestorDto {
+    pub path: String,
+    pub identity_files: Vec<String>,
+    pub host_extras: Vec<String>,
+}
+
+impl From<&omnifrons_domain::nesting::Ancestor> for AncestorDto {
+    fn from(ancestor: &omnifrons_domain::nesting::Ancestor) -> Self {
+        Self {
+            path: ancestor.path.clone(),
+            identity_files: ancestor.identity_files.clone(),
+            host_extras: ancestor.host_extras.clone(),
+        }
+    }
+}
+
+/// `definition_status`'s payload (the prototype's own
+/// `ScanResult.to_json`, carrying the `schema` and `root` keys that
+/// [`omnifrons_app::definition::ScanReport`] itself leaves to its
+/// caller).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionStatusDto {
+    pub schema: String,
+    pub root: String,
+    pub ancestors: Vec<AncestorDto>,
+    pub agents: Vec<AgentDto>,
+}
+
+impl DefinitionStatusDto {
+    /// Builds the payload for `report`, scanned at `workspace`.
+    #[must_use]
+    pub fn from_report(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        report: &omnifrons_app::definition::ScanReport,
+    ) -> Self {
+        Self {
+            schema: "omnifrons.definition-scan/1".to_string(),
+            root: workspace.path().to_string_lossy().into_owned(),
+            ancestors: report.ancestors.iter().map(Into::into).collect(),
+            agents: report.agents.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `definition_verify`'s payload (the prototype's own `verify_agent`
+/// return value, minus `backups`: this port keeps snapshots in its own
+/// store rather than reporting them back on this wire shape, and minus
+/// an explicit target path -- see [`omnifrons_app::definition::verify`]).
+/// `agent` is the verified workspace root's own display path, never a
+/// device path of whichever file was actually read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionVerifyDto {
+    pub schema: String,
+    pub agent: String,
+    pub state: RootStateTag,
+    pub canonical: bool,
+    pub problems: Vec<String>,
+}
+
+impl DefinitionVerifyDto {
+    /// Builds the payload for `report`, verified at `workspace`.
+    #[must_use]
+    pub fn from_report(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        report: &omnifrons_app::definition::VerifyReport,
+    ) -> Self {
+        Self {
+            schema: "omnifrons.definition-verify/1".to_string(),
+            agent: workspace.path().to_string_lossy().into_owned(),
+            state: report.state.into(),
+            canonical: report.canonical,
+            problems: report.problems.clone(),
         }
     }
 }
@@ -3936,5 +4259,345 @@ mod tests {
                 "a catalogue message never carries a path separator"
             );
         }
+    }
+
+    // -- ADR-0005 sub-slice 1h: agent-definition scan and verify --
+
+    #[test]
+    fn root_state_tag_serializes_as_kebab_case() {
+        use omnifrons_domain::definition::RootState;
+        let cases = [
+            (RootState::Canonical, "canonical"),
+            (RootState::ClaudeOnly, "claude-only"),
+            (RootState::AgentsOnly, "agents-only"),
+            (RootState::IdenticalCopies, "identical-copies"),
+            (RootState::NearWrapper, "near-wrapper"),
+            (RootState::HostExtras, "host-extras"),
+            (RootState::Conflict, "conflict"),
+            (RootState::Unsafe, "unsafe"),
+            (RootState::None, "none"),
+        ];
+        for (state, token) in cases {
+            let tag: super::RootStateTag = state.into();
+            assert_eq!(json(&tag), serde_json::json!(token), "{token}");
+        }
+    }
+
+    /// The domain's own tokens, spelled with hyphens instead of
+    /// underscores.
+    #[test]
+    fn warning_code_tag_serializes_with_hyphens_not_underscores() {
+        use omnifrons_domain::warnings::WarningCode;
+        let cases = [
+            (WarningCode::AncestorExposure, "ancestor-exposure"),
+            (WarningCode::AncestorShadowing, "ancestor-shadowing"),
+            (WarningCode::ChildNotMentioned, "child-not-mentioned"),
+            (WarningCode::HostImports, "host-imports"),
+            (WarningCode::HostImportsBoundary, "host-imports-boundary"),
+            (WarningCode::ExtraHostFile, "extra-host-file"),
+            (WarningCode::SizeCodex, "size-codex"),
+            (WarningCode::SizeAntigravity, "size-antigravity"),
+            (WarningCode::GeneratedStateDir, "generated-state-dir"),
+        ];
+        for (code, token) in cases {
+            assert_eq!(code.as_str().replace('_', "-"), token, "{token}");
+            let tag: super::WarningCodeTag = code.into();
+            assert_eq!(json(&tag), serde_json::json!(token), "{token}");
+        }
+    }
+
+    /// ADR-0005 sub-slice 1h's one new error code.
+    #[test]
+    fn definition_invalid_error_code_serializes_as_kebab_case() {
+        let error = ShellError::new(ShellErrorCode::DefinitionInvalid, "message");
+        assert_eq!(
+            json(&error)["code"],
+            serde_json::json!("definition-invalid")
+        );
+    }
+
+    #[test]
+    fn definition_reason_detail_json_shape() {
+        let error = ShellError {
+            code: ShellErrorCode::DefinitionInvalid,
+            message: "message".to_string(),
+            detail: Some(ShellErrorDetail::DefinitionReason {
+                reason: "duplicate-identity-kind".to_string(),
+            }),
+        };
+        assert_eq!(
+            json(&error)["detail"],
+            serde_json::json!({"reason": "duplicate-identity-kind"})
+        );
+    }
+
+    #[test]
+    fn identity_file_dto_json_shape_for_a_regular_file() {
+        use omnifrons_domain::definition::{FileShape, IdentityKind};
+        let report = omnifrons_app::definition::IdentityFileReport {
+            kind: IdentityKind::Agents,
+            bytes: 42,
+            sha256: Some("ab".repeat(32)),
+            shape: FileShape::Regular,
+        };
+        let dto: super::IdentityFileDto = (&report).into();
+        let value = json(&dto);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "AGENTS.md",
+                "sha256": "ab".repeat(32),
+                "bytes": 42,
+                "symlink": null,
+            })
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["bytes", "kind", "sha256", "symlink"]
+        );
+    }
+
+    /// A symlink and an irregular file both read `sha256: null`; only the
+    /// symlink also carries a non-null `symlink` target.
+    #[test]
+    fn identity_file_dto_json_shape_for_a_symlink_has_no_digest() {
+        use omnifrons_domain::definition::{FileShape, IdentityKind};
+        let report = omnifrons_app::definition::IdentityFileReport {
+            kind: IdentityKind::Claude,
+            bytes: 0,
+            sha256: None,
+            shape: FileShape::Symlink {
+                target: "AGENTS.md".to_string(),
+            },
+        };
+        let dto: super::IdentityFileDto = (&report).into();
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "kind": "CLAUDE.md",
+                "sha256": null,
+                "bytes": 0,
+                "symlink": "AGENTS.md",
+            })
+        );
+    }
+
+    #[test]
+    fn skills_dto_json_shape() {
+        let report = omnifrons_app::definition::SkillsReport {
+            discovered: vec!["skills/x/SKILL.md".to_string()],
+            indexed: vec![],
+            missing: vec!["skills/x/SKILL.md".to_string()],
+            dangling: vec![],
+            precedence: false,
+        };
+        let dto: super::SkillsDto = (&report).into();
+        let value = json(&dto);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "discovered": ["skills/x/SKILL.md"],
+                "indexed": [],
+                "missing": ["skills/x/SKILL.md"],
+                "dangling": [],
+                "precedence": false,
+            })
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["dangling", "discovered", "indexed", "missing", "precedence"]
+        );
+    }
+
+    #[test]
+    fn parent_dto_json_shape_for_root_and_outside() {
+        use omnifrons_domain::nesting::Parent;
+        let root: super::ParentDto = (&Parent::Root(".".to_string())).into();
+        assert_eq!(
+            json(&root),
+            serde_json::json!({"kind": "root", "path": "."})
+        );
+        let outside: super::ParentDto = (&Parent::Outside("/far".to_string())).into();
+        assert_eq!(
+            json(&outside),
+            serde_json::json!({"kind": "outside", "path": "/far"})
+        );
+    }
+
+    #[test]
+    fn warning_dto_json_shape() {
+        use omnifrons_domain::warnings::{Warning, WarningCode};
+        let warning = Warning {
+            code: WarningCode::ExtraHostFile,
+            hosts: vec!["claude-code"],
+            detail: "a host-specific file sits alongside the identity files".to_string(),
+        };
+        let dto: super::WarningDto = (&warning).into();
+        let value = json(&dto);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "code": "extra-host-file",
+                "hosts": ["claude-code"],
+                "detail": "a host-specific file sits alongside the identity files",
+            })
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["code", "detail", "hosts"]
+        );
+    }
+
+    #[test]
+    fn agent_dto_json_shape_has_the_prototypes_nine_keys() {
+        let report = omnifrons_app::definition::AgentReport {
+            path: ".".to_string(),
+            state: omnifrons_domain::definition::RootState::AgentsOnly,
+            identity_files: vec![],
+            title: Some("Fixture".to_string()),
+            parent: None,
+            nested: vec![],
+            consent_required: false,
+            skills: omnifrons_app::definition::SkillsReport {
+                discovered: vec![],
+                indexed: vec![],
+                missing: vec![],
+                dangling: vec![],
+                precedence: false,
+            },
+            warnings: vec![],
+        };
+        let dto: super::AgentDto = (&report).into();
+        let value = json(&dto);
+        assert_eq!(value["parent"], serde_json::json!(null));
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec![
+                "consentRequired",
+                "identityFiles",
+                "nested",
+                "parent",
+                "path",
+                "skills",
+                "state",
+                "title",
+                "warnings",
+            ]
+        );
+    }
+
+    /// The port's own extension beyond the prototype's `ANCESTOR` key set
+    /// (`path`, `identity_files`): `hostExtras`.
+    #[test]
+    fn ancestor_dto_json_shape_adds_host_extras_beyond_the_prototype() {
+        let ancestor = omnifrons_domain::nesting::Ancestor {
+            path: "/outside".to_string(),
+            identity_files: vec!["AGENTS.md".to_string()],
+            host_extras: vec!["CLAUDE.local.md".to_string()],
+        };
+        let dto: super::AncestorDto = (&ancestor).into();
+        let value = json(&dto);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "path": "/outside",
+                "identityFiles": ["AGENTS.md"],
+                "hostExtras": ["CLAUDE.local.md"],
+            })
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["hostExtras", "identityFiles", "path"]
+        );
+    }
+
+    #[test]
+    fn definition_status_dto_json_shape_and_schema() {
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let report = omnifrons_app::definition::ScanReport {
+            ancestors: vec![],
+            agents: vec![],
+        };
+        let dto = super::DefinitionStatusDto::from_report(&workspace, &report);
+        let value = json(&dto);
+        assert_eq!(
+            value["schema"],
+            serde_json::json!("omnifrons.definition-scan/1")
+        );
+        assert_eq!(
+            value["root"],
+            serde_json::json!(workspace.path().to_string_lossy())
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["agents", "ancestors", "root", "schema"]
+        );
+    }
+
+    /// Unlike the prototype's own `verify_agent` payload, this wire shape
+    /// carries no `backups` key: this port keeps snapshots in its own
+    /// store instead.
+    #[test]
+    fn definition_verify_dto_json_shape_has_no_backups_key() {
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let report = omnifrons_app::definition::VerifyReport {
+            state: omnifrons_domain::definition::RootState::None,
+            canonical: false,
+            problems: vec!["state is none".to_string()],
+        };
+        let dto = super::DefinitionVerifyDto::from_report(&workspace, &report);
+        let value = json(&dto);
+        assert_eq!(
+            value["schema"],
+            serde_json::json!("omnifrons.definition-verify/1")
+        );
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["agent", "canonical", "problems", "schema", "state"]
+        );
     }
 }

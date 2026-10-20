@@ -22,6 +22,7 @@ use ipc::commands::{
     executable_revoke, harness_observe, harness_spawn, harness_stop, outbox_status,
     workspace_current, workspace_pick,
 };
+use ipc::definition::{definition_status, definition_verify};
 use ipc::guidance::{
     guidance_apply, guidance_pin, guidance_preview, guidance_remove, guidance_restore,
     guidance_snapshots, guidance_status,
@@ -141,6 +142,8 @@ pub fn run() {
             catalog_repair,
             recovery_list,
             recovery_approve,
+            definition_status,
+            definition_verify,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

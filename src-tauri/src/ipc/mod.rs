@@ -3,6 +3,7 @@
 
 pub mod catalog_repair;
 pub mod commands;
+pub mod definition;
 pub mod dto;
 pub mod guidance;
 pub mod publication;
