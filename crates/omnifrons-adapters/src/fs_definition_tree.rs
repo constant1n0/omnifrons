@@ -81,11 +81,14 @@
 //! confirmed to be a real directory -- goes through
 //! `lexists_or_absent` too, both in `read_identity_file`'s own
 //! symlinked-intermediate branch and in `read_identity_at`.
-//! `record_skill` is a fifth site discovered the same way, by this
-//! adapter's own tests rather than by reading the prototype: see its
-//! own doc comment for why it is deliberately more lenient than a
-//! literal reading of the prototype's `SKILL_FILE in filenames` check
-//! would be.
+//! `record_skill` is not a fifth lenient site: the prototype's own
+//! walk asks `SKILL_FILE in filenames` against a listing already in
+//! hand before ever calling its own `lstat`, so this module gates
+//! `record_skill` on `list_subdirectories`'s own listing the same way
+//! and then reads the file's metadata through
+//! `symlink_metadata_or_absent`, the strict primitive, failing the
+//! whole scan on anything other than the entry vanishing in between --
+//! see `record_skill`'s own doc comment for the full rule.
 //!
 //! **A below-root listing failure is skipped, not fatal.** When this
 //! module's own recursive walk cannot even list a directory's own
@@ -323,7 +326,7 @@ fn visit(
     ctx: &WalkContext<'_>,
     collected: &mut Collected,
 ) -> Result<(), DefinitionTreeError> {
-    let Some(candidates) = list_subdirectories(absolute, is_root)? else {
+    let Some(listing) = list_subdirectories(absolute, is_root)? else {
         return Ok(());
     };
 
@@ -339,11 +342,12 @@ fn visit(
         absolute,
         relative_display,
         relative_display_is_lossy,
+        listing.skill_listed,
         is_root,
         &mut collected.skills,
     )?;
 
-    for name in candidates {
+    for name in listing.subdirectories {
         let child_absolute = absolute.join(&name);
         let child_is_lossy = relative_display_is_lossy || name.to_str().is_none();
         let child_relative = join_relative(relative_display, &name.to_string_lossy());
@@ -359,9 +363,27 @@ fn visit(
     Ok(())
 }
 
-/// Lists `absolute`'s immediate real, non-pruned subdirectories eligible
-/// for recursion, in sorted name order -- or `None` when the listing
-/// itself fails *below* the scan root.
+/// [`list_subdirectories`]'s own result: `absolute`'s real, non-pruned
+/// subdirectory names eligible for recursion, in sorted order,
+/// alongside whether [`SKILL_FILE_NAME`] was itself one of this
+/// directory's listed entries, by name alone, regardless of that
+/// entry's own type. [`record_skill`] reads only
+/// [`Self::skill_listed`], reusing the one `read_dir` pass
+/// [`list_subdirectories`] already made of this same directory instead
+/// of probing the filesystem a second time -- the prototype's own
+/// `SKILL_FILE in filenames` membership test against its own walk
+/// tuple, translated to this port's two-pass directory/skill recording
+/// split.
+struct DirectoryListing {
+    /// The real, non-pruned subdirectory names, in sorted order.
+    subdirectories: Vec<OsString>,
+    /// Whether an entry named [`SKILL_FILE_NAME`] was among this
+    /// directory's listed entries.
+    skill_listed: bool,
+}
+
+/// Lists `absolute`'s immediate entries into a [`DirectoryListing`] --
+/// or `None` when the listing itself fails *below* the scan root.
 ///
 /// Mirrors `os.walk`'s own default `onerror=None`: a directory this
 /// process cannot even open for listing, or whose entry iteration fails
@@ -372,7 +394,8 @@ fn visit(
 /// classifying one specific entry's own file type is narrower still:
 /// that one entry alone is treated as "not a directory" (the
 /// prototype's own `entry.is_dir()` fallback), which never forces this
-/// wider, whole-directory skip.
+/// wider, whole-directory skip, and never keeps that same entry's name
+/// from still counting toward [`DirectoryListing::skill_listed`].
 ///
 /// At the scan root itself (`is_root`), any such failure instead
 /// becomes `Err(DefinitionTreeError::RootUnreadable)`, matching every
@@ -380,15 +403,20 @@ fn visit(
 fn list_subdirectories(
     absolute: &Path,
     is_root: bool,
-) -> Result<Option<Vec<OsString>>, DefinitionTreeError> {
+) -> Result<Option<DirectoryListing>, DefinitionTreeError> {
     let Ok(read_dir) = std::fs::read_dir(absolute) else {
         return listing_failed(is_root);
     };
-    let mut candidates: Vec<OsString> = Vec::new();
+    let mut subdirectories: Vec<OsString> = Vec::new();
+    let mut skill_listed = false;
     for entry in read_dir {
         let Ok(entry) = entry else {
             return listing_failed(is_root);
         };
+        let name = entry.file_name();
+        if name == SKILL_FILE_NAME {
+            skill_listed = true;
+        }
         // Not following a symlink at this name: a symlink is never a
         // recursion candidate regardless of what it points to, so
         // `FileType::is_dir` here -- which, like `symlink_metadata`,
@@ -401,14 +429,16 @@ fn list_subdirectories(
         if !is_dir {
             continue;
         }
-        let name = entry.file_name();
         if SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
             continue;
         }
-        candidates.push(name);
+        subdirectories.push(name);
     }
-    candidates.sort();
-    Ok(Some(candidates))
+    subdirectories.sort();
+    Ok(Some(DirectoryListing {
+        subdirectories,
+        skill_listed,
+    }))
 }
 
 /// [`list_subdirectories`]'s own failure convention: `Err` at the scan
@@ -416,7 +446,7 @@ fn list_subdirectories(
 /// `Ok(None)` -- "skip, do not descend" -- everywhere else, so a caller
 /// never repeats the `is_root` branch at each of that listing's two
 /// failure points (opening the directory, and iterating its entries).
-const fn listing_failed(is_root: bool) -> Result<Option<Vec<OsString>>, DefinitionTreeError> {
+const fn listing_failed(is_root: bool) -> Result<Option<DirectoryListing>, DefinitionTreeError> {
     if is_root {
         Err(DefinitionTreeError::RootUnreadable)
     } else {
@@ -473,25 +503,27 @@ fn record_directory(
 /// (the prototype's own `lstat`-based `stat.S_ISREG` check on the
 /// walk's `filenames` entry).
 ///
-/// The presence check is deliberately lenient, through
-/// [`lexists_or_absent`] rather than [`symlink_metadata_or_absent`]:
-/// this is a discovered fifth presence-probe site beyond this module's
-/// own "Lenient, not strict" documentation's four, found by this
-/// adapter's own test for a listable-but-unsearchable directory, which
-/// this blind probe -- attempted unconditionally, win or lose, for
-/// every visited directory -- would otherwise abort the whole scan on,
-/// exactly like [`find_host_extras`] before its own fix, even when no
-/// `SKILL.md` is there at all. The prototype's own walk never pays this
-/// cost: `SKILL_FILE in filenames` is a free check against a listing
-/// already in hand (needing only read permission on the directory,
-/// never search permission into it), so it only ever attempts its own
-/// `skill.lstat()` -- raised uncaught, matching
-/// [`symlink_metadata_or_absent`]'s own strictness -- once a `SKILL.md`
-/// is already known to be there. This function does not reconstruct
-/// that same listing-reuse structure; it is deliberately more lenient
-/// than the prototype for the narrow case the prototype itself never
-/// reliably handles either: a real `SKILL.md` sitting in a directory
-/// this process can list but not search.
+/// Gated on `skill_listed`, the one `read_dir` pass
+/// [`list_subdirectories`] already made of this same directory: the
+/// prototype's own walk checks `SKILL_FILE in filenames`, a free test
+/// against a listing already in hand, before ever calling its own
+/// `lstat`, so this function takes that same listing as its own
+/// presence gate instead of probing the filesystem a second time.
+/// `skill_listed` false short-circuits here with no filesystem call of
+/// this function's own at all -- a directory with no `SKILL.md` is
+/// simply absent, needing only the read permission the listing itself
+/// already needed. Once `skill_listed` is true, this function reads
+/// the entry's metadata through the *strict* [`symlink_metadata_or_absent`],
+/// matching the prototype's own `lstat`, which raises on anything but
+/// success: an entry the listing just reported but this process cannot
+/// then stat -- a permission error on an otherwise
+/// listable-but-unsearchable directory, in particular -- fails the
+/// whole scan with [`DefinitionTreeError::WalkFailed`] (or
+/// [`DefinitionTreeError::RootUnreadable`] at the scan root), never
+/// silently folded into "absent". Only the metadata call reporting the
+/// entry gone outright -- vanishing in the narrow window between the
+/// listing and this stat -- still resolves to absent, the one case
+/// [`symlink_metadata_or_absent`] itself treats leniently.
 ///
 /// Refuses with [`DefinitionTreeError::PathNotUnicode`] when
 /// `relative_display_is_lossy` and a reportable `SKILL.md` is actually
@@ -500,11 +532,15 @@ fn record_skill(
     absolute: &Path,
     relative_display: &str,
     relative_display_is_lossy: bool,
+    skill_listed: bool,
     is_root: bool,
     out: &mut Vec<SkillFile>,
 ) -> Result<(), DefinitionTreeError> {
+    if !skill_listed {
+        return Ok(());
+    }
     let path = absolute.join(SKILL_FILE_NAME);
-    let Some(metadata) = lexists_or_absent(&path) else {
+    let Some(metadata) = symlink_metadata_or_absent(&path, is_root)? else {
         return Ok(());
     };
     if !metadata.is_file() {

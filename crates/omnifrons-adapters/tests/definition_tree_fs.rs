@@ -1038,6 +1038,122 @@ fn a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kin
     );
 }
 
+/// A `.claude` directory this process can list but not search (unix
+/// mode `0o400`, `r--`) holding a real `SKILL.md` fails the whole scan
+/// with `WalkFailed`, never silently omitting a skill the listing
+/// already discovered: the prototype's own walk finds `SKILL.md`
+/// through `SKILL_FILE in filenames` -- a check against the listing
+/// `.claude` itself still yields even though it cannot be searched --
+/// and only then calls its own `lstat`, which raises on the very
+/// permission error this directory's restricted mode produces.
+/// `.claude` being one of `HOST_CONFIG_DIRS` still means
+/// `identity_kinds_for` hands it no identity kinds at all, so
+/// `record_directory`'s own per-kind loop, and the *other* strict
+/// check the sibling test
+/// `a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kind`
+/// pins, never run for it; this directory fails only because
+/// `record_skill` itself must fail once its own listing already names
+/// `SKILL.md`, not for the sibling test's own reason.
+///
+/// Skipped when running as `root`, which bypasses unix permission
+/// bits entirely.
+#[cfg(unix)]
+#[test]
+fn a_listable_but_unsearchable_dot_claude_directory_with_a_listed_skill_md_fails_the_walk() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping a_listable_but_unsearchable_dot_claude_directory_with_a_listed_skill_md_fails_the_walk: \
+             running as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("dot-claude-skill-listable-not-searchable");
+    write(
+        project.path(),
+        ".claude/SKILL.md",
+        b"---\nname: leaked\n---\n",
+    );
+    write(project.path(), "agent/AGENTS.md", SIMPLE_BODY);
+    let dot_claude = project.path().join(".claude");
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o400))
+        .expect("chmod 0o400 (r--: listable, not searchable)");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    assert_eq!(
+        result,
+        Err(DefinitionTreeError::WalkFailed),
+        "a SKILL.md the listing already discovered must fail the scan when it cannot \
+         then be stat'd, never be silently treated as absent"
+    );
+}
+
+/// A `.claude` directory this process can list but not search (unix
+/// mode `0o400`, `r--`) that holds no `SKILL.md` at all still yields a
+/// successful snapshot: `record_skill`'s own listing gate -- the same
+/// `read_dir` pass `list_subdirectories` already made -- answers
+/// absent without ever attempting the strict `symlink_metadata` that
+/// would otherwise hit this directory's own permission error. This is
+/// the shape the listing gate exists to keep working; the sibling test
+/// above pins the opposite case, where `SKILL.md` *is* listed and that
+/// same permission error becomes fatal instead.
+///
+/// Skipped when running as `root`, which bypasses unix permission
+/// bits entirely.
+#[cfg(unix)]
+#[test]
+fn a_listable_but_unsearchable_dot_claude_directory_without_a_skill_md_still_succeeds() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "skipping a_listable_but_unsearchable_dot_claude_directory_without_a_skill_md_still_succeeds: \
+             running as root, which bypasses unix permission bits entirely"
+        );
+        return;
+    }
+    let project = TempDir::new("dot-claude-no-skill-listable-not-searchable");
+    std::fs::create_dir_all(project.path().join(".claude")).expect("mkdir .claude");
+    write(project.path(), "agent/AGENTS.md", SIMPLE_BODY);
+    let dot_claude = project.path().join(".claude");
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o400))
+        .expect("chmod 0o400 (r--: listable, not searchable)");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
+        .expect("restore permissions before cleanup");
+    let snapshot = result.expect(
+        "SKILL.md absent from .claude's own listing must short-circuit record_skill \
+         before any stat is attempted, so an unsearchable .claude with nothing listed \
+         there never fails the scan",
+    );
+    assert!(
+        !snapshot
+            .skills
+            .iter()
+            .any(|skill| skill.path.starts_with(".claude/")),
+        "{:?}",
+        snapshot.skills
+    );
+    assert!(
+        snapshot
+            .directories
+            .iter()
+            .any(|directory| directory.path == "agent"),
+        "the sibling agent must still be reported: {:?}",
+        snapshot.directories
+    );
+}
+
 // -- refusing, not folding, a *reported* non-Unicode path --
 
 /// Treats `result` -- the outcome of a fixture's own `create_dir` or
