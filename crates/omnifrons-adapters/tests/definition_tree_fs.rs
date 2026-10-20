@@ -1040,6 +1040,32 @@ fn a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kin
 
 // -- refusing, not folding, a *reported* non-Unicode path --
 
+/// Treats `result` -- the outcome of a fixture's own `create_dir` or
+/// `write` call that names a non-Unicode path component directly -- as
+/// a graceful skip rather than a fixture panic when the filesystem
+/// itself refuses such a name outright (a UTF-8-enforcing filesystem,
+/// APFS on macOS in particular, refuses the `create_dir` before this
+/// suite ever reaches `FsDefinitionTree` at all). Prints a one-line
+/// note naming `label` and the observed error, then returns `false` so
+/// the caller can return early -- the same shape the "skipped when
+/// running as root" tests above use, keyed on filesystem behaviour
+/// instead of process identity. Returns `true` on `Ok`, so every
+/// non-Unicode test below still runs to completion and passes on a
+/// filesystem that allows such names, Linux included.
+#[cfg(unix)]
+fn non_unicode_fixture_supported(label: &str, result: std::io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "skipping {label}: this filesystem refuses a non-Unicode path component \
+                 ({error})"
+            );
+            false
+        }
+    }
+}
+
 /// Two sibling directories whose names are each a single invalid UTF-8
 /// byte (`0xff` and `0xfe`) both lossily collapse to the same `U+FFFD`
 /// replacement text; once both hold an `AGENTS.md`, reporting either
@@ -1048,6 +1074,10 @@ fn a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kin
 /// duplicate `DirectoryEntry::path`. This adapter refuses the whole
 /// snapshot with `PathNotUnicode` instead of ever reaching that
 /// choice.
+///
+/// Skipped when the filesystem itself refuses a single-invalid-byte
+/// directory name, via `non_unicode_fixture_supported` (APFS on macOS
+/// enforces valid UTF-8 names).
 #[cfg(unix)]
 #[test]
 fn two_non_unicode_sibling_names_refuse_the_snapshot_instead_of_colliding() {
@@ -1057,8 +1087,18 @@ fn two_non_unicode_sibling_names_refuse_the_snapshot_instead_of_colliding() {
     let project = TempDir::new("non-unicode-siblings");
     let first = OsStr::from_bytes(&[0xff]);
     let second = OsStr::from_bytes(&[0xfe]);
-    std::fs::create_dir(project.path().join(first)).expect("mkdir 0xff");
-    std::fs::create_dir(project.path().join(second)).expect("mkdir 0xfe");
+    if !non_unicode_fixture_supported(
+        "two_non_unicode_sibling_names_refuse_the_snapshot_instead_of_colliding",
+        std::fs::create_dir(project.path().join(first)),
+    ) {
+        return;
+    }
+    if !non_unicode_fixture_supported(
+        "two_non_unicode_sibling_names_refuse_the_snapshot_instead_of_colliding",
+        std::fs::create_dir(project.path().join(second)),
+    ) {
+        return;
+    }
     std::fs::write(project.path().join(first).join("AGENTS.md"), SIMPLE_BODY)
         .expect("write AGENTS.md under 0xff");
     std::fs::write(project.path().join(second).join("AGENTS.md"), SIMPLE_BODY)
@@ -1076,6 +1116,10 @@ fn two_non_unicode_sibling_names_refuse_the_snapshot_instead_of_colliding() {
 /// `String` built from it at all, so it is walked through silently,
 /// exactly like any other directory with nothing of interest; the
 /// root's own, perfectly ordinary `AGENTS.md` is unaffected.
+///
+/// Skipped when the filesystem itself refuses a single-invalid-byte
+/// directory name, via `non_unicode_fixture_supported` (APFS on macOS
+/// enforces valid UTF-8 names).
 #[cfg(unix)]
 #[test]
 fn a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently() {
@@ -1085,7 +1129,12 @@ fn a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently
     let project = TempDir::new("non-unicode-empty");
     write(project.path(), "AGENTS.md", SIMPLE_BODY);
     let name = OsStr::from_bytes(&[0xff]);
-    std::fs::create_dir(project.path().join(name)).expect("mkdir 0xff");
+    if !non_unicode_fixture_supported(
+        "a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently",
+        std::fs::create_dir(project.path().join(name)),
+    ) {
+        return;
+    }
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
@@ -1099,4 +1148,157 @@ fn a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently
         .map(|directory| directory.path.as_str())
         .collect();
     assert_eq!(directory_paths, vec!["."]);
+}
+
+/// Proves the `SKILL.md`-specific refusal path: a `SKILL.md` sitting
+/// directly inside a non-Unicode-named directory refuses with
+/// `PathNotUnicode` from `record_skill`'s own check, even though that
+/// same directory holds no identity file or host extra of its own --
+/// `record_directory`'s emptiness check lets that directory through
+/// first, so this test pins that `record_skill` repeats the identical
+/// refusal independently rather than relying on `record_directory`
+/// having already caught it.
+///
+/// Skipped when the filesystem itself refuses a single-invalid-byte
+/// directory name, via `non_unicode_fixture_supported` (APFS on macOS
+/// enforces valid UTF-8 names).
+#[cfg(unix)]
+#[test]
+fn a_skill_file_under_a_non_unicode_directory_refuses_via_record_skill() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let project = TempDir::new("non-unicode-skill");
+    let lossy = OsStr::from_bytes(&[0xff]);
+    let lossy_dir = project.path().join(lossy);
+    if !non_unicode_fixture_supported(
+        "a_skill_file_under_a_non_unicode_directory_refuses_via_record_skill",
+        std::fs::create_dir(&lossy_dir),
+    ) {
+        return;
+    }
+    std::fs::write(lossy_dir.join("SKILL.md"), b"---\nname: lossy\n---\n")
+        .expect("write SKILL.md under the non-Unicode directory");
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    assert_eq!(result, Err(DefinitionTreeError::PathNotUnicode));
+}
+
+/// Proves the inherited-flag propagation through `visit`: a
+/// non-Unicode directory holding nothing reportable of its own is
+/// walked through without error, exactly like
+/// `a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently`
+/// above -- but its own lossy flag still carries down to its `child`
+/// subdirectory, whose own name is perfectly ordinary Unicode. Once
+/// `child` turns out to hold a reportable `AGENTS.md`, the snapshot
+/// still refuses with `PathNotUnicode`, proving the flag is inherited
+/// from an ancestor segment rather than recomputed from each
+/// directory's own name alone.
+///
+/// Skipped when the filesystem itself refuses a single-invalid-byte
+/// directory name, via `non_unicode_fixture_supported` (APFS on macOS
+/// enforces valid UTF-8 names).
+#[cfg(unix)]
+#[test]
+fn a_reportable_directory_beneath_a_non_unicode_ancestor_segment_refuses_via_the_inherited_flag() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let project = TempDir::new("non-unicode-ancestor-segment");
+    let lossy = OsStr::from_bytes(&[0xff]);
+    let lossy_dir = project.path().join(lossy);
+    if !non_unicode_fixture_supported(
+        "a_reportable_directory_beneath_a_non_unicode_ancestor_segment_refuses_via_the_inherited_flag",
+        std::fs::create_dir(&lossy_dir),
+    ) {
+        return;
+    }
+    write(&lossy_dir, "child/AGENTS.md", SIMPLE_BODY);
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    assert_eq!(result, Err(DefinitionTreeError::PathNotUnicode));
+}
+
+/// Proves the ancestor-side refusal: a scan root built *inside* a
+/// non-Unicode-named directory that itself holds an identity file
+/// refuses with `PathNotUnicode` from `posix_absolute`, the only
+/// fallible step in `find_ancestors` -- mirroring how
+/// `an_unreadable_ancestor_identity_file_does_not_fail_the_scan` and
+/// its neighbours above build an outer directory and a `WorkspaceRoot`
+/// below it, rather than at it.
+///
+/// Skipped when the filesystem itself refuses a single-invalid-byte
+/// directory name, via `non_unicode_fixture_supported` (APFS on macOS
+/// enforces valid UTF-8 names).
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_ancestor_path_refuses_from_posix_absolute() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let base = TempDir::new("non-unicode-ancestor");
+    let lossy = OsStr::from_bytes(&[0xff]);
+    let lossy_dir = base.path().join(lossy);
+    if !non_unicode_fixture_supported(
+        "a_non_unicode_ancestor_path_refuses_from_posix_absolute",
+        std::fs::create_dir(&lossy_dir),
+    ) {
+        return;
+    }
+    std::fs::write(lossy_dir.join("AGENTS.md"), SIMPLE_BODY)
+        .expect("write AGENTS.md under the non-Unicode ancestor");
+    std::fs::create_dir_all(lossy_dir.join("nested")).expect("mkdir nested");
+    let workspace = WorkspaceRoot::new(lossy_dir.join("nested")).expect("workspace");
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let result = fs_tree.snapshot(&workspace);
+
+    assert_eq!(result, Err(DefinitionTreeError::PathNotUnicode));
+}
+
+/// Pins the success side alongside the three refusals above: a
+/// non-Unicode sibling holding nothing reportable, sitting beside a
+/// reportable Unicode-named sibling -- rather than beside a reportable
+/// scan root itself, which
+/// `a_non_unicode_directory_holding_nothing_reportable_is_walked_through_silently`
+/// already covers -- still yields a successful snapshot that lists
+/// only the reportable sibling.
+///
+/// Skipped when the filesystem itself refuses a single-invalid-byte
+/// directory name, via `non_unicode_fixture_supported` (APFS on macOS
+/// enforces valid UTF-8 names).
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_sibling_holding_nothing_reportable_leaves_a_reportable_sibling_intact() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let project = TempDir::new("non-unicode-sibling-pin");
+    write(project.path(), "reportable/AGENTS.md", SIMPLE_BODY);
+    let lossy = OsStr::from_bytes(&[0xff]);
+    if !non_unicode_fixture_supported(
+        "a_non_unicode_sibling_holding_nothing_reportable_leaves_a_reportable_sibling_intact",
+        std::fs::create_dir(project.path().join(lossy)),
+    ) {
+        return;
+    }
+    let workspace = project.workspace();
+    let fs_tree = FsDefinitionTree::new(None);
+
+    let snapshot = fs_tree
+        .snapshot(&workspace)
+        .expect("the non-Unicode sibling holds nothing reportable, so it never blocks the scan");
+
+    let directory_paths: Vec<&str> = snapshot
+        .directories
+        .iter()
+        .map(|directory| directory.path.as_str())
+        .collect();
+    assert_eq!(directory_paths, vec!["reportable"]);
 }
