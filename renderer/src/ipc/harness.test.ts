@@ -1472,7 +1472,7 @@ describe('slice 5b closed sets', () => {
     expect(availabilities.map(availabilityLabel)).toEqual(availabilities)
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes, the three slice 5d codes and the four slice 5e codes among the forty-five -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes, the three slice 5d codes and the four slice 5e codes and the one ADR-0005 sub-slice 1h code among the forty-six -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
     function codeLabel(code: ShellErrorCode): string {
       switch (code) {
         case 'unknown-process':
@@ -1520,6 +1520,7 @@ describe('slice 5b closed sets', () => {
         case 'catalog-changed':
         case 'repair-refused':
         case 'recovery-unknown':
+        case 'definition-invalid':
           return code
         default: {
           const unreachable: never = code
@@ -1574,8 +1575,9 @@ describe('slice 5b closed sets', () => {
       'catalog-changed',
       'repair-refused',
       'recovery-unknown',
+      'definition-invalid',
     ]
-    expect(new Set(codes).size).toBe(45)
+    expect(new Set(codes).size).toBe(46)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
@@ -3159,6 +3161,7 @@ const SHELL_ERROR_CODES = [
   'catalog-changed',
   'repair-refused',
   'recovery-unknown',
+  'definition-invalid',
 ] as const
 /** Every token {@link ApprovalStatus} declares. */
 const APPROVAL_STATUSES = ['active', 'revoked'] as const
