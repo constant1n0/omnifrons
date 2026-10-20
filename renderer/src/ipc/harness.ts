@@ -432,6 +432,14 @@ export type ShellErrorCode =
    * (HAP-001-R18; spike slice 5e).
    */
   | 'recovery-unknown'
+  /**
+   * The agent definition scan or verify met a shape the filesystem port
+   * must never produce: an invalid nesting relation, a directory whose
+   * identity files repeat a kind, or a snapshot repeating a path. Never
+   * reached from an ordinary workspace; the shell's detail carries the
+   * reason token (ADR-0005 sub-slice 1h).
+   */
+  | 'definition-invalid'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {
