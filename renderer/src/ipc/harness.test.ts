@@ -14,6 +14,8 @@ import {
   candidatesList,
   catalogRepair,
   catalogRepairPreview,
+  definitionStatus,
+  definitionVerify,
   executableApprove,
   executablePickAndProbe,
   executableRevoke,
@@ -86,6 +88,16 @@ import {
   type WorkAreaState,
   type WrongRootReason,
   type WrongRootStatus,
+  type DefinitionAgent,
+  type DefinitionAncestor,
+  type DefinitionIdentityFile,
+  type DefinitionParent,
+  type DefinitionSkills,
+  type DefinitionStatus,
+  type DefinitionVerify,
+  type DefinitionWarning,
+  type DefinitionWarningCode,
+  type RootState,
 } from './harness'
 
 // The jsdom crypto polyfill is installed once for every test file by
@@ -3007,6 +3019,170 @@ describe('recoveryApprove (slice 5e)', () => {
   })
 })
 
+// -- ADR-0005 sub-slice 1i: the agent-definition scan and verify --
+
+const DEFINITION_IDENTITY_FILE: DefinitionIdentityFile = {
+  kind: 'AGENTS.md',
+  sha256: 'ab'.repeat(32),
+  bytes: 42,
+  symlink: null,
+}
+
+const DEFINITION_SKILLS: DefinitionSkills = {
+  discovered: ['skills/x/SKILL.md'],
+  indexed: [],
+  missing: ['skills/x/SKILL.md'],
+  dangling: [],
+  precedence: false,
+}
+
+const DEFINITION_WARNING: DefinitionWarning = {
+  code: 'extra-host-file',
+  hosts: ['claude-code'],
+  detail: 'a host-specific file sits alongside the identity files',
+}
+
+const DEFINITION_AGENT: DefinitionAgent = {
+  path: '.',
+  state: 'agents-only',
+  identityFiles: [DEFINITION_IDENTITY_FILE],
+  title: 'Fixture',
+  parent: { kind: 'root', path: '.' },
+  nested: ['sub'],
+  consentRequired: true,
+  skills: DEFINITION_SKILLS,
+  warnings: [DEFINITION_WARNING],
+}
+
+const DEFINITION_ANCESTOR: DefinitionAncestor = {
+  path: '/outside',
+  identityFiles: ['AGENTS.md'],
+  hostExtras: ['CLAUDE.local.md'],
+}
+
+/** Mirrors `definition_status_dto_json_shape_and_schema`'s own shape (`dto.rs`). */
+const DEFINITION_STATUS: DefinitionStatus = {
+  schema: 'omnifrons.definition-scan/1',
+  root: '/workspace',
+  ancestors: [DEFINITION_ANCESTOR],
+  agents: [DEFINITION_AGENT],
+}
+
+/** Mirrors `definition_verify_dto_json_shape_has_no_backups_key`'s own shape (`dto.rs`). */
+const DEFINITION_VERIFY: DefinitionVerify = {
+  schema: 'omnifrons.definition-verify/1',
+  agent: '/workspace',
+  state: 'none',
+  canonical: false,
+  problems: ['state is none'],
+}
+
+describe('definitionStatus (ADR-0005 sub-slice 1i)', () => {
+  it('invokes definition_status with no arguments and returns the scan verbatim', async () => {
+    const mock = mockCommand('definition_status', () => DEFINITION_STATUS)
+
+    const status = await definitionStatus()
+
+    expect(mock.args()).toEqual({})
+    expect(Object.keys(mock.args())).toEqual([])
+    expect(status).toEqual(DEFINITION_STATUS)
+    expect(Object.keys(status).sort()).toEqual(['agents', 'ancestors', 'root', 'schema'])
+    expect(status.schema).toBe('omnifrons.definition-scan/1')
+  })
+
+  it("parses a definition_status payload exactly as the shell emits it -- the key sets dto.rs's own tests pin -- narrowing every nested shape to its TS type", () => {
+    const parsed: unknown = JSON.parse(
+      '{"schema":"omnifrons.definition-scan/1","root":"/workspace",' +
+        '"ancestors":[{"path":"/outside","identityFiles":["AGENTS.md"],"hostExtras":["CLAUDE.local.md"]}],' +
+        '"agents":[{"path":".","state":"agents-only",' +
+        `"identityFiles":[{"kind":"AGENTS.md","sha256":"${'ab'.repeat(32)}","bytes":42,"symlink":null}],` +
+        '"title":"Fixture","parent":{"kind":"root","path":"."},"nested":["sub"],"consentRequired":true,' +
+        '"skills":{"discovered":["skills/x/SKILL.md"],"indexed":[],"missing":["skills/x/SKILL.md"],"dangling":[],"precedence":false},' +
+        '"warnings":[{"code":"extra-host-file","hosts":["claude-code"],"detail":"a host-specific file sits alongside the identity files"}]' +
+        '}]}',
+    )
+
+    expect(parsed).toEqual(DEFINITION_STATUS)
+    const status = parsed as DefinitionStatus
+    const agent = status.agents[0]
+    expect(Object.keys(agent!).sort()).toEqual([
+      'consentRequired',
+      'identityFiles',
+      'nested',
+      'parent',
+      'path',
+      'skills',
+      'state',
+      'title',
+      'warnings',
+    ])
+    expect(Object.keys(status.ancestors[0]!).sort()).toEqual(['hostExtras', 'identityFiles', 'path'])
+    expect(Object.keys(agent!.identityFiles[0]!).sort()).toEqual(['bytes', 'kind', 'sha256', 'symlink'])
+    expect(Object.keys(agent!.skills).sort()).toEqual(['dangling', 'discovered', 'indexed', 'missing', 'precedence'])
+    expect(Object.keys(agent!.warnings[0]!).sort()).toEqual(['code', 'detail', 'hosts'])
+    if (agent?.parent?.kind !== 'root') throw new Error('expected a root parent')
+    expect(agent.parent.path).toBe('.')
+  })
+
+  it("parses the outside ParentDto variant the same way as the root variant -- both closed `kind` tokens (mirrors dto.rs's parent_dto_json_shape_for_root_and_outside)", () => {
+    const parsed: unknown = JSON.parse('{"kind":"outside","path":"/far"}')
+    const parent = parsed as DefinitionParent
+    if (parent.kind !== 'outside') throw new Error('expected an outside parent')
+    expect(parent.path).toBe('/far')
+  })
+
+  it('rejects with the typed scan-failed ShellError when the workspace could not be walked', async () => {
+    const error: ShellError = { code: 'scan-failed', message: 'the workspace could not be scanned' }
+    mockCommand('definition_status', () => Promise.reject(error))
+
+    await expect(definitionStatus()).rejects.toMatchObject(error)
+    expect(isShellError(error)).toBe(true)
+  })
+
+  it('rejects with the typed workspace-unavailable ShellError when no workspace is active', async () => {
+    const error: ShellError = { code: 'workspace-unavailable', message: 'no workspace has been picked yet' }
+    mockCommand('definition_status', () => Promise.reject(error))
+
+    await expect(definitionStatus()).rejects.toMatchObject(error)
+  })
+})
+
+describe('definitionVerify (ADR-0005 sub-slice 1i)', () => {
+  it('invokes definition_verify with no arguments and returns the verification verbatim, targeting the active workspace root', async () => {
+    const mock = mockCommand('definition_verify', () => DEFINITION_VERIFY)
+
+    const verify = await definitionVerify()
+
+    expect(mock.args()).toEqual({})
+    expect(Object.keys(mock.args())).toEqual([])
+    expect(verify).toEqual(DEFINITION_VERIFY)
+    expect(Object.keys(verify).sort()).toEqual(['agent', 'canonical', 'problems', 'schema', 'state'])
+    expect(verify.schema).toBe('omnifrons.definition-verify/1')
+  })
+
+  it('parses a definition_verify payload exactly as the shell emits it -- no backups key, unlike the prototype -- narrowing to the TS type', () => {
+    const parsed: unknown = JSON.parse(
+      '{"schema":"omnifrons.definition-verify/1","agent":"/workspace","state":"none","canonical":false,"problems":["state is none"]}',
+    )
+
+    expect(parsed).toEqual(DEFINITION_VERIFY)
+    expect(Object.keys(parsed as object).sort()).toEqual(['agent', 'canonical', 'problems', 'schema', 'state'])
+    const verify = parsed as DefinitionVerify
+    expect(verify.state).toBe('none')
+  })
+
+  it('rejects with the typed definition-invalid ShellError carrying its DefinitionReason detail', async () => {
+    const error: ShellError = {
+      code: 'definition-invalid',
+      message: 'a directory reported the same identity file more than once',
+      detail: { reason: 'duplicate-identity-kind' },
+    }
+    mockCommand('definition_verify', () => Promise.reject(error))
+
+    await expect(definitionVerify()).rejects.toMatchObject(error)
+  })
+})
+
 /**
  * The closed sets this file mirrors are closed by the **shell**, not by
  * this file, so the guard has to read the shell.
@@ -3033,7 +3209,7 @@ describe('recoveryApprove (slice 5e)', () => {
  * that a cross-language contract needs the other language in its guard,
  * and that is true of every such set, not of the two that were caught.
  * {@link MIRRORED_UNIONS} is therefore every closed token set this file
- * declares that a `pub enum` in `dto.rs` closes -- twenty-five of them,
+ * declares that a `pub enum` in `dto.rs` closes -- twenty-seven of them,
  * swept by hand against `dto.rs` -- and the three the reader structurally
  * **cannot** reach are named here rather than left to look guarded:
  *
@@ -3268,6 +3444,30 @@ const REMEDY_OUTCOMES = ['quarantined', 'copied-to-outbox', 'ignored'] as const
 const REPAIR_RULES = ['duplicate-record', 'dangling-alias'] as const
 /** Every token {@link RefusalReason} declares. */
 const REFUSAL_REASONS = ['catalog-id-mismatch', 'duplicate-across-asset-roots', 'unparsable'] as const
+/** Every token {@link RootState} declares. */
+const ROOT_STATES = [
+  'canonical',
+  'claude-only',
+  'agents-only',
+  'identical-copies',
+  'near-wrapper',
+  'host-extras',
+  'conflict',
+  'unsafe',
+  'none',
+] as const
+/** Every token {@link DefinitionWarningCode} declares. */
+const DEFINITION_WARNING_CODES = [
+  'ancestor-exposure',
+  'ancestor-shadowing',
+  'child-not-mentioned',
+  'host-imports',
+  'host-imports-boundary',
+  'extra-host-file',
+  'size-codex',
+  'size-antigravity',
+  'generated-state-dir',
+] as const
 
 // Compile-time, enforced by `tsc -b` in `pnpm -r build` and not by vitest:
 // each array covers its union exactly -- no member missing, no extra.
@@ -3297,7 +3497,11 @@ const _assertions: [
   CoversExactly<RemedyOutcome, typeof REMEDY_OUTCOMES>,
   CoversExactly<RepairRule, typeof REPAIR_RULES>,
   CoversExactly<RefusalReason, typeof REFUSAL_REASONS>,
+  CoversExactly<RootState, typeof ROOT_STATES>,
+  CoversExactly<DefinitionWarningCode, typeof DEFINITION_WARNING_CODES>,
 ] = [
+  true,
+  true,
   true,
   true,
   true,
@@ -3357,6 +3561,8 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['RemedyOutcomeTag', REMEDY_OUTCOMES],
   ['RepairRuleTag', REPAIR_RULES],
   ['RepairRefusalTag', REFUSAL_REASONS],
+  ['RootStateTag', ROOT_STATES],
+  ['WarningCodeTag', DEFINITION_WARNING_CODES],
 ]
 
 describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103)', () => {
@@ -3388,6 +3594,6 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(25)
+    expect(enums).toHaveLength(27)
   })
 })

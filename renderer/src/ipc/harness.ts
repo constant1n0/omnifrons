@@ -1886,3 +1886,177 @@ export async function recoveryList(): Promise<RecoveryEntry[]> {
 export async function recoveryApprove(digest: string): Promise<ArtifactApproval> {
   return invoke('recovery_approve', { digest })
 }
+
+// -- ADR-0005 sub-slice 1i: the agent-definition scan and verify --
+
+/**
+ * [`omnifrons_domain::definition::RootState`], as it crosses IPC: the same
+ * nine states, mirroring `dto.rs`'s `RootStateTag`.
+ */
+export type RootState =
+  | 'canonical'
+  | 'claude-only'
+  | 'agents-only'
+  | 'identical-copies'
+  | 'near-wrapper'
+  | 'host-extras'
+  | 'conflict'
+  | 'unsafe'
+  | 'none'
+
+/**
+ * [`omnifrons_domain::warnings::WarningCode`], as it crosses IPC: the same
+ * nine tokens, mirroring `dto.rs`'s `WarningCodeTag` (for example
+ * `AncestorExposure`'s own `"ancestor_exposure"` becomes
+ * `"ancestor-exposure"` on the wire).
+ */
+export type DefinitionWarningCode =
+  | 'ancestor-exposure'
+  | 'ancestor-shadowing'
+  | 'child-not-mentioned'
+  | 'host-imports'
+  | 'host-imports-boundary'
+  | 'extra-host-file'
+  | 'size-codex'
+  | 'size-antigravity'
+  | 'generated-state-dir'
+
+/**
+ * One warning on an agent root, as it crosses IPC. Mirrors `WarningDto`
+ * field-for-field: the closed code, the hosts it names, and its fixed
+ * detail text.
+ */
+export interface DefinitionWarning {
+  code: DefinitionWarningCode
+  hosts: string[]
+  detail: string
+}
+
+/**
+ * One identity file found at an agent root, as it crosses IPC. Mirrors
+ * `IdentityFileDto` field-for-field: `kind` is the file's own name (for
+ * example `"AGENTS.md"`, `".claude/CLAUDE.md"`); `symlink` is the link's
+ * own target when this file is a symlink and `null` otherwise -- also
+ * `null` for an irregular file, exactly like a regular file's own
+ * `symlink`; `sha256` is `null` for an irregular file too, since only a
+ * regular file's content is ever hashed.
+ */
+export interface DefinitionIdentityFile {
+  kind: string
+  sha256: string | null
+  bytes: number
+  symlink: string | null
+}
+
+/**
+ * One agent's skills-index status, as it crosses IPC. Mirrors `SkillsDto`
+ * field-for-field: the discovered, indexed, missing, and dangling skill
+ * names, and whether precedence between duplicate indexes was observed.
+ */
+export interface DefinitionSkills {
+  discovered: string[]
+  indexed: string[]
+  missing: string[]
+  dangling: string[]
+  precedence: boolean
+}
+
+/**
+ * [`omnifrons_domain::nesting::Parent`], as it crosses IPC: an internally
+ * tagged `{ kind: 'root', path }` or `{ kind: 'outside', path }` -- mirrors
+ * `dto.rs`'s `ParentDto`, the same shape {@link Attribution} already uses
+ * for a closed, path-carrying enum.
+ */
+export type DefinitionParent = { kind: 'root'; path: string } | { kind: 'outside'; path: string }
+
+/**
+ * One discovered agent root, as it crosses IPC. Mirrors `AgentDto`
+ * field-for-field: its own path, classification state, identity files, an
+ * optional title, its parent relation (`null` at the scan root), nested
+ * agent paths below it, whether consent is required, its skills-index
+ * status, and its warnings.
+ */
+export interface DefinitionAgent {
+  path: string
+  state: RootState
+  identityFiles: DefinitionIdentityFile[]
+  title: string | null
+  parent: DefinitionParent | null
+  nested: string[]
+  consentRequired: boolean
+  skills: DefinitionSkills
+  warnings: DefinitionWarning[]
+}
+
+/**
+ * An agent root above the scan root, as it crosses IPC. Mirrors
+ * `AncestorDto` field-for-field: its path, the identity files found there,
+ * and `hostExtras` -- host-specific files the ancestor carries beyond the
+ * identity files (this port's own extension; the prototype's own
+ * `ANCESTOR` key set has no such key).
+ */
+export interface DefinitionAncestor {
+  path: string
+  identityFiles: string[]
+  hostExtras: string[]
+}
+
+/**
+ * `definitionStatus`'s payload, schema `"omnifrons.definition-scan/1"`.
+ * Mirrors `DefinitionStatusDto` field-for-field: the scanned workspace
+ * root, the agent roots above it, and every discovered agent root.
+ */
+export interface DefinitionStatus {
+  schema: string
+  root: string
+  ancestors: DefinitionAncestor[]
+  agents: DefinitionAgent[]
+}
+
+/**
+ * `definitionVerify`'s payload, schema `"omnifrons.definition-verify/1"`.
+ * Mirrors `DefinitionVerifyDto` field-for-field: the verified root's own
+ * display path, its classification state, whether it is canonical, and
+ * every problem found. Unlike the prototype this wraps, carries no
+ * `backups` key -- this port keeps snapshots in its own store.
+ */
+export interface DefinitionVerify {
+  schema: string
+  agent: string
+  state: RootState
+  canonical: boolean
+  problems: string[]
+}
+
+/**
+ * The active workspace's agent-definition scan (ADR-0005 sub-slice 1h):
+ * every discovered agent root, the agent roots above it, and each root's
+ * identity files, skills-index status, and warnings. Schema
+ * `"omnifrons.definition-scan/1"`. Read-only: nothing is written, locked,
+ * or snapshotted. Invokes `definition_status` with no arguments.
+ *
+ * # Errors
+ * Rejects with `workspace-unavailable` if no workspace is active,
+ * `scan-failed` if the workspace could not be walked at all, or
+ * `definition-invalid` if the walk's own result is internally
+ * inconsistent (unreachable with the real filesystem adapter).
+ */
+export async function definitionStatus(): Promise<DefinitionStatus> {
+  return invoke('definition_status')
+}
+
+/**
+ * A verification of the active workspace root's own canonical definition
+ * (ADR-0005 sub-slice 1h): its classification state, whether it is
+ * canonical, and every problem found. Schema
+ * `"omnifrons.definition-verify/1"`. Targets the active workspace root
+ * itself, never an explicit agent path below it -- an explicit target is a
+ * later extension. Read-only: nothing is written, locked, or snapshotted.
+ * Invokes `definition_verify` with no arguments.
+ *
+ * # Errors
+ * As {@link definitionStatus}.
+ */
+export async function definitionVerify(): Promise<DefinitionVerify> {
+  return invoke('definition_verify')
+}

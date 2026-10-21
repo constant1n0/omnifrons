@@ -147,6 +147,14 @@ function defaultHandlers(
     if (cmd === 'recovery_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
     if (cmd === 'adapters_list') return options.adapters ?? [SAMPLE_ADAPTER, PTY_ADAPTER]
     if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
+    // `DefinitionSection` (ADR-0005 sub-slice 1i) fetches on mount like the
+    // five commands above; a neutral empty scan keeps every test that does
+    // not care about it from seeing its own error banner (unlike
+    // `guidance_status`, which is not given a default here and so meets its
+    // own rejection locally, a pre-existing gap this does not repeat).
+    if (cmd === 'definition_status') {
+      return { schema: 'omnifrons.definition-scan/1', root: '', ancestors: [], agents: [] }
+    }
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
     throw new Error(`unexpected command: ${cmd}`)
   }

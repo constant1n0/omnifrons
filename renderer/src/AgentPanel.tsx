@@ -79,6 +79,7 @@ import {
   type WrongRootReason,
   type WrongRootStatus,
 } from './ipc/harness'
+import { DefinitionSection } from './DefinitionSection'
 import { PlainTextLine } from './PlainTextLine'
 
 /**
@@ -4961,6 +4962,9 @@ export function AgentPanel() {
           </p>
         )}
       </section>
+
+      {/* ADR-0005 sub-slice 1i: the agent-definition scan and verify, a sibling of Guidance. */}
+      <DefinitionSection />
 
       {/*
         Wrong roots (slice 5d; HAP-001-R32, R33, R34, D16): a sibling of the
