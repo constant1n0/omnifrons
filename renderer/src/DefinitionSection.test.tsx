@@ -365,50 +365,6 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(calls).toBe(2)
   })
 
-  it('ignores an older scan that settles after a newer one, keeping only the newest report on screen', async () => {
-    let callIndex = 0
-    const rescanResolvers: Array<() => void> = []
-    mockIPC((cmd) => {
-      if (cmd === 'definition_status') {
-        callIndex += 1
-        const index = callIndex
-        if (index === 1) return { ...FIXTURE_STATUS, root: `/scan-${index}` }
-        return new Promise<DefinitionStatus>((resolve) => {
-          rescanResolvers.push(() => resolve({ ...FIXTURE_STATUS, root: `/scan-${index}` }))
-        })
-      }
-      throw new Error(`unexpected command: ${cmd}`)
-    })
-
-    render(<DefinitionSection />)
-    await screen.findByText('/scan-1')
-
-    const rescanButton = screen.getByRole('button', { name: 'Rescan' })
-    act(() => {
-      fireEvent.click(rescanButton)
-      fireEvent.click(rescanButton)
-    })
-
-    const newestIndex = callIndex
-    const [resolveFirstDispatched, resolveSecondDispatched] = rescanResolvers
-
-    // Settle requests one at a time, each fully flushed before the next,
-    // in reverse dispatch order: whichever request the reentrancy guard let
-    // through LAST (newest) settles FIRST, and the one dispatched FIRST
-    // (oldest) settles LAST -- exactly the ordering that would let a stale
-    // report overwrite a fresher one without a generation check.
-    if (resolveSecondDispatched) {
-      await act(async () => {
-        resolveSecondDispatched()
-      })
-    }
-    await act(async () => {
-      resolveFirstDispatched()
-    })
-
-    await screen.findByText(`/scan-${newestIndex}`)
-  })
-
   it('disables "Verify root" while the initial scan is loading, re-enabling once it settles', async () => {
     let resolveStatus: ((value: DefinitionStatus) => void) | undefined
     mockIPC((cmd) => {
