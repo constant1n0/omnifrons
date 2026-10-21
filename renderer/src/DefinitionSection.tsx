@@ -160,8 +160,12 @@ interface DefinitionReportProps {
    * Disables "Verify root": true while a verify is already in flight, or
    * while any scan is loading. A verification belongs to the report on
    * screen, so it cannot be started against one that is still being
-   * fetched -- the container's `generationRef` is what drops a verify that
-   * was nonetheless already in flight when a scan supersedes it.
+   * fetched: `runVerify` itself refuses synchronously while `scanningRef`
+   * shows a scan in flight (mount or rescan), and this prop is what keeps
+   * the button visibly disabled for that same window. The container's
+   * `generationRef` covers the one case neither of those catches -- a
+   * verify that was already running *before* a scan started -- by
+   * dropping its result once that scan supersedes it.
    */
   verifyPending: boolean
   onRescan: () => void
@@ -279,6 +283,23 @@ export function DefinitionSection() {
   const generationRef = useRef(0)
 
   /**
+   * Guards both the mount-time scan and `rescan` against a reentrant
+   * dispatch, and tells `runVerify` below when a scan -- either one -- is
+   * in flight. The reentrancy guard matters for the same reason as
+   * `runVerify`'s own `verifyingRef`: `loading` (state) only reflects the
+   * last completed render, so two clicks fired in the same tick (no
+   * `await` between them) both see `loading === false` and both would
+   * call `scan`. A ref is read and written synchronously, so it is
+   * current for every call in the same tick, even back-to-back ones --
+   * which is also why `runVerify` reads it directly instead of relying on
+   * the `disabled` attribute its own click cannot yet observe mid-tick: a
+   * verify dispatched in the same tick as a scan, before React has
+   * committed the `disabled` attribute that scan just set, must still see
+   * that scan in flight.
+   */
+  const scanningRef = useRef(false)
+
+  /**
    * Scans the active workspace. `surfaceError` mirrors `AgentPanel`'s own
    * `fetchGuidanceStatus`: the automatic mount-time scan below passes
    * `false` -- a rejection just leaves the report empty, no alert -- and
@@ -286,9 +307,19 @@ export function DefinitionSection() {
    * directly is always answered, even by a failure. Either way, a
    * rejection clears `status`: a rescan that fails never leaves the prior
    * report on screen beside the new error, symmetric with the quiet
-   * mount-time failure. Returns the settled promise so `rescan` can tell
-   * when this particular dispatch is done, regardless of which generation
-   * wins.
+   * mount-time failure. Returns the settled promise so the caller can
+   * tell when this particular dispatch is done, regardless of which
+   * generation wins.
+   *
+   * `setLoading(false)` runs unconditionally, before the generation
+   * check: `loading` is this scan's own pending flag, not a result, and
+   * this is the only code that ever clears it, so it must run even when a
+   * later verify has since bumped `generationRef` past this scan's own
+   * value. Skipping it on a superseded generation is the bug this guards
+   * against -- it left `loading` stuck `true` forever, with "Rescan" and
+   * "Verify root" disabled until remount. `setStatus`/`setError` stay
+   * gated on the generation check below it: they carry this scan's
+   * *result*, which a newer generation has already made stale.
    */
   // No synchronous `setState` here (react-hooks/set-state-in-effect):
   // `loading` starts `true` by its own initializer for the mount call
@@ -300,13 +331,15 @@ export function DefinitionSection() {
     const generation = ++generationRef.current
     return definitionStatus().then(
       (result) => {
-        if (!mountedRef.current || generationRef.current !== generation) return
-        setStatus(result)
+        if (!mountedRef.current) return
         setLoading(false)
+        if (generationRef.current !== generation) return
+        setStatus(result)
       },
       (reason: unknown) => {
-        if (!mountedRef.current || generationRef.current !== generation) return
+        if (!mountedRef.current) return
         setLoading(false)
+        if (generationRef.current !== generation) return
         setStatus(null)
         if (surfaceError) {
           setError(toSectionError(reason))
@@ -315,20 +348,24 @@ export function DefinitionSection() {
     )
   }, [])
 
-  useEffect(() => {
-    scan(false)
-  }, [scan])
-
   /**
-   * Guards `rescan` against two clicks dispatched before React re-renders
-   * between them -- the same shape as `runVerify`'s own `verifyingRef`
-   * below, and for the same reason: `loading` (state) only reflects the
-   * last completed render, so two clicks fired in the same tick (no
-   * `await` between them) both see `loading === false` and both would
-   * call `scan`. A ref is read and written synchronously, so it is
-   * current for every call in the same tick, even back-to-back ones.
+   * The automatic mount-time scan is still a scan, so it sets
+   * `scanningRef` exactly like `rescan` below does -- a verify clicked
+   * before this very first fetch has settled must see one in flight, the
+   * same way it would during a later rescan. In practice "Verify root" is
+   * already disabled for this entire window regardless (`verifyPending`
+   * includes `loading`, which starts `true` from this component's own
+   * state initializer, not from this effect), so this is belt and
+   * suspenders: it costs nothing and keeps `scanningRef`'s own invariant
+   * -- true whenever a scan is in flight -- true regardless of how that
+   * scan was triggered, rather than true only for `rescan`.
    */
-  const scanningRef = useRef(false)
+  useEffect(() => {
+    scanningRef.current = true
+    scan(false).finally(() => {
+      scanningRef.current = false
+    })
+  }, [scan])
 
   /**
    * The explicit "Rescan" click: unlike the mount call, this sets
@@ -373,10 +410,22 @@ export function DefinitionSection() {
    * handling: `verifyingRef` guards this handler itself against a second
    * click arriving before the first verify settles, so at most one
    * `definitionVerify` call is ever in flight; `verifying` (state) only
-   * disables the button below and drives the pending UI. Clearing
-   * `verify` here -- not only in the rejection branch -- means a stale
-   * result is never shown beside either a new success or a new error
-   * banner; only the latest outcome is ever on screen. Capturing
+   * disables the button below and drives the pending UI.
+   *
+   * Refusing synchronously when `scanningRef.current` is also set is what
+   * "Verify root"'s own `disabled` attribute already intends
+   * (`verifyPending` includes `loading`): a verification belongs to the
+   * report on screen, so none starts while that report is still being
+   * fetched -- fetched by either the mount-time scan or a rescan, both of
+   * which set `scanningRef`. Without this check, a verify dispatched in
+   * the same tick as a scan -- before React has committed that scan's own
+   * `disabled` attribute -- would still start, bump `generationRef`, and
+   * supersede the scan it raced; see `scan`'s own doc comment for what
+   * that did to `loading`.
+   *
+   * Clearing `verify` here -- not only in the rejection branch -- means a
+   * stale result is never shown beside either a new success or a new
+   * error banner; only the latest outcome is ever on screen. Capturing
    * `generationRef`'s post-bump value means a result that settles after a
    * rescan has already moved the ref on is dropped instead of displayed:
    * `verifyingRef` and `verifying` are still cleared unconditionally (the
@@ -384,7 +433,7 @@ export function DefinitionSection() {
    * `setVerifyError` only run when this is still the latest generation.
    */
   const runVerify = useCallback(() => {
-    if (verifyingRef.current) return
+    if (verifyingRef.current || scanningRef.current) return
     verifyingRef.current = true
     const generation = ++generationRef.current
     setVerifying(true)

@@ -388,4 +388,97 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
 
     expect(verifyButton.disabled).toBe(false)
   })
+
+  it('refuses a "Verify root" click dispatched in the same tick as "Rescan", before the disabled attribute renders, and still recovers once the rescan settles', async () => {
+    let verifyCalls = 0
+    let statusCalls = 0
+    let resolveRescanStatus: ((value: DefinitionStatus) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        statusCalls += 1
+        if (statusCalls === 1) return FIXTURE_STATUS
+        return new Promise((resolve) => {
+          resolveRescanStatus = resolve as (value: DefinitionStatus) => void
+        })
+      }
+      if (cmd === 'definition_verify') {
+        verifyCalls += 1
+        return FIXTURE_VERIFY
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    const rescanButton = screen.getByRole('button', { name: 'Rescan' })
+    const verifyButton = screen.getByRole('button', { name: 'Verify root' })
+    // Both clicks are dispatched inside one `act` call, exactly like the
+    // existing same-tick "Verify root" double-click test above, so React
+    // never gets a chance to commit "Verify root"'s own `disabled`
+    // attribute (tied to `loading`, which the `rescan` click just set
+    // `true`) between them -- the race the bugfix guards against.
+    act(() => {
+      fireEvent.click(rescanButton)
+      fireEvent.click(verifyButton)
+    })
+
+    expect(verifyCalls).toBe(0)
+    // One call for the mount scan, one for this rescan -- never a third
+    // from the raced verify.
+    expect(statusCalls).toBe(2)
+
+    if (!resolveRescanStatus) throw new Error('definition_status was not called a second time')
+    await act(async () => {
+      resolveRescanStatus!(FIXTURE_STATUS_RESCANNED)
+    })
+
+    // Before the fix, the raced verify's own generation bump made the
+    // rescan's settle handler see itself as superseded, so it returned
+    // before ever calling `setLoading(false)` -- "Rescan" stayed disabled
+    // and the new report never rendered, with no way to recover short of
+    // remounting the section.
+    expect((screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByLabelText('Verification')).toBeNull()
+    expect(screen.getByText('/workspace-rescanned')).toBeTruthy()
+  })
+
+  it('refuses a "Verify root" click dispatched while the mount-time scan is still pending, recovering once it settles', async () => {
+    let verifyCalls = 0
+    let resolveStatus: ((value: DefinitionStatus) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        return new Promise((resolve) => {
+          resolveStatus = resolve as (value: DefinitionStatus) => void
+        })
+      }
+      if (cmd === 'definition_verify') {
+        verifyCalls += 1
+        return FIXTURE_VERIFY
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+
+    // "Verify root" is already disabled from the very first render
+    // (`loading` starts `true`), so this click is refused the same way a
+    // same-tick race would be -- `scanningRef` is set for this mount scan
+    // exactly as it would be for a rescan, keeping the ref's own
+    // invariant true regardless of which scan is in flight.
+    const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+    expect(verifyButton.disabled).toBe(true)
+    fireEvent.click(verifyButton)
+    expect(verifyCalls).toBe(0)
+
+    if (!resolveStatus) throw new Error('definition_status was not called')
+    await act(async () => {
+      resolveStatus!(FIXTURE_STATUS)
+    })
+
+    expect(verifyButton.disabled).toBe(false)
+    fireEvent.click(verifyButton)
+    await screen.findByLabelText('Verification')
+    expect(verifyCalls).toBe(1)
+  })
 })
