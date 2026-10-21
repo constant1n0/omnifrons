@@ -298,4 +298,138 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     await screen.findByText('/workspace')
     expect(screen.queryByRole('status')).toBeNull()
   })
+
+  it('drops a verify result that settles after a rescan has already replaced the report', async () => {
+    let statusCalls = 0
+    let resolveVerify: ((value: DefinitionVerify) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        statusCalls += 1
+        return statusCalls === 1 ? FIXTURE_STATUS : FIXTURE_STATUS_RESCANNED
+      }
+      if (cmd === 'definition_verify') {
+        return new Promise((resolve) => {
+          resolveVerify = resolve as (value: DefinitionVerify) => void
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    if (!resolveVerify) throw new Error('definition_verify was not called')
+
+    // The rescan's own `definition_status` call resolves while the verify
+    // above is still pending -- a verification belongs to the report it
+    // was run against, so this rescan invalidates it.
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+    await screen.findByText('/workspace-rescanned')
+
+    await act(async () => {
+      resolveVerify!(FIXTURE_VERIFY)
+    })
+
+    expect(screen.queryByLabelText('Verification')).toBeNull()
+    expect(screen.getByText('/workspace-rescanned')).toBeTruthy()
+  })
+
+  it('calls definition_status exactly once even when two "Rescan" clicks are dispatched before a re-render settles', async () => {
+    let calls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        calls += 1
+        // The 1st call is the mount scan (resolved right away so the
+        // button is enabled); later calls are left pending -- this test
+        // only cares how many are dispatched, never how they resolve.
+        if (calls === 1) return FIXTURE_STATUS
+        return new Promise<DefinitionStatus>(() => {})
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    const rescanButton = screen.getByRole('button', { name: 'Rescan' })
+    // Both clicks are dispatched inside one `act` call, so React never gets
+    // a chance to re-render between them -- mirrors the existing same-tick
+    // "Verify root" test above, this time proving `rescan`'s own ref guard
+    // (not just the `disabled` attribute) keeps it to a single dispatch.
+    act(() => {
+      fireEvent.click(rescanButton)
+      fireEvent.click(rescanButton)
+    })
+
+    expect(calls).toBe(2)
+  })
+
+  it('ignores an older scan that settles after a newer one, keeping only the newest report on screen', async () => {
+    let callIndex = 0
+    const rescanResolvers: Array<() => void> = []
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        callIndex += 1
+        const index = callIndex
+        if (index === 1) return { ...FIXTURE_STATUS, root: `/scan-${index}` }
+        return new Promise<DefinitionStatus>((resolve) => {
+          rescanResolvers.push(() => resolve({ ...FIXTURE_STATUS, root: `/scan-${index}` }))
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/scan-1')
+
+    const rescanButton = screen.getByRole('button', { name: 'Rescan' })
+    act(() => {
+      fireEvent.click(rescanButton)
+      fireEvent.click(rescanButton)
+    })
+
+    const newestIndex = callIndex
+    const [resolveFirstDispatched, resolveSecondDispatched] = rescanResolvers
+
+    // Settle requests one at a time, each fully flushed before the next,
+    // in reverse dispatch order: whichever request the reentrancy guard let
+    // through LAST (newest) settles FIRST, and the one dispatched FIRST
+    // (oldest) settles LAST -- exactly the ordering that would let a stale
+    // report overwrite a fresher one without a generation check.
+    if (resolveSecondDispatched) {
+      await act(async () => {
+        resolveSecondDispatched()
+      })
+    }
+    await act(async () => {
+      resolveFirstDispatched()
+    })
+
+    await screen.findByText(`/scan-${newestIndex}`)
+  })
+
+  it('disables "Verify root" while the initial scan is loading, re-enabling once it settles', async () => {
+    let resolveStatus: ((value: DefinitionStatus) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        return new Promise((resolve) => {
+          resolveStatus = resolve as (value: DefinitionStatus) => void
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+
+    const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+    expect(verifyButton.disabled).toBe(true)
+
+    if (!resolveStatus) throw new Error('definition_status was not called')
+    await act(async () => {
+      resolveStatus!(FIXTURE_STATUS)
+    })
+
+    expect(verifyButton.disabled).toBe(false)
+  })
 })

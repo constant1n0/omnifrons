@@ -156,6 +156,13 @@ interface DefinitionReportProps {
   error: DefinitionSectionError | null
   verify: DefinitionVerify | null
   verifyError: DefinitionSectionError | null
+  /**
+   * Disables "Verify root": true while a verify is already in flight, or
+   * while any scan is loading. A verification belongs to the report on
+   * screen, so it cannot be started against one that is still being
+   * fetched -- the container's `generationRef` is what drops a verify that
+   * was nonetheless already in flight when a scan supersedes it.
+   */
   verifyPending: boolean
   onRescan: () => void
   onVerify: () => void
@@ -259,6 +266,19 @@ export function DefinitionSection() {
   }, [])
 
   /**
+   * One shared request counter for every scan *and* verify below. Each
+   * dispatch bumps it and captures the post-bump value as its own
+   * "generation"; a settle handler that finds the ref has since moved on
+   * belongs to a request a later one has already superseded, so it skips
+   * every state update tied to the result -- not just the display. This is
+   * what makes a rescan invalidate a verify still in flight against the
+   * report it was run against (a verification belongs to that report,
+   * never a newer one), and what makes a scan whose settle handler runs
+   * late lose to one dispatched more recently, regardless of settle order.
+   */
+  const generationRef = useRef(0)
+
+  /**
    * Scans the active workspace. `surfaceError` mirrors `AgentPanel`'s own
    * `fetchGuidanceStatus`: the automatic mount-time scan below passes
    * `false` -- a rejection just leaves the report empty, no alert -- and
@@ -266,7 +286,9 @@ export function DefinitionSection() {
    * directly is always answered, even by a failure. Either way, a
    * rejection clears `status`: a rescan that fails never leaves the prior
    * report on screen beside the new error, symmetric with the quiet
-   * mount-time failure.
+   * mount-time failure. Returns the settled promise so `rescan` can tell
+   * when this particular dispatch is done, regardless of which generation
+   * wins.
    */
   // No synchronous `setState` here (react-hooks/set-state-in-effect):
   // `loading` starts `true` by its own initializer for the mount call
@@ -275,14 +297,15 @@ export function DefinitionSection() {
   // `refreshOutboxStatus`, which sets no state before its own fetch
   // settles either.
   const scan = useCallback((surfaceError: boolean) => {
-    definitionStatus().then(
+    const generation = ++generationRef.current
+    return definitionStatus().then(
       (result) => {
-        if (!mountedRef.current) return
+        if (!mountedRef.current || generationRef.current !== generation) return
         setStatus(result)
         setLoading(false)
       },
       (reason: unknown) => {
-        if (!mountedRef.current) return
+        if (!mountedRef.current || generationRef.current !== generation) return
         setLoading(false)
         setStatus(null)
         if (surfaceError) {
@@ -297,20 +320,39 @@ export function DefinitionSection() {
   }, [scan])
 
   /**
+   * Guards `rescan` against two clicks dispatched before React re-renders
+   * between them -- the same shape as `runVerify`'s own `verifyingRef`
+   * below, and for the same reason: `loading` (state) only reflects the
+   * last completed render, so two clicks fired in the same tick (no
+   * `await` between them) both see `loading === false` and both would
+   * call `scan`. A ref is read and written synchronously, so it is
+   * current for every call in the same tick, even back-to-back ones.
+   */
+  const scanningRef = useRef(false)
+
+  /**
    * The explicit "Rescan" click: unlike the mount call, this sets
    * `loading`/clears `error` itself -- an event handler, never an effect,
    * so the lint rule above does not apply here. A verification belongs
    * to the report it was run against, so a user-initiated rescan also
    * clears any prior `verify`/`verifyError` -- otherwise a stale
    * verification would sit beside a freshly scanned report it was never
-   * run against.
+   * run against. Bumping `generationRef` (inside `scan`) is what makes
+   * that true even for a verify that is still in flight: its settle
+   * handler finds the ref has moved on and skips `setVerify` entirely, so
+   * a verification result that arrives after this rescan never appears
+   * beside the newly scanned report, no matter when it settles.
    */
   const rescan = useCallback(() => {
+    if (scanningRef.current) return
+    scanningRef.current = true
     setLoading(true)
     setError(null)
     setVerify(null)
     setVerifyError(null)
-    scan(true)
+    scan(true).finally(() => {
+      scanningRef.current = false
+    })
   }, [scan])
 
   /**
@@ -334,11 +376,17 @@ export function DefinitionSection() {
    * disables the button below and drives the pending UI. Clearing
    * `verify` here -- not only in the rejection branch -- means a stale
    * result is never shown beside either a new success or a new error
-   * banner; only the latest outcome is ever on screen.
+   * banner; only the latest outcome is ever on screen. Capturing
+   * `generationRef`'s post-bump value means a result that settles after a
+   * rescan has already moved the ref on is dropped instead of displayed:
+   * `verifyingRef` and `verifying` are still cleared unconditionally (the
+   * request is no longer in flight either way), but `setVerify`/
+   * `setVerifyError` only run when this is still the latest generation.
    */
   const runVerify = useCallback(() => {
     if (verifyingRef.current) return
     verifyingRef.current = true
+    const generation = ++generationRef.current
     setVerifying(true)
     setVerify(null)
     setVerifyError(null)
@@ -347,12 +395,14 @@ export function DefinitionSection() {
         verifyingRef.current = false
         if (!mountedRef.current) return
         setVerifying(false)
+        if (generationRef.current !== generation) return
         setVerify(result)
       },
       (reason: unknown) => {
         verifyingRef.current = false
         if (!mountedRef.current) return
         setVerifying(false)
+        if (generationRef.current !== generation) return
         setVerify(null)
         setVerifyError(toSectionError(reason))
       },
@@ -366,7 +416,7 @@ export function DefinitionSection() {
       error={error}
       verify={verify}
       verifyError={verifyError}
-      verifyPending={verifying}
+      verifyPending={verifying || loading}
       onRescan={rescan}
       onVerify={runVerify}
     />
