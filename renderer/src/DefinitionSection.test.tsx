@@ -5,6 +5,7 @@
 // wrapper functions against a mocked `invoke`.
 
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -480,5 +481,142 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     fireEvent.click(verifyButton)
     await screen.findByLabelText('Verification')
     expect(verifyCalls).toBe(1)
+  })
+
+  // React StrictMode (development only; `main.tsx` renders the real app
+  // under it) replays a mount effect: setup, cleanup, setup again, before
+  // either dispatched `definition_status` call can settle. Both
+  // dispatches share this one instance's `generationRef`/`scanningRef`,
+  // so the fix has to hold regardless of which of the two settles first.
+  it(
+    'keeps "Verify root" refused and shows no report while a StrictMode-replayed scan is still pending, ' +
+      'recovering once both dispatches have settled (first-dispatched settles first)',
+    async () => {
+      const resolvers: Array<(value: DefinitionStatus) => void> = []
+      let verifyCalls = 0
+      mockIPC((cmd) => {
+        if (cmd === 'definition_status') {
+          return new Promise<DefinitionStatus>((resolve) => {
+            resolvers.push(resolve)
+          })
+        }
+        if (cmd === 'definition_verify') {
+          verifyCalls += 1
+          return FIXTURE_VERIFY
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      render(
+        <StrictMode>
+          <DefinitionSection />
+        </StrictMode>,
+      )
+
+      await waitFor(() => {
+        expect(resolvers.length).toBe(2)
+      })
+
+      // The first of the two replayed dispatches settles first. Before
+      // the fix, its own unconditional `setLoading(false)` and
+      // `scanningRef` clear made "Verify root" usable here, even though
+      // the second (authoritative) scan was still pending.
+      await act(async () => {
+        resolvers[0](FIXTURE_STATUS)
+      })
+
+      const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+      expect(verifyButton.disabled).toBe(true)
+      fireEvent.click(verifyButton)
+      expect(verifyCalls).toBe(0)
+      expect(screen.queryByText('/workspace')).toBeNull()
+
+      // The second (superseding) dispatch now settles -- this is the one
+      // that must win, and nothing should have discarded it.
+      await act(async () => {
+        resolvers[1](FIXTURE_STATUS)
+      })
+
+      await screen.findByText('/workspace')
+      expect(verifyButton.disabled).toBe(false)
+      expect((screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement).disabled).toBe(false)
+
+      fireEvent.click(verifyButton)
+      await screen.findByLabelText('Verification')
+      expect(verifyCalls).toBe(1)
+      expect(screen.getByText('/workspace')).toBeTruthy()
+    },
+  )
+
+  it(
+    'renders the report once a StrictMode-replayed scan\'s second dispatch settles first, dropping the stale ' +
+      'first dispatch once it later settles too',
+    async () => {
+      const resolvers: Array<(value: DefinitionStatus) => void> = []
+      let verifyCalls = 0
+      mockIPC((cmd) => {
+        if (cmd === 'definition_status') {
+          return new Promise<DefinitionStatus>((resolve) => {
+            resolvers.push(resolve)
+          })
+        }
+        if (cmd === 'definition_verify') {
+          verifyCalls += 1
+          return FIXTURE_VERIFY
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      render(
+        <StrictMode>
+          <DefinitionSection />
+        </StrictMode>,
+      )
+
+      await waitFor(() => {
+        expect(resolvers.length).toBe(2)
+      })
+
+      // The second dispatch -- the one that actually wins -- settles
+      // first this time.
+      await act(async () => {
+        resolvers[1](FIXTURE_STATUS)
+      })
+
+      await screen.findByText('/workspace')
+      const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+      expect(verifyButton.disabled).toBe(false)
+
+      fireEvent.click(verifyButton)
+      await screen.findByLabelText('Verification')
+      expect(verifyCalls).toBe(1)
+
+      // The stale first dispatch settles last -- it must change nothing:
+      // not the report just rendered, and not the verification just
+      // shown beside it.
+      await act(async () => {
+        resolvers[0](FIXTURE_STATUS)
+      })
+
+      expect(screen.getByText('/workspace')).toBeTruthy()
+      expect(screen.getByLabelText('Verification')).toBeTruthy()
+      expect((screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement).disabled).toBe(false)
+    },
+  )
+
+  it('issues exactly one definition_status call on a plain (non-StrictMode) mount', async () => {
+    let calls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        calls += 1
+        return FIXTURE_STATUS
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    expect(calls).toBe(1)
   })
 })

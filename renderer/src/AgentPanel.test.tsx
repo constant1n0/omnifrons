@@ -565,6 +565,95 @@ describe('AgentPanel', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
+  // ADR-0005 sub-slice 1i follow-up: `DefinitionSection` owns its own
+  // state and is mounted with no prop, so without a mechanism tying it to
+  // the active workspace it never learns a pick happened. These two tests
+  // use a raw `mockIPC` (not `defaultHandlers`) because they need
+  // `definition_status` to answer differently across calls, and
+  // `defaultHandlers` answers that command itself before an `onCommand`
+  // override ever sees it.
+  it("rescans the agent-definition section against the new workspace after a pick", async () => {
+    let definitionCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/project-b', workArea: 'valid' }
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'recovery_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
+      if (cmd === 'definition_status') {
+        definitionCalls += 1
+        // The 1st call is the quiet mount-time scan, made before any
+        // workspace exists -- it fails the same way `outbox_status` does
+        // with none picked yet.
+        if (definitionCalls === 1) return Promise.reject(OUTBOX_NO_WORKSPACE)
+        return { schema: 'omnifrons.definition-scan/1', root: '/workspace-b', ancestors: [], agents: [] }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+
+    await screen.findByText('/workspace-b')
+    expect(definitionCalls).toBe(2)
+  })
+
+  it("replaces the agent-definition section's report, and drops a shown verification, when switching workspaces", async () => {
+    let definitionCalls = 0
+    let pickCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'workspace_current') return null
+      if (cmd === 'workspace_pick') {
+        pickCalls += 1
+        return pickCalls === 1
+          ? { displayPath: '/home/user/project-a', workArea: 'valid' }
+          : { displayPath: '/home/user/project-b', workArea: 'valid' }
+      }
+      if (cmd === 'outbox_status') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'publications_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'recovery_list') return Promise.reject(OUTBOX_NO_WORKSPACE)
+      if (cmd === 'adapters_list') return [SAMPLE_ADAPTER, PTY_ADAPTER]
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
+      if (cmd === 'definition_verify') {
+        return {
+          schema: 'omnifrons.definition-verify/1',
+          agent: '/workspace-a',
+          state: 'none',
+          canonical: false,
+          problems: [],
+        }
+      }
+      if (cmd === 'definition_status') {
+        definitionCalls += 1
+        if (definitionCalls === 1) return Promise.reject(OUTBOX_NO_WORKSPACE)
+        return {
+          schema: 'omnifrons.definition-scan/1',
+          root: definitionCalls === 2 ? '/workspace-a' : '/workspace-b',
+          ancestors: [],
+          agents: [],
+        }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<AgentPanel />)
+    const pick = screen.getByRole('button', { name: 'Pick workspace' })
+
+    fireEvent.click(pick)
+    await screen.findByText('/workspace-a')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    await screen.findByLabelText('Verification')
+
+    fireEvent.click(pick)
+    await screen.findByText('/workspace-b')
+
+    expect(screen.queryByText('/workspace-a')).toBeNull()
+    expect(screen.queryByLabelText('Verification')).toBeNull()
+  })
+
   it('shows a quiet status, without an alert, when the workspace pick is canceled', async () => {
     mockIPC(
       defaultHandlers((cmd) => {

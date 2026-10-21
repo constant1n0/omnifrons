@@ -307,19 +307,41 @@ export function DefinitionSection() {
    * directly is always answered, even by a failure. Either way, a
    * rejection clears `status`: a rescan that fails never leaves the prior
    * report on screen beside the new error, symmetric with the quiet
-   * mount-time failure. Returns the settled promise so the caller can
-   * tell when this particular dispatch is done, regardless of which
-   * generation wins.
+   * mount-time failure.
    *
-   * `setLoading(false)` runs unconditionally, before the generation
-   * check: `loading` is this scan's own pending flag, not a result, and
-   * this is the only code that ever clears it, so it must run even when a
-   * later verify has since bumped `generationRef` past this scan's own
-   * value. Skipping it on a superseded generation is the bug this guards
-   * against -- it left `loading` stuck `true` forever, with "Rescan" and
-   * "Verify root" disabled until remount. `setStatus`/`setError` stay
-   * gated on the generation check below it: they carry this scan's
-   * *result*, which a newer generation has already made stale.
+   * `setLoading(false)` and `scanningRef.current = false` both wait on
+   * the same generation check as `setStatus`/`setError` below: only the
+   * settle whose captured `generation` still matches `generationRef.current`
+   * clears anything at all. A scan that has already been superseded --
+   * by React StrictMode's development-only effect replay dispatching a
+   * second mount-time scan (see the mount effect below), or by a later
+   * "Rescan" -- does nothing when it settles, pending flags included.
+   *
+   * Gating `loading`'s own clearing like this used to be exactly the bug:
+   * an in-flight "Verify root" could bump `generationRef` past a *scan*
+   * that was still genuinely pending, so the scan's own settle would find
+   * itself superseded and leave `loading` stuck `true` forever, with
+   * "Rescan" and "Verify root" disabled until remount. It is safe again
+   * now because `scanningRef` -- set the moment a scan dispatches, in
+   * both callers below -- stays `true` for the *entire* window any
+   * relevant scan is in flight, not just until the first of two racing
+   * dispatches happens to settle, precisely because its own clearing now
+   * waits on this same check instead of running from an unconditional
+   * `.finally`. `runVerify` already refuses synchronously while
+   * `scanningRef.current` is set, so no verify can ever supersede a scan
+   * that is genuinely still pending; the only thing that can ever move
+   * `generationRef` past a pending scan's own value is another scan, and
+   * that scan clears these same two flags when *it* settles. No scan, in
+   * flight or superseded, is ever left with nothing left to clear them.
+   *
+   * `verifyingRef`/`verifying` are deliberately not given this same
+   * treatment in `runVerify` below: a "Rescan" can still supersede a
+   * verify that is genuinely in flight (see `rescan`'s own doc comment),
+   * and nothing clears a superseded verify's *own* pending flags on its
+   * behalf the way a winning scan clears a superseded scan's -- gating
+   * them there would leave "Verify root" refused forever instead.
+   * `setVerify`/`setVerifyError` keep their pre-existing generation gate:
+   * only the *result* a superseded verify carries is ever dropped.
    */
   // No synchronous `setState` here (react-hooks/set-state-in-effect):
   // `loading` starts `true` by its own initializer for the mount call
@@ -332,14 +354,16 @@ export function DefinitionSection() {
     return definitionStatus().then(
       (result) => {
         if (!mountedRef.current) return
-        setLoading(false)
         if (generationRef.current !== generation) return
+        setLoading(false)
+        scanningRef.current = false
         setStatus(result)
       },
       (reason: unknown) => {
         if (!mountedRef.current) return
-        setLoading(false)
         if (generationRef.current !== generation) return
+        setLoading(false)
+        scanningRef.current = false
         setStatus(null)
         if (surfaceError) {
           setError(toSectionError(reason))
@@ -355,16 +379,42 @@ export function DefinitionSection() {
    * same way it would during a later rescan. In practice "Verify root" is
    * already disabled for this entire window regardless (`verifyPending`
    * includes `loading`, which starts `true` from this component's own
-   * state initializer, not from this effect), so this is belt and
-   * suspenders: it costs nothing and keeps `scanningRef`'s own invariant
-   * -- true whenever a scan is in flight -- true regardless of how that
-   * scan was triggered, rather than true only for `rescan`.
+   * state initializer, not from this effect), so setting it here too is
+   * belt and suspenders for that part: it costs nothing and keeps
+   * `scanningRef`'s own invariant -- true whenever a scan is in flight --
+   * true regardless of how that scan was triggered, rather than true only
+   * for `rescan`.
+   *
+   * The cleanup below is not belt and suspenders: it is what keeps this
+   * effect correct under React StrictMode's development-only behavior of
+   * running a mount effect, its cleanup, and the same mount effect again
+   * -- precisely to surface the kind of missing-cleanup bug this one used
+   * to have. Both replayed invocations call this same `scan`, so both
+   * dispatches share this one instance's `generationRef`/`scanningRef`.
+   * Bumping `generationRef` here, the instant React tears the first
+   * invocation down, guarantees the second invocation's own call to
+   * `scan` captures a strictly higher generation -- so the first scan's
+   * eventual settle always finds itself superseded and does nothing (see
+   * `scan`'s own doc comment above for exactly what that means now).
+   * Resetting `scanningRef` to `false` here is not load-bearing by
+   * itself -- the second invocation's own setup sets it `true` again
+   * immediately after, in the same synchronous replay -- but it keeps the
+   * ref an honest reflection of "this effect's own scan is in flight" at
+   * every point in between, the same discipline `rescan` below follows.
+   *
+   * Outside StrictMode's development-only replay, this cleanup only ever
+   * runs once, on a genuine unmount, after `mountedRef`'s own cleanup
+   * (above) has already turned off every further state update from this
+   * instance -- bumping a `generationRef` nothing will read again is
+   * harmless.
    */
   useEffect(() => {
     scanningRef.current = true
-    scan(false).finally(() => {
+    scan(false)
+    return () => {
+      generationRef.current += 1
       scanningRef.current = false
-    })
+    }
   }, [scan])
 
   /**
@@ -379,6 +429,13 @@ export function DefinitionSection() {
    * handler finds the ref has moved on and skips `setVerify` entirely, so
    * a verification result that arrives after this rescan never appears
    * beside the newly scanned report, no matter when it settles.
+   *
+   * `scan` now clears `scanningRef` itself, once its own settle's
+   * generation is still current (see `scan`'s own doc comment above), so
+   * this click no longer chains a `.finally` to do it. The guard `if
+   * (scanningRef.current) return` above is what keeps this function from
+   * ever dispatching a second scan while this one, or the mount scan, is
+   * still in flight.
    */
   const rescan = useCallback(() => {
     if (scanningRef.current) return
@@ -387,9 +444,7 @@ export function DefinitionSection() {
     setError(null)
     setVerify(null)
     setVerifyError(null)
-    scan(true).finally(() => {
-      scanningRef.current = false
-    })
+    scan(true)
   }, [scan])
 
   /**

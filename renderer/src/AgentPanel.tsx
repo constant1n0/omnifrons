@@ -2199,6 +2199,22 @@ export function AgentPanel() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null)
   const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null)
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false)
+  /**
+   * ADR-0005 sub-slice 1i follow-up: remounts `DefinitionSection` (as its
+   * own `key`, below) on every successful "Pick workspace," so its
+   * internal state and its mount-time quiet scan are always fresh for
+   * the workspace just picked. Bumped only in `handlePickWorkspace`'s own
+   * success path, deliberately *not* wherever `workspace` itself changes
+   * -- the mount-time `workspaceCurrent()` effect below also calls
+   * `setWorkspace`, to display an already-active workspace from a
+   * previous session, and that is not a pick: the backend's active
+   * workspace does not depend on this component's own state catching up
+   * to it, so `DefinitionSection`'s first, `workspace`-independent mount
+   * already scans the right thing in that case. Keying on `workspace`'s
+   * own identity directly would remount a second time regardless, for a
+   * scan that could only ever repeat the first one's result.
+   */
+  const [definitionGeneration, setDefinitionGeneration] = useState(0)
 
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([])
   const [adapterId, setAdapterId] = useState<string | null>(null)
@@ -3219,6 +3235,11 @@ export function AgentPanel() {
       const picked = await workspacePick()
       if (!mountedRef.current) return
       setWorkspace(picked)
+      // The agent-definition section is the project's too, and it owns
+      // every bit of its own state internally with no prop this panel
+      // could reset -- so, unlike every refresh below, this one works by
+      // remounting it fresh instead (its own `key`, where it is mounted).
+      setDefinitionGeneration((generation) => generation + 1)
       // The outbox is declared per project: a new workspace means a new
       // status, fetched afresh rather than carried over -- and the Catalog
       // is the project's too, so its publications are fetched afresh.
@@ -4963,8 +4984,23 @@ export function AgentPanel() {
         )}
       </section>
 
-      {/* ADR-0005 sub-slice 1i: the agent-definition scan and verify, a sibling of Guidance. */}
-      <DefinitionSection />
+      {/*
+        ADR-0005 sub-slice 1i: the agent-definition scan and verify, a
+        sibling of Guidance. Unlike Guidance's own state (reset here and
+        refetched through `refreshGuidance` after a pick -- see
+        `handlePickWorkspace` above), `DefinitionSection` owns every bit
+        of its own loading/error/data state internally and exposes no
+        prop this panel could use to reset it. Keying it on
+        `definitionGeneration` (bumped only on a successful pick, see
+        where that state is declared above) makes a pick, or a switch
+        from one workspace to another, replace it with a brand new
+        instance instead of leaving the previous one's report on screen:
+        React unmounts the old instance (its own `mountedRef` cleanup
+        stops any still-in-flight scan or verify from touching state
+        nobody can see anymore) and mounts a fresh one, whose own mount
+        effect runs a quiet scan against the newly active workspace.
+      */}
+      <DefinitionSection key={definitionGeneration} />
 
       {/*
         Wrong roots (slice 5d; HAP-001-R32, R33, R34, D16): a sibling of the
