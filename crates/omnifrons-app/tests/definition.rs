@@ -1971,6 +1971,67 @@ fn verify_reports_canonical_for_a_block_this_crate_already_generated() {
     assert_eq!(report.problems, Vec::<String>::new());
 }
 
+/// A nested canonical target whose own skills block is current: its
+/// rows are relative to the target (`skills/own/SKILL.md`), and `verify`
+/// re-roots the discovered `child/skills/own/SKILL.md` to match them.
+/// Leaving the `child/` prefix on the discovered path, or computing the
+/// absolute root from `.` instead of the target, would make
+/// `read_skill_index` report the skill both missing and dangling.
+#[test]
+fn verify_reports_canonical_for_a_nested_target_with_a_current_skills_block() {
+    let project = TempDir::new("verify-nested-skills-block");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let row = SkillRow {
+        name: "own".to_string(),
+        description: "The child's own skill".to_string(),
+        path: "skills/own/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let child_bytes =
+        format!("# Child\n\nYou are Child, a nested fixture agent.\n\n{rendered}\n").into_bytes();
+    let root_bytes = b"# Root\n\nYou are Root, a fixture agent.\n";
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Agents, root_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![
+                identity(IdentityKind::Agents, &child_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "child/skills/own/SKILL.md",
+            b"---\nname: own\ndescription: The child's own skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace, "child").expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
 /// (i) The same block, but a second skill was discovered since it was
 /// generated: `verify` reports exactly one `pending: regenerate ...`,
 /// naming both rows and the precedence rule -- never the `append`

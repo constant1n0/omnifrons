@@ -98,23 +98,28 @@ fn not_a_workspace_directory() -> ShellError {
 }
 
 /// Refuses a verify `target` that is not a clean relative path naming an
-/// existing, non-symlink directory under `workspace` (the prototype's
-/// own `require_directory`, which refuses a symlink or a non-directory
-/// as a usage error). The path syntax is checked first, with the same
-/// domain rules the application service applies, so the service's own
-/// target error is unreachable from the command.
+/// existing directory under `workspace` with no symlink in any
+/// component (the prototype's own `require_directory`, which refuses a
+/// symlink or a non-directory as a usage error). Each prefix of the
+/// target is checked in turn, so a symlinked intermediate component is
+/// refused just like a symlinked final one. The path syntax is checked
+/// first, with the same domain rules the application service applies,
+/// so the service's own target error is unreachable from the command.
 fn require_workspace_directory(workspace: &WorkspaceRoot, target: &str) -> Result<(), ShellError> {
     nesting::relate(&[target], &[]).map_err(|_| not_a_workspace_directory())?;
     if target == "." {
         return Ok(());
     }
-    let metadata = std::fs::symlink_metadata(workspace.path().join(target))
-        .map_err(|_| not_a_workspace_directory())?;
-    if metadata.is_dir() {
-        Ok(())
-    } else {
-        Err(not_a_workspace_directory())
+    let mut prefix = workspace.path().to_path_buf();
+    for component in target.split('/') {
+        prefix.push(component);
+        let metadata =
+            std::fs::symlink_metadata(&prefix).map_err(|_| not_a_workspace_directory())?;
+        if !metadata.is_dir() {
+            return Err(not_a_workspace_directory());
+        }
     }
+    Ok(())
 }
 
 /// A verification of one agent directory's canonical definition: its
@@ -469,6 +474,36 @@ mod tests {
         let workspace = project.workspace();
 
         assert_invalid_request(definition_verify_for(&workspace, Some("link")));
+    }
+
+    /// A symlinked intermediate component is refused too, even when the
+    /// final component is a real directory outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn definition_verify_for_refuses_a_symlinked_intermediate_component() {
+        let project = TempDir::new("verify-symlink-mid");
+        let outside = TempDir::new("verify-symlink-mid-outside");
+        write(outside.path(), "sub/AGENTS.md", AGENT_BODY);
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        std::os::unix::fs::symlink(outside.path(), project.path().join("link"))
+            .expect("create the symlink");
+        let workspace = project.workspace();
+
+        assert_invalid_request(definition_verify_for(&workspace, Some("link/sub")));
+    }
+
+    /// A plain nested directory several levels deep still verifies.
+    #[test]
+    fn definition_verify_for_verifies_a_deeply_nested_agent() {
+        let project = TempDir::new("verify-deep");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        write(project.path(), "a/b/AGENTS.md", AGENT_BODY);
+        write(project.path(), "a/b/CLAUDE.md", b"@AGENTS.md\n");
+        let workspace = project.workspace();
+
+        let verify = definition_verify_for(&workspace, Some("a/b")).expect("verify succeeds");
+
+        assert!(verify.canonical, "{:?}", verify.problems);
     }
 
     /// An unclean or escaping target is refused before it touches the
