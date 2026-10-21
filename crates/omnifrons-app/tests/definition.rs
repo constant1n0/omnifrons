@@ -24,7 +24,7 @@ use omnifrons_app::definition_tree::{
 };
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, RootState, WRAPPER};
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock};
-use omnifrons_domain::nesting::{Ancestor, Parent};
+use omnifrons_domain::nesting::{Ancestor, NestingError, Parent};
 use omnifrons_domain::skills_index::{PRECEDENCE_RULE, SkillRow, render_body};
 use omnifrons_domain::warnings::WarningCode;
 
@@ -1580,7 +1580,7 @@ fn verify_reports_canonical_with_no_problems() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(report.canonical, "{:?}", report.problems);
@@ -1613,7 +1613,7 @@ fn verify_reports_host_extras_state_with_no_problems() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::HostExtras);
     assert!(report.canonical, "{:?}", report.problems);
@@ -1644,7 +1644,7 @@ fn verify_reports_agents_only_state_and_pending_wrapper_write() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::AgentsOnly);
     assert!(!report.canonical);
@@ -1689,7 +1689,7 @@ fn verify_reports_pending_skills_block_for_an_unindexed_discovered_skill() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -1737,7 +1737,7 @@ fn verify_refuses_a_skill_whose_description_holds_an_unsafe_at_token() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -1795,7 +1795,7 @@ description: "x\ud800y"
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -1850,7 +1850,7 @@ fn verify_refuses_a_hand_edited_skills_block() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -1894,7 +1894,7 @@ fn verify_reports_conflict_state_and_refusal() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Conflict);
     assert!(!report.canonical);
@@ -1964,7 +1964,7 @@ fn verify_reports_canonical_for_a_block_this_crate_already_generated() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(report.canonical, "{:?}", report.problems);
@@ -2022,7 +2022,7 @@ fn verify_reports_one_regenerate_pending_when_a_skill_was_added_since() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2091,7 +2091,7 @@ fn verify_reports_nothing_pending_for_a_stale_block_the_prefix_already_covers() 
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(report.canonical, "{:?}", report.problems);
@@ -2149,7 +2149,7 @@ fn verify_reports_only_migrate_for_a_legacy_block_with_an_unlinked_skill() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2204,7 +2204,7 @@ fn verify_refuses_a_malformed_skills_block_sentinel_pair() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2262,7 +2262,7 @@ description: "x\ud800y\ud801z"
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2335,7 +2335,7 @@ fn verify_reports_migrate_for_a_legacy_block_whose_rows_are_current() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2391,7 +2391,7 @@ fn verify_refuses_a_legacy_block_whose_body_no_longer_matches_its_digest() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2444,7 +2444,7 @@ fn verify_refuses_an_unpaired_legacy_begin_marker() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2490,7 +2490,7 @@ fn verify_reports_near_wrapper_state_and_replaces_sha256_of_claude() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     let wrapper_pending = format!(
         "pending: write the wrapper CLAUDE.md (replaces sha256 {})",
@@ -2527,7 +2527,7 @@ fn verify_reports_unsafe_state_and_refusal_for_a_stray_claude_symlink() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Unsafe);
     assert!(!report.canonical);
@@ -2556,7 +2556,7 @@ fn verify_reports_none_state_with_only_the_state_problem() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::None);
     assert!(!report.canonical);
@@ -2591,7 +2591,7 @@ fn verify_reports_none_state_for_an_extras_only_target() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::None);
     assert!(!report.canonical, "{:?}", report.problems);
@@ -2646,7 +2646,8 @@ fn mixed_duplicate_of_the_scan_root_path_is_refused_by_verify() {
         hasher: &hasher,
     };
 
-    let error = verify(&ports, &workspace).expect_err("a mixed duplicate root path is refused");
+    let error =
+        verify(&ports, &workspace, ".").expect_err("a mixed duplicate root path is refused");
 
     assert!(matches!(
         &error,
@@ -2695,7 +2696,7 @@ fn ancestor_duplicate_from_the_port_is_refused_by_verify() {
         hasher: &hasher,
     };
 
-    let error = verify(&ports, &workspace).expect_err("a duplicate ancestor path is refused");
+    let error = verify(&ports, &workspace, ".").expect_err("a duplicate ancestor path is refused");
 
     assert!(matches!(
         &error,
@@ -2735,7 +2736,7 @@ fn verify_reads_claude_md_as_the_source_for_claude_only_state() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::ClaudeOnly);
     assert!(!report.canonical);
@@ -2783,7 +2784,7 @@ fn verify_reads_agents_md_as_the_source_for_identical_copies_state() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::IdenticalCopies);
     assert!(!report.canonical);
@@ -2828,7 +2829,7 @@ fn verify_reports_the_wrapper_write_before_the_skills_block_pending() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::AgentsOnly);
     assert!(!report.canonical);
@@ -2890,7 +2891,7 @@ fn verify_refuses_a_fenced_legacy_begin_marker_with_no_end() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -2945,7 +2946,7 @@ fn verify_treats_a_prose_legacy_marker_mention_as_content() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3010,7 +3011,7 @@ fn verify_refuses_a_legacy_begin_marker_after_an_unclosed_fence_with_no_quoted_e
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3079,7 +3080,7 @@ fn verify_refuses_a_legacy_block_with_a_closed_fence_quoting_both_markers_before
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3159,7 +3160,7 @@ fn verify_reports_migrate_for_a_legacy_block_beside_an_intact_omnifrons_block() 
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3232,7 +3233,7 @@ fn verify_reports_migrate_for_a_legacy_block_whose_body_holds_a_non_utf8_byte() 
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3289,7 +3290,7 @@ fn verify_refuses_a_legacy_block_whose_non_utf8_body_was_altered_by_one_byte() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3355,7 +3356,7 @@ fn verify_reports_migrate_for_a_legacy_block_in_a_cr_only_file() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3410,7 +3411,7 @@ fn verify_reports_migrate_for_a_legacy_block_in_a_crlf_file() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3466,7 +3467,7 @@ fn verify_refuses_a_legacy_block_with_a_second_begin_marker() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3519,7 +3520,7 @@ fn verify_refuses_a_legacy_block_with_text_after_the_end_marker() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3576,7 +3577,7 @@ fn verify_refuses_a_legacy_block_with_trailing_text_and_a_mismatched_digest() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3650,7 +3651,7 @@ fn verify_refuses_a_legacy_block_placed_before_an_intact_omnifrons_block() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3718,7 +3719,7 @@ fn verify_refuses_an_edited_omnifrons_block_even_beside_an_intact_legacy_pair() 
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3784,7 +3785,7 @@ fn verify_refuses_a_broken_legacy_block_beside_an_intact_omnifrons_block() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3843,7 +3844,7 @@ fn verify_prefers_the_earlier_refusal_in_file_order_when_both_block_families_ref
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3908,7 +3909,7 @@ fn verify_ignores_a_fenced_legacy_marker_example_when_choosing_the_earlier_refus
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -3969,7 +3970,7 @@ fn verify_prefers_the_earlier_refusal_in_file_order_when_the_legacy_marker_comes
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4049,7 +4050,7 @@ fn verify_prefers_the_omnifrons_refusal_when_a_prose_continued_begin_precedes_a_
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4126,7 +4127,7 @@ fn verify_treats_an_indented_omnifrons_sentinel_mention_as_content() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4197,7 +4198,7 @@ fn verify_counts_a_fenced_omnifrons_sentinel_example_when_choosing_the_earlier_r
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4255,7 +4256,7 @@ fn verify_prefers_the_omnifrons_refusal_when_its_end_sentinel_precedes_a_malform
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4307,7 +4308,7 @@ fn verify_prefers_the_legacy_refusal_when_its_begin_precedes_an_omnifrons_end_se
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4371,7 +4372,7 @@ fn verify_prefers_the_omnifrons_refusal_when_a_malformed_begin_precedes_a_legacy
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4438,7 +4439,7 @@ fn verify_prefers_the_omnifrons_refusal_when_a_non_hex_digest_begin_precedes_a_l
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4506,7 +4507,7 @@ fn verify_prefers_the_omnifrons_refusal_when_a_truncated_begin_line_precedes_a_l
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4574,7 +4575,7 @@ fn verify_prefers_the_omnifrons_refusal_when_a_stray_end_precedes_a_legacy_marke
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4641,7 +4642,7 @@ fn verify_prefers_the_legacy_refusal_over_a_phantom_omnifrons_marker_from_a_lone
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4697,7 +4698,7 @@ fn verify_prefers_the_omnifrons_refusal_when_a_crlf_end_sentinel_precedes_a_lega
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(!report.canonical);
@@ -4754,7 +4755,7 @@ fn verify_excludes_a_nested_agents_own_skill_from_the_root_report() {
         hasher: &hasher,
     };
 
-    let report = verify(&ports, &workspace).expect("verify succeeds");
+    let report = verify(&ports, &workspace, ".").expect("verify succeeds");
 
     assert_eq!(report.state, RootState::Canonical);
     assert!(
@@ -4770,4 +4771,182 @@ fn verify_excludes_a_nested_agents_own_skill_from_the_root_report() {
         "no problem must name the nested agent's own skill, got {:?}",
         report.problems
     );
+}
+
+// -- verify: an explicit target directory --
+
+/// The snapshot the target tests share: a root that is only partly
+/// defined (an `AGENTS.md` with no wrapper), a canonical nested agent
+/// `child` that owns the skill `child/skills/x/SKILL.md`, a host-extras-only
+/// directory `extras`, and a root-owned skill `skills/y/SKILL.md`.
+fn target_snapshot() -> omnifrons_app::definition_tree::TreeSnapshot {
+    TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(
+                IdentityKind::Agents,
+                b"# Root\n\nYou are Root.\n\n[y](skills/y/SKILL.md)\n",
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![
+                identity(IdentityKind::Agents, b"# Child\n\nYou are Child.\n"),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "extras",
+            Vec::new(),
+            vec!["CLAUDE.local.md".to_string()],
+            Vec::new(),
+        )
+        .skill("child/skills/x/SKILL.md", b"---\nname: x\n---\n".to_vec())
+        .skill("skills/y/SKILL.md", b"---\nname: y\n---\n".to_vec())
+        .build()
+}
+
+/// A nested canonical agent verifies on its own: its state is its own, not
+/// the scan root's.
+#[test]
+fn verify_of_a_nested_target_reports_its_own_state() {
+    let project = TempDir::new("verify-target-own-state");
+    let workspace = project.workspace();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![
+                identity(IdentityKind::Agents, b"# Child\n\nYou are Child.\n"),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let nested = verify(&ports, &workspace, "child").expect("verify succeeds");
+    let root = verify(&ports, &workspace, ".").expect("verify succeeds");
+
+    assert_eq!(nested.state, RootState::Canonical);
+    assert!(nested.canonical, "{:?}", nested.problems);
+    assert_eq!(nested.problems, Vec::<String>::new());
+    assert_ne!(root.state, RootState::Canonical);
+}
+
+/// A nested target's skills are the ones its own directory owns (the
+/// nearest root is the target), and the scan root's skills are never
+/// attributed to it.
+#[test]
+fn verify_of_a_nested_target_uses_the_nearest_root_for_skill_ownership() {
+    let project = TempDir::new("verify-target-skill-ownership");
+    let workspace = project.workspace();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, target_snapshot());
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let nested = verify(&ports, &workspace, "child").expect("verify succeeds");
+
+    assert_eq!(nested.state, RootState::Canonical);
+    // One row only: the target's own skill. The scan root's skill is
+    // owned by the scan root and never counted here.
+    assert_eq!(
+        nested.problems,
+        vec![
+            "pending: append the skill index block in AGENTS.md (1 skill rows and the \
+             precedence rule)"
+                .to_string()
+        ]
+    );
+}
+
+/// A target that is absent from the snapshot reports `state is none`,
+/// exactly like an empty root.
+#[test]
+fn verify_of_an_absent_target_reports_state_none() {
+    let project = TempDir::new("verify-target-absent");
+    let workspace = project.workspace();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, target_snapshot());
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace, "missing/dir").expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::None);
+    assert!(!report.canonical);
+    assert_eq!(report.problems, vec!["state is none".to_string()]);
+}
+
+/// A target holding only host extras has no identity file, so it reports
+/// `state is none` too.
+#[test]
+fn verify_of_an_extras_only_target_reports_state_none() {
+    let project = TempDir::new("verify-target-extras-only");
+    let workspace = project.workspace();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, target_snapshot());
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace, "extras").expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::None);
+    assert!(!report.canonical);
+    assert_eq!(report.problems, vec!["state is none".to_string()]);
+}
+
+/// A target that is not a clean relative POSIX path is refused with the
+/// domain's own nesting error before any snapshot lookup.
+#[test]
+fn verify_of_an_invalid_target_is_a_nesting_error() {
+    let project = TempDir::new("verify-target-invalid");
+    let workspace = project.workspace();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, target_snapshot());
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    for target in ["../x", "/abs", "a//b", "./a", "a/", "", "a/./b"] {
+        let error = verify(&ports, &workspace, target).expect_err("an unclean target is refused");
+        assert!(
+            matches!(
+                error,
+                DefinitionError::Nesting(
+                    NestingError::ParentComponent(_)
+                        | NestingError::AbsolutePath(_)
+                        | NestingError::DoubledSlash(_)
+                        | NestingError::DotSlashPrefix(_)
+                        | NestingError::TrailingSlash(_)
+                        | NestingError::EmptyPath
+                        | NestingError::DotComponent(_)
+                )
+            ),
+            "{target:?} must be a nesting error, got {error:?}"
+        );
+    }
 }

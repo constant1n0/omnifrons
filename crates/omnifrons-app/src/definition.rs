@@ -746,16 +746,21 @@ pub fn scan(
     })
 }
 
-/// Verifies the scan root's own canonical definition through `ports`
+/// Verifies one agent directory's canonical definition through `ports`
 /// (ADR-0005 sub-slice 1e-D; the prototype's own `verify_agent`, called
 /// with `PlanOptions(nested=True)` -- so the prototype's own
 /// `nested_agent` refusal never fires inside it, and this port never
 /// computes it either). Composed from the same snapshot [`scan`] uses,
 /// sharing its classification helpers ([`classify`] and this module's
-/// own private `canonical_bytes`) rather than re-deriving them: the
-/// verified agent is always the scan root `"."`, and a nested agent
-/// elsewhere in the snapshot is never a problem of its own, exactly as
-/// `PlanOptions(nested=True)` says.
+/// own private `canonical_bytes`) rather than re-deriving them.
+///
+/// `target` names the verified agent: a clean, scan-root-relative POSIX
+/// path, spelled `"."` for the scan root itself. A target that is absent
+/// from the snapshot, or that holds only host extras, has no identity
+/// file and reports `state is none`, exactly as an empty scan root does;
+/// a nested agent elsewhere in the snapshot is never a problem of its
+/// own, and a skill belongs to the target only when the target is its
+/// nearest agent root, exactly as `PlanOptions(nested=True)` says.
 ///
 /// Mirrors `verify_agent`'s own three problem categories, in the
 /// prototype's own order: the root's [`RootState`]
@@ -806,15 +811,21 @@ pub fn scan(
 ///
 /// # Errors
 ///
-/// Returns [`DefinitionError::Tree`] when the [`DefinitionTree`] port
-/// could not produce a snapshot, [`DefinitionError::DuplicateSnapshotPath`]
-/// when the snapshot repeats a directory or ancestor path, or
-/// [`DefinitionError::DuplicateIdentityKind`] when the scan root's
-/// identity files repeat a kind.
+/// Returns [`DefinitionError::Nesting`] when `target` is not a clean
+/// relative POSIX path (checked before the port is called),
+/// [`DefinitionError::Tree`] when the [`DefinitionTree`] port could not
+/// produce a snapshot, [`DefinitionError::DuplicateSnapshotPath`] when the
+/// snapshot repeats a directory or ancestor path, or
+/// [`DefinitionError::DuplicateIdentityKind`] when the target's identity
+/// files repeat a kind.
 pub fn verify(
     ports: &DefinitionPorts<'_>,
     workspace: &WorkspaceRoot,
+    target: &str,
 ) -> Result<VerifyReport, DefinitionError> {
+    // The domain validates every root it relates; relating the target
+    // alone applies exactly its clean-path rules.
+    nesting::relate(&[target], &[]).map_err(DefinitionError::Nesting)?;
     let snapshot = ports
         .tree
         .snapshot(workspace)
@@ -828,7 +839,7 @@ pub fn verify(
     let root_entry = snapshot
         .directories
         .iter()
-        .find(|directory| directory.path == ".");
+        .find(|directory| directory.path == target);
     let identity_files: Vec<IdentityFile> =
         root_entry.map_or_else(Vec::new, |directory| directory.identity_files.clone());
     let host_extras: Vec<String> =
@@ -849,6 +860,7 @@ pub fn verify(
         workspace,
         &snapshot,
         &roots,
+        target,
         &identity_files,
         &classification,
     ));
@@ -874,6 +886,7 @@ fn verify_problems_after_state(
     workspace: &WorkspaceRoot,
     snapshot: &TreeSnapshot,
     roots: &[&str],
+    target: &str,
     identity_files: &[IdentityFile],
     classification: &Classification,
 ) -> Vec<String> {
@@ -897,10 +910,17 @@ fn verify_problems_after_state(
         _ => {}
     }
 
-    let root_skills: Vec<&SkillFile> = snapshot
+    // Each skill is re-rooted at the target: its row and discovered
+    // paths are relative to the verified agent, exactly as the
+    // prototype's own `skill.relative_to(owner)` reads them.
+    let root_skills: Vec<SkillFile> = snapshot
         .skills
         .iter()
-        .filter(|skill| nesting::nearest_root(roots, parent_directory(&skill.path)) == Some("."))
+        .filter(|skill| nesting::nearest_root(roots, parent_directory(&skill.path)) == Some(target))
+        .map(|skill| SkillFile {
+            path: relative_within(target, &skill.path),
+            bytes: skill.bytes.clone(),
+        })
         .collect();
     let (rows, skill_refusal) = skill_rows(&root_skills);
     if let Some(refusal) = skill_refusal {
@@ -908,7 +928,7 @@ fn verify_problems_after_state(
     }
 
     let discovered: Vec<String> = root_skills.iter().map(|skill| skill.path.clone()).collect();
-    let root_absolute = absolute_posix(workspace, ".");
+    let root_absolute = absolute_posix(workspace, target);
     let canonical_text = canonical_bytes(identity_files, classification.source);
     let status = read_skill_index(canonical_text.unwrap_or(&[]), &discovered, &root_absolute);
 
@@ -1024,7 +1044,7 @@ const UNSAFE_SKILL_METADATA_CODE: &str = "unsafe_skill_metadata";
 /// possible `@` import is ever checked for any of them; only when none
 /// is found does [`unsafe_row_fields`] run over the rest. Either way all
 /// of `root_skills` shares the one refusal, never one row at a time.
-fn skill_rows(root_skills: &[&SkillFile]) -> (Vec<SkillRow>, Option<String>) {
+fn skill_rows(root_skills: &[SkillFile]) -> (Vec<SkillRow>, Option<String>) {
     let mut invalid_problems: Vec<String> = Vec::new();
     let mut rows: Vec<SkillRow> = Vec::with_capacity(root_skills.len());
     for skill in root_skills {

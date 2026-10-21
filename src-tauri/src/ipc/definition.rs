@@ -12,15 +12,15 @@
 //! over (`omnifrons_app::definition::{scan, verify}`) never touch a
 //! filesystem except through the adapters they are given.
 //!
-//! The prototype's own `verify_agent` additionally accepts an explicit
-//! agent path below the scan root and reports its write path's pending
-//! snapshots (`backups`); this command verifies only the active
-//! workspace root itself, read-only -- an explicit target is a later
-//! extension.
+//! `definition_verify` takes an optional agent directory below the
+//! workspace (the prototype's own `verify --agent <path>`), defaulting
+//! to the workspace root; it reports no pending snapshots (`backups`),
+//! which belong to the write path.
 
 use omnifrons_adapters::{FsDefinitionTree, Sha2Hasher};
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
+use omnifrons_domain::nesting;
 use tauri::AppHandle;
 
 use crate::ipc::commands::active_workspace;
@@ -88,22 +88,58 @@ pub fn definition_status_for(workspace: &WorkspaceRoot) -> Result<DefinitionStat
     Ok(DefinitionStatusDto::from_report(workspace, &report))
 }
 
-/// A verification of `workspace`'s own canonical definition: its
+/// The fixed refusal for a verify target that is not a plain directory
+/// of the workspace; never the target itself.
+fn not_a_workspace_directory() -> ShellError {
+    ShellError::new(
+        ShellErrorCode::InvalidRequest,
+        "the agent is not a workspace directory",
+    )
+}
+
+/// Refuses a verify `target` that is not a clean relative path naming an
+/// existing, non-symlink directory under `workspace` (the prototype's
+/// own `require_directory`, which refuses a symlink or a non-directory
+/// as a usage error). The path syntax is checked first, with the same
+/// domain rules the application service applies, so the service's own
+/// target error is unreachable from the command.
+fn require_workspace_directory(workspace: &WorkspaceRoot, target: &str) -> Result<(), ShellError> {
+    nesting::relate(&[target], &[]).map_err(|_| not_a_workspace_directory())?;
+    if target == "." {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(workspace.path().join(target))
+        .map_err(|_| not_a_workspace_directory())?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(not_a_workspace_directory())
+    }
+}
+
+/// A verification of one agent directory's canonical definition: its
 /// classification state, whether it is canonical, and every problem
-/// found.
+/// found. `agent` is a clean relative path below `workspace` (`None`
+/// is the workspace root itself).
 ///
 /// # Errors
 ///
-/// As [`definition_status_for`].
-pub fn definition_verify_for(workspace: &WorkspaceRoot) -> Result<DefinitionVerifyDto, ShellError> {
+/// `invalid-request` if `agent` is not an existing, non-symlink
+/// directory under `workspace`; otherwise as [`definition_status_for`].
+pub fn definition_verify_for(
+    workspace: &WorkspaceRoot,
+    agent: Option<&str>,
+) -> Result<DefinitionVerifyDto, ShellError> {
+    let target = agent.unwrap_or(".");
+    require_workspace_directory(workspace, target)?;
     let tree = FsDefinitionTree::from_environment();
     let hasher = Sha2Hasher::new();
     let ports = DefinitionPorts {
         tree: &tree,
         hasher: &hasher,
     };
-    let report = verify(&ports, workspace)?;
-    Ok(DefinitionVerifyDto::from_report(workspace, &report))
+    let report = verify(&ports, workspace, target)?;
+    Ok(DefinitionVerifyDto::from_report(workspace, target, &report))
 }
 
 /// The active workspace's agent-definition scan.
@@ -120,18 +156,24 @@ pub async fn definition_status(app: AppHandle) -> Result<DefinitionStatusDto, Sh
         .expect("the blocking definition-status task panicked")
 }
 
-/// The active workspace's own canonical-definition verification.
+/// The canonical-definition verification of the active workspace's
+/// root, or of `agent`, a directory below it.
 ///
 /// # Errors
 ///
 /// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active, and
 /// [`definition_verify_for`]'s errors.
 #[tauri::command]
-pub async fn definition_verify(app: AppHandle) -> Result<DefinitionVerifyDto, ShellError> {
+pub async fn definition_verify(
+    app: AppHandle,
+    agent: Option<String>,
+) -> Result<DefinitionVerifyDto, ShellError> {
     let workspace = active_workspace(&app)?;
-    tauri::async_runtime::spawn_blocking(move || definition_verify_for(&workspace))
-        .await
-        .expect("the blocking definition-verify task panicked")
+    tauri::async_runtime::spawn_blocking(move || {
+        definition_verify_for(&workspace, agent.as_deref())
+    })
+    .await
+    .expect("the blocking definition-verify task panicked")
 }
 
 #[cfg(test)]
@@ -343,7 +385,7 @@ mod tests {
         write(project.path(), "CLAUDE.md", b"@AGENTS.md\n");
         let workspace = project.workspace();
 
-        let verify = definition_verify_for(&workspace).expect("verify succeeds");
+        let verify = definition_verify_for(&workspace, None).expect("verify succeeds");
 
         assert_eq!(verify.schema, "omnifrons.definition-verify/1");
         assert_eq!(verify.agent, workspace.path().to_string_lossy());
@@ -361,10 +403,84 @@ mod tests {
         let project = TempDir::new("verify-none");
         let workspace = project.workspace();
 
-        let verify = definition_verify_for(&workspace).expect("verify succeeds");
+        let verify = definition_verify_for(&workspace, None).expect("verify succeeds");
 
         assert_eq!(verify.state, crate::ipc::dto::RootStateTag::None);
         assert!(!verify.canonical, "{:?}", verify.problems);
         assert_eq!(verify.problems, vec!["state is none".to_string()]);
+    }
+
+    /// A nested canonical agent verifies as itself, and the payload's
+    /// `agent` is the workspace path joined with the target.
+    #[test]
+    fn definition_verify_for_verifies_a_nested_agent() {
+        let project = TempDir::new("verify-nested");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        write(project.path(), "child/AGENTS.md", AGENT_BODY);
+        write(project.path(), "child/CLAUDE.md", b"@AGENTS.md\n");
+        let workspace = project.workspace();
+
+        let verify = definition_verify_for(&workspace, Some("child")).expect("verify succeeds");
+
+        assert_eq!(verify.state, crate::ipc::dto::RootStateTag::Canonical);
+        assert!(verify.canonical, "{:?}", verify.problems);
+        assert_eq!(
+            verify.agent,
+            workspace.path().join("child").to_string_lossy()
+        );
+        let root = definition_verify_for(&workspace, Some(".")).expect("verify succeeds");
+        assert_eq!(root.agent, workspace.path().to_string_lossy());
+    }
+
+    fn assert_invalid_request(result: Result<crate::ipc::dto::DefinitionVerifyDto, ShellError>) {
+        let error = result.expect_err("the target is refused");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+        assert_eq!(error.message, "the agent is not a workspace directory");
+    }
+
+    /// A target that does not exist is refused before any scan.
+    #[test]
+    fn definition_verify_for_refuses_a_missing_target() {
+        let project = TempDir::new("verify-missing");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        let workspace = project.workspace();
+
+        assert_invalid_request(definition_verify_for(&workspace, Some("nowhere")));
+    }
+
+    /// A regular file is not an agent directory.
+    #[test]
+    fn definition_verify_for_refuses_a_file_target() {
+        let project = TempDir::new("verify-file");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        let workspace = project.workspace();
+
+        assert_invalid_request(definition_verify_for(&workspace, Some("AGENTS.md")));
+    }
+
+    /// A symlink to a directory is refused, not followed.
+    #[cfg(unix)]
+    #[test]
+    fn definition_verify_for_refuses_a_symlinked_directory_target() {
+        let project = TempDir::new("verify-symlink");
+        write(project.path(), "real/AGENTS.md", AGENT_BODY);
+        std::os::unix::fs::symlink(project.path().join("real"), project.path().join("link"))
+            .expect("create the symlink");
+        let workspace = project.workspace();
+
+        assert_invalid_request(definition_verify_for(&workspace, Some("link")));
+    }
+
+    /// An unclean or escaping target is refused before it touches the
+    /// filesystem.
+    #[test]
+    fn definition_verify_for_refuses_an_unclean_target() {
+        let project = TempDir::new("verify-unclean");
+        write(project.path(), "child/AGENTS.md", AGENT_BODY);
+        let workspace = project.workspace();
+
+        for target in ["../x", "/abs", "a//b", "./child", "child/", "", "child/./x"] {
+            assert_invalid_request(definition_verify_for(&workspace, Some(target)));
+        }
     }
 }

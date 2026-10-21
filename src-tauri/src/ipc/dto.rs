@@ -2330,10 +2330,10 @@ impl DefinitionStatusDto {
 
 /// `definition_verify`'s payload (the prototype's own `verify_agent`
 /// return value, minus `backups`: this port keeps snapshots in its own
-/// store rather than reporting them back on this wire shape, and minus
-/// an explicit target path -- see [`omnifrons_app::definition::verify`]).
-/// `agent` is the verified workspace root's own display path, never a
-/// device path of whichever file was actually read.
+/// store rather than reporting them back on this wire shape).
+/// `agent` is the verified agent directory's own display path -- the
+/// workspace path joined with the target -- never a device path of
+/// whichever file was actually read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefinitionVerifyDto {
@@ -2345,15 +2345,22 @@ pub struct DefinitionVerifyDto {
 }
 
 impl DefinitionVerifyDto {
-    /// Builds the payload for `report`, verified at `workspace`.
+    /// Builds the payload for `report`, verified at `target` (a clean
+    /// relative POSIX path, `"."` for the workspace root) below
+    /// `workspace`.
     #[must_use]
     pub fn from_report(
         workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
         report: &omnifrons_app::definition::VerifyReport,
     ) -> Self {
         Self {
             schema: "omnifrons.definition-verify/1".to_string(),
-            agent: workspace.path().to_string_lossy().into_owned(),
+            agent: if target == "." {
+                workspace.path().to_string_lossy().into_owned()
+            } else {
+                workspace.path().join(target).to_string_lossy().into_owned()
+            },
             state: report.state.into(),
             canonical: report.canonical,
             problems: report.problems.clone(),
@@ -4615,8 +4622,13 @@ mod tests {
             canonical: false,
             problems: vec!["state is none".to_string()],
         };
-        let dto = super::DefinitionVerifyDto::from_report(&workspace, &report);
+        let dto = super::DefinitionVerifyDto::from_report(&workspace, ".", &report);
         let value = json(&dto);
+        let nested = super::DefinitionVerifyDto::from_report(&workspace, "child", &report);
+        assert_eq!(
+            json(&nested)["agent"],
+            serde_json::json!(workspace.path().join("child").to_string_lossy())
+        );
         assert_eq!(
             value["schema"],
             serde_json::json!("omnifrons.definition-verify/1")
