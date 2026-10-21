@@ -94,6 +94,29 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(calls).toBe(2)
   })
 
+  it('clears a previous verification result when "Rescan" is clicked', async () => {
+    let statusCalls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') {
+        statusCalls += 1
+        return statusCalls === 1 ? FIXTURE_STATUS : FIXTURE_STATUS_RESCANNED
+      }
+      if (cmd === 'definition_verify') return FIXTURE_VERIFY
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    await screen.findByLabelText('Verification')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+
+    await screen.findByText('/workspace-rescanned')
+    expect(screen.queryByLabelText('Verification')).toBeNull()
+  })
+
   it('renders the verification\'s state, canonical flag, and problems when "Verify root" is clicked', async () => {
     mockIPC((cmd) => {
       if (cmd === 'definition_status') return FIXTURE_STATUS
@@ -173,6 +196,41 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(calls).toBe(1)
   })
 
+  it('calls definition_verify exactly once even when two "Verify root" clicks are dispatched before a re-render settles', async () => {
+    let calls = 0
+    let resolveVerify: ((value: DefinitionVerify) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS
+      if (cmd === 'definition_verify') {
+        calls += 1
+        return new Promise((resolve) => {
+          resolveVerify = resolve as (value: DefinitionVerify) => void
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    const verifyButton = screen.getByRole('button', { name: 'Verify root' })
+    // Both clicks are dispatched inside one `act` call, so React never gets
+    // a chance to re-render between them -- unlike the double-click test
+    // above, which awaits the `disabled` attribute first and so only
+    // proves that attribute, never that `runVerify` itself is reentrant-safe
+    // against two clicks racing on the pre-re-render `verifying` closure.
+    act(() => {
+      fireEvent.click(verifyButton)
+      fireEvent.click(verifyButton)
+    })
+    expect(calls).toBe(1)
+
+    if (!resolveVerify) throw new Error('definition_verify was not called')
+    await act(async () => {
+      resolveVerify!(FIXTURE_VERIFY)
+    })
+  })
+
   it('renders a ShellError from definition_status as its code and message, never the raw object', async () => {
     // The mount-time scan suppresses its own error (it meets a rejection
     // with an empty report, like `AgentPanel`'s own automatic fetches) --
@@ -194,6 +252,26 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(within(banner).getByText('scan-failed')).toBeTruthy()
     expect(within(banner).getByText(/the workspace could not be scanned/)).toBeTruthy()
     expect(banner.textContent).not.toContain('[object Object]')
+  })
+
+  it('clears the old report when a user-initiated "Rescan" fails, showing only the error', async () => {
+    let shouldFail = false
+    const error: ShellError = { code: 'scan-failed', message: 'the workspace could not be rescanned' }
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return shouldFail ? Promise.reject(error) : FIXTURE_STATUS
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    shouldFail = true
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(within(banner).getByText('scan-failed')).toBeTruthy()
+    expect(within(banner).getByText(/the workspace could not be rescanned/)).toBeTruthy()
+    expect(screen.queryByText('/workspace')).toBeNull()
   })
 
   it('shows a loading state before the scan resolves, then replaces it with the report', async () => {

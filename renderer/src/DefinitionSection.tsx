@@ -263,7 +263,10 @@ export function DefinitionSection() {
    * `fetchGuidanceStatus`: the automatic mount-time scan below passes
    * `false` -- a rejection just leaves the report empty, no alert -- and
    * the explicit "Rescan" click passes `true`, so a request the user made
-   * directly is always answered, even by a failure.
+   * directly is always answered, even by a failure. Either way, a
+   * rejection clears `status`: a rescan that fails never leaves the prior
+   * report on screen beside the new error, symmetric with the quiet
+   * mount-time failure.
    */
   // No synchronous `setState` here (react-hooks/set-state-in-effect):
   // `loading` starts `true` by its own initializer for the mount call
@@ -281,11 +284,10 @@ export function DefinitionSection() {
       (reason: unknown) => {
         if (!mountedRef.current) return
         setLoading(false)
-        if (!surfaceError) {
-          setStatus(null)
-          return
+        setStatus(null)
+        if (surfaceError) {
+          setError(toSectionError(reason))
         }
-        setError(toSectionError(reason))
       },
     )
   }, [])
@@ -294,41 +296,68 @@ export function DefinitionSection() {
     scan(false)
   }, [scan])
 
-  /** The explicit "Rescan" click: unlike the mount call, this sets `loading`/clears `error` itself -- an event handler, never an effect, so the lint rule above does not apply here. */
+  /**
+   * The explicit "Rescan" click: unlike the mount call, this sets
+   * `loading`/clears `error` itself -- an event handler, never an effect,
+   * so the lint rule above does not apply here. A verification belongs
+   * to the report it was run against, so a user-initiated rescan also
+   * clears any prior `verify`/`verifyError` -- otherwise a stale
+   * verification would sit beside a freshly scanned report it was never
+   * run against.
+   */
   const rescan = useCallback(() => {
     setLoading(true)
     setError(null)
+    setVerify(null)
+    setVerifyError(null)
     scan(true)
   }, [scan])
 
   /**
+   * Guards `runVerify` against two clicks dispatched before React
+   * re-renders between them. The `verifying` *state* only reflects the
+   * last completed render, so a click handler's closure captured before
+   * that render still reads the old value -- two clicks fired in the same
+   * tick (no `await` between them) both see `verifying === false` and
+   * both would call `definitionVerify`. A ref is read and written
+   * synchronously, so it is current for every call in the same tick, even
+   * back-to-back ones. `verifying` (state) is kept only to drive the
+   * button's `disabled` attribute and the pending UI below.
+   */
+  const verifyingRef = useRef(false)
+
+  /**
    * The explicit "Verify root" click. Mirrors `rescan`'s own in-flight
-   * state: `verifying` both disables the button below and guards this
-   * handler itself against a second click arriving before the first
-   * verify settles, so at most one `definitionVerify` call is ever in
-   * flight. Clearing `verify` here -- not only in the rejection branch
-   * -- means a stale result is never shown beside either a new success
-   * or a new error banner; only the latest outcome is ever on screen.
+   * handling: `verifyingRef` guards this handler itself against a second
+   * click arriving before the first verify settles, so at most one
+   * `definitionVerify` call is ever in flight; `verifying` (state) only
+   * disables the button below and drives the pending UI. Clearing
+   * `verify` here -- not only in the rejection branch -- means a stale
+   * result is never shown beside either a new success or a new error
+   * banner; only the latest outcome is ever on screen.
    */
   const runVerify = useCallback(() => {
-    if (verifying) return
+    if (verifyingRef.current) return
+    verifyingRef.current = true
     setVerifying(true)
     setVerify(null)
     setVerifyError(null)
     definitionVerify().then(
       (result) => {
+        verifyingRef.current = false
         if (!mountedRef.current) return
         setVerifying(false)
         setVerify(result)
       },
       (reason: unknown) => {
+        verifyingRef.current = false
         if (!mountedRef.current) return
         setVerifying(false)
         setVerify(null)
         setVerifyError(toSectionError(reason))
       },
     )
-  }, [verifying])
+  }, [])
 
   return (
     <DefinitionReport
