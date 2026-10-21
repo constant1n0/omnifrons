@@ -112,6 +112,67 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(within(verification).getByText('state is none')).toBeTruthy()
   })
 
+  it('clears a stale verification result when a later verify rejects, showing only the new error', async () => {
+    let shouldFail = false
+    // `scan-failed` is the code `definition_verify`'s own definition-tree
+    // read failure shares with `definition_status` (see `ShellErrorCode`'s
+    // own doc comment on `scan-failed`), not a dedicated "verify" code.
+    const error: ShellError = { code: 'scan-failed', message: 'the root could not be verified' }
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS
+      if (cmd === 'definition_verify') return shouldFail ? Promise.reject(error) : FIXTURE_VERIFY
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    await screen.findByLabelText('Verification')
+
+    shouldFail = true
+    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+
+    const banner = await screen.findByTestId('definition-verify-error')
+    expect(within(banner).getByText('scan-failed')).toBeTruthy()
+    expect(within(banner).getByText(/the root could not be verified/)).toBeTruthy()
+    expect(screen.queryByLabelText('Verification')).toBeNull()
+  })
+
+  it('ignores a second "Verify root" click while a verify is pending, calling definition_verify exactly once', async () => {
+    let calls = 0
+    let resolveVerify: ((value: DefinitionVerify) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS
+      if (cmd === 'definition_verify') {
+        calls += 1
+        return new Promise((resolve) => {
+          resolveVerify = resolve as (value: DefinitionVerify) => void
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+    fireEvent.click(verifyButton)
+
+    await waitFor(() => {
+      expect(verifyButton.disabled).toBe(true)
+    })
+    fireEvent.click(verifyButton)
+
+    if (!resolveVerify) throw new Error('definition_verify was not called')
+    await act(async () => {
+      resolveVerify!(FIXTURE_VERIFY)
+    })
+
+    await screen.findByLabelText('Verification')
+    expect(calls).toBe(1)
+  })
+
   it('renders a ShellError from definition_status as its code and message, never the raw object', async () => {
     // The mount-time scan suppresses its own error (it meets a rejection
     // with an empty report, like `AgentPanel`'s own automatic fetches) --

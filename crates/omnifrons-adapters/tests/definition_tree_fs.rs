@@ -56,6 +56,41 @@ impl Drop for TempDir {
     }
 }
 
+/// A `#[cfg(unix)]` drop guard that restores a path's permission mode
+/// when it goes out of scope, including while unwinding from a panic --
+/// unlike this file's own hand-written restore calls, which only run on
+/// the path that reaches them and otherwise leave a fixture at a
+/// restrictive mode that `TempDir`'s own `Drop` cannot clean up
+/// (`remove_dir_all` needs search permission on every directory it
+/// descends into).
+#[cfg(unix)]
+struct RestoreMode {
+    path: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl RestoreMode {
+    /// Remembers `mode` to restore at `path` on `Drop`. Call this right
+    /// after lowering `path`'s mode by hand, and bind the result to a
+    /// named local (never bare `_`, which would drop -- and restore --
+    /// immediately) so it lives until the end of the test.
+    fn new(path: &Path, mode: u32) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            mode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+    }
+}
+
 /// Writes `bytes` at `base`/`relative`, creating every parent directory
 /// first.
 fn write(base: &Path, relative: &str, bytes: &[u8]) {
@@ -686,12 +721,11 @@ fn an_unreadable_root_reports_root_unreadable() {
     let workspace = project.workspace();
     std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(project.path(), 0o700);
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     assert_eq!(result, Err(DefinitionTreeError::RootUnreadable));
 }
 
@@ -735,13 +769,12 @@ fn an_unreadable_subdirectory_below_the_root_is_skipped() {
     let blocked = project.path().join("blocked");
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(&blocked, 0o700);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     let snapshot = result.expect("snapshot succeeds despite the blocked subdirectory");
     let directory_paths: Vec<&str> = snapshot
         .directories
@@ -793,13 +826,12 @@ fn an_unreadable_identity_file_still_aborts_the_walk() {
     let identity_file = project.path().join("nested").join("AGENTS.md");
     std::fs::set_permissions(&identity_file, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(&identity_file, 0o600);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&identity_file, std::fs::Permissions::from_mode(0o600))
-        .expect("restore permissions before cleanup");
     assert_eq!(result, Err(DefinitionTreeError::WalkFailed));
 }
 
@@ -831,14 +863,13 @@ fn an_unreadable_ancestor_identity_file_does_not_fail_the_scan() {
     let ancestor_file = base.path().join("AGENTS.md");
     std::fs::set_permissions(&ancestor_file, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(&ancestor_file, 0o600);
     let base_posix = canonical_posix(base.path());
     let workspace = WorkspaceRoot::new(base.path().join("nested")).expect("workspace");
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&ancestor_file, std::fs::Permissions::from_mode(0o600))
-        .expect("restore permissions before cleanup");
     let snapshot = result.expect("snapshot succeeds despite the unreadable ancestor");
     let ancestors = ancestors_under(&snapshot.ancestors, &base_posix);
     assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
@@ -873,13 +904,12 @@ fn an_unreadable_skill_file_still_aborts_the_walk() {
     let skill_file = project.path().join("nested").join("SKILL.md");
     std::fs::set_permissions(&skill_file, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(&skill_file, 0o600);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&skill_file, std::fs::Permissions::from_mode(0o600))
-        .expect("restore permissions before cleanup");
     assert_eq!(result, Err(DefinitionTreeError::WalkFailed));
 }
 
@@ -915,14 +945,13 @@ fn an_unsearchable_dot_claude_at_an_ancestor_makes_its_identity_and_extra_absent
     let dot_claude = base.path().join(".claude");
     std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(&dot_claude, 0o700);
     let base_posix = canonical_posix(base.path());
     let workspace = WorkspaceRoot::new(base.path().join("nested")).expect("workspace");
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     let snapshot = result.expect("snapshot succeeds despite the unsearchable .claude");
     let ancestors = ancestors_under(&snapshot.ancestors, &base_posix);
     assert_eq!(ancestors.len(), 1, "{:?}", snapshot.ancestors);
@@ -966,13 +995,12 @@ fn a_host_extra_behind_an_unsearchable_dot_claude_inside_the_scan_is_absent_not_
     let dot_claude = project.path().join(".claude");
     std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0o000");
+    let _restore_mode = RestoreMode::new(&dot_claude, 0o700);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     let snapshot = result.expect(
         "find_host_extras asks a blanket lexists-shaped question, so an unsearchable \
          .claude makes the .claude/AGENTS.md extra absent, never a hard failure",
@@ -1023,13 +1051,12 @@ fn a_listable_but_unsearchable_subdirectory_still_aborts_via_a_multi_segment_kin
     let blocked = project.path().join("blocked");
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o400))
         .expect("chmod 0o400 (r--: listable, not searchable)");
+    let _restore_mode = RestoreMode::new(&blocked, 0o700);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     assert_eq!(
         result,
         Err(DefinitionTreeError::WalkFailed),
@@ -1079,13 +1106,12 @@ fn a_listable_but_unsearchable_dot_claude_directory_with_a_listed_skill_md_fails
     let dot_claude = project.path().join(".claude");
     std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o400))
         .expect("chmod 0o400 (r--: listable, not searchable)");
+    let _restore_mode = RestoreMode::new(&dot_claude, 0o700);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     assert_eq!(
         result,
         Err(DefinitionTreeError::WalkFailed),
@@ -1124,13 +1150,12 @@ fn a_listable_but_unsearchable_dot_claude_directory_without_a_skill_md_still_suc
     let dot_claude = project.path().join(".claude");
     std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o400))
         .expect("chmod 0o400 (r--: listable, not searchable)");
+    let _restore_mode = RestoreMode::new(&dot_claude, 0o700);
     let workspace = project.workspace();
     let fs_tree = FsDefinitionTree::new(None);
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(&dot_claude, std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     let snapshot = result.expect(
         "SKILL.md absent from .claude's own listing must short-circuit record_skill \
          before any stat is attempted, so an unsearchable .claude with nothing listed \
@@ -1201,6 +1226,7 @@ fn a_listable_but_unsearchable_scan_root_with_a_listed_skill_md_reports_root_unr
     write(project.path(), "SKILL.md", b"---\nname: own\n---\n");
     std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o400))
         .expect("chmod 0o400 (r--: listable, not searchable)");
+    let _restore_mode = RestoreMode::new(project.path(), 0o700);
 
     let workspace = WorkspaceRoot::new(project.path()).expect(
         "WorkspaceRoot::new only resolves the root's own parent, so a 0o400 root still \
@@ -1210,8 +1236,6 @@ fn a_listable_but_unsearchable_scan_root_with_a_listed_skill_md_reports_root_unr
 
     let result = fs_tree.snapshot(&workspace);
 
-    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions before cleanup");
     assert_eq!(
         result,
         Err(DefinitionTreeError::RootUnreadable),

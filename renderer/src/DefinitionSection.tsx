@@ -156,6 +156,7 @@ interface DefinitionReportProps {
   error: DefinitionSectionError | null
   verify: DefinitionVerify | null
   verifyError: DefinitionSectionError | null
+  verifyPending: boolean
   onRescan: () => void
   onVerify: () => void
 }
@@ -171,6 +172,7 @@ export function DefinitionReport({
   error,
   verify,
   verifyError,
+  verifyPending,
   onRescan,
   onVerify,
 }: DefinitionReportProps) {
@@ -204,7 +206,7 @@ export function DefinitionReport({
           </ul>
         </>
       )}
-      <button type="button" onClick={onVerify}>
+      <button type="button" onClick={onVerify} disabled={verifyPending}>
         Verify root
       </button>
       {verifyError && (
@@ -245,6 +247,7 @@ export function DefinitionSection() {
   const [error, setError] = useState<DefinitionSectionError | null>(null)
   const [verify, setVerify] = useState<DefinitionVerify | null>(null)
   const [verifyError, setVerifyError] = useState<DefinitionSectionError | null>(null)
+  const [verifying, setVerifying] = useState(false)
 
   /** Guards every async continuation below against a post-unmount state update (mirrors `AgentPanel`'s own `mountedRef`). */
   const mountedRef = useRef(true)
@@ -298,19 +301,34 @@ export function DefinitionSection() {
     scan(true)
   }, [scan])
 
+  /**
+   * The explicit "Verify root" click. Mirrors `rescan`'s own in-flight
+   * state: `verifying` both disables the button below and guards this
+   * handler itself against a second click arriving before the first
+   * verify settles, so at most one `definitionVerify` call is ever in
+   * flight. Clearing `verify` here -- not only in the rejection branch
+   * -- means a stale result is never shown beside either a new success
+   * or a new error banner; only the latest outcome is ever on screen.
+   */
   const runVerify = useCallback(() => {
+    if (verifying) return
+    setVerifying(true)
+    setVerify(null)
     setVerifyError(null)
     definitionVerify().then(
       (result) => {
         if (!mountedRef.current) return
+        setVerifying(false)
         setVerify(result)
       },
       (reason: unknown) => {
         if (!mountedRef.current) return
+        setVerifying(false)
+        setVerify(null)
         setVerifyError(toSectionError(reason))
       },
     )
-  }, [])
+  }, [verifying])
 
   return (
     <DefinitionReport
@@ -319,6 +337,7 @@ export function DefinitionSection() {
       error={error}
       verify={verify}
       verifyError={verifyError}
+      verifyPending={verifying}
       onRescan={rescan}
       onVerify={runVerify}
     />
