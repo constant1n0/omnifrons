@@ -2015,7 +2015,7 @@ export interface DefinitionStatus {
 
 /**
  * `definitionVerify`'s payload, schema `"omnifrons.definition-verify/1"`.
- * Mirrors `DefinitionVerifyDto` field-for-field: the verified root's own
+ * Mirrors `DefinitionVerifyDto` field-for-field: the verified target's own
  * display path, its classification state, whether it is canonical, and
  * every problem found. Unlike the prototype this wraps, carries no
  * `backups` key -- this port keeps snapshots in its own store.
@@ -2046,17 +2046,21 @@ export async function definitionStatus(): Promise<DefinitionStatus> {
 }
 
 /**
- * A verification of the active workspace root's own canonical definition
+ * A verification of one agent directory inside the active workspace
  * (ADR-0005 sub-slice 1h): its classification state, whether it is
  * canonical, and every problem found. Schema
- * `"omnifrons.definition-verify/1"`. Targets the active workspace root
- * itself, never an explicit agent path below it -- an explicit target is a
- * later extension. Read-only: nothing is written, locked, or snapshotted.
- * Invokes `definition_verify` with no arguments.
+ * `"omnifrons.definition-verify/1"`. Read-only: nothing is written,
+ * locked, or snapshotted. Invokes `definition_verify` with `{ agent }`.
+ *
+ * `agent` is a clean relative POSIX path inside the active workspace;
+ * `"."` (the default) is the workspace root itself. The response's `agent`
+ * is the verified target's absolute display path.
  *
  * # Errors
- * As {@link definitionStatus}.
+ * As {@link definitionStatus}, plus `invalid-request` if `agent` is not a
+ * workspace directory (bad syntax, missing, a file, or a symlinked
+ * directory).
  */
-export async function definitionVerify(): Promise<DefinitionVerify> {
-  return invoke('definition_verify')
+export async function definitionVerify(agent: string = '.'): Promise<DefinitionVerify> {
+  return invoke('definition_verify', { agent })
 }

@@ -3148,16 +3148,23 @@ describe('definitionStatus (ADR-0005 sub-slice 1i)', () => {
 })
 
 describe('definitionVerify (ADR-0005 sub-slice 1i)', () => {
-  it('invokes definition_verify with no arguments and returns the verification verbatim, targeting the active workspace root', async () => {
+  it('invokes definition_verify with the root target "." by default and returns the verification verbatim', async () => {
     const mock = mockCommand('definition_verify', () => DEFINITION_VERIFY)
 
     const verify = await definitionVerify()
 
-    expect(mock.args()).toEqual({})
-    expect(Object.keys(mock.args())).toEqual([])
+    expect(mock.args()).toEqual({ agent: '.' })
     expect(verify).toEqual(DEFINITION_VERIFY)
     expect(Object.keys(verify).sort()).toEqual(['agent', 'canonical', 'problems', 'schema', 'state'])
     expect(verify.schema).toBe('omnifrons.definition-verify/1')
+  })
+
+  it('passes an explicit nested agent path through as the agent argument', async () => {
+    const mock = mockCommand('definition_verify', () => DEFINITION_VERIFY)
+
+    await definitionVerify('agents/sub')
+
+    expect(mock.args()).toEqual({ agent: 'agents/sub' })
   })
 
   it('parses a definition_verify payload exactly as the shell emits it -- no backups key, unlike the prototype -- narrowing to the TS type', () => {

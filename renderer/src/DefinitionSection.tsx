@@ -76,11 +76,25 @@ function DefinitionWarningRow({ warning }: { warning: DefinitionWarning }) {
   )
 }
 
-function DefinitionAgentRow({ agent }: { agent: DefinitionAgent }) {
+interface DefinitionAgentRowProps {
+  agent: DefinitionAgent
+  verifyPending: boolean
+  onVerify: (target: string) => void
+}
+
+function DefinitionAgentRow({ agent, verifyPending, onVerify }: DefinitionAgentRowProps) {
   return (
     <li aria-label="Agent root">
       <p>
-        <PlainTextLine text={agent.path} /> <PlainTextLine text={agent.state} />
+        <PlainTextLine text={agent.path} /> <PlainTextLine text={agent.state} />{' '}
+        <button
+          type="button"
+          aria-label={`Verify ${agent.path}`}
+          onClick={() => onVerify(agent.path)}
+          disabled={verifyPending}
+        >
+          Verify
+        </button>
       </p>
       {agent.title !== null && (
         <p>
@@ -156,8 +170,10 @@ interface DefinitionReportProps {
   error: DefinitionSectionError | null
   verify: DefinitionVerify | null
   verifyError: DefinitionSectionError | null
+  /** The relative target the shown verification (or error) was run for. */
+  verifyTarget: string | null
   /**
-   * Disables "Verify root": true while a verify is already in flight, or
+   * Disables every row's "Verify" button: true while a verify is already in flight, or
    * while any scan is loading. A verification belongs to the report on
    * screen, so it cannot be started against one that is still being
    * fetched: `runVerify` itself refuses synchronously while `scanningRef`
@@ -169,7 +185,7 @@ interface DefinitionReportProps {
    */
   verifyPending: boolean
   onRescan: () => void
-  onVerify: () => void
+  onVerify: (target: string) => void
 }
 
 /**
@@ -183,6 +199,7 @@ export function DefinitionReport({
   error,
   verify,
   verifyError,
+  verifyTarget,
   verifyPending,
   onRescan,
   onVerify,
@@ -212,14 +229,11 @@ export function DefinitionReport({
           )}
           <ul aria-label="Agents">
             {status.agents.map((agent) => (
-              <DefinitionAgentRow key={agent.path} agent={agent} />
+              <DefinitionAgentRow key={agent.path} agent={agent} verifyPending={verifyPending} onVerify={onVerify} />
             ))}
           </ul>
         </>
       )}
-      <button type="button" onClick={onVerify} disabled={verifyPending}>
-        Verify root
-      </button>
       {verifyError && (
         <div role="alert" data-testid="definition-verify-error">
           <DefinitionErrorLine error={verifyError} />
@@ -227,6 +241,11 @@ export function DefinitionReport({
       )}
       {verify && (
         <div aria-label="Verification">
+          {verifyTarget !== null && (
+            <p>
+              target: <PlainTextLine text={verifyTarget} /> (<PlainTextLine text={verify.agent} />)
+            </p>
+          )}
           <p>
             state: <PlainTextLine text={verify.state} />
           </p>
@@ -248,8 +267,8 @@ export function DefinitionReport({
 
 /**
  * The container half: fetches the active workspace's agent-definition scan
- * on mount and on "Rescan," and runs a verification of the active
- * workspace root on demand ("Verify root"). Holds every loading/error/data
+ * on mount and on "Rescan," and runs a verification of a
+ * chosen agent directory on demand (a row's "Verify"). Holds every loading/error/data
  * state; {@link DefinitionReport} only renders it.
  */
 export function DefinitionSection() {
@@ -259,6 +278,7 @@ export function DefinitionSection() {
   const [verify, setVerify] = useState<DefinitionVerify | null>(null)
   const [verifyError, setVerifyError] = useState<DefinitionSectionError | null>(null)
   const [verifying, setVerifying] = useState(false)
+  const [verifyTarget, setVerifyTarget] = useState<string | null>(null)
 
   /** Guards every async continuation below against a post-unmount state update (mirrors `AgentPanel`'s own `mountedRef`). */
   const mountedRef = useRef(true)
@@ -318,10 +338,10 @@ export function DefinitionSection() {
    * "Rescan" -- does nothing when it settles, pending flags included.
    *
    * Gating `loading`'s own clearing like this used to be exactly the bug:
-   * an in-flight "Verify root" could bump `generationRef` past a *scan*
+   * an in-flight verify could bump `generationRef` past a *scan*
    * that was still genuinely pending, so the scan's own settle would find
    * itself superseded and leave `loading` stuck `true` forever, with
-   * "Rescan" and "Verify root" disabled until remount. It is safe again
+   * "Rescan" and the row's "Verify" disabled until remount. It is safe again
    * now because `scanningRef` -- set the moment a scan dispatches, in
    * both callers below -- stays `true` for the *entire* window any
    * relevant scan is in flight, not just until the first of two racing
@@ -339,7 +359,7 @@ export function DefinitionSection() {
    * verify that is genuinely in flight (see `rescan`'s own doc comment),
    * and nothing clears a superseded verify's *own* pending flags on its
    * behalf the way a winning scan clears a superseded scan's -- gating
-   * them there would leave "Verify root" refused forever instead.
+   * them there would leave the row's "Verify" refused forever instead.
    * `setVerify`/`setVerifyError` keep their pre-existing generation gate:
    * only the *result* a superseded verify carries is ever dropped.
    */
@@ -376,7 +396,7 @@ export function DefinitionSection() {
    * The automatic mount-time scan is still a scan, so it sets
    * `scanningRef` exactly like `rescan` below does -- a verify clicked
    * before this very first fetch has settled must see one in flight, the
-   * same way it would during a later rescan. In practice "Verify root" is
+   * same way it would during a later rescan. In practice the row's "Verify" is
    * already disabled for this entire window regardless (`verifyPending`
    * includes `loading`, which starts `true` from this component's own
    * state initializer, not from this effect), so setting it here too is
@@ -444,6 +464,7 @@ export function DefinitionSection() {
     setError(null)
     setVerify(null)
     setVerifyError(null)
+    setVerifyTarget(null)
     scan(true)
   }, [scan])
 
@@ -461,14 +482,14 @@ export function DefinitionSection() {
   const verifyingRef = useRef(false)
 
   /**
-   * The explicit "Verify root" click. Mirrors `rescan`'s own in-flight
+   * The explicit row "Verify" click, run for one agent path. Mirrors `rescan`'s own in-flight
    * handling: `verifyingRef` guards this handler itself against a second
    * click arriving before the first verify settles, so at most one
    * `definitionVerify` call is ever in flight; `verifying` (state) only
    * disables the button below and drives the pending UI.
    *
    * Refusing synchronously when `scanningRef.current` is also set is what
-   * "Verify root"'s own `disabled` attribute already intends
+   * each "Verify" button's own `disabled` attribute already intends
    * (`verifyPending` includes `loading`): a verification belongs to the
    * report on screen, so none starts while that report is still being
    * fetched -- fetched by either the mount-time scan or a rescan, both of
@@ -487,14 +508,15 @@ export function DefinitionSection() {
    * request is no longer in flight either way), but `setVerify`/
    * `setVerifyError` only run when this is still the latest generation.
    */
-  const runVerify = useCallback(() => {
+  const runVerify = useCallback((target: string) => {
     if (verifyingRef.current || scanningRef.current) return
     verifyingRef.current = true
     const generation = ++generationRef.current
     setVerifying(true)
     setVerify(null)
     setVerifyError(null)
-    definitionVerify().then(
+    setVerifyTarget(target)
+    definitionVerify(target).then(
       (result) => {
         verifyingRef.current = false
         if (!mountedRef.current) return
@@ -520,6 +542,7 @@ export function DefinitionSection() {
       error={error}
       verify={verify}
       verifyError={verifyError}
+      verifyTarget={verifyTarget}
       verifyPending={verifying || loading}
       onRescan={rescan}
       onVerify={runVerify}

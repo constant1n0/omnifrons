@@ -43,6 +43,21 @@ const FIXTURE_STATUS: DefinitionStatus = {
   ],
 }
 
+const NESTED_AGENT: DefinitionStatus['agents'][number] = {
+  ...FIXTURE_STATUS.agents[0],
+  path: 'sub/agent',
+  title: 'Nested fixture agent',
+  parent: { kind: 'root', path: '.' },
+  nested: [],
+  consentRequired: false,
+  warnings: [],
+}
+
+const FIXTURE_STATUS_NESTED: DefinitionStatus = {
+  ...FIXTURE_STATUS,
+  agents: [FIXTURE_STATUS.agents[0], NESTED_AGENT],
+}
+
 const FIXTURE_STATUS_RESCANNED: DefinitionStatus = { ...FIXTURE_STATUS, root: '/workspace-rescanned' }
 
 const FIXTURE_VERIFY: DefinitionVerify = {
@@ -109,7 +124,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     render(<DefinitionSection />)
     await screen.findByText('/workspace')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
     await screen.findByLabelText('Verification')
 
     fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
@@ -118,7 +133,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(screen.queryByLabelText('Verification')).toBeNull()
   })
 
-  it('renders the verification\'s state, canonical flag, and problems when "Verify root" is clicked', async () => {
+  it("renders the verification's state, canonical flag, and problems when the '.' row's Verify is clicked", async () => {
     mockIPC((cmd) => {
       if (cmd === 'definition_status') return FIXTURE_STATUS
       if (cmd === 'definition_verify') return FIXTURE_VERIFY
@@ -128,7 +143,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     render(<DefinitionSection />)
     await screen.findByText('/workspace')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
 
     const verification = await screen.findByLabelText('Verification')
     expect(within(verification).getByText('none')).toBeTruthy()
@@ -151,11 +166,11 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     render(<DefinitionSection />)
     await screen.findByText('/workspace')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
     await screen.findByLabelText('Verification')
 
     shouldFail = true
-    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
 
     const banner = await screen.findByTestId('definition-verify-error')
     expect(within(banner).getByText('scan-failed')).toBeTruthy()
@@ -163,7 +178,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(screen.queryByLabelText('Verification')).toBeNull()
   })
 
-  it('ignores a second "Verify root" click while a verify is pending, calling definition_verify exactly once', async () => {
+  it('ignores a second "Verify ." click while a verify is pending, calling definition_verify exactly once', async () => {
     let calls = 0
     let resolveVerify: ((value: DefinitionVerify) => void) | undefined
     mockIPC((cmd) => {
@@ -180,7 +195,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     render(<DefinitionSection />)
     await screen.findByText('/workspace')
 
-    const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+    const verifyButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
     fireEvent.click(verifyButton)
 
     await waitFor(() => {
@@ -197,7 +212,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(calls).toBe(1)
   })
 
-  it('calls definition_verify exactly once even when two "Verify root" clicks are dispatched before a re-render settles', async () => {
+  it('calls definition_verify exactly once even when two "Verify ." clicks are dispatched before a re-render settles', async () => {
     let calls = 0
     let resolveVerify: ((value: DefinitionVerify) => void) | undefined
     mockIPC((cmd) => {
@@ -214,7 +229,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     render(<DefinitionSection />)
     await screen.findByText('/workspace')
 
-    const verifyButton = screen.getByRole('button', { name: 'Verify root' })
+    const verifyButton = screen.getByRole('button', { name: 'Verify .' })
     // Both clicks are dispatched inside one `act` call, so React never gets
     // a chance to re-render between them -- unlike the double-click test
     // above, which awaits the `disabled` attribute first and so only
@@ -319,7 +334,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     render(<DefinitionSection />)
     await screen.findByText('/workspace')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
     if (!resolveVerify) throw new Error('definition_verify was not called')
 
     // The rescan's own `definition_status` call resolves while the verify
@@ -356,7 +371,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     const rescanButton = screen.getByRole('button', { name: 'Rescan' })
     // Both clicks are dispatched inside one `act` call, so React never gets
     // a chance to re-render between them -- mirrors the existing same-tick
-    // "Verify root" test above, this time proving `rescan`'s own ref guard
+    // the root Verify button test above, this time proving `rescan`'s own ref guard
     // (not just the `disabled` attribute) keeps it to a single dispatch.
     act(() => {
       fireEvent.click(rescanButton)
@@ -366,7 +381,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(calls).toBe(2)
   })
 
-  it('disables "Verify root" while the initial scan is loading, re-enabling once it settles', async () => {
+  it('offers no Verify button while the initial scan is loading, then an enabled one per agent once it settles', async () => {
     let resolveStatus: ((value: DefinitionStatus) => void) | undefined
     mockIPC((cmd) => {
       if (cmd === 'definition_status') {
@@ -379,18 +394,19 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
 
     render(<DefinitionSection />)
 
-    const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
-    expect(verifyButton.disabled).toBe(true)
+    // Verify buttons live on the agent rows, so none exists before a report.
+    expect(screen.queryByRole('button', { name: 'Verify .' })).toBeNull()
 
     if (!resolveStatus) throw new Error('definition_status was not called')
     await act(async () => {
       resolveStatus!(FIXTURE_STATUS)
     })
 
+    const verifyButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
     expect(verifyButton.disabled).toBe(false)
   })
 
-  it('refuses a "Verify root" click dispatched in the same tick as "Rescan", before the disabled attribute renders, and still recovers once the rescan settles', async () => {
+  it('refuses a "Verify ." click dispatched in the same tick as "Rescan", before the disabled attribute renders, and still recovers once the rescan settles', async () => {
     let verifyCalls = 0
     let statusCalls = 0
     let resolveRescanStatus: ((value: DefinitionStatus) => void) | undefined
@@ -413,10 +429,10 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     await screen.findByText('/workspace')
 
     const rescanButton = screen.getByRole('button', { name: 'Rescan' })
-    const verifyButton = screen.getByRole('button', { name: 'Verify root' })
+    const verifyButton = screen.getByRole('button', { name: 'Verify .' })
     // Both clicks are dispatched inside one `act` call, exactly like the
-    // existing same-tick "Verify root" double-click test above, so React
-    // never gets a chance to commit "Verify root"'s own `disabled`
+    // existing same-tick the root Verify button double-click test above, so React
+    // never gets a chance to commit the root Verify button's own `disabled`
     // attribute (tied to `loading`, which the `rescan` click just set
     // `true`) between them -- the race the bugfix guards against.
     act(() => {
@@ -444,7 +460,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(screen.getByText('/workspace-rescanned')).toBeTruthy()
   })
 
-  it('refuses a "Verify root" click dispatched while the mount-time scan is still pending, recovering once it settles', async () => {
+  it('offers no Verify button while the mount-time scan is still pending, and verifies once it settles', async () => {
     let verifyCalls = 0
     let resolveStatus: ((value: DefinitionStatus) => void) | undefined
     mockIPC((cmd) => {
@@ -462,14 +478,8 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
 
     render(<DefinitionSection />)
 
-    // "Verify root" is already disabled from the very first render
-    // (`loading` starts `true`), so this click is refused the same way a
-    // same-tick race would be -- `scanningRef` is set for this mount scan
-    // exactly as it would be for a rescan, keeping the ref's own
-    // invariant true regardless of which scan is in flight.
-    const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
-    expect(verifyButton.disabled).toBe(true)
-    fireEvent.click(verifyButton)
+    // No report yet, so no agent row and no Verify button to click.
+    expect(screen.queryByRole('button', { name: 'Verify .' })).toBeNull()
     expect(verifyCalls).toBe(0)
 
     if (!resolveStatus) throw new Error('definition_status was not called')
@@ -477,6 +487,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
       resolveStatus!(FIXTURE_STATUS)
     })
 
+    const verifyButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
     expect(verifyButton.disabled).toBe(false)
     fireEvent.click(verifyButton)
     await screen.findByLabelText('Verification')
@@ -489,7 +500,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
   // dispatches share this one instance's `generationRef`/`scanningRef`,
   // so the fix has to hold regardless of which of the two settles first.
   it(
-    'keeps "Verify root" refused and shows no report while a StrictMode-replayed scan is still pending, ' +
+    'offers no Verify button and shows no report while a StrictMode-replayed scan is still pending, ' +
       'recovering once both dispatches have settled (first-dispatched settles first)',
     async () => {
       const resolvers: Array<(value: DefinitionStatus) => void> = []
@@ -519,15 +530,13 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
 
       // The first of the two replayed dispatches settles first. Before
       // the fix, its own unconditional `setLoading(false)` and
-      // `scanningRef` clear made "Verify root" usable here, even though
-      // the second (authoritative) scan was still pending.
+      // `scanningRef` clear made the report usable here, even though the
+      // second (authoritative) scan was still pending.
       await act(async () => {
         resolvers[0](FIXTURE_STATUS)
       })
 
-      const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
-      expect(verifyButton.disabled).toBe(true)
-      fireEvent.click(verifyButton)
+      expect(screen.queryByRole('button', { name: 'Verify .' })).toBeNull()
       expect(verifyCalls).toBe(0)
       expect(screen.queryByText('/workspace')).toBeNull()
 
@@ -538,13 +547,14 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
       })
 
       await screen.findByText('/workspace')
+      const verifyButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
       expect(verifyButton.disabled).toBe(false)
       expect((screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement).disabled).toBe(false)
 
       fireEvent.click(verifyButton)
       await screen.findByLabelText('Verification')
       expect(verifyCalls).toBe(1)
-      expect(screen.getByText('/workspace')).toBeTruthy()
+      expect(screen.getByText('root:', { exact: false })).toBeTruthy()
     },
   )
 
@@ -584,7 +594,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
       })
 
       await screen.findByText('/workspace')
-      const verifyButton = screen.getByRole('button', { name: 'Verify root' }) as HTMLButtonElement
+      const verifyButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
       expect(verifyButton.disabled).toBe(false)
 
       fireEvent.click(verifyButton)
@@ -598,7 +608,7 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
         resolvers[0](FIXTURE_STATUS)
       })
 
-      expect(screen.getByText('/workspace')).toBeTruthy()
+      expect(screen.getByText('root:', { exact: false })).toBeTruthy()
       expect(screen.getByLabelText('Verification')).toBeTruthy()
       expect((screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement).disabled).toBe(false)
     },
@@ -618,5 +628,102 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     await screen.findByText('/workspace')
 
     expect(calls).toBe(1)
+  })
+
+  it("verifies a nested agent through its own row's button, passing its relative path and naming that target in the result", async () => {
+    const verifyArgs: unknown[] = []
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS_NESTED
+      if (cmd === 'definition_verify') {
+        verifyArgs.push(args)
+        return { ...FIXTURE_VERIFY, agent: '/workspace/sub/agent' }
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify sub/agent' }))
+
+    const verification = await screen.findByLabelText('Verification')
+    expect(verifyArgs).toEqual([{ agent: 'sub/agent' }])
+    expect(within(verification).getByText('sub/agent')).toBeTruthy()
+    expect(within(verification).getByText('/workspace/sub/agent')).toBeTruthy()
+  })
+
+  it('verifies the root through the "." row, passing "." as the agent', async () => {
+    const verifyArgs: unknown[] = []
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS_NESTED
+      if (cmd === 'definition_verify') {
+        verifyArgs.push(args)
+        return FIXTURE_VERIFY
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
+
+    const verification = await screen.findByLabelText('Verification')
+    expect(verifyArgs).toEqual([{ agent: '.' }])
+    expect(within(verification).getByText('/workspace')).toBeTruthy()
+  })
+
+  it('disables every Verify button while a verify is pending', async () => {
+    let resolveVerify: ((value: DefinitionVerify) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS_NESTED
+      if (cmd === 'definition_verify') {
+        return new Promise((resolve) => {
+          resolveVerify = resolve as (value: DefinitionVerify) => void
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+    const rootButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
+    const nestedButton = screen.getByRole('button', { name: 'Verify sub/agent' }) as HTMLButtonElement
+    expect(rootButton.disabled).toBe(false)
+    expect(nestedButton.disabled).toBe(false)
+
+    fireEvent.click(nestedButton)
+
+    await waitFor(() => {
+      expect(rootButton.disabled).toBe(true)
+      expect(nestedButton.disabled).toBe(true)
+    })
+    if (!resolveVerify) throw new Error('definition_verify was not called')
+    await act(async () => {
+      resolveVerify!(FIXTURE_VERIFY)
+    })
+    await waitFor(() => {
+      expect(rootButton.disabled).toBe(false)
+      expect(nestedButton.disabled).toBe(false)
+    })
+  })
+
+  it("renders the code and message of the shell's invalid-request rejection for a verify", async () => {
+    const error: ShellError = { code: 'invalid-request', message: 'the agent is not a workspace directory' }
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS_NESTED
+      if (cmd === 'definition_verify') return Promise.reject(error)
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify sub/agent' }))
+
+    const banner = await screen.findByTestId('definition-verify-error')
+    expect(within(banner).getByText('invalid-request')).toBeTruthy()
+    expect(within(banner).getByText(/the agent is not a workspace directory/)).toBeTruthy()
+    expect(screen.queryByLabelText('Verification')).toBeNull()
   })
 })

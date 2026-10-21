@@ -632,7 +632,19 @@ describe('AgentPanel', () => {
           schema: 'omnifrons.definition-scan/1',
           root: definitionCalls === 2 ? '/workspace-a' : '/workspace-b',
           ancestors: [],
-          agents: [],
+          agents: [
+            {
+              path: '.',
+              state: 'agents-only',
+              identityFiles: [],
+              title: null,
+              parent: null,
+              nested: [],
+              consentRequired: false,
+              skills: { discovered: [], indexed: [], missing: [], dangling: [], precedence: false },
+              warnings: [],
+            },
+          ],
         }
       }
       throw new Error(`unexpected command: ${cmd}`)
@@ -644,7 +656,7 @@ describe('AgentPanel', () => {
     fireEvent.click(pick)
     await screen.findByText('/workspace-a')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Verify root' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
     await screen.findByLabelText('Verification')
 
     fireEvent.click(pick)
