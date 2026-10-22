@@ -105,10 +105,20 @@ fn not_a_workspace_directory() -> ShellError {
 /// refused just like a symlinked final one. The path syntax is checked
 /// first, with the same domain rules the application service applies,
 /// so the service's own target error is unreachable from the command.
+///
+/// The target is a workspace-relative POSIX path whose components are
+/// plain names: non-empty, not `.` or `..`, and free of `\`, `:` and
+/// NUL. That is checked on every platform before the filesystem is
+/// touched, so a native path syntax (a drive prefix, a rooted or
+/// backslash-separated component) can never reach the join below and
+/// escape or replace the workspace prefix.
 fn require_workspace_directory(workspace: &WorkspaceRoot, target: &str) -> Result<(), ShellError> {
     nesting::relate(&[target], &[]).map_err(|_| not_a_workspace_directory())?;
     if target == "." {
         return Ok(());
+    }
+    if !target.split('/').all(is_plain_name) {
+        return Err(not_a_workspace_directory());
     }
     let mut prefix = workspace.path().to_path_buf();
     for component in target.split('/') {
@@ -120,6 +130,16 @@ fn require_workspace_directory(workspace: &WorkspaceRoot, target: &str) -> Resul
         }
     }
     Ok(())
+}
+
+/// Whether `component` is a plain directory name: non-empty, not `.` or
+/// `..`, and carrying no backslash, colon or NUL, which a native path
+/// would read as a separator, a drive prefix or a terminator.
+fn is_plain_name(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains(['\\', ':', '\0'])
 }
 
 /// A verification of one agent directory's canonical definition: its
@@ -515,6 +535,40 @@ mod tests {
         let workspace = project.workspace();
 
         for target in ["../x", "/abs", "a//b", "./child", "child/", "", "child/./x"] {
+            assert_invalid_request(definition_verify_for(&workspace, Some(target)));
+        }
+    }
+
+    /// Targets whose components carry a native path syntax (a backslash
+    /// or a drive colon) are refused on every platform, before any
+    /// filesystem call.
+    #[test]
+    fn definition_verify_for_refuses_a_native_path_syntax_target() {
+        let project = TempDir::new("verify-native-syntax");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        let workspace = project.workspace();
+
+        for target in [
+            "a\\..\\b", "..\\x", "C:", "C:\\x", "\\abs", "a:b", "ok/C:", "ok/a\\b",
+        ] {
+            assert_invalid_request(definition_verify_for(&workspace, Some(target)));
+        }
+    }
+
+    /// On Unix a backslash or colon is an ordinary name character, so a
+    /// directory literally named like that exists; it is still refused,
+    /// because the target is a POSIX path of plain names only.
+    #[cfg(unix)]
+    #[test]
+    fn definition_verify_for_refuses_an_existing_directory_named_with_native_syntax() {
+        let project = TempDir::new("verify-native-existing");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        for name in ["a\\..\\b", "..\\x", "C:", "C:\\x", "\\abs", "a:b"] {
+            write(project.path(), &format!("{name}/AGENTS.md"), AGENT_BODY);
+        }
+        let workspace = project.workspace();
+
+        for target in ["a\\..\\b", "..\\x", "C:", "C:\\x", "\\abs", "a:b"] {
             assert_invalid_request(definition_verify_for(&workspace, Some(target)));
         }
     }
