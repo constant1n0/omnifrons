@@ -107,11 +107,13 @@ fn not_a_workspace_directory() -> ShellError {
 /// so the service's own target error is unreachable from the command.
 ///
 /// The target is a workspace-relative POSIX path whose components are
-/// plain names: non-empty, not `.` or `..`, and free of `\`, `:` and
-/// NUL. That is checked on every platform before the filesystem is
-/// touched, so a native path syntax (a drive prefix, a rooted or
+/// plain names: non-empty, not `.` or `..`, free of NUL, and on Windows
+/// free of `\` and `:` as well. That is checked before the filesystem
+/// is touched, so a native path syntax (a drive prefix, a rooted or
 /// backslash-separated component) can never reach the join below and
-/// escape or replace the workspace prefix.
+/// escape or replace the workspace prefix there. On Unix those two are
+/// ordinary name characters, so a directory the scan lists under such
+/// a name verifies like any other.
 fn require_workspace_directory(workspace: &WorkspaceRoot, target: &str) -> Result<(), ShellError> {
     nesting::relate(&[target], &[]).map_err(|_| not_a_workspace_directory())?;
     if target == "." {
@@ -133,13 +135,14 @@ fn require_workspace_directory(workspace: &WorkspaceRoot, target: &str) -> Resul
 }
 
 /// Whether `component` is a plain directory name: non-empty, not `.` or
-/// `..`, and carrying no backslash, colon or NUL, which a native path
-/// would read as a separator, a drive prefix or a terminator.
+/// `..`, carrying no NUL, and on Windows no backslash or colon either,
+/// which a native path there reads as a separator or a drive prefix.
 fn is_plain_name(component: &str) -> bool {
     !component.is_empty()
         && component != "."
         && component != ".."
-        && !component.contains(['\\', ':', '\0'])
+        && !component.contains('\0')
+        && (!cfg!(windows) || !component.contains(['\\', ':']))
 }
 
 /// A verification of one agent directory's canonical definition: its
@@ -543,8 +546,9 @@ mod tests {
     }
 
     /// Targets whose components carry a native path syntax (a backslash
-    /// or a drive colon) are refused on every platform, before any
-    /// filesystem call.
+    /// or a drive colon) are refused on every platform: on Windows before
+    /// any filesystem call, on Unix because no directory of that name
+    /// exists here.
     #[test]
     fn definition_verify_for_refuses_a_native_path_syntax_target() {
         let project = TempDir::new("verify-native-syntax");
@@ -559,11 +563,12 @@ mod tests {
     }
 
     /// On Unix a backslash or colon is an ordinary name character, so a
-    /// directory literally named like that exists; it is still refused,
-    /// because the target is a POSIX path of plain names only.
+    /// directory literally named like that exists, the scan lists it,
+    /// and its row verifies like any other: the name is one component
+    /// that never reaches a native path parser.
     #[cfg(unix)]
     #[test]
-    fn definition_verify_for_refuses_an_existing_directory_named_with_native_syntax() {
+    fn definition_verify_for_verifies_an_existing_directory_named_with_native_syntax() {
         let project = TempDir::new("verify-native-existing");
         write(project.path(), "AGENTS.md", AGENT_BODY);
         for name in ["a\\..\\b", "..\\x", "C:", "C:\\x", "\\abs", "a:b"] {
@@ -572,7 +577,15 @@ mod tests {
         let workspace = project.workspace();
 
         for target in ["a\\..\\b", "..\\x", "C:", "C:\\x", "\\abs", "a:b"] {
-            assert_invalid_request(definition_verify_for(&workspace, Some(target)));
+            let verify = definition_verify_for(&workspace, Some(target)).expect("verify succeeds");
+            assert_eq!(
+                verify.state,
+                crate::ipc::dto::RootStateTag::AgentsOnly,
+                "{target}"
+            );
+            let mut expected = workspace.path().to_path_buf();
+            expected.push(target);
+            assert_eq!(verify.agent, expected.to_string_lossy());
         }
     }
 }
