@@ -436,7 +436,7 @@ mod tests {
     }
 
     /// A nested canonical agent verifies as itself, and the payload's
-    /// `agent` is the workspace path joined with the target.
+    /// `agent` is the workspace path with the target pushed on component by component.
     #[test]
     fn definition_verify_for_verifies_a_nested_agent() {
         let project = TempDir::new("verify-nested");
@@ -449,10 +449,9 @@ mod tests {
 
         assert_eq!(verify.state, crate::ipc::dto::RootStateTag::Canonical);
         assert!(verify.canonical, "{:?}", verify.problems);
-        assert_eq!(
-            verify.agent,
-            workspace.path().join("child").to_string_lossy()
-        );
+        let mut expected = workspace.path().to_path_buf();
+        expected.push("child");
+        assert_eq!(verify.agent, expected.to_string_lossy());
         let root = definition_verify_for(&workspace, Some(".")).expect("verify succeeds");
         assert_eq!(root.agent, workspace.path().to_string_lossy());
     }
@@ -524,6 +523,10 @@ mod tests {
         let verify = definition_verify_for(&workspace, Some("a/b")).expect("verify succeeds");
 
         assert!(verify.canonical, "{:?}", verify.problems);
+        let mut expected = workspace.path().to_path_buf();
+        expected.push("a");
+        expected.push("b");
+        assert_eq!(verify.agent, expected.to_string_lossy());
     }
 
     /// An unclean or escaping target is refused before it touches the

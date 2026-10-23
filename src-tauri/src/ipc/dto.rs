@@ -2332,8 +2332,10 @@ impl DefinitionStatusDto {
 /// return value, minus `backups`: this port keeps snapshots in its own
 /// store rather than reporting them back on this wire shape).
 /// `agent` is the verified agent directory's own display path -- the
-/// workspace path joined with the target -- never a device path of
-/// whichever file was actually read.
+/// workspace path with each `/`-separated component of the target pushed
+/// onto it, so the separators are native on every platform (`"."` is the
+/// workspace path itself) -- never a device path of whichever file was
+/// actually read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefinitionVerifyDto {
@@ -2356,16 +2358,27 @@ impl DefinitionVerifyDto {
     ) -> Self {
         Self {
             schema: "omnifrons.definition-verify/1".to_string(),
-            agent: if target == "." {
-                workspace.path().to_string_lossy().into_owned()
-            } else {
-                workspace.path().join(target).to_string_lossy().into_owned()
-            },
+            agent: display_agent_path(workspace.path(), target)
+                .to_string_lossy()
+                .into_owned(),
             state: report.state.into(),
             canonical: report.canonical,
             problems: report.problems.clone(),
         }
     }
+}
+
+/// The agent directory's display path: `workspace` with each
+/// `/`-separated component of `target` pushed on, so the separators are
+/// the platform's own. `"."` yields `workspace` unchanged.
+fn display_agent_path(workspace: &std::path::Path, target: &str) -> std::path::PathBuf {
+    let mut path = workspace.to_path_buf();
+    if target != "." {
+        for component in target.split('/') {
+            path.push(component);
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -4628,6 +4641,20 @@ mod tests {
         assert_eq!(
             json(&nested)["agent"],
             serde_json::json!(workspace.path().join("child").to_string_lossy())
+        );
+        // A deeper target is built component by component, never by
+        // joining the POSIX string, so separators are native everywhere.
+        let deep = super::DefinitionVerifyDto::from_report(&workspace, "a/b", &report);
+        let mut expected = workspace.path().to_path_buf();
+        expected.push("a");
+        expected.push("b");
+        assert_eq!(
+            json(&deep)["agent"],
+            serde_json::json!(expected.to_string_lossy())
+        );
+        assert_eq!(
+            json(&dto)["agent"],
+            serde_json::json!(workspace.path().to_string_lossy())
         );
         assert_eq!(
             value["schema"],

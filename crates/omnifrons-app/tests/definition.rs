@@ -4939,6 +4939,79 @@ fn verify_of_a_nested_target_uses_the_nearest_root_for_skill_ownership() {
     );
 }
 
+/// A deeper agent below the target owns its own skill: the nearest root
+/// of `child/grandchild/skills/x/SKILL.md` is `child/grandchild`, so the
+/// target `child` counts only its own skill. `child`'s skills block lists
+/// just `own`; if the grandchild's skill were attributed to `child`, the
+/// block would be stale (a pending regenerate) or the row would be
+/// reported missing.
+#[test]
+fn verify_of_a_nested_target_excludes_a_grandchild_agents_skill() {
+    let project = TempDir::new("verify-target-grandchild-skill");
+    let workspace = project.workspace();
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let row = SkillRow {
+        name: "own".to_string(),
+        description: "The child's own skill".to_string(),
+        path: "skills/own/SKILL.md".to_string(),
+        had_undecodable_bytes: false,
+    };
+    let body = render_body(&[row], true);
+    let block = ManagedBlock::skills(body, &digest).expect("a non-empty body builds a block");
+    let rendered = block.render(LineEnding::Lf);
+    let child_bytes =
+        format!("# Child\n\nYou are Child, a nested fixture agent.\n\n{rendered}\n").into_bytes();
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Agents, b"# Root\n\nYou are Root.\n")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child",
+            vec![
+                identity(IdentityKind::Agents, &child_bytes),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .directory(
+            "child/grandchild",
+            vec![
+                identity(
+                    IdentityKind::Agents,
+                    b"# Grandchild\n\nYou are Grandchild.\n",
+                ),
+                identity(IdentityKind::Claude, WRAPPER),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill(
+            "child/skills/own/SKILL.md",
+            b"---\nname: own\ndescription: The child's own skill\n---\n".to_vec(),
+        )
+        .skill(
+            "child/grandchild/skills/x/SKILL.md",
+            b"---\nname: x\ndescription: The grandchild's skill\n---\n".to_vec(),
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let report = verify(&ports, &workspace, "child").expect("verify succeeds");
+
+    assert_eq!(report.state, RootState::Canonical);
+    assert!(report.canonical, "{:?}", report.problems);
+    assert_eq!(report.problems, Vec::<String>::new());
+}
+
 /// A target that is absent from the snapshot reports `state is none`,
 /// exactly like an empty root.
 #[test]
@@ -4980,34 +5053,64 @@ fn verify_of_an_extras_only_target_reports_state_none() {
 }
 
 /// A target that is not a clean relative POSIX path is refused with the
-/// domain's own nesting error before any snapshot lookup.
+/// domain's own nesting error, and the refusal is validated before the
+/// tree is consulted: the tree here holds no snapshot at all, so a
+/// `Nesting` error (never `Tree(RootUnreadable)`) proves the validation
+/// ran first. Each input is paired with the exact variant it yields.
+/// The validator checks, in order: a leading `/` (`AbsolutePath`), an
+/// empty path (`EmptyPath`), a `./` prefix (`DotSlashPrefix`), a trailing
+/// `/` (`TrailingSlash`), then each component (`DoubledSlash` for an
+/// empty one, `ParentComponent` for `..`, `DotComponent` for `.`). No
+/// input below matches two rules, so the order does not change a result.
 #[test]
 fn verify_of_an_invalid_target_is_a_nesting_error() {
     let project = TempDir::new("verify-target-invalid");
     let workspace = project.workspace();
-    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, target_snapshot());
+    let tree = InMemoryDefinitionTree::new();
     let hasher = FakeHasher;
     let ports = DefinitionPorts {
         tree: &tree,
         hasher: &hasher,
     };
 
-    for target in ["../x", "/abs", "a//b", "./a", "a/", "", "a/./b"] {
+    let table = [
+        ("../x", NestingError::ParentComponent("../x".to_string())),
+        ("/abs", NestingError::AbsolutePath("/abs".to_string())),
+        ("a//b", NestingError::DoubledSlash("a//b".to_string())),
+        ("./a", NestingError::DotSlashPrefix("./a".to_string())),
+        ("a/", NestingError::TrailingSlash("a/".to_string())),
+        ("", NestingError::EmptyPath),
+        ("a/./b", NestingError::DotComponent("a/./b".to_string())),
+    ];
+    for (target, expected) in table {
         let error = verify(&ports, &workspace, target).expect_err("an unclean target is refused");
         assert!(
-            matches!(
-                error,
-                DefinitionError::Nesting(
-                    NestingError::ParentComponent(_)
-                        | NestingError::AbsolutePath(_)
-                        | NestingError::DoubledSlash(_)
-                        | NestingError::DotSlashPrefix(_)
-                        | NestingError::TrailingSlash(_)
-                        | NestingError::EmptyPath
-                        | NestingError::DotComponent(_)
-                )
-            ),
-            "{target:?} must be a nesting error, got {error:?}"
+            matches!(&error, DefinitionError::Nesting(actual) if *actual == expected),
+            "{target:?} must be {expected:?}, got {error:?}"
         );
     }
+}
+
+/// A clean target that no snapshot can answer for surfaces the tree's own
+/// error, so the test above really distinguishes validation from lookup.
+#[test]
+fn verify_of_a_valid_target_without_a_snapshot_is_a_tree_error() {
+    let project = TempDir::new("verify-target-no-snapshot");
+    let workspace = project.workspace();
+    let tree = InMemoryDefinitionTree::new();
+    let hasher = FakeHasher;
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+
+    let error = verify(&ports, &workspace, "child").expect_err("no snapshot is prepared");
+
+    assert!(
+        matches!(
+            error,
+            DefinitionError::Tree(DefinitionTreeError::RootUnreadable)
+        ),
+        "got {error:?}"
+    );
 }
