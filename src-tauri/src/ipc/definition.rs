@@ -39,10 +39,12 @@ impl From<DefinitionError> for ShellError {
     /// | `Nesting` | `definition-invalid` | `nesting(duplicate-root)` |
     /// | `DuplicateIdentityKind` | `definition-invalid` | `duplicate-identity-kind` |
     /// | `DuplicateSnapshotPath` | `definition-invalid` | `duplicate-snapshot-path` |
+    /// | `InvalidCanonicalChoice` | `invalid-request` | `invalid-canonical-choice` |
     fn from(error: DefinitionError) -> Self {
         let reason = error.reason().to_string();
         let code = match &error {
             DefinitionError::Tree(_) => ShellErrorCode::ScanFailed,
+            DefinitionError::InvalidCanonicalChoice { .. } => ShellErrorCode::InvalidRequest,
             DefinitionError::Nesting(_)
             | DefinitionError::DuplicateIdentityKind(_)
             | DefinitionError::DuplicateSnapshotPath { .. } => ShellErrorCode::DefinitionInvalid,
@@ -57,6 +59,9 @@ impl From<DefinitionError> for ShellError {
             }
             DefinitionError::DuplicateSnapshotPath { .. } => {
                 "the scan reported the same path more than once"
+            }
+            DefinitionError::InvalidCanonicalChoice { .. } => {
+                "the canonical file choice does not apply to this definition"
             }
         };
         Self {
@@ -285,7 +290,7 @@ mod tests {
     /// practical way to exercise their mapping.
     #[test]
     fn definition_error_maps_to_shell_error_by_variant() {
-        let cases: [(DefinitionError, ShellErrorCode, &str); 4] = [
+        let cases: [(DefinitionError, ShellErrorCode, &str); 5] = [
             (
                 DefinitionError::Tree(DefinitionTreeError::RootUnreadable),
                 ShellErrorCode::ScanFailed,
@@ -310,6 +315,13 @@ mod tests {
                 },
                 ShellErrorCode::DefinitionInvalid,
                 "duplicate-snapshot-path",
+            ),
+            (
+                DefinitionError::InvalidCanonicalChoice {
+                    detail: "--canonical-from only resolves a conflict".to_string(),
+                },
+                ShellErrorCode::InvalidRequest,
+                "invalid-canonical-choice",
             ),
         ];
         for (error, code, reason) in cases {

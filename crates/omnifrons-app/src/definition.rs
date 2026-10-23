@@ -106,6 +106,16 @@ pub enum DefinitionError {
         /// The repeated path itself.
         path: String,
     },
+    /// The caller's `canonical_from` choice does not apply to the
+    /// target: the root is not in conflict, the choice is not
+    /// `CLAUDE.md` or `AGENTS.md`, or the chosen file holds no content.
+    /// A caller mistake, not a property of the definition, so it is an
+    /// error rather than a plan refusal.
+    #[error("{detail}")]
+    InvalidCanonicalChoice {
+        /// What is wrong with the choice; names no absolute path.
+        detail: String,
+    },
 }
 
 impl DefinitionError {
@@ -139,6 +149,7 @@ impl DefinitionError {
             },
             Self::DuplicateIdentityKind(_) => "duplicate-identity-kind",
             Self::DuplicateSnapshotPath { .. } => "duplicate-snapshot-path",
+            Self::InvalidCanonicalChoice { .. } => "invalid-canonical-choice",
         }
     }
 }
@@ -330,7 +341,7 @@ fn attribute_skills<'a>(roots: &[&'a str], skills: &[SkillFile]) -> HashMap<&'a 
 /// (`crate::definition_tree`'s own documentation) is never one of
 /// these, so it can never become an agent, a nesting parent, or
 /// anything needing consent through [`nesting::relate`].
-fn agent_root_paths(directories: &[DirectoryEntry]) -> Vec<&str> {
+pub(crate) fn agent_root_paths(directories: &[DirectoryEntry]) -> Vec<&str> {
     directories
         .iter()
         .filter(|directory| !directory.identity_files.is_empty())
@@ -778,25 +789,27 @@ pub fn scan(
 /// # Deferred to slice 2 (the write path)
 ///
 /// This pass can only know what a snapshot already answers; it never
-/// plans a write, so it cannot know:
+/// plans a write. [`crate::definition_plan::plan`] (sub-slice 2a) now
+/// computes, over the same snapshot and the same skill-metadata and
+/// managed-block analysis, what this pass leaves out:
 ///
-/// - the `nested_agent` refusal (excluded structurally, as above);
-/// - the `unresolved_file` refusal (an unmanaged secondary identity file
-///   -- `GEMINI.md`, `QWEN.md`, `.claude/CLAUDE.md`, `AGENTS.override.md`
-///   -- that would still differ from the chosen source once copied) and
-///   the `diverging_copy` refusal (an unmanaged secondary that would
-///   stop matching once the skill index block is written): both need
-///   `plan_operations`'s own secondary-file comparison, not only the
-///   root's classification;
-/// - the `AGENTS.md` copy operation (`ClaudeOnly`/`IdenticalCopies`
-///   states resolve `CLAUDE.md` as the source and would copy it onto
-///   `AGENTS.md`) and the opt-in `GEMINI.md` wrapper write
-///   (`--with-gemini`): this pass only ever reports the `CLAUDE.md`
-///   wrapper, for [`RootState::AgentsOnly`]/[`RootState::NearWrapper`];
-/// - every `backup` operation `build_plan` would plan alongside a write
-///   it is about to make: a mechanical side effect of the write path,
-///   never a problem describing what is wrong with the canonical text
-///   itself.
+/// - the `nested_agent` refusal (excluded here structurally, as above);
+/// - the `unresolved_file` and `diverging_copy` refusals, which need a
+///   comparison of each unmanaged secondary identity file (`GEMINI.md`,
+///   `QWEN.md`, `.claude/CLAUDE.md`, `AGENTS.override.md`) against the
+///   chosen source, not only the root's classification;
+/// - the `AGENTS.md` copy operation and the opt-in `GEMINI.md` wrapper
+///   write, whereas this pass only ever reports the `CLAUDE.md` wrapper,
+///   for [`RootState::AgentsOnly`]/[`RootState::NearWrapper`];
+/// - a plan id over the definition's path, every input fingerprint, and
+///   the planned operations.
+///
+/// Still deferred to the sub-slices after 2a: the skills-block and
+/// legacy-migration operations and the block diff (2b), the `backup`
+/// operation planned alongside each overwrite (a mechanical side effect
+/// of the write path, never a problem describing the canonical text),
+/// and the apply step that re-checks each input fingerprint and writes
+/// (2c and 2d).
 ///
 /// Within the refusals and pending operations this pass *can* know, one
 /// further simplification is documented where it is computed: the
@@ -823,30 +836,13 @@ pub fn verify(
     workspace: &WorkspaceRoot,
     target: &str,
 ) -> Result<VerifyReport, DefinitionError> {
-    // The domain validates every root it relates; relating the target
-    // alone applies exactly its clean-path rules.
-    nesting::relate(&[target], &[]).map_err(DefinitionError::Nesting)?;
-    let snapshot = ports
-        .tree
-        .snapshot(workspace)
-        .map_err(DefinitionError::Tree)?;
-    reject_duplicate_snapshot_paths(&snapshot)?;
+    let loaded = load_target(ports, workspace, target)?;
+    let LoadedTarget {
+        snapshot,
+        identity_files,
+        classification,
+    } = loaded;
     let roots = agent_root_paths(&snapshot.directories);
-
-    // A repeated path is already refused above, so this lookup never
-    // has to guess which of two same-path copies is the real one the
-    // way it silently did before that guard existed.
-    let root_entry = snapshot
-        .directories
-        .iter()
-        .find(|directory| directory.path == target);
-    let identity_files: Vec<IdentityFile> =
-        root_entry.map_or_else(Vec::new, |directory| directory.identity_files.clone());
-    let host_extras: Vec<String> =
-        root_entry.map_or_else(Vec::new, |directory| directory.host_extras.clone());
-    let identity = DirectoryIdentity::new(identity_files.clone(), host_extras)
-        .map_err(DefinitionError::DuplicateIdentityKind)?;
-    let classification = classify(&identity);
 
     let mut problems = Vec::new();
     if !matches!(
@@ -872,6 +868,58 @@ pub fn verify(
     })
 }
 
+/// One target's snapshot and classification, as [`verify`] and the plan
+/// builder both read them.
+pub(crate) struct LoadedTarget {
+    /// The snapshot, already checked for repeated paths.
+    pub(crate) snapshot: TreeSnapshot,
+    /// The target's identity files (empty when the target holds none).
+    pub(crate) identity_files: Vec<IdentityFile>,
+    /// The target's classification.
+    pub(crate) classification: Classification,
+}
+
+/// Validates `target`, reads the snapshot, and classifies the target's
+/// identity files: the first half of [`verify`], shared with the plan
+/// builder.
+///
+/// # Errors
+///
+/// The same errors [`verify`] documents.
+pub(crate) fn load_target(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: &str,
+) -> Result<LoadedTarget, DefinitionError> {
+    // The domain validates every root it relates; relating the target
+    // alone applies exactly its clean-path rules.
+    nesting::relate(&[target], &[]).map_err(DefinitionError::Nesting)?;
+    let snapshot = ports
+        .tree
+        .snapshot(workspace)
+        .map_err(DefinitionError::Tree)?;
+    reject_duplicate_snapshot_paths(&snapshot)?;
+
+    // A repeated path is already refused above, so this lookup never
+    // has to guess which of two same-path copies is the real one.
+    let root_entry = snapshot
+        .directories
+        .iter()
+        .find(|directory| directory.path == target);
+    let identity_files: Vec<IdentityFile> =
+        root_entry.map_or_else(Vec::new, |directory| directory.identity_files.clone());
+    let host_extras: Vec<String> =
+        root_entry.map_or_else(Vec::new, |directory| directory.host_extras.clone());
+    let identity = DirectoryIdentity::new(identity_files.clone(), host_extras)
+        .map_err(DefinitionError::DuplicateIdentityKind)?;
+    let classification = classify(&identity);
+    Ok(LoadedTarget {
+        snapshot,
+        identity_files,
+        classification,
+    })
+}
+
 /// Every problem after the state check: the prototype's own refusal, or
 /// else its pending operations, directly mirroring `build_plan`'s own
 /// short circuit (see [`verify`]'s own documentation) through this
@@ -879,8 +927,7 @@ pub fn verify(
 /// covered: [`RootState::None`] returns nothing (the prototype's own
 /// `if report.state == NONE: return plan`, an unrefused, empty plan),
 /// [`RootState::Unsafe`]/[`RootState::Conflict`] each return their one
-/// refusal, and every other state falls through to the skill-metadata
-/// and skills-block checks below.
+/// refusal, and every other state falls through to [`block_analysis`].
 fn verify_problems_after_state(
     ports: &DefinitionPorts<'_>,
     workspace: &WorkspaceRoot,
@@ -910,6 +957,66 @@ fn verify_problems_after_state(
         _ => {}
     }
 
+    match block_analysis(
+        ports,
+        workspace,
+        snapshot,
+        roots,
+        target,
+        identity_files,
+        classification.source,
+    ) {
+        BlockAnalysis::Refused(refusal) => vec![refusal],
+        BlockAnalysis::Settled { pending } => {
+            let mut problems = wrapper_problems(classification.state, ports.hasher, identity_files);
+            problems.extend(pending);
+            problems
+        }
+    }
+}
+
+/// What [`block_analysis`] found for one agent root's skills metadata
+/// and managed blocks.
+pub(crate) enum BlockAnalysis {
+    /// A refusal, in the prototype's own `refused (<code>): <detail>`
+    /// wording ([`split_refusal`] reads its parts back): unsafe skill
+    /// metadata, or a malformed or hand-edited block in either block
+    /// family.
+    Refused(String),
+    /// No refusal. `pending` is the one block operation still due -- a
+    /// legacy migration, or an append or regenerate of the skills block --
+    /// in the prototype's own `pending:` wording; `None` when the block
+    /// layer needs no write.
+    Settled {
+        /// The pending block operation's description, if any.
+        pending: Option<String>,
+    },
+}
+
+/// Splits a `refused (<code>): <detail>` string, as every refusal this
+/// module produces is spelled, into its code and detail; `None` for any
+/// other string.
+pub(crate) fn split_refusal(message: &str) -> Option<(&str, &str)> {
+    let rest = message.strip_prefix("refused (")?;
+    let (code, detail) = rest.split_once("): ")?;
+    Some((code, detail))
+}
+
+/// The skill-metadata and managed-block layer of `build_plan` for one
+/// agent root: the refusals that outrank every pending operation, or
+/// else the one block operation still due. `source` is the identity
+/// kind whose bytes are the canonical text -- the classification's own
+/// source, or the kind a caller chose to resolve a conflict. Shared by
+/// [`verify`] and the plan builder so neither re-derives it.
+pub(crate) fn block_analysis(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    snapshot: &TreeSnapshot,
+    roots: &[&str],
+    target: &str,
+    identity_files: &[IdentityFile],
+    source: Option<IdentityKind>,
+) -> BlockAnalysis {
     // Each skill is re-rooted at the target: its row and discovered
     // paths are relative to the verified agent, exactly as the
     // prototype's own `skill.relative_to(owner)` reads them.
@@ -924,12 +1031,12 @@ fn verify_problems_after_state(
         .collect();
     let (rows, skill_refusal) = skill_rows(&root_skills);
     if let Some(refusal) = skill_refusal {
-        return vec![refusal];
+        return BlockAnalysis::Refused(refusal);
     }
 
     let discovered: Vec<String> = root_skills.iter().map(|skill| skill.path.clone()).collect();
     let root_absolute = absolute_posix(workspace, target);
-    let canonical_text = canonical_bytes(identity_files, classification.source);
+    let canonical_text = canonical_bytes(identity_files, source);
     let status = read_skill_index(canonical_text.unwrap_or(&[]), &discovered, &root_absolute);
 
     if let Some(text) = canonical_text {
@@ -974,28 +1081,28 @@ fn verify_problems_after_state(
             } else {
                 omnifrons_refusal
             };
-            return vec![winner.clone()];
+            return BlockAnalysis::Refused(winner.clone());
         }
         if let Some((legacy_message, _)) = legacy_refusal {
-            return vec![legacy_message];
+            return BlockAnalysis::Refused(legacy_message);
         }
         if let Some(refusal) = omnifrons_refusal {
-            return vec![refusal];
+            return BlockAnalysis::Refused(refusal);
         }
         if let Some(migrate) = legacy_pending {
-            let mut problems = wrapper_problems(classification.state, ports.hasher, identity_files);
-            problems.push(migrate);
-            return problems;
+            return BlockAnalysis::Settled {
+                pending: Some(migrate),
+            };
         }
         if let Some(pending) = omnifrons_pending {
-            let mut problems = wrapper_problems(classification.state, ports.hasher, identity_files);
-            problems.push(pending);
-            return problems;
+            return BlockAnalysis::Settled {
+                pending: Some(pending),
+            };
         }
-        return wrapper_problems(classification.state, ports.hasher, identity_files);
+        return BlockAnalysis::Settled { pending: None };
     }
 
-    wrapper_problems(classification.state, ports.hasher, identity_files)
+    BlockAnalysis::Settled { pending: None }
 }
 
 /// The pending `CLAUDE.md` wrapper write, when `state` is

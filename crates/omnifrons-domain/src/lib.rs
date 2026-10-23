@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod definition;
+pub mod definition_plan;
 pub mod executable;
 mod fences;
 pub mod guidance;
