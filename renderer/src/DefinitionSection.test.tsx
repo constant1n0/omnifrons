@@ -730,4 +730,65 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
     expect(within(banner).getByText(/the agent is not a workspace directory/)).toBeTruthy()
     expect(screen.queryByLabelText('Verification')).toBeNull()
   })
+
+  it('still offers "Verify ." for a root whose scan lists no agents, and shows the none outcome', async () => {
+    const verifyArgs: unknown[] = []
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_status') return { ...FIXTURE_STATUS, agents: [] }
+      if (cmd === 'definition_verify') {
+        verifyArgs.push(args)
+        return FIXTURE_VERIFY
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Verify .' }))
+
+    const verification = await screen.findByLabelText('Verification')
+    expect(verifyArgs).toEqual([{ agent: '.' }])
+    expect(within(verification).getByText('none')).toBeTruthy()
+    expect(within(verification).getByText('state is none')).toBeTruthy()
+  })
+
+  it('offers exactly one "Verify ." control when the scan lists a "." row', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return FIXTURE_STATUS_NESTED
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    await screen.findByText('/workspace')
+
+    expect(screen.getAllByRole('button', { name: 'Verify .' })).toHaveLength(1)
+  })
+
+  it('disables the root Verify control while loading and while a verify is pending', async () => {
+    let resolveVerify: ((value: DefinitionVerify) => void) | undefined
+    mockIPC((cmd) => {
+      if (cmd === 'definition_status') return { ...FIXTURE_STATUS, agents: [] }
+      if (cmd === 'definition_verify') {
+        return new Promise((resolve) => {
+          resolveVerify = resolve as (value: DefinitionVerify) => void
+        })
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<DefinitionSection />)
+    expect(screen.queryByRole('button', { name: 'Verify .' })).toBeNull()
+    await screen.findByText('/workspace')
+    const rootButton = screen.getByRole('button', { name: 'Verify .' }) as HTMLButtonElement
+    expect(rootButton.disabled).toBe(false)
+
+    fireEvent.click(rootButton)
+    await waitFor(() => expect(rootButton.disabled).toBe(true))
+    if (!resolveVerify) throw new Error('definition_verify was not called')
+    await act(async () => {
+      resolveVerify!(FIXTURE_VERIFY)
+    })
+    await waitFor(() => expect(rootButton.disabled).toBe(false))
+  })
 })

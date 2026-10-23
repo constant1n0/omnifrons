@@ -219,6 +219,14 @@ export function DefinitionReport({
         <>
           <p>
             root: <PlainTextLine text={status.root} />
+            {!status.agents.some((agent) => agent.path === '.') && (
+              <>
+                {' '}
+                <button type="button" aria-label="Verify ." onClick={() => onVerify('.')} disabled={verifyPending}>
+                  Verify
+                </button>
+              </>
+            )}
           </p>
           {status.ancestors.length > 0 && (
             <ul aria-label="Ancestors">

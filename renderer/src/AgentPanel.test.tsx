@@ -632,19 +632,7 @@ describe('AgentPanel', () => {
           schema: 'omnifrons.definition-scan/1',
           root: definitionCalls === 2 ? '/workspace-a' : '/workspace-b',
           ancestors: [],
-          agents: [
-            {
-              path: '.',
-              state: 'agents-only',
-              identityFiles: [],
-              title: null,
-              parent: null,
-              nested: [],
-              consentRequired: false,
-              skills: { discovered: [], indexed: [], missing: [], dangling: [], precedence: false },
-              warnings: [],
-            },
-          ],
+          agents: [],
         }
       }
       throw new Error(`unexpected command: ${cmd}`)
