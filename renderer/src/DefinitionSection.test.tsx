@@ -554,7 +554,9 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
       fireEvent.click(verifyButton)
       await screen.findByLabelText('Verification')
       expect(verifyCalls).toBe(1)
-      expect(screen.getByText('root:', { exact: false })).toBeTruthy()
+      // Scoped to the report's own root line: the Verification block also
+      // prints a path, so an unscoped lookup would not prove the report survived.
+      expect(within(screen.getByText('root:', { exact: false })).getByText('/workspace')).toBeTruthy()
     },
   )
 
@@ -608,7 +610,9 @@ describe('DefinitionSection (ADR-0005 sub-slice 1i)', () => {
         resolvers[0](FIXTURE_STATUS)
       })
 
-      expect(screen.getByText('root:', { exact: false })).toBeTruthy()
+      // Scoped to the report's own root line: the Verification block also
+      // prints a path, so an unscoped lookup would not prove the report survived.
+      expect(within(screen.getByText('root:', { exact: false })).getByText('/workspace')).toBeTruthy()
       expect(screen.getByLabelText('Verification')).toBeTruthy()
       expect((screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement).disabled).toBe(false)
     },
