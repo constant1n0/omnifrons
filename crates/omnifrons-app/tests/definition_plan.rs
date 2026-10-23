@@ -314,17 +314,19 @@ fn canonical_from_that_does_not_apply_is_an_error_not_a_refusal() {
         "invalid-canonical-choice"
     );
 
-    let wrapper_choice = single_root(vec![
-        identity(IdentityKind::Agents, AGENTS_TEXT),
-        identity(IdentityKind::Claude, OTHER_TEXT),
-    ]);
-    let choose_wrapper_less = PlanOptions {
-        canonical_from: Some(IdentityKind::Agents),
+    // `CLAUDE.md` is the wrapper and `GEMINI.md` differs: a conflict
+    // whose `CLAUDE.md` holds no content of its own, so choosing it
+    // cannot work.
+    let wrapper_conflict = with_gemini_copy(OTHER_TEXT);
+    let choose_wrapper = PlanOptions {
+        canonical_from: Some(IdentityKind::Claude),
         ..PlanOptions::default()
     };
+    let error = run(wrapper_conflict, None, choose_wrapper)
+        .expect_err("the wrapper holds no content to promote");
     assert!(matches!(
-        run(wrapper_choice, None, choose_wrapper_less),
-        Ok(PlanOutcome::Planned(_))
+        error,
+        DefinitionError::InvalidCanonicalChoice { .. }
     ));
 }
 
@@ -624,4 +626,81 @@ fn an_invalid_target_is_a_definition_error() {
     let error = run(claude_only(), Some("../up"), PlanOptions::default())
         .expect_err("a parent component is refused");
     assert_eq!(error.reason(), "nesting(parent-component)");
+}
+
+fn sample_skill() -> Vec<u8> {
+    b"---\nname: sample\n---\n".to_vec()
+}
+
+#[test]
+fn a_claude_only_root_needing_a_block_refuses_only_when_an_unmanaged_copy_exists() {
+    let without_copy = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![identity(IdentityKind::Claude, AGENTS_TEXT)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("skills/sample/SKILL.md", sample_skill())
+        .build();
+    let plan = planned(run(without_copy, None, PlanOptions::default()));
+    assert_eq!(paths(&plan), vec!["AGENTS.md", "CLAUDE.md"]);
+
+    let with_copy = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![
+                identity(IdentityKind::Claude, AGENTS_TEXT),
+                identity(IdentityKind::Qwen, AGENTS_TEXT),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .skill("skills/sample/SKILL.md", sample_skill())
+        .build();
+    let refusal = refused(run(with_copy, None, PlanOptions::default()));
+    assert_eq!(refusal.code(), "diverging_copy");
+    assert!(refusal.message().contains("QWEN.md"));
+    assert!(refusal.message().contains("byte copy of CLAUDE.md"));
+}
+
+#[test]
+fn a_conflict_resolved_toward_claude_analyses_the_claude_bytes_for_blocks() {
+    let hasher = FakeHasher;
+    let digest = |bytes: &[u8]| hasher.sha256(bytes);
+    let begin = ManagedBlock::skills("placeholder", &digest)
+        .expect("a block")
+        .begin_sentinel();
+    let claude = format!("# Sample\n\nYou are a different Sample.\n\n{begin}\n").into_bytes();
+    let snapshot = || {
+        TreeSnapshotBuilder::new()
+            .directory(
+                ".",
+                vec![
+                    identity(IdentityKind::Agents, AGENTS_TEXT),
+                    identity(IdentityKind::Claude, &claude),
+                ],
+                Vec::new(),
+                Vec::new(),
+            )
+            .skill("skills/sample/SKILL.md", sample_skill())
+            .build()
+    };
+    let choose_claude = PlanOptions {
+        canonical_from: Some(IdentityKind::Claude),
+        ..PlanOptions::default()
+    };
+    assert_eq!(
+        refused(run(snapshot(), None, choose_claude)).code(),
+        "block_layout"
+    );
+
+    // The same root resolved toward `AGENTS.md` never reads the
+    // malformed `CLAUDE.md` text as the canonical one.
+    let choose_agents = PlanOptions {
+        canonical_from: Some(IdentityKind::Agents),
+        ..PlanOptions::default()
+    };
+    let plan = planned(run(snapshot(), None, choose_agents));
+    assert_eq!(paths(&plan), vec!["CLAUDE.md"]);
 }
