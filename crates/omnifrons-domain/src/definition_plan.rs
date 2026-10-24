@@ -37,7 +37,7 @@ use crate::guidance::{ManagedFileKind, SKILLS_TEMPLATE_VERSION};
 /// The first line of every [`canonical_bytes`] text. Changing the layout
 /// of that text means changing this tag, so an old id can never match a
 /// new layout.
-pub const CANONICAL_FORM_TAG: &str = "omnifrons-plan-v2";
+pub const CANONICAL_FORM_TAG: &str = "omnifrons-plan-v3";
 
 /// What a plan knows about one input file when it was planned. A later
 /// apply compares the file's current fingerprint against this one and
@@ -86,6 +86,15 @@ pub enum BlockMode {
 }
 
 impl BlockMode {
+    /// Every mode, for exhaustive iteration and parsing.
+    pub const ALL: [Self; 3] = [Self::Append, Self::Replace, Self::MigrateLegacy];
+
+    /// Parse a token produced by [`Self::as_str`].
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == token)
+    }
+
     /// This mode's stable token, as written in [`canonical_bytes`].
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -221,9 +230,11 @@ const fn block_kind_token(kind: ManagedFileKind) -> &'static str {
 pub struct BlockDiff {
     /// The file the block lives in.
     pub path: &'static str,
-    /// The block's lines before the write: empty for an append, the
-    /// current Omnifrons block for a replacement, the legacy block for a
-    /// migration.
+    /// The lines of every block the write replaces or removes, in file
+    /// order: empty for an append, the current Omnifrons block for a
+    /// replacement, the legacy block for a migration, and both blocks
+    /// (current first when it comes first) for a migration beside a
+    /// current block.
     pub before: Vec<String>,
     /// The block's lines after the write, sentinels included.
     pub after: Vec<String>,
@@ -342,9 +353,11 @@ impl fmt::Display for PlanId {
 /// canonical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    /// The canonical workspace root the plan was made for, `/`-separated.
-    /// The id covers it, so a preview never authorises a write in another
-    /// workspace.
+    /// The canonical workspace root the plan was made for, as lossy
+    /// `/`-separated text. Display only: the id covers the root's raw
+    /// platform bytes instead, so a preview never authorises a write in
+    /// another workspace, even one whose name differs only in a byte
+    /// that is not valid UTF-8.
     pub workspace: String,
     /// The agent root's path, relative to the workspace (`.` for the
     /// workspace itself).
@@ -373,8 +386,8 @@ pub struct Plan {
 /// so no two different plans share a text:
 ///
 /// ```text
-/// omnifrons-plan-v2
-/// workspace <len>:<canonical workspace root>
+/// omnifrons-plan-v3
+/// workspace <len>:<canonical workspace root, raw platform bytes>
 /// agent <len>:<path>
 /// inputs <count>
 /// input <len>:<file name> <fingerprint>      (sorted by file name)
@@ -382,7 +395,10 @@ pub struct Plan {
 /// <operation line>                           (in plan order)
 /// ```
 ///
-/// Each line ends in `\n`. The fingerprint and operation lines are
+/// The workspace root is the platform's raw path bytes (on Unix, exactly
+/// the bytes of the path), so two roots that differ only in a byte that is
+/// not valid UTF-8 never share an id. A plan's own display text for the
+/// root is lossy and is never hashed. Each line ends in `\n`. The fingerprint and operation lines are
 /// [`InputFingerprint::canonical`] and [`Operation::canonical`]. The
 /// operation lines are:
 ///
@@ -398,15 +414,19 @@ pub struct Plan {
 /// not reproduce any earlier tool's id layout.
 #[must_use]
 pub fn canonical_bytes(
-    workspace: &str,
+    workspace: &[u8],
     agent: &str,
     inputs: &BTreeMap<String, InputFingerprint>,
     operations: &[Operation],
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!("{CANONICAL_FORM_TAG}\nworkspace {}:", workspace.len()).as_bytes(),
+    );
+    out.extend_from_slice(workspace);
+    out.push(b'\n');
     let mut text = String::new();
     // Writing into a `String` never fails.
-    let _ = writeln!(text, "{CANONICAL_FORM_TAG}");
-    let _ = writeln!(text, "workspace {}:{workspace}", workspace.len());
     let _ = writeln!(text, "agent {}:{agent}", agent.len());
     let _ = writeln!(text, "inputs {}", inputs.len());
     for (name, fingerprint) in inputs {
@@ -421,7 +441,8 @@ pub fn canonical_bytes(
     for operation in operations {
         let _ = writeln!(text, "{}", operation.canonical());
     }
-    text.into_bytes()
+    out.extend_from_slice(text.as_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -440,12 +461,26 @@ mod tests {
             "AGENTS.md".to_string(),
             InputFingerprint::Symlink("a\nb".to_string()),
         );
-        let text = String::from_utf8(canonical_bytes("/w", ".", &inputs, &[])).unwrap();
+        let text = String::from_utf8(canonical_bytes(b"/w", ".", &inputs, &[])).unwrap();
         assert_eq!(
             text,
-            "omnifrons-plan-v2\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
+            "omnifrons-plan-v3\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
              input 9:CLAUDE.md irregular\noperations 0\n"
         );
+    }
+
+    #[test]
+    fn a_root_with_a_non_utf8_byte_changes_the_workspace_line_bytes() {
+        let none = BTreeMap::new();
+        let high = canonical_bytes(b"/w\xff", ".", &none, &[]);
+        let low = canonical_bytes(b"/w\xfe", ".", &none, &[]);
+        let header = b"omnifrons-plan-v3\nworkspace 3:/w\xff\nagent 1:.\n";
+        assert!(high.starts_with(header), "{high:?}");
+        assert_ne!(high, low);
+        // The prefix counts raw bytes, not the lossy text's characters.
+        let lossy = canonical_bytes("/w\u{fffd}".as_bytes(), ".", &none, &[]);
+        assert!(lossy.starts_with(b"omnifrons-plan-v3\nworkspace 5:"));
+        assert_ne!(high, lossy);
     }
 
     #[test]
@@ -464,5 +499,14 @@ mod tests {
             PlanRefusal::EditedBlock(String::new()).code(),
             "edited_block"
         );
+    }
+
+    #[test]
+    fn every_block_mode_round_trips_through_its_token() {
+        for mode in BlockMode::ALL {
+            assert_eq!(BlockMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(BlockMode::parse("nope"), None);
+        assert_eq!(BlockMode::ALL.len(), 3);
     }
 }

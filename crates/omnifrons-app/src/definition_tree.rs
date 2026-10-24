@@ -168,6 +168,11 @@ pub struct DirectoryEntry {
     /// Which of [`omnifrons_domain::hosts::GENERATED_STATE_DIRS`]'s entries exist at
     /// this directory.
     pub generated_state_dirs: Vec<&'static str>,
+    /// Whether a real (non-symlink) `.portable-agent` directory sits
+    /// directly inside this directory: the prototype's adapter-state
+    /// folder, which holds its backups. Existence only; the walk prunes
+    /// that folder, so nothing below it is ever read or reported.
+    pub portable_agent_folder: bool,
 }
 
 /// One discovered `SKILL.md` (the prototype's own walk, which records a

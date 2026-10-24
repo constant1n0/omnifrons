@@ -243,14 +243,234 @@ pub fn prune_targets(
         .collect()
 }
 
+// -- definition-file snapshots (ADR-0005 decisions 2 and 3) --
+
+/// The domain tag mixed into a definition snapshot's id preimage, apart
+/// from [`SNAPSHOT_ID_DOMAIN`] so the two id spaces can never collide.
+pub const DEFINITION_SNAPSHOT_ID_DOMAIN: &[u8] = b"omnifrons-definition-snapshot-v1";
+
+/// What a definition snapshot is of: one identity file of one agent
+/// directory. The agent is the directory's path relative to the
+/// workspace -- `.` for the workspace itself, otherwise `/`-separated
+/// plain components -- and the file is a plain file name with no
+/// separator. Validated on construction, so nothing that reads one back
+/// from disk can smuggle a traversal in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DefinitionSubject {
+    agent: String,
+    file: String,
+}
+
+impl DefinitionSubject {
+    /// The subject for `file` of `agent`, or `None` when `agent` is not
+    /// `.` or a relative `/`-separated path of plain components, or
+    /// `file` is not a plain file name.
+    #[must_use]
+    pub fn new(agent: &str, file: &str) -> Option<Self> {
+        let agent_ok = agent == "." || agent.split('/').all(is_plain_component);
+        (agent_ok && !file.contains('/') && is_plain_component(file)).then(|| Self {
+            agent: agent.to_string(),
+            file: file.to_string(),
+        })
+    }
+
+    /// The agent directory, relative to the workspace.
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// The file name inside the agent directory.
+    #[must_use]
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+}
+
+/// A path component that is a real name: not empty, not `.` or `..`, and
+/// free of NUL and control characters everywhere, and of `\` and `:`
+/// on Windows only -- the rule the definition plan and writer apply,
+/// since on Unix those are ordinary name characters.
+fn is_plain_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !(cfg!(windows) && component.contains(['\\', ':']))
+        && !component.chars().any(char::is_control)
+}
+
+/// The exact bytes a definition snapshot id is the SHA-256 of:
+/// [`DEFINITION_SNAPSHOT_ID_DOMAIN`] ‖ the project identity's 32 bytes ‖
+/// the agent's length (big-endian `u32`) and bytes ‖ the file's length
+/// and bytes ‖ the file digest's 32 bytes ‖ the instant as nanoseconds
+/// since the Unix epoch, big-endian `u128`. The subject is part of the
+/// preimage because the identical wrapper bytes of two agents, taken in
+/// one instant, must not share an id.
+#[must_use]
+pub fn definition_snapshot_id_preimage(
+    project: &ProjectIdentity,
+    subject: &DefinitionSubject,
+    digest: &Sha256Digest,
+    taken_at: SystemTime,
+) -> Vec<u8> {
+    let nanos: u128 = taken_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let mut preimage = DEFINITION_SNAPSHOT_ID_DOMAIN.to_vec();
+    preimage.extend_from_slice(&project.0.0);
+    for part in [subject.agent(), subject.file()] {
+        let length = u32::try_from(part.len()).unwrap_or(u32::MAX);
+        preimage.extend_from_slice(&length.to_be_bytes());
+        preimage.extend_from_slice(part.as_bytes());
+    }
+    preimage.extend_from_slice(&digest.0);
+    preimage.extend_from_slice(&nanos.to_be_bytes());
+    preimage
+}
+
+/// One definition snapshot's manifest: the state of one identity file of
+/// one agent directory at one instant. Shaped like [`SnapshotManifest`],
+/// with a [`DefinitionSubject`] where that one has a kind and a root file
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionSnapshotManifest {
+    /// [`SNAPSHOT_SCHEMA_VERSION`].
+    pub schema: u32,
+    /// The snapshot's id.
+    pub id: SnapshotId,
+    /// The file this is a snapshot of.
+    pub subject: DefinitionSubject,
+    /// Whether the file existed; a snapshot of an absent file carries no
+    /// bytes.
+    pub existed: bool,
+    /// The digest of the bytes recorded (of no bytes, for an absent file).
+    pub sha256: Sha256Digest,
+    /// How many bytes were recorded.
+    pub size: u64,
+    /// When the snapshot was taken.
+    pub taken_at: SystemTime,
+    /// Whether the user pinned it: never pruned while pinned.
+    pub pinned: bool,
+}
+
+impl DefinitionSnapshotManifest {
+    /// Whether `other` records the same state of the same file: the same
+    /// subject, existence and digest -- what dedup compares.
+    #[must_use]
+    pub fn same_state_as(&self, other: &Self) -> bool {
+        self.subject == other.subject
+            && self.existed == other.existed
+            && self.sha256 == other.sha256
+    }
+}
+
+/// A port over the device's definition-file snapshots, per project
+/// identity, kept beside the [`SnapshotStore`] snapshots in the same
+/// store and under the same rules: dedup against the most recent snapshot
+/// of the same subject, pruning to [`MAX_UNPINNED_SNAPSHOTS`] unpinned
+/// per subject, pinned ones always kept.
+pub trait DefinitionSnapshotStore {
+    /// Record `bytes` under `manifest` for `project` -- unless the most
+    /// recent snapshot of the same subject records the same state, in
+    /// which case nothing is written and that snapshot's id comes back --
+    /// then prune that subject. Returns the id that stands for the state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotStoreError`] if the store cannot be read, is
+    /// corrupt, or cannot be written.
+    fn record_definition(
+        &mut self,
+        project: &ProjectIdentity,
+        manifest: DefinitionSnapshotManifest,
+        bytes: &[u8],
+    ) -> Result<SnapshotId, SnapshotStoreError>;
+
+    /// The definition snapshots of `project`, newest first: those of
+    /// `agent` when given, else every agent's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotStoreError`] if the store cannot be read or any
+    /// manifest is corrupt.
+    fn list_definitions(
+        &self,
+        project: &ProjectIdentity,
+        agent: Option<&str>,
+    ) -> Result<Vec<DefinitionSnapshotManifest>, SnapshotStoreError>;
+
+    /// The definition snapshot `id` of `project`: its manifest and bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotStoreError::Unknown`] if no such snapshot exists,
+    /// or [`SnapshotStoreError`] if it cannot be read or is corrupt.
+    fn read_definition(
+        &self,
+        project: &ProjectIdentity,
+        id: SnapshotId,
+    ) -> Result<(DefinitionSnapshotManifest, Vec<u8>), SnapshotStoreError>;
+
+    /// Pin or unpin the definition snapshot `id` of `project`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotStoreError::Unknown`] if no such snapshot exists,
+    /// or [`SnapshotStoreError`] if the manifest cannot be rewritten.
+    fn pin_definition(
+        &mut self,
+        project: &ProjectIdentity,
+        id: SnapshotId,
+        pinned: bool,
+    ) -> Result<(), SnapshotStoreError>;
+}
+
+/// Order `manifests` newest first, as [`sort_newest_first`] does.
+pub fn sort_definitions_newest_first(manifests: &mut [DefinitionSnapshotManifest]) {
+    manifests.sort_by(|a, b| b.taken_at.cmp(&a.taken_at).then_with(|| b.id.cmp(&a.id)));
+}
+
+/// The id an identical state dedups to: the most recent snapshot of
+/// `manifest`'s subject, when it records the same state.
+#[must_use]
+pub fn definition_dedup_target(
+    newest_first: &[DefinitionSnapshotManifest],
+    manifest: &DefinitionSnapshotManifest,
+) -> Option<SnapshotId> {
+    newest_first
+        .iter()
+        .find(|existing| existing.subject == manifest.subject)
+        .filter(|existing| existing.same_state_as(manifest))
+        .map(|existing| existing.id)
+}
+
+/// The definition snapshots to prune from a newest-first list: every
+/// unpinned snapshot of `subject` beyond the [`MAX_UNPINNED_SNAPSHOTS`]
+/// newest ones. Pinned snapshots are never listed.
+#[must_use]
+pub fn definition_prune_targets(
+    newest_first: &[DefinitionSnapshotManifest],
+    subject: &DefinitionSubject,
+) -> Vec<SnapshotId> {
+    newest_first
+        .iter()
+        .filter(|manifest| &manifest.subject == subject && !manifest.pinned)
+        .skip(MAX_UNPINNED_SNAPSHOTS)
+        .map(|manifest| manifest.id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_UNPINNED_SNAPSHOTS, SnapshotId, SnapshotManifest, dedup_target, prune_targets,
-        sort_newest_first,
+        DEFINITION_SNAPSHOT_ID_DOMAIN, DefinitionSubject, MAX_UNPINNED_SNAPSHOTS,
+        SNAPSHOT_ID_DOMAIN, SnapshotId, SnapshotManifest, dedup_target,
+        definition_snapshot_id_preimage, prune_targets, snapshot_id_preimage, sort_newest_first,
     };
     use omnifrons_domain::executable::Sha256Digest;
     use omnifrons_domain::guidance::ManagedFileKind;
+    use omnifrons_domain::publication::ProjectIdentity;
     use std::time::{Duration, SystemTime};
 
     fn manifest(n: u64, secs: u64, pinned: bool) -> SnapshotManifest {
@@ -312,5 +532,62 @@ mod tests {
         assert_eq!(pruned, vec![SnapshotId(3), SnapshotId(1)]);
         assert_eq!(MAX_UNPINNED_SNAPSHOTS, 5);
         assert!(prune_targets(&manifests, ManagedFileKind::Ignore, ".gitignore").is_empty());
+    }
+
+    fn subject(agent: &str, file: &str) -> DefinitionSubject {
+        DefinitionSubject::new(agent, file).expect("a valid subject")
+    }
+
+    const PROJECT: ProjectIdentity = ProjectIdentity(Sha256Digest([1; 32]));
+
+    fn instant() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::new(1, 2)
+    }
+
+    #[test]
+    fn the_definition_preimage_has_the_documented_byte_layout() {
+        let digest = Sha256Digest([2; 32]);
+        let mut expected = DEFINITION_SNAPSHOT_ID_DOMAIN.to_vec();
+        expected.extend_from_slice(&[1; 32]);
+        expected.extend_from_slice(&3_u32.to_be_bytes());
+        expected.extend_from_slice(b"a/b");
+        expected.extend_from_slice(&4_u32.to_be_bytes());
+        expected.extend_from_slice(b"C.md");
+        expected.extend_from_slice(&[2; 32]);
+        expected.extend_from_slice(&1_000_000_002_u128.to_be_bytes());
+        assert_eq!(
+            definition_snapshot_id_preimage(&PROJECT, &subject("a/b", "C.md"), &digest, instant()),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_definition_preimage_depends_on_agent_and_file_with_length_framing() {
+        let digest = Sha256Digest([2; 32]);
+        let preimage = |agent: &str, file: &str| {
+            definition_snapshot_id_preimage(&PROJECT, &subject(agent, file), &digest, instant())
+        };
+        let base = preimage("a/b", "C.md");
+        assert_ne!(base, preimage("a/c", "C.md"));
+        assert_ne!(base, preimage("a/b", "D.md"));
+        // The length prefixes keep a boundary shift from aliasing.
+        assert_ne!(preimage("ab", "c.md"), preimage("a", "bc.md"));
+    }
+
+    #[test]
+    fn a_definition_preimage_never_equals_a_guidance_one() {
+        let digest = Sha256Digest([2; 32]);
+        let guidance = snapshot_id_preimage(&PROJECT, &digest, instant());
+        let definition = definition_snapshot_id_preimage(
+            &PROJECT,
+            &subject(".", "AGENTS.md"),
+            &digest,
+            instant(),
+        );
+        assert_ne!(guidance, definition);
+        assert!(guidance.starts_with(SNAPSHOT_ID_DOMAIN));
+        assert!(definition.starts_with(DEFINITION_SNAPSHOT_ID_DOMAIN));
+        assert!(!definition.starts_with(SNAPSHOT_ID_DOMAIN));
+        assert!(!guidance.starts_with(DEFINITION_SNAPSHOT_ID_DOMAIN));
     }
 }

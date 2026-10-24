@@ -4,6 +4,7 @@
 //! (docs/repository-layout.md § Crate map): this crate and the domain core
 //! it sits on must run and test without Tauri, Tokio, or any adapter.
 
+pub mod apply_record;
 pub mod approval_store;
 pub mod blob_store;
 pub mod catalog_repair;
@@ -13,6 +14,7 @@ pub mod content_hasher;
 pub mod definition;
 pub mod definition_plan;
 pub mod definition_tree;
+pub mod definition_writer;
 pub mod executable_prober;
 pub mod guidance;
 pub mod harness_adapter;

@@ -494,6 +494,7 @@ fn record_directory(
         identity_files,
         host_extras,
         generated_state_dirs,
+        portable_agent_folder: has_portable_agent_folder(absolute),
     });
     Ok(())
 }
@@ -705,6 +706,10 @@ fn find_host_extras(directory: &Path) -> Vec<String> {
     extras
 }
 
+/// The prototype's adapter-state folder name (`STATE_DIR`), also one of
+/// [`SKIP_DIRS`]' entries.
+const PORTABLE_AGENT_DIR: &str = ".portable-agent";
+
 /// The [`GENERATED_STATE_DIRS`] entries that exist directly under
 /// `directory`, existence only (through [`lexists_or_absent`], for the
 /// same reason [`find_host_extras`] uses it), in their table order.
@@ -716,6 +721,19 @@ fn find_generated_state_dirs(directory: &Path) -> Vec<&'static str> {
         }
     }
     found
+}
+
+/// Whether `directory` holds a real `.portable-agent` directory -- the
+/// prototype's adapter-state folder (`STATE_DIR`), where its backups
+/// live. One lenient probe ([`lexists_or_absent`], like the other
+/// existence checks here), mirroring the prototype's `list_backups`,
+/// which only reads below it when it is neither a symlink nor anything
+/// but a directory: a symlink, a plain file, or an unreadable entry is
+/// not the folder. The walk prunes that folder (`SKIP_DIRS`), so this
+/// is the only look anyone takes at it and nothing below it is read.
+fn has_portable_agent_folder(directory: &Path) -> bool {
+    lexists_or_absent(&directory.join(PORTABLE_AGENT_DIR))
+        .is_some_and(|metadata| metadata.file_type().is_dir())
 }
 
 /// The identity kinds that make `directory` an agent root, exactly like

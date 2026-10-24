@@ -96,6 +96,7 @@ impl TreeSnapshotBuilder {
             identity_files,
             host_extras,
             generated_state_dirs,
+            portable_agent_folder: false,
         });
         self
     }

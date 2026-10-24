@@ -26,6 +26,12 @@ pub const RECOVERY_DIR: &str = "recovery";
 /// (spike slice 5c, HAP-001 D18): one subdirectory per project identity.
 pub const SNAPSHOTS_DIR: &str = "snapshots";
 
+/// The definition apply records' directory under the work area
+/// (ADR-0005 sub-slice 2c): one subdirectory per project identity, one
+/// JSON file per apply. Not created when the work area opens: the store
+/// creates it, owner-only, on the first record.
+pub const APPLIES_DIR: &str = "applies";
+
 /// The wrong-root ignore ledger's directory under the work area (spike
 /// slice 5d, HAP-001 § Wrong-root detection and remedies): the one durable
 /// fact a remedy leaves behind. `misplaced` itself is recomputed by every
@@ -261,6 +267,12 @@ impl WorkAreaRoot {
     #[must_use]
     pub fn snapshots_dir(&self) -> PathBuf {
         self.path.join(SNAPSHOTS_DIR)
+    }
+
+    /// The definition apply records' directory (ADR-0005 sub-slice 2c).
+    #[must_use]
+    pub fn applies_dir(&self) -> PathBuf {
+        self.path.join(APPLIES_DIR)
     }
 
     /// The wrong-root ignore ledger's directory (spike slice 5d).
