@@ -27,10 +27,15 @@
 //! # Exclusive create
 //!
 //! A create is published with a hard link, the one primitive that fails
-//! when anything appeared at the name. Where the filesystem cannot make
-//! hard links the create is refused with
-//! [`DefinitionWriteError::ExclusiveCreateUnsupported`]; an
-//! implementation never falls back to a non-atomic create.
+//! when anything appeared at the name. When the link is refused for a
+//! reason that is not a name collision, the create fails with
+//! [`DefinitionWriteError::ExclusiveCreateRefused`]. The operating
+//! system's error cannot tell the two usual causes apart: a filesystem
+//! without hard links (for example FAT or exFAT, or some network and FUSE
+//! mounts), or a directory that refuses new links (for example an
+//! immutable or append-only directory, or a protected-hardlinks policy).
+//! The error names both and claims neither. An implementation never
+//! falls back to a non-atomic create.
 //!
 //! # Permission bits
 //!
@@ -130,13 +135,19 @@ pub enum DefinitionWriteError {
         /// The workspace-relative path.
         path: String,
     },
-    /// The filesystem under the workspace cannot make the hard link an
-    /// exclusive create is published with (for example FAT or exFAT, or
-    /// some network and FUSE mounts). There is no fallback: a create that
-    /// is not atomic could leave a partial file a rerun cannot
-    /// recognise. Replacing existing files is unaffected.
-    #[error("the filesystem cannot create {path} exclusively")]
-    ExclusiveCreateUnsupported {
+    /// The hard link an exclusive create is published with was refused,
+    /// either because the filesystem has no hard links (for example FAT
+    /// or exFAT, or some network and FUSE mounts) or because the
+    /// directory refuses new links (for example an immutable or
+    /// append-only directory). The system's error does not say which.
+    /// There is no fallback: a create that is not atomic could leave a
+    /// partial file a rerun cannot recognise. Replacing existing files is
+    /// unaffected.
+    #[error(
+        "{path} cannot be created exclusively: the filesystem has no hard links, or the \
+         directory refuses new links"
+    )]
+    ExclusiveCreateRefused {
         /// The workspace-relative path.
         path: String,
     },
@@ -161,7 +172,7 @@ impl DefinitionWriteError {
             Self::Stale { .. } => "stale",
             Self::SourceUnavailable { .. } => "source-unavailable",
             Self::ReadBackMismatch { .. } => "read-back-mismatch",
-            Self::ExclusiveCreateUnsupported { .. } => "exclusive-create-unsupported",
+            Self::ExclusiveCreateRefused { .. } => "exclusive-create-refused",
             Self::Io { .. } => "io",
         }
     }
@@ -183,8 +194,9 @@ pub trait DefinitionWriter {
     /// matches the plan; [`DefinitionWriteError::SourceUnavailable`] for
     /// an unusable permission source;
     /// [`DefinitionWriteError::ReadBackMismatch`];
-    /// [`DefinitionWriteError::ExclusiveCreateUnsupported`] when a create
-    /// needs a hard link the filesystem refuses (replaces still work);
+    /// [`DefinitionWriteError::ExclusiveCreateRefused`] when a create's
+    /// hard link is refused by the filesystem or the directory (replaces
+    /// still work);
     /// or [`DefinitionWriteError::Io`]. Every refusal leaves the target
     /// exactly as it was and no temporary file behind (a read-back
     /// mismatch happens after publishing and reports what is on disk).
@@ -279,7 +291,7 @@ mod tests {
             },
             DefinitionWriteError::SourceUnavailable { path: path() },
             DefinitionWriteError::ReadBackMismatch { path: path() },
-            DefinitionWriteError::ExclusiveCreateUnsupported { path: path() },
+            DefinitionWriteError::ExclusiveCreateRefused { path: path() },
             DefinitionWriteError::Io { path: path() },
         ]
         .map(|error| error.reason());

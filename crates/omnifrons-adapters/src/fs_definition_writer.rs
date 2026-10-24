@@ -14,14 +14,18 @@
 //! inspected with `symlink_metadata`, and the temporary file is created
 //! with `O_EXCL`, which never follows a link.
 //!
-//! A create needs the hard link. Where the filesystem cannot make one
-//! (FAT and exFAT, and some network or FUSE mounts, answer `EPERM`,
-//! `ENOTSUP` or `EOPNOTSUPP` on Unix, `ERROR_NOT_SUPPORTED` or
-//! `ERROR_INVALID_FUNCTION` on Windows) the create is refused with
-//! `ExclusiveCreateUnsupported`. There is deliberately no fallback to a
-//! plain create: it would not be atomic and could leave a partial file a
-//! rerun cannot recognise. Replacing an existing file is a rename and is
-//! unaffected.
+//! A create needs the hard link. When the link is refused for a reason
+//! other than a name collision, the create fails with
+//! `ExclusiveCreateRefused`: `EPERM`, `ENOTSUP`, `EOPNOTSUPP` or
+//! `ErrorKind::Unsupported` on Unix, `ERROR_NOT_SUPPORTED` (50) on
+//! Windows. The system does not say whether the filesystem has no hard
+//! links (FAT and exFAT, some network and FUSE mounts) or the directory
+//! refuses new links (an immutable or append-only directory, a
+//! protected-hardlinks policy), so the error claims neither. There is
+//! deliberately no fallback to a plain create: it would not be atomic and
+//! could leave a partial file a rerun cannot recognise. Replacing an
+//! existing file is a rename and is unaffected. Any other link failure is
+//! `Io`.
 //!
 //! The target is re-fingerprinted immediately before publishing. A
 //! rewrite landing between that check and a rename stays possible
@@ -244,18 +248,39 @@ impl DefinitionWriter for FsDefinitionWriter {
         root: &WorkspaceRoot,
         request: &WriteRequest<'_>,
     ) -> Result<Sha256Digest, DefinitionWriteError> {
-        write_with(root, request, &|| {}, &|| {})
+        write_with(root, request, &Seams::real())
     }
 }
 
-/// [`FsDefinitionWriter::write`], with two seams for tests: `after_temp`
-/// runs once the temporary file exists, `before_publish` right before
-/// the link or rename.
+/// The points where a test can step into a write. The production path
+/// fills them with no-ops and the real `hard_link` and `rename`.
+struct Seams<'a> {
+    /// Runs once the temporary file exists.
+    after_temp: &'a dyn Fn(),
+    /// Runs right before the link or rename.
+    before_publish: &'a dyn Fn(),
+    /// Publishes a create: `(temporary file, target)`.
+    link: &'a dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    /// Publishes a replace: `(temporary file, target)`.
+    rename: &'a dyn Fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+impl Seams<'_> {
+    fn real() -> Seams<'static> {
+        Seams {
+            after_temp: &|| {},
+            before_publish: &|| {},
+            link: &|temp, target| std::fs::hard_link(temp, target),
+            rename: &|temp, target| std::fs::rename(temp, target),
+        }
+    }
+}
+
+/// [`FsDefinitionWriter::write`], stepping through `seams`.
 fn write_with(
     root: &WorkspaceRoot,
     request: &WriteRequest<'_>,
-    after_temp: &dyn Fn(),
-    before_publish: &dyn Fn(),
+    seams: &Seams<'_>,
 ) -> Result<Sha256Digest, DefinitionWriteError> {
     let path = request.path;
     let components = validate_write_path(path)?;
@@ -300,14 +325,14 @@ fn write_with(
     let temp = dir.join(temp_name(name, hasher, sequence));
     let _guard = TempGuard(temp.clone());
     write_temp(&temp, request.bytes, mode).map_err(|_| io())?;
-    after_temp();
+    (seams.after_temp)();
 
     // The last check before publishing.
     verify(request.expected)?;
-    before_publish();
+    (seams.before_publish)();
     match request.expected {
         InputFingerprint::Absent => {
-            std::fs::hard_link(&temp, &target).map_err(|e| match classify_link_error(&e) {
+            (seams.link)(&temp, &target).map_err(|e| match classify_link_error(&e) {
                 LinkFailure::Exists => {
                     let found = inspect(&target, hasher, &io)
                         .map_or(InputFingerprint::Irregular, |found| found.fingerprint());
@@ -317,13 +342,13 @@ fn write_with(
                         found,
                     }
                 }
-                LinkFailure::Unsupported => DefinitionWriteError::ExclusiveCreateUnsupported {
+                LinkFailure::Refused => DefinitionWriteError::ExclusiveCreateRefused {
                     path: path.to_string(),
                 },
                 LinkFailure::Other => io(),
             })?;
         }
-        _ => std::fs::rename(&temp, &target).map_err(|_| io())?,
+        _ => (seams.rename)(&temp, &target).map_err(|_| io())?,
     }
     sync_directory(&dir);
 
@@ -341,37 +366,38 @@ fn write_with(
 enum LinkFailure {
     /// Something already sits at the name.
     Exists,
-    /// The filesystem cannot make hard links.
-    Unsupported,
+    /// The link was refused: the filesystem has no hard links or the
+    /// directory refuses them; the error cannot say which.
+    Refused,
     /// Any other failure.
     Other,
 }
 
-/// Reads a failed `hard_link`: an existing name, a filesystem without
-/// hard links (by the OS's own code), or anything else.
+/// Reads a failed `hard_link`: an existing name, a refusal the system
+/// reports with a code that covers both "no hard links here" and "this
+/// directory refuses links" (`EPERM` is both for `link(2)`), or anything
+/// else. Windows' `ERROR_INVALID_FUNCTION` is a generic failure and is
+/// not read as a refusal.
 fn classify_link_error(error: &std::io::Error) -> LinkFailure {
     if error.kind() == std::io::ErrorKind::AlreadyExists {
         return LinkFailure::Exists;
     }
     if error.kind() == std::io::ErrorKind::Unsupported {
-        return LinkFailure::Unsupported;
+        return LinkFailure::Refused;
     }
     #[cfg(unix)]
     if let Some(raw) = error.raw_os_error() {
         use nix::errno::Errno;
         if [Errno::EPERM, Errno::ENOTSUP, Errno::EOPNOTSUPP].contains(&Errno::from_raw(raw)) {
-            return LinkFailure::Unsupported;
+            return LinkFailure::Refused;
         }
     }
     #[cfg(windows)]
     {
-        /// `ERROR_INVALID_FUNCTION` and `ERROR_NOT_SUPPORTED`.
-        const UNSUPPORTED: [i32; 2] = [1, 50];
-        if error
-            .raw_os_error()
-            .is_some_and(|raw| UNSUPPORTED.contains(&raw))
-        {
-            return LinkFailure::Unsupported;
+        /// `ERROR_NOT_SUPPORTED`.
+        const NOT_SUPPORTED: i32 = 50;
+        if error.raw_os_error() == Some(NOT_SUPPORTED) {
+            return LinkFailure::Refused;
         }
     }
     LinkFailure::Other
@@ -394,11 +420,7 @@ mod tests {
             nix::errno::Errno::EOPNOTSUPP,
         ] {
             let error = std::io::Error::from_raw_os_error(errno as i32);
-            assert_eq!(
-                classify_link_error(&error),
-                LinkFailure::Unsupported,
-                "{errno}"
-            );
+            assert_eq!(classify_link_error(&error), LinkFailure::Refused, "{errno}");
         }
         #[cfg(unix)]
         {
@@ -406,14 +428,15 @@ mod tests {
             assert_eq!(classify_link_error(&denied), LinkFailure::Other);
         }
         #[cfg(windows)]
-        for code in [50, 1] {
-            let error = std::io::Error::from_raw_os_error(code);
-            assert_eq!(
-                classify_link_error(&error),
-                LinkFailure::Unsupported,
-                "{code}"
-            );
+        {
+            let not_supported = std::io::Error::from_raw_os_error(50);
+            assert_eq!(classify_link_error(&not_supported), LinkFailure::Refused);
+            // ERROR_INVALID_FUNCTION is a generic failure, not a link refusal.
+            let invalid_function = std::io::Error::from_raw_os_error(1);
+            assert_eq!(classify_link_error(&invalid_function), LinkFailure::Other);
         }
+        let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert_eq!(classify_link_error(&unsupported), LinkFailure::Refused);
     }
 
     /// A scratch directory removed on drop.
@@ -496,11 +519,13 @@ mod tests {
         let error = write_with(
             &scratch.root(),
             &request("AGENTS.md", b"mine\n", &InputFingerprint::Absent),
-            &|| {
-                temp_seen.set(scratch.entries().iter().any(|n| n.contains(".tmp")));
-                std::fs::write(&target, b"theirs\n").expect("appears");
+            &Seams {
+                after_temp: &|| {
+                    temp_seen.set(scratch.entries().iter().any(|n| n.contains(".tmp")));
+                    std::fs::write(&target, b"theirs\n").expect("appears");
+                },
+                ..Seams::real()
             },
-            &|| {},
         )
         .expect_err("refused");
         assert!(temp_seen.get(), "the temp file existed at the seam");
@@ -516,8 +541,10 @@ mod tests {
         let error = write_with(
             &scratch.root(),
             &request("AGENTS.md", b"mine\n", &InputFingerprint::Absent),
-            &|| {},
-            &|| std::fs::write(&target, b"theirs\n").expect("appears"),
+            &Seams {
+                before_publish: &|| std::fs::write(&target, b"theirs\n").expect("appears"),
+                ..Seams::real()
+            },
         )
         .expect_err("refused");
         let DefinitionWriteError::Stale { found, .. } = &error else {
@@ -540,13 +567,96 @@ mod tests {
         let error = write_with(
             &scratch.root(),
             &request("AGENTS.md", b"mine\n", &planned),
-            &|| std::fs::write(&target, b"edited\n").expect("edit"),
-            &|| {},
+            &Seams {
+                after_temp: &|| std::fs::write(&target, b"edited\n").expect("edit"),
+                ..Seams::real()
+            },
         )
         .expect_err("refused");
         assert_eq!(error.reason(), "stale");
         assert_eq!(std::fs::read(&target).expect("read"), b"edited\n");
         assert_eq!(scratch.entries(), vec!["AGENTS.md"]);
+    }
+
+    /// A create whose link is made to fail with `error`.
+    fn create_with_failing_link(
+        scratch: &Scratch,
+        error: fn() -> std::io::Error,
+    ) -> DefinitionWriteError {
+        write_with(
+            &scratch.root(),
+            &request("AGENTS.md", b"mine\n", &InputFingerprint::Absent),
+            &Seams {
+                link: &|_, _| Err(error()),
+                // A fallback to a plain create would go through rename.
+                rename: &|_, _| panic!("a create must never fall back to a rename"),
+                ..Seams::real()
+            },
+        )
+        .expect_err("refused")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_the_system_refuses_is_a_refused_exclusive_create_and_leaves_nothing() {
+        let refusals: [fn() -> std::io::Error; 2] = [
+            || std::io::Error::from_raw_os_error(nix::errno::Errno::EPERM as i32),
+            || std::io::Error::from_raw_os_error(nix::errno::Errno::ENOTSUP as i32),
+        ];
+        for refusal in refusals {
+            let scratch = Scratch::new("link-refused");
+            let error = create_with_failing_link(&scratch, refusal);
+            assert_eq!(error.reason(), "exclusive-create-refused");
+            assert!(scratch.entries().is_empty(), "{:?}", scratch.entries());
+        }
+    }
+
+    #[test]
+    fn a_generic_link_failure_is_io_and_leaves_nothing() {
+        let scratch = Scratch::new("link-generic");
+        let error = create_with_failing_link(&scratch, || {
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        });
+        assert_eq!(error.reason(), "io");
+        assert!(scratch.entries().is_empty(), "{:?}", scratch.entries());
+    }
+
+    #[test]
+    fn a_link_that_reports_an_existing_name_is_stale_and_leaves_the_name_alone() {
+        let scratch = Scratch::new("link-exists");
+        let target = scratch.0.join("AGENTS.md");
+        let error = write_with(
+            &scratch.root(),
+            &request("AGENTS.md", b"mine\n", &InputFingerprint::Absent),
+            &Seams {
+                link: &|_, _| {
+                    std::fs::write(&target, b"theirs\n").expect("appears");
+                    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                },
+                ..Seams::real()
+            },
+        )
+        .expect_err("refused");
+        assert_eq!(error.reason(), "stale");
+        assert_eq!(scratch.entries(), vec!["AGENTS.md"]);
+    }
+
+    #[test]
+    fn a_replace_publishes_through_rename_never_a_link() {
+        let scratch = Scratch::new("replace-rename");
+        let target = scratch.0.join("AGENTS.md");
+        std::fs::write(&target, b"planned\n").expect("seed");
+        let planned = InputFingerprint::Sha256(Sha2Hasher::new().sha256(b"planned\n"));
+        write_with(
+            &scratch.root(),
+            &request("AGENTS.md", b"mine\n", &planned),
+            &Seams {
+                link: &|_, _| panic!("a replace must not link"),
+                ..Seams::real()
+            },
+        )
+        .expect("replaced");
+        assert_eq!(std::fs::read(&target).expect("read"), b"mine\n");
     }
 
     #[test]

@@ -61,6 +61,12 @@ impl State {
 }
 
 /// The in-memory writer. One workspace: the `root` argument is ignored.
+///
+/// Parents follow the filesystem adapter's rule: a parent directory must
+/// be seeded ([`Self::with_directory`]) or be an ancestor of a seeded or
+/// written entry, otherwise the write refuses with `parent-missing`; a
+/// parent that exists as a link or any other entry refuses with
+/// `not-regular`. The workspace root itself always exists.
 #[derive(Debug, Default)]
 pub struct InMemoryDefinitionWriter {
     state: Mutex<State>,
@@ -94,7 +100,10 @@ impl InMemoryDefinitionWriter {
         self
     }
 
-    /// Seeds an empty directory at `path` (its ancestors too).
+    /// Seeds an empty directory at `path` (its ancestors too). A write
+    /// needs its parent to exist: a seeded directory, or an ancestor of
+    /// a seeded or written entry; any other parent refuses with
+    /// `parent-missing`, as the filesystem adapter does.
     #[must_use]
     pub fn with_directory(self, path: &str) -> Self {
         self.lock().directories.push(path.to_string());
