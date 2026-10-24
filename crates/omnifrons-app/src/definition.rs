@@ -1061,10 +1061,10 @@ pub(crate) struct PendingBlock {
     /// trailing newline). Never empty.
     pub(crate) body: String,
     /// How many index rows the write adds, for the pending sentence.
-    rows: usize,
+    pub(crate) rows: usize,
     /// Whether the write adds the precedence rule, for the same
     /// sentence.
-    rule: bool,
+    pub(crate) rule: bool,
 }
 
 impl PendingBlock {
@@ -1184,9 +1184,11 @@ pub(crate) fn block_analysis(
             return BlockAnalysis::Refused(refusal);
         }
         if let Some(legacy_span) = legacy_pending {
-            let migrate = migration_block(text, legacy_span, &rows, &root_absolute);
-            return BlockAnalysis::Settled {
-                pending: Some(migrate),
+            return match migration_block(text, legacy_span, &rows, &root_absolute, &needed) {
+                Ok(migrate) => BlockAnalysis::Settled {
+                    pending: Some(migrate),
+                },
+                Err(refusal) => BlockAnalysis::Refused(refusal),
             };
         }
         if let Some(pending) = omnifrons_pending {
@@ -1432,13 +1434,15 @@ fn skills_block_outcome(
     // original bytes, never by `located.span`, which indexes the lossily
     // decoded text and so drifts from the file's own offsets after a
     // byte that is not valid UTF-8.
-    let Some(span) = omnifrons_block_span(canonical_text) else {
-        return BlockOutcome::None;
+    let span = match require_span(
+        omnifrons_block_span(canonical_text),
+        &block_needed_names(status),
+    ) {
+        Ok(span) => span,
+        Err(refusal) => return BlockOutcome::Refusal(refusal),
     };
     let prefix_bytes = &canonical_text[..span.start];
-    let rule_needed = !has_precedence_phrases(&String::from_utf8_lossy(prefix_bytes));
-    let fresh_rows = rows_to_generate(prefix_bytes, rows, root_absolute);
-    let fresh_body = render_body(&fresh_rows, rule_needed);
+    let (fresh_body, row_count, rule_needed) = regenerated_body(prefix_bytes, rows, root_absolute);
     if located.body == fresh_body {
         BlockOutcome::None
     } else {
@@ -1447,7 +1451,7 @@ fn skills_block_outcome(
             span: Some(span),
             also_remove: None,
             body: fresh_body,
-            rows: fresh_rows.len(),
+            rows: row_count,
             rule: rule_needed,
         })
     }
@@ -2105,40 +2109,81 @@ fn legacy_block_outcome(
 /// the legacy rows do not count as already indexed. It takes the legacy
 /// block's place, and every byte outside that span is kept.
 ///
-/// When an intact current block sits beside the legacy one, exactly one
-/// block must remain: the legacy span is removed and the current block
-/// is regenerated in place, from the text before it.
+/// A current block elsewhere in the text leaves exactly one block:
+///
+/// - before the legacy block (the usual shape, since an intact legacy
+///   block is the last thing in the file): the legacy span is removed
+///   and the current block is regenerated in place, from the text
+///   before it;
+/// - inside the legacy block (its digest covers whatever bytes it
+///   holds): the legacy replacement removes it along with the rest of
+///   the body, so nothing else is needed;
+/// - overlapping the legacy block without either containing the other:
+///   refused as `block_layout`, since no edit keeps one block and every
+///   byte outside the blocks.
 fn migration_block(
     text: &[u8],
     legacy: Range<usize>,
     rows: &[SkillRow],
     root_absolute: &str,
-) -> PendingBlock {
-    let Some(current) = omnifrons_block_span(text) else {
-        let excised = [&text[..legacy.start], &text[legacy.end..]].concat();
-        let (body, row_count, rule) = regenerated_body(&excised, rows, root_absolute);
-        return PendingBlock {
+    needed: &str,
+) -> Result<PendingBlock, BlockRefusal> {
+    let current = omnifrons_block_span(text);
+    if let Some(current) = current
+        .as_ref()
+        .filter(|current| current.end <= legacy.start)
+    {
+        let (body, row_count, rule) = regenerated_body(&text[..current.start], rows, root_absolute);
+        return Ok(PendingBlock {
             mode: BlockMode::MigrateLegacy,
-            span: Some(legacy),
-            also_remove: None,
+            span: Some(current.clone()),
+            also_remove: Some(legacy),
             body,
             rows: row_count,
             rule,
-        };
-    };
-    // An intact legacy block is the last thing in the file, so the
-    // current block always sits before it and the text before the
-    // current block never holds legacy bytes.
-    debug_assert!(current.end <= legacy.start);
-    let (body, row_count, rule) = regenerated_body(&text[..current.start], rows, root_absolute);
-    PendingBlock {
+        });
+    }
+    if current
+        .as_ref()
+        .is_some_and(|current| !(legacy.start <= current.start && current.end <= legacy.end))
+    {
+        return Err(BlockRefusal::new(
+            BlockRefusalCode::BlockLayout,
+            format!(
+                "the skill index block cannot be migrated: the portable-agent block and the \
+                 omnifrons block overlap without either containing the other. Fix the markers \
+                 by hand or index {needed} by hand"
+            ),
+        ));
+    }
+    let excised = [&text[..legacy.start], &text[legacy.end..]].concat();
+    let (body, row_count, rule) = regenerated_body(&excised, rows, root_absolute);
+    Ok(PendingBlock {
         mode: BlockMode::MigrateLegacy,
-        span: Some(current),
-        also_remove: Some(legacy),
+        span: Some(legacy),
+        also_remove: None,
         body,
         rows: row_count,
         rule,
-    }
+    })
+}
+
+/// `span`, the byte span of an omnifrons block that
+/// [`ManagedBlock::locate`] has already accepted in the decoded text,
+/// or a `block_layout` refusal when the byte-level scan
+/// ([`omnifrons_block_span`]) cannot find the same block. Both scans
+/// split lines the same way, so this is a guard against the two rules
+/// ever drifting apart, never a silent "nothing pending".
+fn require_span(span: Option<Range<usize>>, needed: &str) -> Result<Range<usize>, BlockRefusal> {
+    span.ok_or_else(|| {
+        BlockRefusal::new(
+            BlockRefusalCode::BlockLayout,
+            format!(
+                "the skill index block cannot be regenerated: the block's lines could not be \
+                 located byte for byte. Fix the markers by hand or index {needed} by hand"
+            ),
+        )
+    })
 }
 
 /// The body of a regenerated block over `prefix`, the text outside it,
@@ -2203,5 +2248,39 @@ mod tests {
             "the domain's own rendered skills sentinel no longer ends with this crate's own \
              duplicated suffix; got {first_line:?}"
         );
+    }
+
+    /// A block the decoded-text scan accepted but the byte scan cannot
+    /// find is a `block_layout` refusal naming the disagreement, never
+    /// "nothing pending". Both scans split lines by the same rule, so no
+    /// file reaches this from the public surface; the helper is pinned
+    /// directly.
+    #[test]
+    fn a_block_the_byte_scan_cannot_find_is_a_block_layout_refusal() {
+        let refusal = super::require_span(None, "the precedence rule").expect_err("refused");
+        assert_eq!(refusal.code, super::BlockRefusalCode::BlockLayout);
+        assert!(
+            refusal.detail.contains("byte for byte"),
+            "{}",
+            refusal.detail
+        );
+        assert_eq!(super::require_span(Some(3..9), "x").expect("found"), 3..9);
+    }
+
+    /// A regeneration with every skill linked and the rule stated outside
+    /// the block would be empty; it falls back to the rule section alone.
+    #[test]
+    fn an_empty_regeneration_falls_back_to_the_rule_section_alone() {
+        use omnifrons_domain::skills_index::{PRECEDENCE_RULE, SkillRow};
+        let outside = format!("See [a](skills/a/SKILL.md).\n\n{PRECEDENCE_RULE}\n");
+        let rows = [SkillRow {
+            name: "a".into(),
+            description: "A.".into(),
+            path: "skills/a/SKILL.md".into(),
+            had_undecodable_bytes: false,
+        }];
+        let (body, row_count, rule) = super::regenerated_body(outside.as_bytes(), &rows, "/w");
+        assert_eq!(body, render_body(&[], true));
+        assert_eq!((row_count, rule), (0, true));
     }
 }

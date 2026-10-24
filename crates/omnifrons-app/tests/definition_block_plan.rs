@@ -670,3 +670,82 @@ fn a_legacy_block_that_is_not_utf8_is_replaced_wholesale() {
     assert!(!after.contains(&0xff), "nothing of the old body is copied");
     assert!(text(&after[outside.len()..]).starts_with(BEGIN));
 }
+
+/// The canonical `skills` block over the one-row index, rendered with LF.
+fn current_block(skills_rows_rule: bool) -> String {
+    let body = legacy_lines(skills_rows_rule).join("\n");
+    let digest = |bytes: &[u8]| FakeHasher.sha256(bytes);
+    omnifrons_domain::guidance::ManagedBlock::skills(body, &digest)
+        .expect("a block")
+        .render(omnifrons_domain::guidance::LineEnding::Lf)
+}
+
+#[test]
+fn a_current_block_inside_the_legacy_block_leaves_one_block() {
+    // The legacy digest covers whatever bytes the body holds, so a
+    // whole current block can sit inside an intact legacy block.
+    let nested = format!("{}\n", current_block(true));
+    let lines: Vec<&str> = nested.lines().collect();
+    let before = format!("{}\n{}", text(BODY), legacy_block(&lines));
+    let (plan, writes) = planned(plan_canonical(before.as_bytes(), &sample_skills()));
+    assert_eq!(paths(&plan), vec!["AGENTS.md"]);
+    assert_eq!(block_mode(&plan), Some(BlockMode::MigrateLegacy));
+    let after = text(&block_bytes(&plan, &writes));
+    assert_eq!(count(&after, BEGIN), 1, "{after}");
+    assert!(!after.contains("portable-agent:"), "{after}");
+    assert!(after.starts_with(&format!("{}\n", text(BODY))));
+    let (again, _) = planned(plan_canonical(after.as_bytes(), &sample_skills()));
+    assert!(again.operations.is_empty(), "{:?}", again.operations);
+}
+
+#[test]
+fn a_current_block_that_straddles_the_legacy_begin_marker_is_refused() {
+    // current begin, legacy begin, current end, legacy end: the two
+    // blocks overlap without either containing the other.
+    let tail = format!("x\n{END}\ntail line\n");
+    let legacy_begin = format!(
+        "<!-- portable-agent:skills:begin sha256={} -->",
+        FakeHasher.sha256(tail.as_bytes()).to_hex()
+    );
+    let body = format!("## Local skill index\n{legacy_begin}\nx");
+    let digest = |bytes: &[u8]| FakeHasher.sha256(bytes);
+    let current = omnifrons_domain::guidance::ManagedBlock::skills(body, &digest)
+        .expect("a block")
+        .render(omnifrons_domain::guidance::LineEnding::Lf);
+    let straddling = format!(
+        "{}\n{current}\ntail line\n<!-- portable-agent:skills:end -->\n",
+        text(BODY)
+    );
+    let refusal = refused(plan_canonical(straddling.as_bytes(), &sample_skills()));
+    assert_eq!(refusal.code(), "block_layout");
+    assert!(refusal.message().contains("overlap"), "{refusal}");
+}
+
+#[test]
+fn appending_pads_from_the_actual_tail() {
+    let crlf = "# Sample\r\n\r\nYou are Sample.\r\nOne more line.\r\n";
+    let append = |tail: &str| {
+        let agents = format!("{crlf}{tail}");
+        let (plan, writes) = planned(run(
+            claude_root(agents.as_bytes(), &sample_skills()),
+            None,
+            PlanOptions::default(),
+        ));
+        (agents, text(&block_bytes(&plan, &writes)))
+    };
+    // A bare LF tail ends the line: one CRLF makes the blank line.
+    let (agents, after) = append("tail\n");
+    assert!(
+        after.starts_with(&format!("{agents}\r\n{BEGIN}")),
+        "{after:?}"
+    );
+    // A tail that already ends in a blank line gets no more padding.
+    let (agents, after) = append("tail\n\n");
+    assert!(after.starts_with(&format!("{agents}{BEGIN}")), "{after:?}");
+    // No terminator at all: two, ending the line and leaving a blank one.
+    let (agents, after) = append("tail");
+    assert!(
+        after.starts_with(&format!("{agents}\r\n\r\n{BEGIN}")),
+        "{after:?}"
+    );
+}

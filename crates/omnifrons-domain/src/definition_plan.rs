@@ -37,7 +37,7 @@ use crate::guidance::{ManagedFileKind, SKILLS_TEMPLATE_VERSION};
 /// The first line of every [`canonical_bytes`] text. Changing the layout
 /// of that text means changing this tag, so an old id can never match a
 /// new layout.
-pub const CANONICAL_FORM_TAG: &str = "omnifrons-plan-v1";
+pub const CANONICAL_FORM_TAG: &str = "omnifrons-plan-v2";
 
 /// What a plan knows about one input file when it was planned. A later
 /// apply compares the file's current fingerprint against this one and
@@ -373,7 +373,7 @@ pub struct Plan {
 /// so no two different plans share a text:
 ///
 /// ```text
-/// omnifrons-plan-v1
+/// omnifrons-plan-v2
 /// workspace <len>:<canonical workspace root>
 /// agent <len>:<path>
 /// inputs <count>
@@ -443,7 +443,7 @@ mod tests {
         let text = String::from_utf8(canonical_bytes("/w", ".", &inputs, &[])).unwrap();
         assert_eq!(
             text,
-            "omnifrons-plan-v1\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
+            "omnifrons-plan-v2\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
              input 9:CLAUDE.md irregular\noperations 0\n"
         );
     }

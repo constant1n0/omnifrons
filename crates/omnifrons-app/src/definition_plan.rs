@@ -210,11 +210,13 @@ pub fn plan_with_writes(
 
     let mut block_diff = None;
     if let Some(pending) = pending {
-        // An empty body means there is nothing to write.
-        if let Some(block) = plan_block(hasher, &source_file.bytes, &pending) {
-            operations.push(block.operation);
-            writes.push(block.write);
-            block_diff = Some(block.diff);
+        match plan_block(hasher, &source_file.bytes, &pending) {
+            Ok(block) => {
+                operations.push(block.operation);
+                writes.push(block.write);
+                block_diff = Some(block.diff);
+            }
+            Err(refusal) => return Ok(refused(refusal)),
         }
     }
     Ok((
@@ -397,9 +399,12 @@ struct BlockPlan {
 }
 
 /// The block write for `pending` over the canonical `text`: the
-/// operation, the whole file after it, and the diff. `None` when the
-/// pending body is empty, which `render_body` documents as "no block to
-/// write".
+/// operation, the whole file after it, and the diff.
+///
+/// The analysis never hands over an empty body (a regeneration falls
+/// back to the rule section alone), so an empty one here is a defect in
+/// the caller: it is reported as a `block_layout` refusal naming the
+/// cause, never dropped.
 ///
 /// Everything outside the block is copied byte for byte. An append adds
 /// one blank line and the block at the end of the text; a replacement or
@@ -411,10 +416,14 @@ fn plan_block(
     hasher: &dyn ContentHasher,
     text: &[u8],
     pending: &PendingBlock,
-) -> Option<BlockPlan> {
+) -> Result<BlockPlan, PlanRefusal> {
     let digest = |bytes: &[u8]| hasher.sha256(bytes);
     let decoded = String::from_utf8_lossy(text);
-    let block = ManagedBlock::skills(pending.body.clone(), &digest).ok()?;
+    let block = ManagedBlock::skills(pending.body.clone(), &digest).map_err(|_| {
+        PlanRefusal::BlockLayout(
+            "the skill index block cannot be written: its body would be empty".to_string(),
+        )
+    })?;
     let ending = LineEnding::dominant(&decoded);
     let rendered = block.render(ending);
     let terminator = ending.as_str();
@@ -441,13 +450,19 @@ fn plan_block(
         bytes.extend_from_slice(&text[at..]);
     } else {
         bytes.extend_from_slice(text);
-        if !text.is_empty() {
-            if !bytes.ends_with(terminator.as_bytes()) {
-                bytes.extend_from_slice(terminator.as_bytes());
-            }
-            if !bytes.ends_with(format!("{terminator}{terminator}").as_bytes()) {
-                bytes.extend_from_slice(terminator.as_bytes());
-            }
+        // One blank line before the block, judged from the actual tail:
+        // none when the text already ends in one, one terminator when it
+        // ends in a line terminator (LF or CRLF), two otherwise.
+        let blank_line = text.ends_with(b"\n\n") || text.ends_with(b"\n\r\n");
+        let padding = if text.is_empty() || blank_line {
+            0
+        } else if text.ends_with(b"\n") {
+            1
+        } else {
+            2
+        };
+        for _ in 0..padding {
+            bytes.extend_from_slice(terminator.as_bytes());
         }
         bytes.extend_from_slice(rendered.as_bytes());
         bytes.extend_from_slice(terminator.as_bytes());
@@ -469,7 +484,7 @@ fn plan_block(
             .collect(),
         after: rendered.lines().map(str::to_string).collect(),
     };
-    Some(BlockPlan {
+    Ok(BlockPlan {
         operation,
         write: PlannedWrite {
             path: IdentityKind::Agents.file_name(),
@@ -516,5 +531,33 @@ fn block_refusal(refusal: BlockRefusal) -> PlanRefusal {
         BlockRefusalCode::EditedBlock => PlanRefusal::EditedBlock(detail),
         BlockRefusalCode::BlockLayout => PlanRefusal::BlockLayout(detail),
         BlockRefusalCode::UnsafeSkillMetadata => PlanRefusal::UnsafeSkillMetadata(detail),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use omnifrons_domain::definition_plan::BlockMode;
+
+    use super::*;
+    use crate::contract::publication::FakeHasher;
+
+    /// An empty body is reported, never dropped: the plan would
+    /// otherwise lose its block operation while `verify` kept saying it
+    /// is pending.
+    #[test]
+    fn an_empty_block_body_is_a_refusal_not_a_dropped_operation() {
+        let pending = PendingBlock {
+            mode: BlockMode::Replace,
+            span: Some(0..3),
+            also_remove: None,
+            body: String::new(),
+            rows: 0,
+            rule: false,
+        };
+        let Err(refusal) = plan_block(&FakeHasher, b"abc", &pending) else {
+            panic!("an empty body must be refused");
+        };
+        assert_eq!(refusal.code(), "block_layout");
+        assert!(refusal.message().contains("empty"), "{refusal}");
     }
 }
