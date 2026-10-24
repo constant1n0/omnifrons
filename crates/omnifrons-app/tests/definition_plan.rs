@@ -20,7 +20,7 @@ use omnifrons_app::definition_plan::{PlanOutcome, plan};
 use omnifrons_app::definition_tree::TreeSnapshot;
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, WRAPPER};
 use omnifrons_domain::definition_plan::{
-    InputFingerprint, Operation, Plan, PlanOptions, PlanRefusal,
+    InputFingerprint, Notice, Operation, Plan, PlanOptions, PlanRefusal,
 };
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock};
 
@@ -44,20 +44,45 @@ impl TempDir {
     }
 }
 
-/// The one workspace root every `run` plans under. It lives for the
-/// whole test process; the id is scoped to it, so two runs only share an
-/// id when they share this root.
-fn shared_workspace() -> WorkspaceRoot {
-    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let root = ROOT.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "omnifrons-definition-plan-shared-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("fixture dir");
-        dir
-    });
-    WorkspaceRoot::new(root).expect("valid workspace")
+/// The one workspace root every `run` plans under, so two runs only
+/// share a plan id when they share this root (the id is scoped to it).
+/// Its path depends only on the process id; the directory exists while
+/// at least one [`SharedWorkspace`] guard is alive and is removed when
+/// the last one drops, so a finished test run leaves nothing behind.
+struct SharedWorkspace;
+
+static SHARED_USERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+fn shared_root_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "omnifrons-definition-plan-shared-{}",
+        std::process::id()
+    ))
+}
+
+impl SharedWorkspace {
+    /// A guard keeping the directory alive, and the root over it.
+    fn acquire() -> (Self, WorkspaceRoot) {
+        let mut users = SHARED_USERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fs::create_dir_all(shared_root_path()).expect("fixture dir");
+        *users += 1;
+        let root = WorkspaceRoot::new(shared_root_path()).expect("valid workspace");
+        (Self, root)
+    }
+}
+
+impl Drop for SharedWorkspace {
+    fn drop(&mut self) {
+        let mut users = SHARED_USERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *users -= 1;
+        if *users == 0 {
+            let _ = std::fs::remove_dir_all(shared_root_path());
+        }
+    }
 }
 
 impl Drop for TempDir {
@@ -109,7 +134,7 @@ fn run(
     options: PlanOptions,
 ) -> Result<PlanOutcome, DefinitionError> {
     // One fixed root, so equal snapshots give equal plan ids.
-    let workspace = shared_workspace();
+    let (_shared, workspace) = SharedWorkspace::acquire();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
     let hasher = FakeHasher;
     let ports = DefinitionPorts {
@@ -744,4 +769,127 @@ fn the_plan_id_is_scoped_to_the_workspace_root() {
     assert_eq!(paths(&a), paths(&b));
     assert!(!a.workspace.contains('\\'));
     assert_ne!(a.workspace, b.workspace);
+}
+
+/// `snapshot` with the `.portable-agent` folder flag set on `path`.
+fn with_state_folder(mut snapshot: TreeSnapshot, path: &str) -> TreeSnapshot {
+    let entry = snapshot
+        .directories
+        .iter_mut()
+        .find(|entry| entry.path == path)
+        .expect("a directory to flag");
+    entry.portable_agent_folder = true;
+    snapshot
+}
+
+fn notice_paths(plan: &Plan) -> Vec<&str> {
+    plan.notices
+        .iter()
+        .map(|Notice::PortableAgentFolder { path }| path.as_str())
+        .collect()
+}
+
+#[test]
+fn a_state_folder_is_reported_without_changing_the_operations_or_the_id() {
+    let plain = planned(run(claude_only(), None, PlanOptions::default()));
+    let flagged = planned(run(
+        with_state_folder(claude_only(), "."),
+        None,
+        PlanOptions::default(),
+    ));
+    assert!(plain.notices.is_empty());
+    assert_eq!(notice_paths(&flagged), vec![".portable-agent"]);
+    assert_eq!(flagged.operations, plain.operations);
+    assert_eq!(flagged.id, plain.id);
+}
+
+#[test]
+fn a_state_folder_is_reported_for_an_already_canonical_root_too() {
+    let canonical = single_root(vec![
+        identity(IdentityKind::Agents, AGENTS_TEXT),
+        identity(IdentityKind::Claude, WRAPPER),
+    ]);
+    let plan = planned(run(
+        with_state_folder(canonical, "."),
+        None,
+        PlanOptions::default(),
+    ));
+    assert!(plan.operations.is_empty());
+    assert_eq!(notice_paths(&plan), vec![".portable-agent"]);
+}
+
+#[test]
+fn a_state_folder_is_reported_only_for_the_agents_own_directory() {
+    let nested = || {
+        TreeSnapshotBuilder::new()
+            .directory(
+                ".",
+                vec![identity(IdentityKind::Claude, AGENTS_TEXT)],
+                Vec::new(),
+                Vec::new(),
+            )
+            .directory(
+                "child",
+                vec![identity(IdentityKind::Claude, AGENTS_TEXT)],
+                Vec::new(),
+                Vec::new(),
+            )
+            .build()
+    };
+    let consent = PlanOptions {
+        nested_consent: true,
+        ..PlanOptions::default()
+    };
+    // The parent's folder is never the child's notice.
+    let child = planned(run(
+        with_state_folder(nested(), "."),
+        Some("child"),
+        consent,
+    ));
+    assert!(child.notices.is_empty(), "{:?}", child.notices);
+    // The child's own folder is, with its workspace-relative path.
+    let child = planned(run(
+        with_state_folder(nested(), "child"),
+        Some("child"),
+        consent,
+    ));
+    assert_eq!(notice_paths(&child), vec!["child/.portable-agent"]);
+    // And the parent's plan does not report the child's.
+    let parent = planned(run(
+        with_state_folder(nested(), "child"),
+        Some("."),
+        consent,
+    ));
+    assert!(parent.notices.is_empty(), "{:?}", parent.notices);
+}
+
+/// Two workspace roots whose names differ only in a byte that is not
+/// UTF-8 both display as the same lossy text, but they are different
+/// roots and must not share a plan id.
+#[cfg(unix)]
+#[test]
+fn roots_differing_in_a_non_utf8_byte_get_different_plan_ids() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let parent = TempDir::new("non-utf8-roots");
+    let make = |byte: u8| {
+        let dir = parent.0.join(OsStr::from_bytes(&[b'w', byte]));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        WorkspaceRoot::new(&dir).expect("valid workspace")
+    };
+    let plan_in = |workspace: &WorkspaceRoot| {
+        let tree = InMemoryDefinitionTree::new().with_snapshot(workspace, claude_only());
+        let hasher = FakeHasher;
+        let ports = DefinitionPorts {
+            tree: &tree,
+            hasher: &hasher,
+        };
+        planned(plan(&ports, workspace, None, &PlanOptions::default()))
+    };
+    let (first, second) = (make(0xff), make(0xfe));
+    let (a, b) = (plan_in(&first), plan_in(&second));
+    assert_ne!(a.id, b.id);
+    assert_eq!(a.workspace, b.workspace, "the display text is lossy");
+    assert_eq!(a.id, plan_in(&make(0xff)).id);
 }

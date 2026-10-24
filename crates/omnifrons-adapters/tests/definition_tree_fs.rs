@@ -1556,3 +1556,98 @@ fn a_non_unicode_sibling_holding_nothing_reportable_leaves_a_reportable_sibling_
         .collect();
     assert_eq!(directory_paths, vec!["reportable"]);
 }
+
+/// The directory entry for `path` in a fresh snapshot of `root`.
+fn entry_of(root: &TempDir, path: &str) -> omnifrons_app::definition_tree::DirectoryEntry {
+    let snapshot = FsDefinitionTree::new(None)
+        .snapshot(&root.workspace())
+        .expect("snapshot succeeds");
+    snapshot
+        .directories
+        .into_iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("no entry for {path}"))
+}
+
+/// The prototype's `.portable-agent/` state folder is pruned from the
+/// walk, but its presence directly inside an agent directory is
+/// reported, for the root and for a nested agent alike.
+#[test]
+fn a_portable_agent_folder_is_flagged_on_its_own_directory_only() {
+    let root = TempDir::new("state-folder");
+    write(root.path(), "AGENTS.md", SIMPLE_BODY);
+    write(
+        root.path(),
+        ".portable-agent/backups/2026/AGENTS.md",
+        OTHER_BODY,
+    );
+    write(root.path(), "child/AGENTS.md", SIMPLE_BODY);
+
+    assert!(entry_of(&root, ".").portable_agent_folder);
+    assert!(!entry_of(&root, "child").portable_agent_folder);
+
+    write(
+        root.path(),
+        "child/.portable-agent/backups/x/AGENTS.md",
+        OTHER_BODY,
+    );
+    assert!(entry_of(&root, "child").portable_agent_folder);
+}
+
+#[test]
+fn no_portable_agent_folder_leaves_the_flag_false() {
+    let root = TempDir::new("no-state-folder");
+    write(root.path(), "AGENTS.md", SIMPLE_BODY);
+    assert!(!entry_of(&root, ".").portable_agent_folder);
+}
+
+/// The prototype only lists backups below a real directory named
+/// `.portable-agent` (`list_backups` returns nothing when it is a
+/// symlink or not a directory), so a plain file of that name is not the
+/// folder and the flag stays false. An empty real directory is the
+/// folder.
+#[test]
+fn only_a_real_directory_counts_as_the_portable_agent_folder() {
+    let file = TempDir::new("state-file");
+    write(file.path(), "AGENTS.md", SIMPLE_BODY);
+    write(file.path(), ".portable-agent", b"not a folder\n");
+    assert!(!entry_of(&file, ".").portable_agent_folder);
+
+    let empty = TempDir::new("state-empty-dir");
+    write(empty.path(), "AGENTS.md", SIMPLE_BODY);
+    std::fs::create_dir(empty.path().join(".portable-agent")).expect("mkdir");
+    assert!(entry_of(&empty, ".").portable_agent_folder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_named_portable_agent_is_not_the_folder() {
+    let root = TempDir::new("state-symlink");
+    let elsewhere = TempDir::new("state-symlink-target");
+    write(root.path(), "AGENTS.md", SIMPLE_BODY);
+    std::os::unix::fs::symlink(elsewhere.path(), root.path().join(".portable-agent"))
+        .expect("symlink");
+    assert!(!entry_of(&root, ".").portable_agent_folder);
+}
+
+/// Nothing below the folder is ever visited: an agent file inside it is
+/// not discovered.
+#[test]
+fn nothing_below_the_portable_agent_folder_is_visited() {
+    let root = TempDir::new("state-pruned");
+    write(root.path(), "AGENTS.md", SIMPLE_BODY);
+    write(
+        root.path(),
+        ".portable-agent/backups/x/AGENTS.md",
+        OTHER_BODY,
+    );
+    let snapshot = FsDefinitionTree::new(None)
+        .snapshot(&root.workspace())
+        .expect("snapshot succeeds");
+    let paths: Vec<&str> = snapshot
+        .directories
+        .iter()
+        .map(|d| d.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["."]);
+}

@@ -2118,6 +2118,9 @@ fn legacy_block_outcome(
 /// - inside the legacy block (its digest covers whatever bytes it
 ///   holds): the legacy replacement removes it along with the rest of
 ///   the body, so nothing else is needed;
+/// - after the legacy block (disjoint): refused as `block_layout`; an
+///   intact legacy block is only recognized with nothing but whitespace
+///   after it, so this shape is unreachable today;
 /// - overlapping the legacy block without either containing the other:
 ///   refused as `block_layout`, since no edit keeps one block and every
 ///   byte outside the blocks.
@@ -2142,6 +2145,23 @@ fn migration_block(
             rows: row_count,
             rule,
         });
+    }
+    if current
+        .as_ref()
+        .is_some_and(|current| legacy.end <= current.start)
+    {
+        // Disjoint, with the current block after the legacy one. An
+        // intact legacy block is only recognized when nothing but
+        // whitespace follows it (`legacy_block_outcome`), so this shape
+        // cannot be reached today; refusing, with the real cause, keeps
+        // a change to that rule from silently misplanning the edit.
+        return Err(BlockRefusal::new(
+            BlockRefusalCode::BlockLayout,
+            format!(
+                "the skill index block cannot be migrated: the omnifrons block sits after the \
+                 portable-agent block. Fix the markers by hand or index {needed} by hand"
+            ),
+        ));
     }
     if current
         .as_ref()
@@ -2282,5 +2302,41 @@ mod tests {
         let (body, row_count, rule) = super::regenerated_body(outside.as_bytes(), &rows, "/w");
         assert_eq!(body, render_body(&[], true));
         assert_eq!((row_count, rule), (0, true));
+    }
+
+    /// `migration_block` over a legacy span and a current block laid out
+    /// as `before` + current block + `after`; the legacy span is
+    /// `legacy`.
+    fn migrate(
+        text: &str,
+        legacy: std::ops::Range<usize>,
+    ) -> Result<super::PendingBlock, super::BlockRefusal> {
+        super::migration_block(text.as_bytes(), legacy, &[], "/w", "the skills")
+    }
+
+    const CURRENT: &str =
+        "<!-- omnifrons:begin skills x -->\nbody\n<!-- omnifrons:end skills -->\n";
+
+    /// A current block wholly after the legacy block is disjoint, not
+    /// overlapping. The legacy rule refuses any text after its end marker
+    /// first, so no file reaches this from the public surface; the helper
+    /// is pinned directly so the refusal names the real cause.
+    #[test]
+    fn a_current_block_after_the_legacy_block_is_refused_as_disjoint() {
+        let text = format!("legacy\n{CURRENT}");
+        let refusal = migrate(&text, 0..6).expect_err("refused");
+        assert_eq!(refusal.code, super::BlockRefusalCode::BlockLayout);
+        assert!(refusal.detail.contains("after"), "{}", refusal.detail);
+        assert!(!refusal.detail.contains("overlap"), "{}", refusal.detail);
+    }
+
+    /// A current block that starts inside the legacy span and ends past
+    /// it overlaps without either containing the other.
+    #[test]
+    fn a_straddling_current_block_is_refused_as_an_overlap() {
+        let text = format!("legacy\n{CURRENT}");
+        let refusal = migrate(&text, 0..20).expect_err("refused");
+        assert_eq!(refusal.code, super::BlockRefusalCode::BlockLayout);
+        assert!(refusal.detail.contains("overlap"), "{}", refusal.detail);
     }
 }

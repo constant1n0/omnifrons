@@ -36,13 +36,16 @@
 //! belong to the write path, which can derive them from each operation's
 //! `before` fingerprint.
 //!
-//! # Not yet reported
+//! # Notices
 //!
-//! A `.portable-agent/` backup folder beside the definition is meant to
-//! be reported, never deleted ([`omnifrons_domain::definition_plan::Notice`]).
-//! The directory walk prunes that folder (`SKIP_DIRS`), so the tree
-//! snapshot cannot show it and [`Plan::notices`] stays empty until the
-//! adapter exposes it.
+//! A `.portable-agent/` backup folder directly inside the agent's own
+//! directory is reported, never deleted
+//! ([`omnifrons_domain::definition_plan::Notice`]). The directory walk
+//! prunes that folder, so the snapshot carries only a presence flag on
+//! the directory ([`crate::definition_tree::DirectoryEntry::portable_agent_folder`]);
+//! a plan reports the flag of its target's directory, never an
+//! ancestor's or a child's. A notice is informational: it is not part of
+//! the plan id.
 
 use std::collections::BTreeMap;
 
@@ -50,7 +53,8 @@ use omnifrons_domain::definition::{
     FileShape, IdentityFile, IdentityKind, RootState, WRAPPER, is_import_only,
 };
 use omnifrons_domain::definition_plan::{
-    BlockDiff, InputFingerprint, Operation, Plan, PlanId, PlanOptions, PlanRefusal, canonical_bytes,
+    BlockDiff, InputFingerprint, Notice, Operation, Plan, PlanId, PlanOptions, PlanRefusal,
+    canonical_bytes,
 };
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock, ManagedFileKind};
 use omnifrons_domain::nesting::{self, Parent};
@@ -60,6 +64,7 @@ use crate::definition::{
     BlockAnalysis, BlockRefusal, BlockRefusalCode, DefinitionError, DefinitionPorts, LoadedTarget,
     PendingBlock, absolute_posix, agent_root_paths, block_analysis, load_target,
 };
+use crate::definition_tree::TreeSnapshot;
 use crate::harness_adapter::WorkspaceRoot;
 
 /// The bytes one planned operation would write.
@@ -128,8 +133,6 @@ pub fn plan_with_writes(
         classification,
     } = load_target(ports, workspace, target)?;
     let hasher = ports.hasher;
-    // The location the plan is scoped to: its id covers it.
-    let location = absolute_posix(workspace, ".");
     let inputs = input_fingerprints(hasher, &identity_files);
 
     let source = resolve_source(
@@ -140,23 +143,23 @@ pub fn plan_with_writes(
         options.canonical_from,
     )?;
     if classification.state == RootState::None {
-        return Ok((
-            PlanOutcome::Planned(finish(hasher, &location, target, inputs, Vec::new(), None)),
+        let empty = finish(
+            hasher,
+            workspace,
+            target,
+            inputs,
             Vec::new(),
-        ));
+            None,
+            &snapshot,
+        );
+        return Ok((PlanOutcome::Planned(empty), Vec::new()));
     }
 
     let roots = agent_root_paths(&snapshot.directories);
-    if !options.nested_consent {
-        let relations =
-            nesting::relate(&roots, &snapshot.ancestors).map_err(DefinitionError::Nesting)?;
-        let parent = relations
-            .iter()
-            .find(|relation| relation.root == target)
-            .and_then(|relation| relation.parent.as_ref());
-        if let Some(parent) = parent {
-            return Ok(refused(nested_refusal(target, parent)));
-        }
+    if !options.nested_consent
+        && let Some(refusal) = nested_without_consent(&snapshot, &roots, target)?
+    {
+        return Ok(refused(refusal));
     }
     if classification.state == RootState::Unsafe {
         return Ok(refused(PlanRefusal::Unsafe(classification.reason)));
@@ -221,11 +224,48 @@ pub fn plan_with_writes(
     }
     Ok((
         PlanOutcome::Planned(finish(
-            hasher, &location, target, inputs, operations, block_diff,
+            hasher, workspace, target, inputs, operations, block_diff, &snapshot,
         )),
         writes,
     ))
 }
+
+/// The refusal for a `target` that sits below another agent root while
+/// its parent's consent is missing, or `None` when it has no parent.
+fn nested_without_consent(
+    snapshot: &TreeSnapshot,
+    roots: &[&str],
+    target: &str,
+) -> Result<Option<PlanRefusal>, DefinitionError> {
+    let relations =
+        nesting::relate(roots, &snapshot.ancestors).map_err(DefinitionError::Nesting)?;
+    Ok(relations
+        .iter()
+        .find(|relation| relation.root == target)
+        .and_then(|relation| relation.parent.as_ref())
+        .map(|parent| nested_refusal(target, parent)))
+}
+
+/// The notices for `target`: a `.portable-agent/` folder directly inside
+/// its own directory, reported at its workspace-relative path.
+fn state_folder_notices(snapshot: &TreeSnapshot, target: &str) -> Vec<Notice> {
+    let flagged = snapshot
+        .directories
+        .iter()
+        .any(|entry| entry.path == target && entry.portable_agent_folder);
+    if !flagged {
+        return Vec::new();
+    }
+    let path = if target == "." {
+        STATE_FOLDER.to_string()
+    } else {
+        format!("{target}/{STATE_FOLDER}")
+    };
+    vec![Notice::PortableAgentFolder { path }]
+}
+
+/// The prototype's adapter-state folder, beside which a plan reports it.
+const STATE_FOLDER: &str = ".portable-agent";
 
 /// The unmanaged secondary files whose bytes differ from the source's.
 fn unresolved_files(
@@ -246,27 +286,32 @@ fn refused(refusal: PlanRefusal) -> (PlanOutcome, Vec<PlannedWrite>) {
 }
 
 /// The plan for `agent` with its id derived from the canonical text.
+///
+/// The id covers the workspace root's raw platform bytes; the
+/// `/`-separated lossy text kept in [`Plan::workspace`] is display only
+/// and two roots differing in a non-UTF-8 byte may share it.
 fn finish(
     hasher: &dyn ContentHasher,
-    workspace: &str,
+    workspace: &WorkspaceRoot,
     agent: &str,
     inputs: BTreeMap<String, InputFingerprint>,
     operations: Vec<Operation>,
     block_diff: Option<BlockDiff>,
+    snapshot: &TreeSnapshot,
 ) -> Plan {
     let id = PlanId::from_digest(hasher.sha256(&canonical_bytes(
-        workspace,
+        workspace.path().as_os_str().as_encoded_bytes(),
         agent,
         &inputs,
         &operations,
     )));
     Plan {
-        workspace: workspace.to_string(),
+        workspace: absolute_posix(workspace, "."),
         agent: agent.to_string(),
         inputs,
         operations,
         block_diff,
-        notices: Vec::new(),
+        notices: state_folder_notices(snapshot, agent),
         id,
     }
 }

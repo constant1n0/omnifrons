@@ -22,20 +22,45 @@ use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, WRAPPE
 use omnifrons_domain::definition_plan::{BlockMode, Operation, Plan, PlanOptions, PlanRefusal};
 use omnifrons_domain::skills_index::{PRECEDENCE_RULE, RULE_HEADING};
 
-/// The one workspace root every `run` plans under. It lives for the
-/// whole test process; the id is scoped to it, so two runs only share an
-/// id when they share this root.
-fn shared_workspace() -> WorkspaceRoot {
-    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let root = ROOT.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "omnifrons-definition-block-plan-shared-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("fixture dir");
-        dir
-    });
-    WorkspaceRoot::new(root).expect("valid workspace")
+/// The one workspace root every `run` plans under, so equal snapshots
+/// give equal plan ids (the id is scoped to the root). Its path depends
+/// only on the process id; the directory exists while at least one
+/// [`SharedWorkspace`] guard is alive and is removed when the last one
+/// drops, so a finished test run leaves nothing behind.
+struct SharedWorkspace;
+
+static SHARED_USERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+fn shared_root_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "omnifrons-definition-block-plan-shared-{}",
+        std::process::id()
+    ))
+}
+
+impl SharedWorkspace {
+    /// A guard keeping the directory alive, and the root over it.
+    fn acquire() -> (Self, WorkspaceRoot) {
+        let mut users = SHARED_USERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fs::create_dir_all(shared_root_path()).expect("fixture dir");
+        *users += 1;
+        let root = WorkspaceRoot::new(shared_root_path()).expect("valid workspace");
+        (Self, root)
+    }
+}
+
+impl Drop for SharedWorkspace {
+    fn drop(&mut self) {
+        let mut users = SHARED_USERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *users -= 1;
+        if *users == 0 {
+            let _ = std::fs::remove_dir_all(shared_root_path());
+        }
+    }
 }
 
 const BODY: &[u8] = b"# Sample\n\nYou are Sample, a fixture agent.\n";
@@ -88,7 +113,7 @@ type Planned = Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError>;
 
 fn run(snapshot: TreeSnapshot, target: Option<&str>, options: PlanOptions) -> Planned {
     // One fixed root, so equal snapshots give equal plan ids.
-    let workspace = shared_workspace();
+    let (_shared, workspace) = SharedWorkspace::acquire();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
     let hasher = FakeHasher;
     let ports = DefinitionPorts {
@@ -613,7 +638,7 @@ fn a_legacy_block_beside_a_current_block_is_migrated_into_one_block() {
     let current = text(&applied(&skills));
     let legacy = legacy_block(&legacy_lines(true));
     let both = format!("{current}\n{legacy}");
-    let workspace = shared_workspace();
+    let (_shared, workspace) = SharedWorkspace::acquire();
     let tree = InMemoryDefinitionTree::new()
         .with_snapshot(&workspace, canonical_root(both.as_bytes(), &skills));
     let hasher = FakeHasher;
@@ -638,6 +663,26 @@ fn a_legacy_block_beside_a_current_block_is_migrated_into_one_block() {
     assert_eq!(count(&after, BEGIN), 1, "{after}");
     assert!(!after.contains("portable-agent:"), "{after}");
     assert!(after.starts_with(&current[..current.find(BEGIN).expect("a block")]));
+    // The dry run shows every block the write replaces or removes, in
+    // file order: the current block first, then the legacy one.
+    let diff = plan.block_diff.as_ref().expect("a block diff");
+    assert!(
+        diff.before
+            .first()
+            .is_some_and(|line| line.starts_with(BEGIN))
+    );
+    assert!(
+        diff.before
+            .iter()
+            .any(|line| line.starts_with("<!-- portable-agent:skills:begin")),
+        "{:?}",
+        diff.before
+    );
+    assert_eq!(
+        diff.before.last().map(String::as_str),
+        Some("<!-- portable-agent:skills:end -->")
+    );
+    assert!(diff.before.iter().any(|line| line == LEGACY_ROW));
     let (again, _) = planned(plan_canonical(after.as_bytes(), &skills));
     assert!(again.operations.is_empty(), "{:?}", again.operations);
 
@@ -747,5 +792,56 @@ fn appending_pads_from_the_actual_tail() {
     assert!(
         after.starts_with(&format!("{agents}\r\n\r\n{BEGIN}")),
         "{after:?}"
+    );
+}
+
+#[test]
+fn a_begin_prefixed_line_before_a_valid_block_refuses_the_layout() {
+    // `ManagedBlock::locate` counts every begin-prefixed line, so a
+    // malformed one ahead of a valid block makes two begins and refuses;
+    // the byte scan never picks the malformed line as the block's start.
+    let skills = sample_skills();
+    let current = text(&applied(&skills));
+    let stray = format!("<!-- omnifrons:begin skills not-a-digest -->\n{current}");
+    let refusal = refused(plan_canonical(stray.as_bytes(), &skills));
+    assert_eq!(refusal.code(), "block_layout");
+    // The same stray line with no block at all is refused too.
+    let alone = format!(
+        "{}\n<!-- omnifrons:begin skills not-a-digest -->\n",
+        text(BODY)
+    );
+    let refusal = refused(plan_canonical(alone.as_bytes(), &skills));
+    assert_eq!(refusal.code(), "block_layout");
+}
+
+#[test]
+fn a_state_folder_beside_a_block_write_is_reported_and_leaves_the_id_alone() {
+    use omnifrons_domain::definition_plan::Notice;
+    let skills = sample_skills();
+    let (plain, plain_writes) = planned(run(
+        claude_root(BODY, &skills),
+        None,
+        PlanOptions::default(),
+    ));
+    let mut flagged_root = claude_root(BODY, &skills);
+    for entry in &mut flagged_root.directories {
+        if entry.path == "." {
+            entry.portable_agent_folder = true;
+        }
+    }
+    let (flagged, flagged_writes) = planned(run(flagged_root, None, PlanOptions::default()));
+    assert_eq!(block_mode(&flagged), Some(BlockMode::Append));
+    assert_eq!(flagged.operations, plain.operations);
+    assert_eq!(flagged.id, plain.id);
+    assert_eq!(
+        flagged_writes.iter().map(|w| &w.bytes).collect::<Vec<_>>(),
+        plain_writes.iter().map(|w| &w.bytes).collect::<Vec<_>>()
+    );
+    assert!(plain.notices.is_empty());
+    assert_eq!(
+        flagged.notices,
+        vec![Notice::PortableAgentFolder {
+            path: ".portable-agent".to_string()
+        }]
     );
 }
