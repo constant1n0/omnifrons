@@ -12,23 +12,27 @@
 //!
 //! # Plan id
 //!
-//! The id is the SHA-256 of [`canonical_bytes`]: the agent path, every
-//! input fingerprint, and every operation, in a fixed text form. The
+//! The id is the SHA-256 of [`canonical_bytes`]: the canonical workspace
+//! root, the agent path, every input fingerprint, and every operation, in a fixed text form. The
 //! form is Omnifrons' own. It does not reproduce the byte layout of any
 //! earlier tool, so ids are stable within this implementation only.
 //!
-//! # Scope of sub-slice 2a
+//! # Scope of sub-slices 2a and 2b
 //!
-//! Operations cover the identity files only: the canonical `AGENTS.md`,
-//! the `CLAUDE.md` wrapper, and the opt-in `GEMINI.md` wrapper. The
-//! skills block, the legacy migration, and backups arrive in later
-//! sub-slices; the refusals those layers can raise already exist here.
+//! Operations cover the identity files (the canonical `AGENTS.md`, the
+//! `CLAUDE.md` wrapper, and the opt-in `GEMINI.md` wrapper) and the one
+//! `skills` block write that follows them: an append, a replacement of
+//! the current block, or the one-time migration of a legacy
+//! `portable-agent:` block ([`BlockMode`]). The public [`Plan`] carries
+//! digests and a [`BlockDiff`], never the bytes to write; the
+//! application layer keeps those. Backups arrive with the write path.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 
 use crate::definition::IdentityKind;
 use crate::executable::Sha256Digest;
+use crate::guidance::{ManagedFileKind, SKILLS_TEMPLATE_VERSION};
 
 /// The first line of every [`canonical_bytes`] text. Changing the layout
 /// of that text means changing this tag, so an old id can never match a
@@ -64,9 +68,38 @@ impl InputFingerprint {
     }
 }
 
-/// One planned identity-file operation, carrying what an apply needs:
-/// the file's relative path, the digest of the bytes to write, and the
-/// fingerprint the file must still have.
+/// How a block write changes the canonical file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockMode {
+    /// No Omnifrons block exists yet: a new one is added at the end of
+    /// the file, after one blank line.
+    Append,
+    /// The current Omnifrons block is regenerated in place. A block that
+    /// was edited by hand is never replaced; it is refused.
+    Replace,
+    /// An intact legacy `portable-agent:` block is replaced, once, by
+    /// the Omnifrons block the `skills` kind defines: its bytes are
+    /// regenerated from the local skills and the precedence rule, never
+    /// carried over. When a current block sits beside it, the legacy
+    /// block is removed and the current one regenerated in place.
+    MigrateLegacy,
+}
+
+impl BlockMode {
+    /// This mode's stable token, as written in [`canonical_bytes`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Replace => "replace",
+            Self::MigrateLegacy => "migrate-legacy",
+        }
+    }
+}
+
+/// One planned operation, carrying what an apply needs: the file's
+/// relative path, the digest of the bytes to write, and the fingerprint
+/// the file must still have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     /// Write `AGENTS.md` with the bytes of `source` (the chosen
@@ -88,6 +121,24 @@ pub enum Operation {
         /// What the file must still look like when this runs.
         before: InputFingerprint,
     },
+    /// Write the `skills` block into the canonical `AGENTS.md`. It
+    /// follows the identity-file operations, so `before` is the file as
+    /// it is when this runs: the current `AGENTS.md`, or the bytes
+    /// [`Self::WriteAgents`] has just written.
+    WriteBlock {
+        /// The kind of block written: always [`ManagedFileKind::Skills`]
+        /// in this slice.
+        kind: ManagedFileKind,
+        /// How the block is added.
+        mode: BlockMode,
+        /// The SHA-256 of the block's canonical body, as pinned in its
+        /// begin sentinel.
+        body: Sha256Digest,
+        /// The SHA-256 of the whole file after the write.
+        after: Sha256Digest,
+        /// What `AGENTS.md` must still look like when this runs.
+        before: InputFingerprint,
+    },
 }
 
 impl Operation {
@@ -95,7 +146,7 @@ impl Operation {
     #[must_use]
     pub const fn path(&self) -> &'static str {
         match self {
-            Self::WriteAgents { .. } => IdentityKind::Agents.file_name(),
+            Self::WriteAgents { .. } | Self::WriteBlock { .. } => IdentityKind::Agents.file_name(),
             Self::WriteWrapper { kind, .. } => kind.file_name(),
         }
     }
@@ -104,7 +155,9 @@ impl Operation {
     #[must_use]
     pub const fn before(&self) -> &InputFingerprint {
         match self {
-            Self::WriteAgents { before, .. } | Self::WriteWrapper { before, .. } => before,
+            Self::WriteAgents { before, .. }
+            | Self::WriteWrapper { before, .. }
+            | Self::WriteBlock { before, .. } => before,
         }
     }
 
@@ -132,8 +185,59 @@ impl Operation {
                 after.to_hex(),
                 before.canonical()
             ),
+            Self::WriteBlock {
+                kind,
+                mode,
+                body,
+                after,
+                before,
+            } => format!(
+                "write-block path={} kind={} version={SKILLS_TEMPLATE_VERSION} mode={} \
+                 body={} after={} before={}",
+                self.path(),
+                block_kind_token(*kind),
+                mode.as_str(),
+                body.to_hex(),
+                after.to_hex(),
+                before.canonical()
+            ),
         }
     }
+}
+
+/// The block kind's token in [`canonical_bytes`]. Only the `skills`
+/// kind is ever planned here.
+const fn block_kind_token(kind: ManagedFileKind) -> &'static str {
+    match kind {
+        ManagedFileKind::Skills => "skills",
+        ManagedFileKind::Guidance => "guidance",
+        ManagedFileKind::Ignore => "ignore",
+    }
+}
+
+/// The lines of the block a plan adds, replaces or migrates, for the
+/// dry run to show. The lines carry no terminators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockDiff {
+    /// The file the block lives in.
+    pub path: &'static str,
+    /// The block's lines before the write: empty for an append, the
+    /// current Omnifrons block for a replacement, the legacy block for a
+    /// migration.
+    pub before: Vec<String>,
+    /// The block's lines after the write, sentinels included.
+    pub after: Vec<String>,
+}
+
+/// Something a dry run reports without ever acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// A `.portable-agent/` backup folder sits beside the definition.
+    /// It is reported and never deleted.
+    PortableAgentFolder {
+        /// The folder's path, relative to the workspace.
+        path: String,
+    },
 }
 
 /// The flags that change what a plan may do.
@@ -206,18 +310,6 @@ impl PlanRefusal {
             | Self::DivergingCopy(message) => message,
         }
     }
-
-    /// The refusal for a reason token and message, when `code` is a
-    /// block or skill-metadata token a block analysis can produce.
-    #[must_use]
-    pub fn from_block_code(code: &str, message: String) -> Option<Self> {
-        match code {
-            "edited_block" => Some(Self::EditedBlock(message)),
-            "block_layout" => Some(Self::BlockLayout(message)),
-            "unsafe_skill_metadata" => Some(Self::UnsafeSkillMetadata(message)),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for PlanRefusal {
@@ -250,6 +342,10 @@ impl fmt::Display for PlanId {
 /// canonical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
+    /// The canonical workspace root the plan was made for, `/`-separated.
+    /// The id covers it, so a preview never authorises a write in another
+    /// workspace.
+    pub workspace: String,
     /// The agent root's path, relative to the workspace (`.` for the
     /// workspace itself).
     pub agent: String,
@@ -257,8 +353,16 @@ pub struct Plan {
     /// A file the plan does not write is still listed when it exists:
     /// changing it changes the id.
     pub inputs: BTreeMap<String, InputFingerprint>,
-    /// The operations to apply, in order.
+    /// The operations to apply, in order: identity files first, the
+    /// `skills` block last.
     pub operations: Vec<Operation>,
+    /// The block the plan adds, replaces or migrates, when it has a
+    /// [`Operation::WriteBlock`]. Display only: the id covers the block
+    /// through its operation.
+    pub block_diff: Option<BlockDiff>,
+    /// What the dry run reports and never acts on. Never part of the
+    /// id.
+    pub notices: Vec<Notice>,
     /// The id of this plan.
     pub id: PlanId,
 }
@@ -270,6 +374,7 @@ pub struct Plan {
 ///
 /// ```text
 /// omnifrons-plan-v1
+/// workspace <len>:<canonical workspace root>
 /// agent <len>:<path>
 /// inputs <count>
 /// input <len>:<file name> <fingerprint>      (sorted by file name)
@@ -279,9 +384,21 @@ pub struct Plan {
 ///
 /// Each line ends in `\n`. The fingerprint and operation lines are
 /// [`InputFingerprint::canonical`] and [`Operation::canonical`]. The
-/// form does not reproduce any earlier tool's id layout.
+/// operation lines are:
+///
+/// ```text
+/// write-agents source=<file> after=<hex> before=<fingerprint>
+/// write-wrapper path=<file> after=<hex> before=<fingerprint>
+/// write-block path=<file> kind=skills version=<template version> mode=<mode> body=<hex> after=<hex> before=<fingerprint>
+/// ```
+///
+/// A block operation therefore changes the id when the block's body, the
+/// template version, the mode or the resulting file changes. The diff
+/// and the notices of a [`Plan`] are not part of the text. The form does
+/// not reproduce any earlier tool's id layout.
 #[must_use]
 pub fn canonical_bytes(
+    workspace: &str,
     agent: &str,
     inputs: &BTreeMap<String, InputFingerprint>,
     operations: &[Operation],
@@ -289,6 +406,7 @@ pub fn canonical_bytes(
     let mut text = String::new();
     // Writing into a `String` never fails.
     let _ = writeln!(text, "{CANONICAL_FORM_TAG}");
+    let _ = writeln!(text, "workspace {}:{workspace}", workspace.len());
     let _ = writeln!(text, "agent {}:{agent}", agent.len());
     let _ = writeln!(text, "inputs {}", inputs.len());
     for (name, fingerprint) in inputs {
@@ -322,10 +440,10 @@ mod tests {
             "AGENTS.md".to_string(),
             InputFingerprint::Symlink("a\nb".to_string()),
         );
-        let text = String::from_utf8(canonical_bytes(".", &inputs, &[])).unwrap();
+        let text = String::from_utf8(canonical_bytes("/w", ".", &inputs, &[])).unwrap();
         assert_eq!(
             text,
-            "omnifrons-plan-v1\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
+            "omnifrons-plan-v1\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
              input 9:CLAUDE.md irregular\noperations 0\n"
         );
     }
@@ -343,9 +461,8 @@ mod tests {
             "nested_agent"
         );
         assert_eq!(
-            PlanRefusal::from_block_code("edited_block", "m".into()),
-            Some(PlanRefusal::EditedBlock("m".into()))
+            PlanRefusal::EditedBlock(String::new()).code(),
+            "edited_block"
         );
-        assert_eq!(PlanRefusal::from_block_code("other", "m".into()), None);
     }
 }

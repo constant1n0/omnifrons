@@ -44,6 +44,22 @@ impl TempDir {
     }
 }
 
+/// The one workspace root every `run` plans under. It lives for the
+/// whole test process; the id is scoped to it, so two runs only share an
+/// id when they share this root.
+fn shared_workspace() -> WorkspaceRoot {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "omnifrons-definition-plan-shared-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        dir
+    });
+    WorkspaceRoot::new(root).expect("valid workspace")
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -92,8 +108,8 @@ fn run(
     target: Option<&str>,
     options: PlanOptions,
 ) -> Result<PlanOutcome, DefinitionError> {
-    let project = TempDir::new("run");
-    let workspace = project.workspace();
+    // One fixed root, so equal snapshots give equal plan ids.
+    let workspace = shared_workspace();
     let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
     let hasher = FakeHasher;
     let ports = DefinitionPorts {
@@ -273,9 +289,7 @@ fn canonical_from_plans_the_copy_from_the_chosen_file_and_records_the_loser() {
             assert_eq!(InputFingerprint::Sha256(*after), digest_of(OTHER_TEXT));
             assert_eq!(*before, digest_of(AGENTS_TEXT));
         }
-        other @ Operation::WriteWrapper { .. } => {
-            panic!("expected the AGENTS.md copy, got {other:?}")
-        }
+        other => panic!("expected the AGENTS.md copy, got {other:?}"),
     }
     assert_eq!(plan.inputs["AGENTS.md"], digest_of(AGENTS_TEXT));
     assert_eq!(plan.inputs["CLAUDE.md"], digest_of(OTHER_TEXT));
@@ -470,7 +484,7 @@ fn each_root_state_plans_its_identity_operations() {
             assert_eq!(*kind, IdentityKind::Claude);
             assert_eq!(InputFingerprint::Sha256(*after), digest_of(WRAPPER));
         }
-        other @ Operation::WriteAgents { .. } => panic!("expected the wrapper, got {other:?}"),
+        other => panic!("expected the wrapper, got {other:?}"),
     }
 
     // A near wrapper is replaced by the exact wrapper.
@@ -644,7 +658,8 @@ fn a_claude_only_root_needing_a_block_refuses_only_when_an_unmanaged_copy_exists
         .skill("skills/sample/SKILL.md", sample_skill())
         .build();
     let plan = planned(run(without_copy, None, PlanOptions::default()));
-    assert_eq!(paths(&plan), vec!["AGENTS.md", "CLAUDE.md"]);
+    // Identity files first, the block last.
+    assert_eq!(paths(&plan), vec!["AGENTS.md", "CLAUDE.md", "AGENTS.md"]);
 
     let with_copy = TreeSnapshotBuilder::new()
         .directory(
@@ -702,5 +717,31 @@ fn a_conflict_resolved_toward_claude_analyses_the_claude_bytes_for_blocks() {
         ..PlanOptions::default()
     };
     let plan = planned(run(snapshot(), None, choose_agents));
-    assert_eq!(paths(&plan), vec!["CLAUDE.md"]);
+    // The wrapper, then the block the sample skill needs.
+    assert_eq!(paths(&plan), vec!["CLAUDE.md", "AGENTS.md"]);
+}
+
+#[test]
+fn the_plan_id_is_scoped_to_the_workspace_root() {
+    let plan_in = |project: &TempDir| {
+        let workspace = project.workspace();
+        let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, claude_only());
+        let hasher = FakeHasher;
+        let ports = DefinitionPorts {
+            tree: &tree,
+            hasher: &hasher,
+        };
+        planned(plan(&ports, &workspace, None, &PlanOptions::default()))
+    };
+    let first = TempDir::new("scope-a");
+    let second = TempDir::new("scope-b");
+    let a = plan_in(&first);
+    let again = plan_in(&first);
+    let b = plan_in(&second);
+    assert_eq!(a.id, again.id);
+    assert_ne!(a.id, b.id);
+    assert_eq!(a.inputs, b.inputs);
+    assert_eq!(paths(&a), paths(&b));
+    assert!(!a.workspace.contains('\\'));
+    assert_ne!(a.workspace, b.workspace);
 }

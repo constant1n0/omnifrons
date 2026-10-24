@@ -35,11 +35,13 @@
 //! module changes once that adapter exists.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use omnifrons_domain::definition::{
     Classification, DirectoryIdentity, FileShape, IdentityFile, IdentityKind, RootState, classify,
     title as extract_title,
 };
+use omnifrons_domain::definition_plan::BlockMode;
 use omnifrons_domain::guidance::{ManagedBlock, ManagedFileError, ManagedFileKind};
 use omnifrons_domain::hosts;
 use omnifrons_domain::nesting::{self, Ancestor, ChainLink, NestingError, Parent, RootRelation};
@@ -280,7 +282,7 @@ fn canonical_bytes(identity_files: &[IdentityFile], source: Option<IdentityKind>
 /// `relative`'s absolute POSIX path under `workspace`'s canonical root
 /// (`"."` for the root itself) -- [`read_skill_index`]'s own `root`
 /// parameter, which only uses it to relativize an absolute link target.
-fn absolute_posix(workspace: &WorkspaceRoot, relative: &str) -> String {
+pub(crate) fn absolute_posix(workspace: &WorkspaceRoot, relative: &str) -> String {
     let joined = if relative == "." {
         workspace.path().to_path_buf()
     } else {
@@ -966,10 +968,10 @@ fn verify_problems_after_state(
         identity_files,
         classification.source,
     ) {
-        BlockAnalysis::Refused(refusal) => vec![refusal],
+        BlockAnalysis::Refused(refusal) => vec![refusal.to_string()],
         BlockAnalysis::Settled { pending } => {
             let mut problems = wrapper_problems(classification.state, ports.hasher, identity_files);
-            problems.extend(pending);
+            problems.extend(pending.map(|block| block.describe()));
             problems
         }
     }
@@ -978,28 +980,120 @@ fn verify_problems_after_state(
 /// What [`block_analysis`] found for one agent root's skills metadata
 /// and managed blocks.
 pub(crate) enum BlockAnalysis {
-    /// A refusal, in the prototype's own `refused (<code>): <detail>`
-    /// wording ([`split_refusal`] reads its parts back): unsafe skill
-    /// metadata, or a malformed or hand-edited block in either block
-    /// family.
-    Refused(String),
-    /// No refusal. `pending` is the one block operation still due -- a
+    /// A refusal: unsafe skill metadata, or a malformed or hand-edited
+    /// block in either block family. Its [`Display`](std::fmt::Display)
+    /// is the prototype's own `refused (<code>): <detail>` wording.
+    Refused(BlockRefusal),
+    /// No refusal. `pending` is the one block write still due -- a
     /// legacy migration, or an append or regenerate of the skills block --
-    /// in the prototype's own `pending:` wording; `None` when the block
-    /// layer needs no write.
+    /// `None` when the block layer needs no write.
     Settled {
-        /// The pending block operation's description, if any.
-        pending: Option<String>,
+        /// The pending block write, if any.
+        pending: Option<PendingBlock>,
     },
 }
 
-/// Splits a `refused (<code>): <detail>` string, as every refusal this
-/// module produces is spelled, into its code and detail; `None` for any
-/// other string.
-pub(crate) fn split_refusal(message: &str) -> Option<(&str, &str)> {
-    let rest = message.strip_prefix("refused (")?;
-    let (code, detail) = rest.split_once("): ")?;
-    Some((code, detail))
+/// The reason token of a [`BlockRefusal`], in the prototype's spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockRefusalCode {
+    /// A block was edited by hand: its recorded digest no longer matches.
+    EditedBlock,
+    /// A block's markers are not one intact pair.
+    BlockLayout,
+    /// A skill's metadata cannot be written into the index.
+    UnsafeSkillMetadata,
+}
+
+impl BlockRefusalCode {
+    /// The stable `snake_case` token, as the prototype writes it.
+    ///
+    /// Deliberately not
+    /// [`omnifrons_domain::skills_safety::SkillSafetyRefusal::as_str`]'s
+    /// kebab-case `"unsafe-skill-metadata"`: that is this crate's own
+    /// house convention for an IPC-facing reason token, while every
+    /// string [`verify`] produces mirrors the prototype's own wire format
+    /// verbatim, `snake_case` code included.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EditedBlock => "edited_block",
+            Self::BlockLayout => "block_layout",
+            Self::UnsafeSkillMetadata => "unsafe_skill_metadata",
+        }
+    }
+}
+
+/// A refusal [`block_analysis`] raised: its code and the detail text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockRefusal {
+    /// The reason token.
+    pub(crate) code: BlockRefusalCode,
+    /// The human-readable detail, without the `refused (...)` prefix.
+    pub(crate) detail: String,
+}
+
+impl BlockRefusal {
+    fn new(code: BlockRefusalCode, detail: String) -> Self {
+        Self { code, detail }
+    }
+}
+
+impl std::fmt::Display for BlockRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused ({}): {}", self.code.as_str(), self.detail)
+    }
+}
+
+/// One `skills` block write still due: how it changes the canonical
+/// text, which bytes it replaces, and the body it writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingBlock {
+    /// Append a new block, regenerate the current one, or migrate the
+    /// legacy one.
+    pub(crate) mode: BlockMode,
+    /// The byte range of the canonical text the new block replaces: the
+    /// existing block from the start of its begin line to the end of
+    /// its end line (terminator excluded). `None` for an append.
+    pub(crate) span: Option<Range<usize>>,
+    /// A second span removed outright: the legacy block, when a current
+    /// block beside it is the one regenerated. Disjoint from `span`.
+    pub(crate) also_remove: Option<Range<usize>>,
+    /// The canonical body of the block to write (`\n`-separated, no
+    /// trailing newline). Never empty.
+    pub(crate) body: String,
+    /// How many index rows the write adds, for the pending sentence.
+    rows: usize,
+    /// Whether the write adds the precedence rule, for the same
+    /// sentence.
+    rule: bool,
+}
+
+impl PendingBlock {
+    /// The prototype's own `pending:` wording for this write
+    /// (`describe_operation`, append/replace branch), always against
+    /// `AGENTS.md`, the one file [`classify`] ever names as the
+    /// canonical source for a state this pass reaches this check from.
+    pub(crate) fn describe(&self) -> String {
+        let verb = match self.mode {
+            BlockMode::MigrateLegacy => {
+                return "pending: migrate the portable-agent skill index block in AGENTS.md to \
+                        the current omnifrons sentinel format"
+                    .to_string();
+            }
+            BlockMode::Append => "append",
+            BlockMode::Replace => "regenerate",
+        };
+        let mut parts = Vec::new();
+        if self.rows > 0 {
+            parts.push(format!("{} skill rows", self.rows));
+        }
+        if self.rule {
+            parts.push("the precedence rule".to_string());
+        }
+        format!(
+            "pending: {verb} the skill index block in AGENTS.md ({})",
+            parts.join(" and ")
+        )
+    }
 }
 
 /// The skill-metadata and managed-block layer of `build_plan` for one
@@ -1060,9 +1154,9 @@ pub(crate) fn block_analysis(
         let (legacy_refusal, legacy_pending) =
             match legacy_block_outcome(ports.hasher, text, &needed) {
                 LegacyBlockOutcome::Refusal {
-                    message,
+                    refusal,
                     marker_offset,
-                } => (Some((message, marker_offset)), None),
+                } => (Some((refusal, marker_offset)), None),
                 LegacyBlockOutcome::Pending(migrate) => (None, Some(migrate)),
                 LegacyBlockOutcome::None => (None, None),
             };
@@ -1089,7 +1183,8 @@ pub(crate) fn block_analysis(
         if let Some(refusal) = omnifrons_refusal {
             return BlockAnalysis::Refused(refusal);
         }
-        if let Some(migrate) = legacy_pending {
+        if let Some(legacy_span) = legacy_pending {
+            let migrate = migration_block(text, legacy_span, &rows, &root_absolute);
             return BlockAnalysis::Settled {
                 pending: Some(migrate),
             };
@@ -1134,24 +1229,13 @@ fn wrapper_problems(
     vec![format!("pending: write the wrapper CLAUDE.md ({effect})")]
 }
 
-/// The stable refusal code the prototype's own `UnsafeSkillMetadata`
-/// exception always carries (`UNSAFE_SKILL_METADATA` in the prototype's
-/// `adapter/portable-agent/scripts/portable_agent.py`), for both of its
-/// causes -- a lone surrogate, or a possible `@` import. Deliberately
-/// not [`omnifrons_domain::skills_safety::SkillSafetyRefusal::as_str`]'s
-/// kebab-case `"unsafe-skill-metadata"`: that is this crate's own house
-/// convention for an IPC-facing reason token, while every string
-/// [`verify`] produces mirrors the prototype's own wire format verbatim,
-/// `snake_case` code included.
-const UNSAFE_SKILL_METADATA_CODE: &str = "unsafe_skill_metadata";
-
 /// Every root skill's row, and the one refusal this pass can raise from
 /// them (the prototype's own `plan_block`): a lone surrogate from
 /// [`read_skill_metadata`] refuses every flagged skill at once, before a
 /// possible `@` import is ever checked for any of them; only when none
 /// is found does [`unsafe_row_fields`] run over the rest. Either way all
 /// of `root_skills` shares the one refusal, never one row at a time.
-fn skill_rows(root_skills: &[SkillFile]) -> (Vec<SkillRow>, Option<String>) {
+fn skill_rows(root_skills: &[SkillFile]) -> (Vec<SkillRow>, Option<BlockRefusal>) {
     let mut invalid_problems: Vec<String> = Vec::new();
     let mut rows: Vec<SkillRow> = Vec::with_capacity(root_skills.len());
     for skill in root_skills {
@@ -1165,17 +1249,17 @@ fn skill_rows(root_skills: &[SkillFile]) -> (Vec<SkillRow>, Option<String>) {
     if !invalid_problems.is_empty() {
         return (
             rows,
-            Some(format!(
-                "refused ({UNSAFE_SKILL_METADATA_CODE}): {}",
-                invalid_unicode_detail(&invalid_problems)
+            Some(BlockRefusal::new(
+                BlockRefusalCode::UnsafeSkillMetadata,
+                invalid_unicode_detail(&invalid_problems),
             )),
         );
     }
     let unsafe_fields = unsafe_row_fields(&rows);
     let refusal = (!unsafe_fields.is_empty()).then(|| {
-        format!(
-            "refused ({UNSAFE_SKILL_METADATA_CODE}): {}",
-            unsafe_rows_detail(&unsafe_fields)
+        BlockRefusal::new(
+            BlockRefusalCode::UnsafeSkillMetadata,
+            unsafe_rows_detail(&unsafe_fields),
         )
     });
     (rows, refusal)
@@ -1247,10 +1331,10 @@ enum BlockOutcome {
     None,
     /// The block is malformed or was edited by hand (the prototype's own
     /// `EditedBlock`).
-    Refusal(String),
+    Refusal(BlockRefusal),
     /// A write or update is pending (the prototype's own
     /// `append_block`/`replace_block`).
-    Pending(String),
+    Pending(PendingBlock),
 }
 
 /// The skills-block refusal or pending operation this pass can know
@@ -1279,19 +1363,23 @@ fn skills_block_outcome(
     let digest = |bytes: &[u8]| hasher.sha256(bytes);
     let located = match ManagedBlock::locate(ManagedFileKind::Skills, &decoded, &digest) {
         Err(ManagedFileError::Malformed) => {
-            return BlockOutcome::Refusal(format!(
-                "refused (block_layout): the skill index block cannot be regenerated: its \
-                 sentinels are not one intact pair. Fix the markers by hand or index {} by \
-                 hand",
-                block_needed_names(status)
+            return BlockOutcome::Refusal(BlockRefusal::new(
+                BlockRefusalCode::BlockLayout,
+                format!(
+                    "the skill index block cannot be regenerated: its sentinels are not one \
+                     intact pair. Fix the markers by hand or index {} by hand",
+                    block_needed_names(status)
+                ),
             ));
         }
         Err(ManagedFileError::Modified) => {
-            return BlockOutcome::Refusal(format!(
-                "refused (edited_block): the skill index block was edited by hand (its \
-                 recorded sha256 no longer matches) and cannot be regenerated; restore it or \
-                 index {} by hand",
-                block_needed_names(status)
+            return BlockOutcome::Refusal(BlockRefusal::new(
+                BlockRefusalCode::EditedBlock,
+                format!(
+                    "the skill index block was edited by hand (its recorded sha256 no longer \
+                     matches) and cannot be regenerated; restore it or index {} by hand",
+                    block_needed_names(status)
+                ),
             ));
         }
         Ok(located) => located,
@@ -1300,11 +1388,15 @@ fn skills_block_outcome(
     let Some(located) = located else {
         return if block_needed(status) {
             let fresh_rows = rows_to_generate(canonical_text, rows, root_absolute);
-            BlockOutcome::Pending(skills_block_pending_text(
-                "append",
-                &fresh_rows,
-                !status.precedence,
-            ))
+            let rule = !status.precedence;
+            BlockOutcome::Pending(PendingBlock {
+                mode: BlockMode::Append,
+                span: None,
+                also_remove: None,
+                body: render_body(&fresh_rows, rule),
+                rows: fresh_rows.len(),
+                rule,
+            })
         } else {
             BlockOutcome::None
         };
@@ -1335,18 +1427,29 @@ fn skills_block_outcome(
     // always omit the rule the existing body carries, never match it,
     // and `verify` would report `pending: regenerate ...` forever for
     // an otherwise canonical agent.
-    let prefix_text = &decoded[..located.span.start];
-    let rule_needed = !has_precedence_phrases(prefix_text);
-    let fresh_rows = rows_to_generate(prefix_text.as_bytes(), rows, root_absolute);
+    //
+    // The block's bytes are located by `omnifrons_block_span`, over the
+    // original bytes, never by `located.span`, which indexes the lossily
+    // decoded text and so drifts from the file's own offsets after a
+    // byte that is not valid UTF-8.
+    let Some(span) = omnifrons_block_span(canonical_text) else {
+        return BlockOutcome::None;
+    };
+    let prefix_bytes = &canonical_text[..span.start];
+    let rule_needed = !has_precedence_phrases(&String::from_utf8_lossy(prefix_bytes));
+    let fresh_rows = rows_to_generate(prefix_bytes, rows, root_absolute);
     let fresh_body = render_body(&fresh_rows, rule_needed);
     if located.body == fresh_body {
         BlockOutcome::None
     } else {
-        BlockOutcome::Pending(skills_block_pending_text(
-            "regenerate",
-            &fresh_rows,
-            rule_needed,
-        ))
+        BlockOutcome::Pending(PendingBlock {
+            mode: BlockMode::Replace,
+            span: Some(span),
+            also_remove: None,
+            body: fresh_body,
+            rows: fresh_rows.len(),
+            rule: rule_needed,
+        })
     }
 }
 
@@ -1359,24 +1462,6 @@ fn block_needed_names(status: &SkillIndexStatus) -> String {
     } else {
         status.missing.join(", ")
     }
-}
-
-/// One skills-block pending operation's description (the prototype's own
-/// `describe_operation`, `append_block`/`replace_block` branch): always
-/// against `AGENTS.md`, the one file [`classify`] ever names as the
-/// canonical source for a state this pass reaches this check from.
-fn skills_block_pending_text(verb: &str, rows: &[SkillRow], rule_needed: bool) -> String {
-    let mut parts = Vec::new();
-    if !rows.is_empty() {
-        parts.push(format!("{} skill rows", rows.len()));
-    }
-    if rule_needed {
-        parts.push("the precedence rule".to_string());
-    }
-    format!(
-        "pending: {verb} the skill index block in AGENTS.md ({})",
-        parts.join(" and ")
-    )
 }
 
 /// The prototype's own legacy skills-block begin marker's fixed prefix
@@ -1498,8 +1583,10 @@ enum LegacyBlockOutcome {
     None,
     /// An intact block (the prototype's own `IndexBlock.intact`) whose
     /// recorded digest matches its body: pending migration to this
-    /// crate's own sentinel format.
-    Pending(String),
+    /// crate's own sentinel format. Carries the legacy block's byte span:
+    /// from the start of its begin line to the end of its end line,
+    /// terminator excluded.
+    Pending(Range<usize>),
     /// A malformed or hand-edited block (the prototype's own
     /// `EditedBlock`), already carrying its fixed code token and the
     /// prototype's own detail wording, alongside `marker_offset`: the
@@ -1512,7 +1599,7 @@ enum LegacyBlockOutcome {
     /// example with a placeholder instead of a real digest, say --
     /// never stands in for the block that is actually refusing.
     Refusal {
-        message: String,
+        refusal: BlockRefusal,
         marker_offset: usize,
     },
 }
@@ -1753,6 +1840,24 @@ fn first_omnifrons_marker_offset(canonical_text: &[u8]) -> Option<usize> {
         .map(|(offset, _)| offset)
 }
 
+/// The byte span of this crate's own skills block in `canonical_text`:
+/// from the start of the first line that begins with
+/// [`OMNIFRONS_SKILLS_BEGIN_PREFIX`] to the end of the next
+/// [`OMNIFRONS_SKILLS_END_LINE`] line, terminator excluded -- the same
+/// span `ManagedBlock::locate` reports, measured over the original bytes
+/// with the same line rule ([`omnifrons_lines`]). `None` when no such
+/// pair is found; callers have already had `locate` accept the text.
+fn omnifrons_block_span(canonical_text: &[u8]) -> Option<Range<usize>> {
+    let lines = omnifrons_lines(canonical_text);
+    let (start, _) = lines.iter().find(|&&(_, raw)| {
+        strip_line_ending(raw).starts_with(OMNIFRONS_SKILLS_BEGIN_PREFIX.as_bytes())
+    })?;
+    let &(end_offset, end_raw) = lines.iter().find(|&&(offset, raw)| {
+        offset > *start && strip_line_ending(raw) == OMNIFRONS_SKILLS_END_LINE.as_bytes()
+    })?;
+    Some(*start..end_offset + strip_line_ending(end_raw).len())
+}
+
 /// Whether the legacy family's own refusing block sits earlier in
 /// `canonical_text` than this crate's own omnifrons skills-block begin
 /// marker -- [`verify_problems_after_state`]'s own file-order
@@ -1959,30 +2064,99 @@ fn legacy_block_outcome(
     if layout.is_empty() {
         if edited {
             return LegacyBlockOutcome::Refusal {
-                message: format!(
-                    "refused (edited_block): the skill index block was edited by hand (its \
-                     recorded sha256 no longer matches) and cannot be regenerated; restore \
-                     it or index {needed} by hand"
+                refusal: BlockRefusal::new(
+                    BlockRefusalCode::EditedBlock,
+                    format!(
+                        "the skill index block was edited by hand (its recorded sha256 no \
+                         longer matches) and cannot be regenerated; restore it or index \
+                         {needed} by hand"
+                    ),
                 ),
                 marker_offset,
             };
         }
         return LegacyBlockOutcome::Pending(
-            "pending: migrate the portable-agent skill index block in AGENTS.md to the \
-             current omnifrons sentinel format"
-                .to_string(),
+            lines[first].offset..lines[ends[0]].offset + lines[ends[0]].text.len(),
         );
     }
     if edited {
         layout.push("its recorded sha256 no longer matches".to_string());
     }
     LegacyBlockOutcome::Refusal {
-        message: format!(
-            "refused (block_layout): the skill index block cannot be regenerated: {}. Fix \
-             the markers by hand or index {needed} by hand",
-            layout.join("; ")
+        refusal: BlockRefusal::new(
+            BlockRefusalCode::BlockLayout,
+            format!(
+                "the skill index block cannot be regenerated: {}. Fix the markers by hand or \
+                 index {needed} by hand",
+                layout.join("; ")
+            ),
         ),
         marker_offset,
+    }
+}
+
+/// The pending migration of the intact legacy block at `legacy`.
+///
+/// A migration regenerates: the legacy block's bytes are never copied.
+/// The new block is the one the `skills` kind defines -- the rows of the
+/// local skills the rest of the text does not already link, plus the
+/// precedence rule when the rest of the text lacks it -- and "the rest
+/// of the text" is the canonical text with the legacy block excised, so
+/// the legacy rows do not count as already indexed. It takes the legacy
+/// block's place, and every byte outside that span is kept.
+///
+/// When an intact current block sits beside the legacy one, exactly one
+/// block must remain: the legacy span is removed and the current block
+/// is regenerated in place, from the text before it.
+fn migration_block(
+    text: &[u8],
+    legacy: Range<usize>,
+    rows: &[SkillRow],
+    root_absolute: &str,
+) -> PendingBlock {
+    let Some(current) = omnifrons_block_span(text) else {
+        let excised = [&text[..legacy.start], &text[legacy.end..]].concat();
+        let (body, row_count, rule) = regenerated_body(&excised, rows, root_absolute);
+        return PendingBlock {
+            mode: BlockMode::MigrateLegacy,
+            span: Some(legacy),
+            also_remove: None,
+            body,
+            rows: row_count,
+            rule,
+        };
+    };
+    // An intact legacy block is the last thing in the file, so the
+    // current block always sits before it and the text before the
+    // current block never holds legacy bytes.
+    debug_assert!(current.end <= legacy.start);
+    let (body, row_count, rule) = regenerated_body(&text[..current.start], rows, root_absolute);
+    PendingBlock {
+        mode: BlockMode::MigrateLegacy,
+        span: Some(current),
+        also_remove: Some(legacy),
+        body,
+        rows: row_count,
+        rule,
+    }
+}
+
+/// The body of a regenerated block over `prefix`, the text outside it,
+/// with its row count and whether it carries the rule. A body that
+/// would be empty -- everything linked and the rule stated outside --
+/// falls back to the rule section alone, so a block is never empty.
+fn regenerated_body(
+    prefix: &[u8],
+    rows: &[SkillRow],
+    root_absolute: &str,
+) -> (String, usize, bool) {
+    let fresh_rows = rows_to_generate(prefix, rows, root_absolute);
+    let rule = !has_precedence_phrases(&String::from_utf8_lossy(prefix));
+    let body = render_body(&fresh_rows, rule);
+    if body.is_empty() {
+        (render_body(&[], true), 0, true)
+    } else {
+        (body, fresh_rows.len(), rule)
     }
 }
 
