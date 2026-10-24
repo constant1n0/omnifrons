@@ -464,11 +464,13 @@ pub fn definition_prune_targets(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_UNPINNED_SNAPSHOTS, SnapshotId, SnapshotManifest, dedup_target, prune_targets,
-        sort_newest_first,
+        DEFINITION_SNAPSHOT_ID_DOMAIN, DefinitionSubject, MAX_UNPINNED_SNAPSHOTS,
+        SNAPSHOT_ID_DOMAIN, SnapshotId, SnapshotManifest, dedup_target,
+        definition_snapshot_id_preimage, prune_targets, snapshot_id_preimage, sort_newest_first,
     };
     use omnifrons_domain::executable::Sha256Digest;
     use omnifrons_domain::guidance::ManagedFileKind;
+    use omnifrons_domain::publication::ProjectIdentity;
     use std::time::{Duration, SystemTime};
 
     fn manifest(n: u64, secs: u64, pinned: bool) -> SnapshotManifest {
@@ -530,5 +532,62 @@ mod tests {
         assert_eq!(pruned, vec![SnapshotId(3), SnapshotId(1)]);
         assert_eq!(MAX_UNPINNED_SNAPSHOTS, 5);
         assert!(prune_targets(&manifests, ManagedFileKind::Ignore, ".gitignore").is_empty());
+    }
+
+    fn subject(agent: &str, file: &str) -> DefinitionSubject {
+        DefinitionSubject::new(agent, file).expect("a valid subject")
+    }
+
+    const PROJECT: ProjectIdentity = ProjectIdentity(Sha256Digest([1; 32]));
+
+    fn instant() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::new(1, 2)
+    }
+
+    #[test]
+    fn the_definition_preimage_has_the_documented_byte_layout() {
+        let digest = Sha256Digest([2; 32]);
+        let mut expected = DEFINITION_SNAPSHOT_ID_DOMAIN.to_vec();
+        expected.extend_from_slice(&[1; 32]);
+        expected.extend_from_slice(&3_u32.to_be_bytes());
+        expected.extend_from_slice(b"a/b");
+        expected.extend_from_slice(&4_u32.to_be_bytes());
+        expected.extend_from_slice(b"C.md");
+        expected.extend_from_slice(&[2; 32]);
+        expected.extend_from_slice(&1_000_000_002_u128.to_be_bytes());
+        assert_eq!(
+            definition_snapshot_id_preimage(&PROJECT, &subject("a/b", "C.md"), &digest, instant()),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_definition_preimage_depends_on_agent_and_file_with_length_framing() {
+        let digest = Sha256Digest([2; 32]);
+        let preimage = |agent: &str, file: &str| {
+            definition_snapshot_id_preimage(&PROJECT, &subject(agent, file), &digest, instant())
+        };
+        let base = preimage("a/b", "C.md");
+        assert_ne!(base, preimage("a/c", "C.md"));
+        assert_ne!(base, preimage("a/b", "D.md"));
+        // The length prefixes keep a boundary shift from aliasing.
+        assert_ne!(preimage("ab", "c.md"), preimage("a", "bc.md"));
+    }
+
+    #[test]
+    fn a_definition_preimage_never_equals_a_guidance_one() {
+        let digest = Sha256Digest([2; 32]);
+        let guidance = snapshot_id_preimage(&PROJECT, &digest, instant());
+        let definition = definition_snapshot_id_preimage(
+            &PROJECT,
+            &subject(".", "AGENTS.md"),
+            &digest,
+            instant(),
+        );
+        assert_ne!(guidance, definition);
+        assert!(guidance.starts_with(SNAPSHOT_ID_DOMAIN));
+        assert!(definition.starts_with(DEFINITION_SNAPSHOT_ID_DOMAIN));
+        assert!(!definition.starts_with(SNAPSHOT_ID_DOMAIN));
+        assert!(!guidance.starts_with(DEFINITION_SNAPSHOT_ID_DOMAIN));
     }
 }

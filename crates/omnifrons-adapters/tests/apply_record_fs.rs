@@ -282,3 +282,36 @@ fn an_empty_reservation_left_by_a_crash_is_skipped_by_the_listing() {
     std::fs::write(dir.join("crashed.json"), b"").expect("empty reservation");
     assert_eq!(store.list(&project()).expect("list").len(), 1);
 }
+
+#[test]
+fn a_stale_temporary_file_is_reclaimed_after_a_record_and_a_fresh_one_is_kept() {
+    let base = TempDir::new("stale");
+    let project_dir = TempDir::new("stale-project");
+    let area = work_area(&base, &project_dir);
+    let store = FsApplyRecordStore::open(&area);
+    store
+        .record(&project(), &sample_record(1, 100))
+        .expect("record");
+    let dir = area.applies_dir().join(project().to_hex());
+    let old = dir.join(".apply.1-1.part");
+    let fresh = dir.join(".apply.2-2.part");
+    for path in [&old, &fresh] {
+        std::fs::write(path, b"partial").expect("plant");
+    }
+    let two_hours_ago = SystemTime::now() - Duration::from_hours(2);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&old)
+        .expect("open")
+        .set_modified(two_hours_ago)
+        .expect("backdate");
+    store
+        .record(&project(), &sample_record(1, 200))
+        .expect("record");
+    assert!(!old.exists(), "the stale temporary file is reclaimed");
+    assert!(
+        fresh.exists(),
+        "a fresh temporary file may belong to a live record"
+    );
+    assert_eq!(store.list(&project()).expect("list").len(), 2);
+}

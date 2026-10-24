@@ -182,7 +182,7 @@ fn definition_and_guidance_snapshots_share_the_store_without_touching_each_other
     let guidance_id = store
         .record(&project(), sample_manifest(1, 100, true, 0x11), b"note")
         .expect("record guidance");
-    let definition_id = store
+    store
         .record_definition(
             &project(),
             sample_definition_manifest(1, 100, &subject(".", "AGENTS.md"), true, 0x11),
@@ -200,15 +200,29 @@ fn definition_and_guidance_snapshots_share_the_store_without_touching_each_other
             .len(),
         1
     );
-    // The guidance read never serves a definition snapshot, nor the reverse,
-    // even when the ids are equal.
-    assert_eq!(guidance_id, definition_id);
+    // Each id space answers only for its own snapshots.
+    let only_definition = store
+        .record_definition(
+            &project(),
+            sample_definition_manifest(0xd1, 200, &subject("child", "AGENTS.md"), true, 0x22),
+            b"d",
+        )
+        .expect("record definition");
+    assert_eq!(
+        SnapshotStore::read(&store, &project(), only_definition),
+        Err(SnapshotStoreError::Unknown),
+        "the guidance read never serves a definition snapshot"
+    );
+    let only_guidance = store
+        .record(&project(), sample_manifest(0xa1, 300, true, 0x33), b"g")
+        .expect("record guidance");
+    assert_eq!(
+        store.read_definition(&project(), only_guidance).map(|_| ()),
+        Err(SnapshotStoreError::Unknown),
+        "the definition read never serves a guidance snapshot"
+    );
     let (manifest, _) = SnapshotStore::read(&store, &project(), guidance_id).expect("read");
     assert_eq!(manifest.kind, ManagedFileKind::Guidance);
-    assert_eq!(
-        SnapshotStore::read(&store, &project(), SnapshotId(0xdead)),
-        Err(SnapshotStoreError::Unknown)
-    );
 }
 
 #[test]

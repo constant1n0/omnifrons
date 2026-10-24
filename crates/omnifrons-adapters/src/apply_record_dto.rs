@@ -42,8 +42,10 @@ struct AppliedFileDto {
 enum FingerprintDto {
     Sha256 { hex: String },
     Symlink { target: String },
-    Irregular,
-    Absent,
+    // Struct variants, not unit ones: serde does not deny extra siblings
+    // of an internally tagged unit variant, and a record must fail closed.
+    Irregular {},
+    Absent {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,8 +87,8 @@ impl From<&InputFingerprint> for FingerprintDto {
             InputFingerprint::Symlink(target) => Self::Symlink {
                 target: target.clone(),
             },
-            InputFingerprint::Irregular => Self::Irregular,
-            InputFingerprint::Absent => Self::Absent,
+            InputFingerprint::Irregular => Self::Irregular {},
+            InputFingerprint::Absent => Self::Absent {},
         }
     }
 }
@@ -98,8 +100,8 @@ impl TryFrom<FingerprintDto> for InputFingerprint {
         Ok(match dto {
             FingerprintDto::Sha256 { hex } => Self::Sha256(digest(&hex)?),
             FingerprintDto::Symlink { target } => Self::Symlink(target),
-            FingerprintDto::Irregular => Self::Irregular,
-            FingerprintDto::Absent => Self::Absent,
+            FingerprintDto::Irregular {} => Self::Irregular,
+            FingerprintDto::Absent {} => Self::Absent,
         })
     }
 }
@@ -177,14 +179,7 @@ impl TryFrom<OperationDto> for Operation {
                 before,
             } => Self::WriteBlock {
                 kind: ManagedFileKind::parse(&block_kind).ok_or(Corrupt)?,
-                mode: [
-                    BlockMode::Append,
-                    BlockMode::Replace,
-                    BlockMode::MigrateLegacy,
-                ]
-                .into_iter()
-                .find(|candidate| candidate.as_str() == mode)
-                .ok_or(Corrupt)?,
+                mode: BlockMode::parse(&mode).ok_or(Corrupt)?,
                 body: digest(&body)?,
                 after: digest(&after)?,
                 before: before.try_into()?,
@@ -252,5 +247,130 @@ impl TryFrom<ApplyRecordDto> for ApplyRecord {
             files,
             operations,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApplyRecordDto;
+    use omnifrons_app::apply_record::{AppliedFile, ApplyRecord};
+    use omnifrons_app::snapshot_store::SnapshotId;
+    use omnifrons_domain::definition::IdentityKind;
+    use omnifrons_domain::definition_plan::{BlockMode, InputFingerprint, Operation, PlanId};
+    use omnifrons_domain::executable::Sha256Digest;
+    use omnifrons_domain::guidance::ManagedFileKind;
+    use serde_json::{Value, json};
+    use std::time::{Duration, SystemTime};
+
+    fn record() -> ApplyRecord {
+        let before = InputFingerprint::Sha256(Sha256Digest([1; 32]));
+        ApplyRecord {
+            plan_id: PlanId([9; 32]),
+            workspace: "w".to_string(),
+            agent: ".".to_string(),
+            taken_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+            files: vec![AppliedFile {
+                path: "AGENTS.md".to_string(),
+                before: before.clone(),
+                after: Some(Sha256Digest([2; 32])),
+                snapshot: Some(SnapshotId(3)),
+            }],
+            operations: vec![
+                Operation::WriteAgents {
+                    source: IdentityKind::Claude,
+                    after: Sha256Digest([2; 32]),
+                    before: before.clone(),
+                },
+                Operation::WriteBlock {
+                    kind: ManagedFileKind::Skills,
+                    mode: BlockMode::Append,
+                    body: Sha256Digest([4; 32]),
+                    after: Sha256Digest([5; 32]),
+                    before: InputFingerprint::Absent,
+                },
+            ],
+        }
+    }
+
+    fn complete() -> Value {
+        serde_json::to_value(ApplyRecordDto::from(&record())).expect("serialize")
+    }
+
+    /// Whether `value` decodes all the way to a record.
+    fn decodes(value: &Value) -> bool {
+        serde_json::from_value::<ApplyRecordDto>(value.clone())
+            .ok()
+            .and_then(|dto| ApplyRecord::try_from(dto).ok())
+            .is_some()
+    }
+
+    #[test]
+    fn the_complete_fixture_round_trips() {
+        let value = complete();
+        assert!(decodes(&value));
+        let dto: ApplyRecordDto = serde_json::from_value(value).expect("parse");
+        assert_eq!(ApplyRecord::try_from(dto), Ok(record()));
+    }
+
+    #[test]
+    fn another_schema_reaches_the_gate_and_is_refused() {
+        let mut value = complete();
+        value["schema"] = json!(2);
+        let dto: ApplyRecordDto =
+            serde_json::from_value(value).expect("the shape is complete, so serde accepts it");
+        assert!(ApplyRecord::try_from(dto).is_err());
+    }
+
+    #[test]
+    fn an_unknown_field_at_any_level_is_refused() {
+        let mut cases = Vec::new();
+        for pointer in [
+            "",
+            "/files/0",
+            "/files/0/before",
+            "/operations/0",
+            "/operations/0/before",
+            "/operations/1/before",
+        ] {
+            let mut value = complete();
+            value
+                .pointer_mut(pointer)
+                .expect("level")
+                .as_object_mut()
+                .expect("object")
+                .insert("extra".to_string(), json!(true));
+            cases.push((pointer, value));
+        }
+        for (pointer, value) in cases {
+            assert!(
+                !decodes(&value),
+                "an extra field at {pointer:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_tag_or_value_is_refused() {
+        let mutations: [(&str, Value); 5] = [
+            ("/operations/0/op", json!("write-everything")),
+            ("/files/0/before/kind", json!("fifo")),
+            ("/operations/1/mode", json!("rewrite")),
+            ("/operations/1/blockKind", json!("nonsense")),
+            ("/files/0/after", json!("not-hex")),
+        ];
+        for (pointer, replacement) in mutations {
+            let mut value = complete();
+            *value.pointer_mut(pointer).expect("field") = replacement;
+            assert!(!decodes(&value), "{pointer} accepted a bad value");
+        }
+        for (pointer, replacement) in [
+            ("/planId", json!("abcd")),
+            ("/files/0/snapshot", json!("xyz")),
+            ("/operations/0/source", json!("OTHER.md")),
+        ] {
+            let mut value = complete();
+            *value.pointer_mut(pointer).expect("field") = replacement;
+            assert!(!decodes(&value), "{pointer} accepted a bad value");
+        }
     }
 }

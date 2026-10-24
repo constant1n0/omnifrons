@@ -10,7 +10,9 @@
 //! ours, so the overwrite is too), and the directory is synced where the
 //! platform allows. No hard links are needed. A failure after the
 //! reservation removes it; one left behind by a crash is an empty file,
-//! which the listing skips as an unfinished record. Any other file that
+//! which the listing skips as an unfinished record. A crash after the
+//! temporary write leaves a `.apply.*.part` file; a later record removes
+//! any older than one hour (a fresher one may belong to a live record). Any other file that
 //! does not parse fails the whole listing closed as `Corrupt`.
 //! Device-local, never a roaming payload.
 
@@ -30,6 +32,13 @@ use crate::fs_snapshot_store::create_owner_only_dir;
 
 /// The process-wide sequence behind the temporary names.
 static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The name every temporary file starts with, and its extension.
+const TEMPORARY_PREFIX: &str = ".apply.";
+const TEMPORARY_EXTENSION: &str = "part";
+
+/// How old a temporary file must be before a later record removes it.
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// How many names one record tries before giving up: the name's sequence
 /// is four digits wide.
@@ -66,7 +75,10 @@ impl FsApplyRecordStore {
     /// synced; the caller publishes or removes it.
     fn write_temp(dir: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
         let sequence = PART_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".apply.{}-{sequence}.part", std::process::id()));
+        let temp = dir.join(format!(
+            "{TEMPORARY_PREFIX}{}-{sequence}.{TEMPORARY_EXTENSION}",
+            std::process::id()
+        ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -106,7 +118,38 @@ impl FsApplyRecordStore {
             return Err(ApplyRecordError::WriteFailed);
         }
         sync_dir(dir);
+        Self::reclaim_stale_temporaries(dir);
         Ok(id)
+    }
+
+    /// Remove temporary files in `dir` last modified over
+    /// [`STALE_TEMPORARY_AGE`] ago: a crash between the temporary write
+    /// and the rename leaves one that nothing else reclaims. A fresh one
+    /// may belong to a record being written, so it stays. Best effort: a
+    /// file that cannot be removed is left for the next record.
+    fn reclaim_stale_temporaries(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_temporary = path.extension().and_then(|extension| extension.to_str())
+                == Some(TEMPORARY_EXTENSION)
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TEMPORARY_PREFIX);
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > STALE_TEMPORARY_AGE);
+            if is_temporary && stale {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     /// Create the first free record name exclusively, owner-only.
@@ -173,6 +216,15 @@ impl ApplyRecordStore for FsApplyRecordStore {
     }
 
     fn list(&self, project: &ProjectIdentity) -> Result<Vec<StoredApplyRecord>, ApplyRecordError> {
+        // Probe the applies path first: absent is an empty listing, but a
+        // path that is there and is not a directory is unreadable, which
+        // no platform may report as "not found" instead.
+        match std::fs::symlink_metadata(&self.root) {
+            Ok(metadata) if !metadata.is_dir() => return Err(ApplyRecordError::Unreadable),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(ApplyRecordError::Unreadable),
+        }
         let dir = self.project_dir(project);
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,

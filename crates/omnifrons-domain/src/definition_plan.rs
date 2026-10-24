@@ -86,6 +86,15 @@ pub enum BlockMode {
 }
 
 impl BlockMode {
+    /// Every mode, for exhaustive iteration and parsing.
+    pub const ALL: [Self; 3] = [Self::Append, Self::Replace, Self::MigrateLegacy];
+
+    /// Parse a token produced by [`Self::as_str`].
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == token)
+    }
+
     /// This mode's stable token, as written in [`canonical_bytes`].
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -490,5 +499,14 @@ mod tests {
             PlanRefusal::EditedBlock(String::new()).code(),
             "edited_block"
         );
+    }
+
+    #[test]
+    fn every_block_mode_round_trips_through_its_token() {
+        for mode in BlockMode::ALL {
+            assert_eq!(BlockMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(BlockMode::parse("nope"), None);
+        assert_eq!(BlockMode::ALL.len(), 3);
     }
 }
