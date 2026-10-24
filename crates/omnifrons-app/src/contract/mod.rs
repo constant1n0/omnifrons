@@ -3,6 +3,7 @@
 
 pub mod approval_store;
 pub mod definition;
+pub mod definition_writer;
 pub mod guidance;
 pub mod harness_adapter;
 pub mod process_supervisor;

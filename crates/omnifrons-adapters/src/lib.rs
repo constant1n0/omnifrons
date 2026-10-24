@@ -64,6 +64,7 @@
 mod catalog_record_dto;
 pub mod fs_candidate_prober;
 pub mod fs_definition_tree;
+pub mod fs_definition_writer;
 pub mod fs_outbox_entry_ops;
 pub mod fs_outbox_inventory;
 pub mod fs_prober;
@@ -90,6 +91,7 @@ pub mod sha2_hasher;
 
 pub use fs_candidate_prober::FsCandidateProber;
 pub use fs_definition_tree::FsDefinitionTree;
+pub use fs_definition_writer::FsDefinitionWriter;
 pub use fs_outbox_entry_ops::FsOutboxEntryOps;
 pub use fs_outbox_inventory::FsOutboxInventory;
 pub use fs_prober::FsExecutableProber;

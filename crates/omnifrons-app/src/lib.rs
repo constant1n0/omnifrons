@@ -13,6 +13,7 @@ pub mod content_hasher;
 pub mod definition;
 pub mod definition_plan;
 pub mod definition_tree;
+pub mod definition_writer;
 pub mod executable_prober;
 pub mod guidance;
 pub mod harness_adapter;

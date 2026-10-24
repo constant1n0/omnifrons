@@ -461,6 +461,20 @@ mod tests {
     }
 
     #[test]
+    fn a_root_with_a_non_utf8_byte_changes_the_workspace_line_bytes() {
+        let none = BTreeMap::new();
+        let high = canonical_bytes(b"/w\xff", ".", &none, &[]);
+        let low = canonical_bytes(b"/w\xfe", ".", &none, &[]);
+        let header = b"omnifrons-plan-v3\nworkspace 3:/w\xff\nagent 1:.\n";
+        assert!(high.starts_with(header), "{high:?}");
+        assert_ne!(high, low);
+        // The prefix counts raw bytes, not the lossy text's characters.
+        let lossy = canonical_bytes("/w\u{fffd}".as_bytes(), ".", &none, &[]);
+        assert!(lossy.starts_with(b"omnifrons-plan-v3\nworkspace 5:"));
+        assert_ne!(high, lossy);
+    }
+
+    #[test]
     fn plan_id_displays_as_lowercase_hex() {
         let id = PlanId::from_digest(digest(0xab));
         assert_eq!(id.to_string(), "ab".repeat(32));
