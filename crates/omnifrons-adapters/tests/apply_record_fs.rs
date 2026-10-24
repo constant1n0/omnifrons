@@ -66,7 +66,8 @@ fn sample_record(plan_byte: u8, secs: u64) -> ApplyRecord {
         plan_id: PlanId([plan_byte; 32]),
         workspace: "/work/space".to_string(),
         agent: "child/grandchild".to_string(),
-        taken_at: SystemTime::UNIX_EPOCH + Duration::new(secs, 5),
+        // 500 ns: Windows `SystemTime` has 100 ns resolution, so the nanos must be a multiple of 100.
+        taken_at: SystemTime::UNIX_EPOCH + Duration::new(secs, 500),
         files: vec![
             AppliedFile {
                 path: "AGENTS.md".to_string(),
@@ -193,7 +194,7 @@ fn the_stored_json_shape_is_stable() {
     let expected = concat!(
         r#"{"schema":1,"planId":"0101010101010101010101010101010101010101010101010101010101010101","#,
         r#""workspace":"/work/space","agent":"child/grandchild","#,
-        r#""takenAt":{"secs":1725782401,"nanos":5},"files":["#,
+        r#""takenAt":{"secs":1725782401,"nanos":500},"files":["#,
         r#"{"path":"AGENTS.md","before":{"kind":"sha256","hex":"1111111111111111111111111111111111111111111111111111111111111111"},"#,
         r#""after":"2222222222222222222222222222222222222222222222222222222222222222","snapshot":"0000000000000abc"},"#,
         r#"{"path":"CLAUDE.md","before":{"kind":"absent"},"#,
@@ -314,4 +315,67 @@ fn a_stale_temporary_file_is_reclaimed_after_a_record_and_a_fresh_one_is_kept() 
         "a fresh temporary file may belong to a live record"
     );
     assert_eq!(store.list(&project()).expect("list").len(), 2);
+}
+
+/// Records `record`, copies its file to `<copy_stem>.json`, and lists.
+fn list_with_copy_named(
+    label: &str,
+    copy_stem: impl Fn(&ApplyRecord) -> String,
+) -> Result<usize, ApplyRecordError> {
+    let base = TempDir::new(label);
+    let project_dir = TempDir::new(&format!("{label}-project"));
+    let area = work_area(&base, &project_dir);
+    let store = FsApplyRecordStore::open(&area);
+    let record = sample_record(1, 100);
+    let id = store.record(&project(), &record).expect("record");
+    let dir = area.applies_dir().join(project().to_hex());
+    std::fs::copy(
+        dir.join(format!("{id}.json")),
+        dir.join(format!("{}.json", copy_stem(&record))),
+    )
+    .expect("copy");
+    store.list(&project()).map(|listed| listed.len())
+}
+
+#[test]
+fn a_valid_record_under_a_name_that_is_not_a_record_name_fails_the_listing_closed() {
+    assert_eq!(
+        list_with_copy_named("junk-name", |_| "junk".to_string()),
+        Err(ApplyRecordError::Corrupt)
+    );
+}
+
+#[test]
+fn a_record_whose_name_carries_another_plan_id_fails_the_listing_closed() {
+    assert_eq!(
+        list_with_copy_named("other-plan", |record| {
+            apply_record_name(&PlanId([2; 32]), record.taken_at, 1).0
+        }),
+        Err(ApplyRecordError::Corrupt)
+    );
+}
+
+#[test]
+fn a_record_whose_name_carries_another_instant_fails_the_listing_closed() {
+    assert_eq!(
+        list_with_copy_named("other-instant", |record| {
+            apply_record_name(
+                &record.plan_id,
+                record.taken_at + Duration::from_nanos(100),
+                1,
+            )
+            .0
+        }),
+        Err(ApplyRecordError::Corrupt)
+    );
+}
+
+#[test]
+fn a_record_copied_under_a_well_formed_matching_name_still_lists() {
+    assert_eq!(
+        list_with_copy_named("matching-name", |record| {
+            apply_record_name(&record.plan_id, record.taken_at, 1).0
+        }),
+        Ok(2)
+    );
 }

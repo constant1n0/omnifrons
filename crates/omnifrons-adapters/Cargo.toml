@@ -32,7 +32,10 @@ sha2 = { workspace = true }
 # one fact in that walk still taken by path (spike slice 5d, R1-013).
 # Verified against the vendored 0.31.3 source: `dir = ["fs"]` in its
 # `[features]` table, so this adds no crate to the dependency graph and
-# `cargo tree -e normal` is unchanged.
+# `cargo tree -e normal` is unchanged. `fs_definition_writer` also uses the
+# existing `fs` feature for its directory-relative calls (`openat`,
+# `fstatat`, `linkat`, `renameat`, `unlinkat`, `readlinkat`, `fsync`): no
+# further feature is needed.
 nix = { version = "0.31.3", default-features = false, features = ["dir", "fs", "signal", "user"] }
 
 [dev-dependencies]

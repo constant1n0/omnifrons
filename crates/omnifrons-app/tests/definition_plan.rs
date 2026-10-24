@@ -875,8 +875,9 @@ fn roots_differing_in_a_non_utf8_byte_get_different_plan_ids() {
     let parent = TempDir::new("non-utf8-roots");
     let make = |byte: u8| {
         let dir = parent.0.join(OsStr::from_bytes(&[b'w', byte]));
-        std::fs::create_dir_all(&dir).expect("fixture dir");
-        WorkspaceRoot::new(&dir).expect("valid workspace")
+        let created = std::fs::create_dir_all(&dir);
+        non_utf8_fixture_supported("non-UTF-8 workspace roots", created)
+            .then(|| WorkspaceRoot::new(&dir).expect("valid workspace"))
     };
     let plan_in = |workspace: &WorkspaceRoot| {
         let tree = InMemoryDefinitionTree::new().with_snapshot(workspace, claude_only());
@@ -887,9 +888,27 @@ fn roots_differing_in_a_non_utf8_byte_get_different_plan_ids() {
         };
         planned(plan(&ports, workspace, None, &PlanOptions::default()))
     };
-    let (first, second) = (make(0xff), make(0xfe));
+    let (Some(first), Some(second), Some(again)) = (make(0xff), make(0xfe), make(0xff)) else {
+        return;
+    };
     let (a, b) = (plan_in(&first), plan_in(&second));
     assert_ne!(a.id, b.id);
     assert_eq!(a.workspace, b.workspace, "the display text is lossy");
-    assert_eq!(a.id, plan_in(&make(0xff)).id);
+    assert_eq!(a.id, plan_in(&again).id);
+}
+
+/// Treats the outcome of a fixture call naming a non-UTF-8 path as a
+/// skip when the filesystem refuses the name outright (APFS on macOS).
+/// Prints the reason and returns `false`; returns `true` on `Ok`.
+#[cfg(unix)]
+fn non_utf8_fixture_supported(label: &str, result: std::io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "skipping {label}: this filesystem refuses a non-UTF-8 path component ({error})"
+            );
+            false
+        }
+    }
 }

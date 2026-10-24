@@ -24,6 +24,14 @@
 //! is read back, and the digest of what was read is returned, so a
 //! caller learns the bytes on disk are the bytes it planned.
 //!
+//! # Parent directories
+//!
+//! On Unix an implementation pins the parent directories by handle, so a
+//! parent swapped for a link after the check cannot redirect the write.
+//! On Windows the parents are checked by path and every later step
+//! resolves the path again: a concurrent swap of a parent for a link
+//! between the check and the publish is not prevented there.
+//!
 //! # Exclusive create
 //!
 //! A create is published with a hard link, the one primitive that fails

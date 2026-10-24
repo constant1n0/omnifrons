@@ -147,3 +147,84 @@ pub fn apply_record_name(plan_id: &PlanId, taken_at: SystemTime, sequence: u32) 
         .as_nanos();
     ApplyRecordId(format!("{plan_id}-{nanos:020}-{sequence:04}"))
 }
+
+/// The parts of a stored record name, as [`parse_apply_record_name`]
+/// reads them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedApplyRecordName {
+    /// The plan id the name carries.
+    pub plan_id: PlanId,
+    /// The instant the name carries, nanosecond-exact.
+    pub taken_at: SystemTime,
+    /// The attempt number the name carries.
+    pub sequence: u32,
+}
+
+/// Reads a stored name written by [`apply_record_name`]:
+/// `<64 hex plan id>-<20 digit nanoseconds>-<4 digit sequence>`. Returns
+/// `None` for any other shape, including different widths, signs, or
+/// uppercase hex.
+#[must_use]
+pub fn parse_apply_record_name(name: &str) -> Option<ParsedApplyRecordName> {
+    let mut parts = name.split('-');
+    let (plan, nanos, sequence) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || plan.len() != 64 || nanos.len() != 20 || sequence.len() != 4 {
+        return None;
+    }
+    let all_digits = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if !all_digits(nanos) || !all_digits(sequence) || !plan.bytes().all(lower_hex) {
+        return None;
+    }
+    let plan_id = PlanId(Sha256Digest::from_hex(plan)?.0);
+    let nanos: u128 = nanos.parse().ok()?;
+    let secs = u64::try_from(nanos / 1_000_000_000).ok()?;
+    let subsec = u32::try_from(nanos % 1_000_000_000).ok()?;
+    let taken_at = SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, subsec))?;
+    Some(ParsedApplyRecordName {
+        plan_id,
+        taken_at,
+        sequence: sequence.parse().ok()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn a_generated_name_parses_back_to_its_parts() {
+        let plan_id = PlanId([0xab; 32]);
+        let taken_at = SystemTime::UNIX_EPOCH + Duration::new(1_725_782_401, 500);
+        let name = apply_record_name(&plan_id, taken_at, 7);
+        let parsed = parse_apply_record_name(&name.0).expect("parses");
+        assert_eq!(parsed.plan_id, plan_id);
+        assert_eq!(parsed.taken_at, taken_at);
+        assert_eq!(parsed.sequence, 7);
+    }
+
+    #[test]
+    fn names_of_any_other_shape_do_not_parse() {
+        let good = apply_record_name(&PlanId([0xab; 32]), SystemTime::UNIX_EPOCH, 0).0;
+        assert!(parse_apply_record_name(&good).is_some());
+        let (plan, rest) = good.split_at(64);
+        let bad_names = [
+            "junk".to_string(),
+            String::new(),
+            good[1..].to_string(),
+            format!("{good}0"),
+            format!("{good}-0001"),
+            format!("{plan}-0000000000000000000x-0000"),
+            format!("{plan}-+0000000000000000000-0000"),
+            format!("{plan}-00000000000000000000-000x"),
+            format!("{plan}-00000000000000000000-+000"),
+            format!("{}{rest}", "+b".repeat(32)),
+            good.to_uppercase(),
+        ];
+        for bad in &bad_names {
+            assert_eq!(parse_apply_record_name(bad), None, "{bad}");
+        }
+    }
+}

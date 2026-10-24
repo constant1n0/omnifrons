@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use omnifrons_app::apply_record::{
     ApplyRecord, ApplyRecordError, ApplyRecordId, ApplyRecordStore, StoredApplyRecord,
-    apply_record_name, sort_records_newest_first,
+    apply_record_name, parse_apply_record_name, sort_records_newest_first,
 };
 use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::publication::ProjectIdentity;
@@ -253,9 +253,16 @@ impl ApplyRecordStore for FsApplyRecordStore {
             let text = std::fs::read_to_string(&path).map_err(|_| ApplyRecordError::Unreadable)?;
             let dto: ApplyRecordDto =
                 serde_json::from_str(&text).map_err(|_| ApplyRecordError::Corrupt)?;
+            let record = ApplyRecord::try_from(dto).map_err(|_| ApplyRecordError::Corrupt)?;
+            // The name is bound to the content: a copy under another stem
+            // would otherwise be listed as a record it is not.
+            let parsed = parse_apply_record_name(&name).ok_or(ApplyRecordError::Corrupt)?;
+            if parsed.plan_id != record.plan_id || parsed.taken_at != record.taken_at {
+                return Err(ApplyRecordError::Corrupt);
+            }
             records.push(StoredApplyRecord {
                 id: ApplyRecordId(name),
-                record: ApplyRecord::try_from(dto).map_err(|_| ApplyRecordError::Corrupt)?,
+                record,
             });
         }
         sort_records_newest_first(&mut records);
