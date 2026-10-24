@@ -1,6 +1,7 @@
 //! Reusable contract tests, gated behind the `contract-tests` feature so
 //! production builds never pay for them.
 
+pub mod apply_record;
 pub mod approval_store;
 pub mod definition;
 pub mod definition_writer;

@@ -55,13 +55,23 @@
 //! the work area's `snapshots/<project hex>/<id>.json` and `<id>.bytes`).
 //! Dependency tables unchanged.
 //!
+//! As of ADR-0005 sub-slice 2c this crate also stores definition-file
+//! snapshots beside the guidance ones ([`FsSnapshotStore`]'s
+//! `DefinitionSnapshotStore`; `snapshots/<project hex>/definitions/`) and
+//! implements [`FsApplyRecordStore`]
+//! (`omnifrons_app::apply_record::ApplyRecordStore`; one JSON file per
+//! apply under the work area's `applies/<project hex>/`). Dependency
+//! tables unchanged.
+//!
 //! As of ADR-0005 sub-slice 1f this crate also implements
 //! [`FsDefinitionTree`] (`omnifrons_app::definition_tree::DefinitionTree`;
 //! a real, plain-`std::fs` walk of a workspace's agent-identity files
 //! and discovered skills, never through a symlink). Dependency tables
 //! unchanged.
 
+mod apply_record_dto;
 mod catalog_record_dto;
+pub mod fs_apply_record;
 pub mod fs_candidate_prober;
 pub mod fs_definition_tree;
 pub mod fs_definition_writer;
@@ -89,6 +99,7 @@ pub mod local_staging_cleanup;
 pub mod pty_cli;
 pub mod sha2_hasher;
 
+pub use fs_apply_record::FsApplyRecordStore;
 pub use fs_candidate_prober::FsCandidateProber;
 pub use fs_definition_tree::FsDefinitionTree;
 pub use fs_definition_writer::FsDefinitionWriter;

@@ -13,14 +13,25 @@
 //! the listing for dedup and prune -- never a listing with the bad one
 //! skipped; the read of that id fails the same way, and another id still
 //! reads. Device-local, never a roaming payload.
+//!
+//! Definition-file snapshots (`DefinitionSnapshotStore`) live in the same
+//! store under `snapshots/<project identity hex>/definitions/`, in the
+//! same two-file layout and with the same write discipline; their
+//! manifest carries the agent directory and file name where a guidance
+//! manifest carries a kind and a root file name. The guidance listing
+//! reads the project directory's `.json` files and never enters the
+//! `definitions` subdirectory, so the two never see each other and every
+//! manifest an earlier release wrote lists as it did.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use omnifrons_app::snapshot_store::{
+    DefinitionSnapshotManifest, DefinitionSnapshotStore, DefinitionSubject,
     SNAPSHOT_SCHEMA_VERSION, SnapshotId, SnapshotManifest, SnapshotStore, SnapshotStoreError,
-    dedup_target, prune_targets, sort_newest_first,
+    dedup_target, definition_dedup_target, definition_prune_targets, prune_targets,
+    sort_definitions_newest_first, sort_newest_first,
 };
 use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::executable::Sha256Digest;
@@ -82,6 +93,58 @@ impl TryFrom<ManifestDto> for SnapshotManifest {
     }
 }
 
+/// One definition manifest file's shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionManifestDto {
+    schema: u32,
+    id: String,
+    agent: String,
+    file: String,
+    existed: bool,
+    sha256: String,
+    size: u64,
+    taken_at: TimestampDto,
+    pinned: bool,
+}
+
+impl From<&DefinitionSnapshotManifest> for DefinitionManifestDto {
+    fn from(manifest: &DefinitionSnapshotManifest) -> Self {
+        Self {
+            schema: manifest.schema,
+            id: manifest.id.to_hex(),
+            agent: manifest.subject.agent().to_string(),
+            file: manifest.subject.file().to_string(),
+            existed: manifest.existed,
+            sha256: manifest.sha256.to_hex(),
+            size: manifest.size,
+            taken_at: manifest.taken_at.into(),
+            pinned: manifest.pinned,
+        }
+    }
+}
+
+impl TryFrom<DefinitionManifestDto> for DefinitionSnapshotManifest {
+    type Error = SnapshotStoreError;
+
+    fn try_from(dto: DefinitionManifestDto) -> Result<Self, SnapshotStoreError> {
+        if dto.schema != SNAPSHOT_SCHEMA_VERSION {
+            return Err(SnapshotStoreError::Corrupt);
+        }
+        Ok(Self {
+            schema: dto.schema,
+            id: SnapshotId::from_hex(&dto.id).ok_or(SnapshotStoreError::Corrupt)?,
+            subject: DefinitionSubject::new(&dto.agent, &dto.file)
+                .ok_or(SnapshotStoreError::Corrupt)?,
+            existed: dto.existed,
+            sha256: Sha256Digest::from_hex(&dto.sha256).ok_or(SnapshotStoreError::Corrupt)?,
+            size: dto.size,
+            taken_at: dto.taken_at.into(),
+            pinned: dto.pinned,
+        })
+    }
+}
+
 /// The process-wide sequence behind the temporary names, so two writes of
 /// one manifest never share a temporary file.
 static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -89,7 +152,7 @@ static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Create `dir` if missing and make it owner-only where the platform
 /// expresses that (unix `0o700`, set explicitly so a permissive umask
 /// cannot widen it).
-fn create_owner_only_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -146,6 +209,10 @@ impl FsSnapshotStore {
 
     /// The bytes file's extension.
     pub const BYTES_EXTENSION: &'static str = "bytes";
+
+    /// The subdirectory of a project's directory that holds its
+    /// definition-file snapshots.
+    pub const DEFINITIONS_DIR: &'static str = "definitions";
 
     /// The store under `work_area`'s snapshots directory.
     #[must_use]
@@ -304,5 +371,145 @@ impl SnapshotStore for FsSnapshotStore {
         let mut manifest = Self::read_manifest(&Self::manifest_path(&dir, id), id)?;
         manifest.pinned = pinned;
         Self::write_manifest(&dir, &manifest)
+    }
+}
+
+// -- definition-file snapshots --
+
+impl FsSnapshotStore {
+    fn definitions_dir(&self, project: &ProjectIdentity) -> PathBuf {
+        self.project_dir(project).join(Self::DEFINITIONS_DIR)
+    }
+
+    fn read_definition_manifest(
+        path: &Path,
+        id: SnapshotId,
+    ) -> Result<DefinitionSnapshotManifest, SnapshotStoreError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SnapshotStoreError::Unknown);
+            }
+            Err(_) => return Err(SnapshotStoreError::Unreadable),
+        };
+        let dto: DefinitionManifestDto =
+            serde_json::from_str(&text).map_err(|_| SnapshotStoreError::Corrupt)?;
+        let manifest = DefinitionSnapshotManifest::try_from(dto)?;
+        if manifest.id != id {
+            return Err(SnapshotStoreError::Corrupt);
+        }
+        Ok(manifest)
+    }
+
+    /// Every definition manifest of `project`, newest first; a missing
+    /// directory is an empty store, and any manifest that does not parse
+    /// fails the whole listing.
+    fn definition_manifests(
+        &self,
+        project: &ProjectIdentity,
+    ) -> Result<Vec<DefinitionSnapshotManifest>, SnapshotStoreError> {
+        let dir = self.definitions_dir(project);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(SnapshotStoreError::Unreadable),
+        };
+        let mut manifests = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|_| SnapshotStoreError::Unreadable)?.path();
+            if path.extension().and_then(|extension| extension.to_str())
+                != Some(Self::MANIFEST_EXTENSION)
+            {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(SnapshotId::from_hex)
+                .ok_or(SnapshotStoreError::Corrupt)?;
+            manifests.push(Self::read_definition_manifest(&path, id)?);
+        }
+        sort_definitions_newest_first(&mut manifests);
+        Ok(manifests)
+    }
+
+    fn write_definition_manifest(
+        dir: &Path,
+        manifest: &DefinitionSnapshotManifest,
+    ) -> Result<(), SnapshotStoreError> {
+        let text = serde_json::to_string(&DefinitionManifestDto::from(manifest))
+            .map_err(|_| SnapshotStoreError::WriteFailed)?;
+        write_owner_only(&Self::manifest_path(dir, manifest.id), text.as_bytes())
+            .map_err(|_| SnapshotStoreError::WriteFailed)
+    }
+}
+
+impl DefinitionSnapshotStore for FsSnapshotStore {
+    fn record_definition(
+        &mut self,
+        project: &ProjectIdentity,
+        manifest: DefinitionSnapshotManifest,
+        bytes: &[u8],
+    ) -> Result<SnapshotId, SnapshotStoreError> {
+        let mut newest_first = self.definition_manifests(project)?;
+        if let Some(id) = definition_dedup_target(&newest_first, &manifest) {
+            return Ok(id);
+        }
+        let dir = self.definitions_dir(project);
+        create_owner_only_dir(&dir).map_err(|_| SnapshotStoreError::WriteFailed)?;
+        let id = manifest.id;
+        // The bytes first: a manifest never names bytes that are not there.
+        write_owner_only(&Self::bytes_path(&dir, id), bytes)
+            .map_err(|_| SnapshotStoreError::WriteFailed)?;
+        Self::write_definition_manifest(&dir, &manifest)?;
+        let subject = manifest.subject.clone();
+        newest_first.push(manifest);
+        sort_definitions_newest_first(&mut newest_first);
+        for pruned in definition_prune_targets(&newest_first, &subject) {
+            Self::delete(&dir, pruned)?;
+        }
+        Ok(id)
+    }
+
+    fn list_definitions(
+        &self,
+        project: &ProjectIdentity,
+        agent: Option<&str>,
+    ) -> Result<Vec<DefinitionSnapshotManifest>, SnapshotStoreError> {
+        Ok(self
+            .definition_manifests(project)?
+            .into_iter()
+            .filter(|manifest| agent.is_none_or(|agent| manifest.subject.agent() == agent))
+            .collect())
+    }
+
+    fn read_definition(
+        &self,
+        project: &ProjectIdentity,
+        id: SnapshotId,
+    ) -> Result<(DefinitionSnapshotManifest, Vec<u8>), SnapshotStoreError> {
+        let dir = self.definitions_dir(project);
+        let manifest = Self::read_definition_manifest(&Self::manifest_path(&dir, id), id)?;
+        let bytes = match std::fs::read(Self::bytes_path(&dir, id)) {
+            Ok(bytes) => bytes,
+            // A manifest naming bytes that are not there is corrupt.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SnapshotStoreError::Corrupt);
+            }
+            Err(_) => return Err(SnapshotStoreError::Unreadable),
+        };
+        Ok((manifest, bytes))
+    }
+
+    fn pin_definition(
+        &mut self,
+        project: &ProjectIdentity,
+        id: SnapshotId,
+        pinned: bool,
+    ) -> Result<(), SnapshotStoreError> {
+        let dir = self.definitions_dir(project);
+        let mut manifest = Self::read_definition_manifest(&Self::manifest_path(&dir, id), id)?;
+        manifest.pinned = pinned;
+        Self::write_definition_manifest(&dir, &manifest)
     }
 }

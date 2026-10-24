@@ -17,8 +17,10 @@ use omnifrons_domain::publication::ProjectIdentity;
 use crate::harness_adapter::WorkspaceRoot;
 use crate::managed_file::{MAX_MANAGED_FILE_BYTES, ProjectTextFile, ProjectTextFileError};
 use crate::snapshot_store::{
-    MAX_UNPINNED_SNAPSHOTS, SNAPSHOT_SCHEMA_VERSION, SnapshotId, SnapshotManifest, SnapshotStore,
-    SnapshotStoreError, dedup_target, prune_targets, sort_newest_first,
+    DefinitionSnapshotManifest, DefinitionSnapshotStore, DefinitionSubject, MAX_UNPINNED_SNAPSHOTS,
+    SNAPSHOT_SCHEMA_VERSION, SnapshotId, SnapshotManifest, SnapshotStore, SnapshotStoreError,
+    dedup_target, definition_dedup_target, definition_prune_targets, prune_targets,
+    sort_definitions_newest_first, sort_newest_first,
 };
 
 /// An in-memory [`ProjectTextFile`] test double: files live in a map by
@@ -133,6 +135,7 @@ impl ProjectTextFile for InMemoryProjectTextFile {
 #[derive(Debug, Default)]
 pub struct InMemorySnapshotStore {
     snapshots: HashMap<ProjectIdentity, Vec<(SnapshotManifest, Vec<u8>)>>,
+    definitions: HashMap<ProjectIdentity, Vec<(DefinitionSnapshotManifest, Vec<u8>)>>,
     fail_next_record: bool,
 }
 
@@ -158,6 +161,83 @@ impl InMemorySnapshotStore {
             .unwrap_or_default();
         sort_newest_first(&mut manifests);
         manifests
+    }
+
+    fn definition_manifests(&self, project: &ProjectIdentity) -> Vec<DefinitionSnapshotManifest> {
+        let mut manifests: Vec<DefinitionSnapshotManifest> = self
+            .definitions
+            .get(project)
+            .map(|entries| entries.iter().map(|(m, _)| m.clone()).collect())
+            .unwrap_or_default();
+        sort_definitions_newest_first(&mut manifests);
+        manifests
+    }
+}
+
+impl DefinitionSnapshotStore for InMemorySnapshotStore {
+    fn record_definition(
+        &mut self,
+        project: &ProjectIdentity,
+        manifest: DefinitionSnapshotManifest,
+        bytes: &[u8],
+    ) -> Result<SnapshotId, SnapshotStoreError> {
+        if self.fail_next_record {
+            self.fail_next_record = false;
+            return Err(SnapshotStoreError::WriteFailed);
+        }
+        if let Some(id) = definition_dedup_target(&self.definition_manifests(project), &manifest) {
+            return Ok(id);
+        }
+        let id = manifest.id;
+        let subject = manifest.subject.clone();
+        self.definitions
+            .entry(*project)
+            .or_default()
+            .push((manifest, bytes.to_vec()));
+        let pruned = definition_prune_targets(&self.definition_manifests(project), &subject);
+        if let Some(entries) = self.definitions.get_mut(project) {
+            entries.retain(|(manifest, _)| !pruned.contains(&manifest.id));
+        }
+        Ok(id)
+    }
+
+    fn list_definitions(
+        &self,
+        project: &ProjectIdentity,
+        agent: Option<&str>,
+    ) -> Result<Vec<DefinitionSnapshotManifest>, SnapshotStoreError> {
+        Ok(self
+            .definition_manifests(project)
+            .into_iter()
+            .filter(|manifest| agent.is_none_or(|agent| manifest.subject.agent() == agent))
+            .collect())
+    }
+
+    fn read_definition(
+        &self,
+        project: &ProjectIdentity,
+        id: SnapshotId,
+    ) -> Result<(DefinitionSnapshotManifest, Vec<u8>), SnapshotStoreError> {
+        self.definitions
+            .get(project)
+            .and_then(|entries| entries.iter().find(|(manifest, _)| manifest.id == id))
+            .cloned()
+            .ok_or(SnapshotStoreError::Unknown)
+    }
+
+    fn pin_definition(
+        &mut self,
+        project: &ProjectIdentity,
+        id: SnapshotId,
+        pinned: bool,
+    ) -> Result<(), SnapshotStoreError> {
+        let entry = self
+            .definitions
+            .get_mut(project)
+            .and_then(|entries| entries.iter_mut().find(|(manifest, _)| manifest.id == id))
+            .ok_or(SnapshotStoreError::Unknown)?;
+        entry.0.pinned = pinned;
+        Ok(())
     }
 }
 
@@ -238,6 +318,28 @@ pub fn sample_manifest(n: u64, secs: u64, existed: bool, byte: u8) -> SnapshotMa
         id: SnapshotId(n),
         kind: ManagedFileKind::Guidance,
         file: "AGENTS.md".to_string(),
+        existed,
+        sha256: Sha256Digest([byte; 32]),
+        size: 3,
+        taken_at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+        pinned: false,
+    }
+}
+
+/// A manifest for `subject`: id `n`, taken at `secs` past the epoch,
+/// digest `[byte; 32]`.
+#[must_use]
+pub fn sample_definition_manifest(
+    n: u64,
+    secs: u64,
+    subject: &DefinitionSubject,
+    existed: bool,
+    byte: u8,
+) -> DefinitionSnapshotManifest {
+    DefinitionSnapshotManifest {
+        schema: SNAPSHOT_SCHEMA_VERSION,
+        id: SnapshotId(n),
+        subject: subject.clone(),
         existed,
         sha256: Sha256Digest([byte; 32]),
         size: 3,
@@ -486,4 +588,143 @@ pub fn managed_file_contract<F: ProjectTextFile>(files: &F, root: &WorkspaceRoot
     files
         .remove(root, &ignore, Some(b"/target\n"))
         .expect("remove");
+}
+
+/// The [`DefinitionSnapshotStore`] contract: an empty listing; a read
+/// round trip; an identical state deduplicated against the most recent
+/// snapshot of the same subject only, so another agent's identical file
+/// and another file of one agent each stand alone; newest-first order and
+/// listing by agent; another project kept apart; pruning per subject to
+/// the five newest unpinned with a pinned one always kept; unknown ids
+/// refused.
+///
+/// # Panics
+///
+/// Panics on any contract violation.
+#[allow(clippy::too_many_lines)]
+pub fn definition_snapshot_store_contract<S: DefinitionSnapshotStore>(store: &mut S) {
+    let project = ProjectIdentity(Sha256Digest([7; 32]));
+    let other_project = ProjectIdentity(Sha256Digest([8; 32]));
+    let subject = |agent: &str, file: &str| DefinitionSubject::new(agent, file).expect("subject");
+    let root_agents = subject(".", "AGENTS.md");
+    let child_agents = subject("child", "AGENTS.md");
+
+    assert!(
+        store
+            .list_definitions(&project, None)
+            .expect("list")
+            .is_empty()
+    );
+    assert_eq!(
+        store.read_definition(&project, SnapshotId(1)),
+        Err(SnapshotStoreError::Unknown)
+    );
+
+    let first = store
+        .record_definition(
+            &project,
+            sample_definition_manifest(1, 10, &root_agents, true, 0x11),
+            b"one",
+        )
+        .expect("record");
+    assert_eq!(first, SnapshotId(1));
+    let (manifest, bytes) = store.read_definition(&project, first).expect("read");
+    assert_eq!(manifest.subject, root_agents);
+    assert_eq!(bytes, b"one");
+
+    let deduped = store
+        .record_definition(
+            &project,
+            sample_definition_manifest(2, 20, &root_agents, true, 0x11),
+            b"one",
+        )
+        .expect("record");
+    assert_eq!(deduped, first, "an unchanged file takes no new snapshot");
+    let other_agent = store
+        .record_definition(
+            &project,
+            sample_definition_manifest(3, 30, &child_agents, true, 0x11),
+            b"one",
+        )
+        .expect("record");
+    assert_eq!(other_agent, SnapshotId(3), "agents never dedup together");
+    let other_file = store
+        .record_definition(
+            &project,
+            sample_definition_manifest(4, 40, &subject(".", "CLAUDE.md"), true, 0x11),
+            b"one",
+        )
+        .expect("record");
+    assert_eq!(other_file, SnapshotId(4), "files never dedup together");
+    let changed = store
+        .record_definition(
+            &project,
+            sample_definition_manifest(5, 50, &root_agents, true, 0x55),
+            b"five",
+        )
+        .expect("record");
+    assert_eq!(changed, SnapshotId(5));
+    let reverted = store
+        .record_definition(
+            &project,
+            sample_definition_manifest(6, 60, &root_agents, true, 0x11),
+            b"one",
+        )
+        .expect("record");
+    assert_eq!(reverted, SnapshotId(6), "dedup looks at the latest only");
+
+    let all = store.list_definitions(&project, None).expect("list");
+    assert_eq!(
+        all.iter().map(|m| m.id.0).collect::<Vec<_>>(),
+        vec![6, 5, 4, 3, 1]
+    );
+    let by_agent = store.list_definitions(&project, Some(".")).expect("list");
+    assert_eq!(
+        by_agent.iter().map(|m| m.id.0).collect::<Vec<_>>(),
+        vec![6, 5, 4, 1]
+    );
+    assert!(
+        store
+            .list_definitions(&other_project, None)
+            .expect("list")
+            .is_empty()
+    );
+
+    // Pruning is per subject, and a pinned snapshot is never pruned.
+    store
+        .pin_definition(&project, SnapshotId(1), true)
+        .expect("pin");
+    for n in 10..=17_u8 {
+        store
+            .record_definition(
+                &project,
+                sample_definition_manifest(u64::from(n), u64::from(n) * 10, &root_agents, true, n),
+                b"x",
+            )
+            .expect("record");
+    }
+    let kept: Vec<DefinitionSnapshotManifest> = store
+        .list_definitions(&project, Some("."))
+        .expect("list")
+        .into_iter()
+        .filter(|m| m.subject == root_agents)
+        .collect();
+    assert_eq!(
+        kept.len(),
+        MAX_UNPINNED_SNAPSHOTS + 1,
+        "five unpinned and the pinned one"
+    );
+    assert!(kept.iter().any(|m| m.id == SnapshotId(1) && m.pinned));
+    assert_eq!(
+        store
+            .list_definitions(&project, Some("child"))
+            .expect("list")
+            .len(),
+        1,
+        "another agent's snapshots are untouched by the prune"
+    );
+    assert_eq!(
+        store.pin_definition(&project, SnapshotId(999), true),
+        Err(SnapshotStoreError::Unknown)
+    );
 }
