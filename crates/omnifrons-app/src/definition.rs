@@ -41,7 +41,7 @@ use omnifrons_domain::definition::{
     Classification, DirectoryIdentity, FileShape, IdentityFile, IdentityKind, RootState, classify,
     title as extract_title,
 };
-use omnifrons_domain::definition_plan::BlockMode;
+use omnifrons_domain::definition_plan::{BlockMode, PlanId};
 use omnifrons_domain::guidance::{ManagedBlock, ManagedFileError, ManagedFileKind};
 use omnifrons_domain::hosts;
 use omnifrons_domain::nesting::{self, Ancestor, ChainLink, NestingError, Parent, RootRelation};
@@ -56,11 +56,14 @@ use omnifrons_domain::warnings::{
     AgentInput, ChainAncestor, ChainMemberKind, Warning, agent_warnings,
 };
 
+use crate::apply_record::ApplyRecordError;
 use crate::content_hasher::ContentHasher;
 use crate::definition_tree::{
     DefinitionTree, DefinitionTreeError, DirectoryEntry, SkillFile, TreeSnapshot,
 };
+use crate::definition_writer::DefinitionWriteError;
 use crate::harness_adapter::WorkspaceRoot;
+use crate::snapshot_store::SnapshotStoreError;
 
 /// The ports [`scan`] runs over.
 pub struct DefinitionPorts<'a> {
@@ -118,6 +121,33 @@ pub enum DefinitionError {
         /// What is wrong with the choice; names no absolute path.
         detail: String,
     },
+    /// The plan the caller holds no longer matches the definition:
+    /// the plan id recomputed now differs from the one given
+    /// (`actual` is the recomputed id), or an input changed while the
+    /// apply was running (`actual` is `None`: no new plan was made).
+    /// Nothing is written for a mismatch found before the first write;
+    /// for a change found later, the files already written stay written
+    /// (see [`crate::definition_apply`]).
+    #[error("the plan no longer matches the definition")]
+    StalePlan {
+        /// The id the caller applied.
+        expected: PlanId,
+        /// The id planned now, when the mismatch was found by planning
+        /// again.
+        actual: Option<PlanId>,
+    },
+    /// A planned write failed for a reason other than the target having
+    /// changed.
+    #[error("{0}")]
+    Write(DefinitionWriteError),
+    /// The snapshot of a file about to be overwritten could not be
+    /// recorded; that file was not written.
+    #[error("{0}")]
+    Snapshot(SnapshotStoreError),
+    /// The apply record could not be stored; every file was already
+    /// written.
+    #[error("{0}")]
+    Record(ApplyRecordError),
 }
 
 impl DefinitionError {
@@ -152,6 +182,10 @@ impl DefinitionError {
             Self::DuplicateIdentityKind(_) => "duplicate-identity-kind",
             Self::DuplicateSnapshotPath { .. } => "duplicate-snapshot-path",
             Self::InvalidCanonicalChoice { .. } => "invalid-canonical-choice",
+            Self::StalePlan { .. } => "stale-plan",
+            Self::Write(error) => error.reason(),
+            Self::Snapshot(error) => error.reason(),
+            Self::Record(error) => error.reason(),
         }
     }
 }

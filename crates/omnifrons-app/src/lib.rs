@@ -12,6 +12,7 @@ pub mod catalog_store;
 pub mod clock;
 pub mod content_hasher;
 pub mod definition;
+pub mod definition_apply;
 pub mod definition_plan;
 pub mod definition_tree;
 pub mod definition_writer;

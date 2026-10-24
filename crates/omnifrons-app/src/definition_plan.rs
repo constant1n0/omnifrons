@@ -317,7 +317,7 @@ fn finish(
 }
 
 /// The fingerprint of every identity file found, keyed by file name.
-fn input_fingerprints(
+pub(crate) fn input_fingerprints(
     hasher: &dyn ContentHasher,
     identity_files: &[IdentityFile],
 ) -> BTreeMap<String, InputFingerprint> {

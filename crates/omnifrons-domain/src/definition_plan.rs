@@ -170,6 +170,16 @@ impl Operation {
         }
     }
 
+    /// The SHA-256 of the whole file after this operation runs.
+    #[must_use]
+    pub const fn after(&self) -> &Sha256Digest {
+        match self {
+            Self::WriteAgents { after, .. }
+            | Self::WriteWrapper { after, .. }
+            | Self::WriteBlock { after, .. } => after,
+        }
+    }
+
     /// This operation's line in [`canonical_bytes`].
     #[must_use]
     pub fn canonical(&self) -> String {

@@ -40,14 +40,23 @@ impl From<DefinitionError> for ShellError {
     /// | `DuplicateIdentityKind` | `definition-invalid` | `duplicate-identity-kind` |
     /// | `DuplicateSnapshotPath` | `definition-invalid` | `duplicate-snapshot-path` |
     /// | `InvalidCanonicalChoice` | `invalid-request` | `invalid-canonical-choice` |
+    /// | `StalePlan` | `invalid-request` | `stale-plan` |
+    /// | `Write` | `definition-invalid` | the write error's own token |
+    /// | `Snapshot`, `Record` | `snapshot-unavailable` | the store error's own token |
     fn from(error: DefinitionError) -> Self {
         let reason = error.reason().to_string();
         let code = match &error {
             DefinitionError::Tree(_) => ShellErrorCode::ScanFailed,
-            DefinitionError::InvalidCanonicalChoice { .. } => ShellErrorCode::InvalidRequest,
+            DefinitionError::InvalidCanonicalChoice { .. } | DefinitionError::StalePlan { .. } => {
+                ShellErrorCode::InvalidRequest
+            }
             DefinitionError::Nesting(_)
             | DefinitionError::DuplicateIdentityKind(_)
-            | DefinitionError::DuplicateSnapshotPath { .. } => ShellErrorCode::DefinitionInvalid,
+            | DefinitionError::DuplicateSnapshotPath { .. }
+            | DefinitionError::Write(_) => ShellErrorCode::DefinitionInvalid,
+            DefinitionError::Snapshot(_) | DefinitionError::Record(_) => {
+                ShellErrorCode::SnapshotUnavailable
+            }
         };
         let message = match &error {
             DefinitionError::Tree(_) => "the workspace could not be scanned",
@@ -62,6 +71,11 @@ impl From<DefinitionError> for ShellError {
             }
             DefinitionError::InvalidCanonicalChoice { .. } => {
                 "the canonical file choice does not apply to this definition"
+            }
+            DefinitionError::StalePlan { .. } => "the plan no longer matches the definition",
+            DefinitionError::Write(_) => "a definition file could not be written",
+            DefinitionError::Snapshot(_) | DefinitionError::Record(_) => {
+                "the apply could not be recorded in the work area"
             }
         };
         Self {
@@ -215,9 +229,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use omnifrons_app::WorkspaceRoot;
+    use omnifrons_app::apply_record::ApplyRecordError;
     use omnifrons_app::definition::DefinitionError;
     use omnifrons_app::definition_tree::DefinitionTreeError;
+    use omnifrons_app::definition_writer::DefinitionWriteError;
+    use omnifrons_app::snapshot_store::SnapshotStoreError;
     use omnifrons_domain::definition::{DuplicateIdentityKindError, IdentityKind};
+    use omnifrons_domain::definition_plan::PlanId;
     use omnifrons_domain::nesting::NestingError;
 
     use super::{definition_status_for, definition_verify_for};
@@ -290,7 +308,7 @@ mod tests {
     /// practical way to exercise their mapping.
     #[test]
     fn definition_error_maps_to_shell_error_by_variant() {
-        let cases: [(DefinitionError, ShellErrorCode, &str); 5] = [
+        let cases: [(DefinitionError, ShellErrorCode, &str); 9] = [
             (
                 DefinitionError::Tree(DefinitionTreeError::RootUnreadable),
                 ShellErrorCode::ScanFailed,
@@ -322,6 +340,31 @@ mod tests {
                 },
                 ShellErrorCode::InvalidRequest,
                 "invalid-canonical-choice",
+            ),
+            (
+                DefinitionError::StalePlan {
+                    expected: PlanId([1; 32]),
+                    actual: Some(PlanId([2; 32])),
+                },
+                ShellErrorCode::InvalidRequest,
+                "stale-plan",
+            ),
+            (
+                DefinitionError::Write(DefinitionWriteError::ParentMissing {
+                    path: "child/AGENTS.md".to_string(),
+                }),
+                ShellErrorCode::DefinitionInvalid,
+                "parent-missing",
+            ),
+            (
+                DefinitionError::Snapshot(SnapshotStoreError::WriteFailed),
+                ShellErrorCode::SnapshotUnavailable,
+                "snapshot-write-failed",
+            ),
+            (
+                DefinitionError::Record(ApplyRecordError::WriteFailed),
+                ShellErrorCode::SnapshotUnavailable,
+                "apply-record-write-failed",
             ),
         ];
         for (error, code, reason) in cases {
