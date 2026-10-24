@@ -44,7 +44,20 @@ pub struct WriteRecord {
 #[derive(Debug, Default)]
 struct State {
     entries: BTreeMap<String, FakeEntry>,
+    directories: Vec<String>,
     writes: Vec<WriteRecord>,
+}
+
+impl State {
+    /// Whether `dir` is a seeded directory, or the ancestor of one or
+    /// of any entry.
+    fn is_directory(&self, dir: &str) -> bool {
+        let below = format!("{dir}/");
+        self.directories
+            .iter()
+            .chain(self.entries.keys())
+            .any(|path| path == dir || path.starts_with(&below))
+    }
 }
 
 /// The in-memory writer. One workspace: the `root` argument is ignored.
@@ -78,6 +91,13 @@ impl InMemoryDefinitionWriter {
     #[must_use]
     pub fn with_irregular(self, path: &str) -> Self {
         self.put(path, FakeEntry::Irregular);
+        self
+    }
+
+    /// Seeds an empty directory at `path` (its ancestors too).
+    #[must_use]
+    pub fn with_directory(self, path: &str) -> Self {
+        self.lock().directories.push(path.to_string());
         self
     }
 
@@ -133,18 +153,18 @@ impl DefinitionWriter for InMemoryDefinitionWriter {
             return Err(DefinitionWriteError::NotWritable { path });
         }
         let mut state = self.lock();
-        // Every parent prefix must not be a link or a file.
+        // Every parent prefix must be a real directory: seeded as one, or
+        // the ancestor of a seeded or written entry.
         let mut prefix = String::new();
         for component in &components[..components.len() - 1] {
             if !prefix.is_empty() {
                 prefix.push('/');
             }
             prefix.push_str(component);
-            if matches!(
-                state.entries.get(&prefix),
-                Some(FakeEntry::Symlink(_) | FakeEntry::File(_))
-            ) {
-                return Err(DefinitionWriteError::NotRegular { path });
+            match state.entries.get(&prefix) {
+                Some(_) => return Err(DefinitionWriteError::NotRegular { path }),
+                None if state.is_directory(&prefix) => {}
+                None => return Err(DefinitionWriteError::ParentMissing { path }),
             }
         }
         let current = state.entries.get(request.path);
@@ -261,6 +281,27 @@ mod tests {
         );
         assert_eq!(code("../x", &InputFingerprint::Absent), "invalid-path");
         assert!(writer.writes().is_empty());
+    }
+
+    #[test]
+    fn only_a_seeded_directory_or_a_seeded_files_ancestors_are_parents() {
+        let writer = InMemoryDefinitionWriter::new()
+            .with_file("seen/inner/a.md", b"a")
+            .with_directory("empty");
+        let code = |path: &str| {
+            write(&writer, path, b"n", &InputFingerprint::Absent)
+                .err()
+                .map(|error| error.reason())
+        };
+        assert_eq!(code("missing/AGENTS.md"), Some("parent-missing"));
+        assert_eq!(code("seen/missing/AGENTS.md"), Some("parent-missing"));
+        assert_eq!(code("AGENTS.md"), None);
+        assert_eq!(code("seen/AGENTS.md"), None);
+        assert_eq!(code("seen/inner/AGENTS.md"), None);
+        assert_eq!(code("empty/AGENTS.md"), None);
+        // A written file makes its own directory real for later writes.
+        assert_eq!(code("empty/sub/AGENTS.md"), Some("parent-missing"));
+        assert_eq!(code("seen/AGENTS.md"), Some("stale"));
     }
 
     #[test]

@@ -24,6 +24,14 @@
 //! is read back, and the digest of what was read is returned, so a
 //! caller learns the bytes on disk are the bytes it planned.
 //!
+//! # Exclusive create
+//!
+//! A create is published with a hard link, the one primitive that fails
+//! when anything appeared at the name. Where the filesystem cannot make
+//! hard links the create is refused with
+//! [`DefinitionWriteError::ExclusiveCreateUnsupported`]; an
+//! implementation never falls back to a non-atomic create.
+//!
 //! # Permission bits
 //!
 //! [`ModePolicy`] names the rule, mirroring the prototype's: a replaced
@@ -122,6 +130,16 @@ pub enum DefinitionWriteError {
         /// The workspace-relative path.
         path: String,
     },
+    /// The filesystem under the workspace cannot make the hard link an
+    /// exclusive create is published with (for example FAT or exFAT, or
+    /// some network and FUSE mounts). There is no fallback: a create that
+    /// is not atomic could leave a partial file a rerun cannot
+    /// recognise. Replacing existing files is unaffected.
+    #[error("the filesystem cannot create {path} exclusively")]
+    ExclusiveCreateUnsupported {
+        /// The workspace-relative path.
+        path: String,
+    },
     /// The write could not be completed; nothing was published and no
     /// temporary file remains.
     #[error("the write to {path} failed")]
@@ -143,6 +161,7 @@ impl DefinitionWriteError {
             Self::Stale { .. } => "stale",
             Self::SourceUnavailable { .. } => "source-unavailable",
             Self::ReadBackMismatch { .. } => "read-back-mismatch",
+            Self::ExclusiveCreateUnsupported { .. } => "exclusive-create-unsupported",
             Self::Io { .. } => "io",
         }
     }
@@ -163,8 +182,10 @@ pub trait DefinitionWriter {
     /// parent; [`DefinitionWriteError::Stale`] when the target no longer
     /// matches the plan; [`DefinitionWriteError::SourceUnavailable`] for
     /// an unusable permission source;
-    /// [`DefinitionWriteError::ReadBackMismatch`]; or
-    /// [`DefinitionWriteError::Io`]. Every refusal leaves the target
+    /// [`DefinitionWriteError::ReadBackMismatch`];
+    /// [`DefinitionWriteError::ExclusiveCreateUnsupported`] when a create
+    /// needs a hard link the filesystem refuses (replaces still work);
+    /// or [`DefinitionWriteError::Io`]. Every refusal leaves the target
     /// exactly as it was and no temporary file behind (a read-back
     /// mismatch happens after publishing and reports what is on disk).
     fn write(
@@ -258,6 +279,7 @@ mod tests {
             },
             DefinitionWriteError::SourceUnavailable { path: path() },
             DefinitionWriteError::ReadBackMismatch { path: path() },
+            DefinitionWriteError::ExclusiveCreateUnsupported { path: path() },
             DefinitionWriteError::Io { path: path() },
         ]
         .map(|error| error.reason());

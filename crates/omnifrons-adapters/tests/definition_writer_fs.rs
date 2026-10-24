@@ -286,6 +286,36 @@ mod unix {
     }
 
     #[test]
+    fn a_target_name_near_the_limit_is_written_and_read_back() {
+        let dir = TempDir::new("long-name");
+        let name = format!("{}.md", "n".repeat(247));
+        assert_eq!(name.len(), 250);
+        let written = write(
+            &dir,
+            &name,
+            b"long\n",
+            &InputFingerprint::Absent,
+            &ModePolicy::Keep,
+        )
+        .expect("created");
+        assert_eq!(written, digest(b"long\n"));
+        let replaced = write(
+            &dir,
+            &name,
+            b"longer\n",
+            &InputFingerprint::Sha256(digest(b"long\n")),
+            &ModePolicy::Keep,
+        )
+        .expect("replaced");
+        assert_eq!(replaced, digest(b"longer\n"));
+        assert_eq!(
+            std::fs::read(dir.path().join(&name)).expect("read"),
+            b"longer\n"
+        );
+        assert_eq!(names(dir.path()), vec![name]);
+    }
+
+    #[test]
     fn a_target_that_became_a_symlink_refuses_without_following_it() {
         let dir = TempDir::new("symlink-target");
         let outside = TempDir::new("symlink-outside");
@@ -443,7 +473,7 @@ mod unix {
     }
 
     #[test]
-    fn no_temporary_file_remains_after_a_failed_publish() {
+    fn a_refused_write_leaves_only_the_original_file() {
         let dir = TempDir::new("no-temp");
         put(&dir, "AGENTS.md", b"changed\n");
         let _ = write(
