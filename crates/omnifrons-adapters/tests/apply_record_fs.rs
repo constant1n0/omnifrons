@@ -379,3 +379,37 @@ fn a_record_copied_under_a_well_formed_matching_name_still_lists() {
         Ok(2)
     );
 }
+
+#[test]
+fn an_absent_applies_root_lists_empty() {
+    let base = TempDir::new("probe-absent");
+    let project_dir = TempDir::new("probe-absent-project");
+    let area = work_area(&base, &project_dir);
+    let store = FsApplyRecordStore::open(&area);
+    let _ = std::fs::remove_dir_all(area.applies_dir());
+    assert_eq!(store.list(&project()), Ok(Vec::new()));
+}
+
+#[test]
+fn a_regular_file_at_the_applies_root_is_unreadable() {
+    let base = TempDir::new("probe-file");
+    let project_dir = TempDir::new("probe-file-project");
+    let area = work_area(&base, &project_dir);
+    let store = FsApplyRecordStore::open(&area);
+    let _ = std::fs::remove_dir_all(area.applies_dir());
+    std::fs::write(area.applies_dir(), b"not a directory").expect("plant a file");
+    assert_eq!(store.list(&project()), Err(ApplyRecordError::Unreadable));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_applies_root_is_unreadable_even_when_it_points_at_a_directory() {
+    let base = TempDir::new("probe-link");
+    let project_dir = TempDir::new("probe-link-project");
+    let elsewhere = TempDir::new("probe-link-target");
+    let area = work_area(&base, &project_dir);
+    let store = FsApplyRecordStore::open(&area);
+    let _ = std::fs::remove_dir_all(area.applies_dir());
+    std::os::unix::fs::symlink(elsewhere.path(), area.applies_dir()).expect("plant a link");
+    assert_eq!(store.list(&project()), Err(ApplyRecordError::Unreadable));
+}

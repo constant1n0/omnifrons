@@ -898,17 +898,60 @@ fn roots_differing_in_a_non_utf8_byte_get_different_plan_ids() {
 }
 
 /// Treats the outcome of a fixture call naming a non-UTF-8 path as a
-/// skip when the filesystem refuses the name outright (APFS on macOS).
-/// Prints the reason and returns `false`; returns `true` on `Ok`.
+/// skip when the filesystem refuses the name itself (APFS on macOS):
+/// `ErrorKind::InvalidInput`, `ErrorKind::InvalidFilename`, or raw OS
+/// error 92 (`EILSEQ`, what APFS returns). Prints the reason and returns
+/// `false`; returns `true` on `Ok`. Any other error (a permission or disk
+/// failure, say) panics with its message instead of passing silently. The
+/// helper of the same purpose in `definition_tree_fs.rs` keeps the wider
+/// skip for now.
 #[cfg(unix)]
 fn non_utf8_fixture_supported(label: &str, result: std::io::Result<()>) -> bool {
+    use std::io::ErrorKind;
+    /// `EILSEQ`: an illegal byte sequence in a name.
+    const ILLEGAL_SEQUENCE: i32 = 92;
     match result {
         Ok(()) => true,
-        Err(error) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::InvalidInput | ErrorKind::InvalidFilename
+            ) || error.raw_os_error() == Some(ILLEGAL_SEQUENCE) =>
+        {
             eprintln!(
                 "skipping {label}: this filesystem refuses a non-UTF-8 path component ({error})"
             );
             false
         }
+        Err(error) => panic!("{label}: the fixture failed for another reason: {error}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn only_a_refused_name_skips_the_non_utf8_fixture() {
+    use std::io::{Error, ErrorKind};
+    assert!(non_utf8_fixture_supported("ok", Ok(())));
+    assert!(!non_utf8_fixture_supported(
+        "invalid input",
+        Err(Error::from(ErrorKind::InvalidInput))
+    ));
+    assert!(!non_utf8_fixture_supported(
+        "invalid filename",
+        Err(Error::from(ErrorKind::InvalidFilename))
+    ));
+    assert!(!non_utf8_fixture_supported(
+        "eilseq",
+        Err(Error::from_raw_os_error(92))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "another reason")]
+fn a_permission_failure_is_not_a_skip_for_the_non_utf8_fixture() {
+    let _ = non_utf8_fixture_supported(
+        "denied",
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+    );
 }

@@ -492,6 +492,34 @@ mod unix {
         );
         assert_eq!(names(dir.path()), vec!["AGENTS.md"]);
     }
+
+    #[test]
+    fn a_workspace_reached_through_a_symlink_resolves_to_the_real_directory_and_accepts_writes() {
+        let real = TempDir::new("symlinked-real");
+        let holder = TempDir::new("symlinked-holder");
+        let link = holder.path().join("workspace-link");
+        symlink(real.path(), &link).expect("symlink to the workspace");
+        let root = WorkspaceRoot::new(&link).expect("valid workspace");
+        let bytes = b"# Agent\n";
+        std::fs::create_dir(real.path().join("child")).expect("child");
+        let written = FsDefinitionWriter::new()
+            .write(
+                &root,
+                &WriteRequest {
+                    path: "child/AGENTS.md",
+                    bytes,
+                    expected: &InputFingerprint::Absent,
+                    mode: &ModePolicy::Keep,
+                },
+            )
+            .expect("written through the canonicalised root");
+        assert_eq!(written, digest(bytes));
+        assert_eq!(
+            std::fs::read(real.path().join("child/AGENTS.md")).expect("read"),
+            bytes
+        );
+        assert_eq!(names(real.path()), vec!["child"]);
+    }
 }
 
 #[cfg(windows)]
