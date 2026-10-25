@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use omnifrons_domain::definition_plan::InputFingerprint;
 use omnifrons_domain::executable::Sha256Digest;
@@ -213,6 +214,97 @@ impl DefinitionWriter for InMemoryDefinitionWriter {
     }
 }
 
+/// A fault-injecting [`DefinitionWriter`] over any other writer: it
+/// forwards each write, counts the ones it performed, and from write
+/// number `crash_before` on returns an error that stands for a process
+/// death, leaving the target untouched.
+///
+/// An error before write N models the process dying between write N-1
+/// and write N: the earlier writes are on disk, the apply service has
+/// stored the snapshots it took before them, and it never reaches the
+/// point where it stores a record. The wrapper does not stop the apply
+/// the way a real death would; it relies on the service ending its run at
+/// the first write error, so no later write is attempted. Should one be,
+/// it fails the same way.
+///
+/// The crash is [`DefinitionWriteError::Io`] carrying the path of the
+/// write that did not happen, the one variant that says "could not be
+/// completed, nothing published". The apply maps it to
+/// `DefinitionError::Write` like any other write error. No fixture a
+/// crash test builds can produce a genuine `Io`, so a test tells the
+/// simulated crash from a refusal by its `io` reason and by
+/// [`Self::crashed`].
+#[derive(Debug)]
+pub struct CrashingWriter<W> {
+    inner: W,
+    crash_before: Option<usize>,
+    attempted: AtomicUsize,
+    performed: AtomicUsize,
+}
+
+impl<W: DefinitionWriter> CrashingWriter<W> {
+    /// A writer that crashes before the `crash_before`th write
+    /// (1-based). `crash_before` of 1 crashes before any file changes.
+    #[must_use]
+    pub fn crashing_before(inner: W, crash_before: usize) -> Self {
+        Self {
+            inner,
+            crash_before: Some(crash_before),
+            attempted: AtomicUsize::new(0),
+            performed: AtomicUsize::new(0),
+        }
+    }
+
+    /// A writer that never crashes and only counts, to learn how many
+    /// writes a run makes.
+    #[must_use]
+    pub fn counting(inner: W) -> Self {
+        Self {
+            inner,
+            crash_before: None,
+            attempted: AtomicUsize::new(0),
+            performed: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many writes reached the inner writer and succeeded.
+    #[must_use]
+    pub fn writes_performed(&self) -> usize {
+        self.performed.load(Ordering::SeqCst)
+    }
+
+    /// Whether the simulated crash fired.
+    #[must_use]
+    pub fn crashed(&self) -> bool {
+        self.crash_before
+            .is_some_and(|n| self.attempted.load(Ordering::SeqCst) >= n)
+    }
+
+    /// The wrapped writer.
+    #[must_use]
+    pub fn inner(&self) -> &W {
+        &self.inner
+    }
+}
+
+impl<W: DefinitionWriter> DefinitionWriter for CrashingWriter<W> {
+    fn write(
+        &self,
+        root: &WorkspaceRoot,
+        request: &WriteRequest<'_>,
+    ) -> Result<Sha256Digest, DefinitionWriteError> {
+        let number = self.attempted.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.crash_before.is_some_and(|n| number >= n) {
+            return Err(DefinitionWriteError::Io {
+                path: request.path.to_string(),
+            });
+        }
+        let digest = self.inner.write(root, request)?;
+        self.performed.fetch_add(1, Ordering::SeqCst);
+        Ok(digest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +332,35 @@ mod tests {
 
     fn sha(bytes: &[u8]) -> InputFingerprint {
         InputFingerprint::Sha256(FakeHasher.sha256(bytes))
+    }
+
+    #[test]
+    fn the_crashing_writer_forwards_until_its_write_and_then_leaves_the_target_alone() {
+        let inner = InMemoryDefinitionWriter::new().with_file("CLAUDE.md", b"old\n");
+        let writer = CrashingWriter::crashing_before(inner, 2);
+        let request = |path, bytes, expected| WriteRequest {
+            path,
+            bytes,
+            expected,
+            mode: &ModePolicy::Keep,
+        };
+        writer
+            .write(
+                &root(),
+                &request("AGENTS.md", b"a\n", &InputFingerprint::Absent),
+            )
+            .expect("write 1 goes through");
+        assert!(!writer.crashed());
+        let error = writer
+            .write(&root(), &request("CLAUDE.md", b"w\n", &sha(b"old\n")))
+            .expect_err("write 2 is the crash");
+        assert_eq!(error.reason(), "io");
+        assert!(writer.crashed());
+        assert_eq!(writer.writes_performed(), 1);
+        assert_eq!(
+            writer.inner().bytes("CLAUDE.md").as_deref(),
+            Some(&b"old\n"[..])
+        );
     }
 
     #[test]

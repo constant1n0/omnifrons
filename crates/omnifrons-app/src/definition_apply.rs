@@ -57,8 +57,17 @@
 //!
 //! A rerun converges: it plans from the disk as it is, and a file already
 //! written to its planned bytes needs no operation, so the new plan is
-//! smaller (or empty) and is applied under its own id. The convergence
-//! tests themselves belong to the next sub-slice.
+//! smaller (or empty) and is applied under its own id.
+//!
+//! Each state a crash can leave is recognised: the root as it was
+//! (`ClaudeOnly` or `Conflict`), `AGENTS.md` written and the wrapper not
+//! (`IdenticalCopies`), or both identity files canonical with only the
+//! `skills` block pending. The tests `definition_apply_crash_fs` (every
+//! crash point over the real adapters, each followed by a rerun) and
+//! `a_crash_before_the_second_write_leaves_one_file_and_no_record` (the
+//! same contract over the in-memory doubles) are the proof. The rerun
+//! names a winning side with `canonical_from` only while the files still
+//! disagree: the planner refuses it for any other state.
 
 use std::collections::BTreeMap;
 

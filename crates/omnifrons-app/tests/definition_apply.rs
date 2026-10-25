@@ -21,7 +21,9 @@ use omnifrons_app::content_hasher::{ContentHasher, derive_project_identity};
 use omnifrons_app::contract::apply_record::InMemoryApplyRecordStore;
 use omnifrons_app::contract::approval_store::FixedClock;
 use omnifrons_app::contract::definition::{InMemoryDefinitionTree, TreeSnapshotBuilder};
-use omnifrons_app::contract::definition_writer::{FakeEntry, InMemoryDefinitionWriter};
+use omnifrons_app::contract::definition_writer::{
+    CrashingWriter, FakeEntry, InMemoryDefinitionWriter,
+};
 use omnifrons_app::contract::guidance::InMemorySnapshotStore;
 use omnifrons_app::contract::publication::FakeHasher;
 use omnifrons_app::definition::DefinitionError;
@@ -29,7 +31,7 @@ use omnifrons_app::definition::DefinitionPorts;
 use omnifrons_app::definition_apply::{ApplyOutcome, ApplyPorts, apply};
 use omnifrons_app::definition_plan::{PlanOutcome, plan, plan_with_writes};
 use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSnapshot};
-use omnifrons_app::definition_writer::{DefinitionWriteError, ModePolicy};
+use omnifrons_app::definition_writer::{DefinitionWriteError, DefinitionWriter, ModePolicy};
 use omnifrons_app::snapshot_store::DefinitionSnapshotStore;
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, WRAPPER};
 use omnifrons_domain::definition_plan::{InputFingerprint, Operation, PlanId, PlanOptions};
@@ -183,7 +185,7 @@ impl Fixture {
     fn apply(
         &mut self,
         tree: &dyn DefinitionTree,
-        writer: &InMemoryDefinitionWriter,
+        writer: &dyn DefinitionWriter,
         workspace: &WorkspaceRoot,
         target: Option<&str>,
         options: PlanOptions,
@@ -450,6 +452,41 @@ fn a_second_plan_after_an_apply_is_a_no_op_and_the_old_id_is_stale() {
     assert_eq!(replay.reason(), "stale-plan");
     let project = derive_project_identity(&FakeHasher, &workspace);
     assert_eq!(fixture.records.list(&project).unwrap().len(), 1);
+}
+
+#[test]
+fn a_crash_before_the_second_write_leaves_one_file_and_no_record() {
+    let dir = TempDir::new("crash-before-second");
+    let workspace = dir.workspace();
+    let crashing = CrashingWriter::crashing_before(
+        InMemoryDefinitionWriter::new().with_file("CLAUDE.md", TEXT),
+        2,
+    );
+    let tree = WriterTree::new(crashing.inner());
+    let options = PlanOptions::default();
+    let id = plan_id(&tree, &workspace, None, options);
+
+    let mut fixture = Fixture::new();
+    let error = fixture
+        .apply(&tree, &crashing, &workspace, None, options, &id)
+        .expect_err("the second write is the crash");
+    assert_eq!(error.reason(), "io");
+    assert!(matches!(
+        error,
+        DefinitionError::Write(DefinitionWriteError::Io { ref path }) if path == "CLAUDE.md"
+    ));
+    assert!(crashing.crashed());
+    assert_eq!(crashing.writes_performed(), 1);
+    let log = crashing.inner().writes();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].path, "AGENTS.md");
+    assert_eq!(
+        crashing.inner().bytes("CLAUDE.md").as_deref(),
+        Some(TEXT),
+        "the file that was not written is untouched"
+    );
+    let project = derive_project_identity(&FakeHasher, &workspace);
+    assert!(fixture.records.list(&project).unwrap().is_empty());
 }
 
 #[test]
