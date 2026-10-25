@@ -8,6 +8,7 @@
 #![cfg(feature = "contract-tests")]
 
 use std::cell::{Cell, RefCell};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +28,7 @@ use omnifrons_app::contract::definition_writer::{
 use omnifrons_app::contract::guidance::InMemorySnapshotStore;
 use omnifrons_app::contract::publication::FakeHasher;
 use omnifrons_app::definition::DefinitionError;
-use omnifrons_app::definition::DefinitionPorts;
+use omnifrons_app::definition::{DefinitionPorts, verify};
 use omnifrons_app::definition_apply::{ApplyOutcome, ApplyPorts, apply};
 use omnifrons_app::definition_plan::{PlanOutcome, plan, plan_with_writes};
 use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSnapshot};
@@ -460,7 +461,7 @@ fn a_crash_before_the_second_write_leaves_one_file_and_no_record() {
     let workspace = dir.workspace();
     let crashing = CrashingWriter::crashing_before(
         InMemoryDefinitionWriter::new().with_file("CLAUDE.md", TEXT),
-        2,
+        NonZeroUsize::new(2).expect("non-zero"),
     );
     let tree = WriterTree::new(crashing.inner());
     let options = PlanOptions::default();
@@ -787,6 +788,54 @@ fn a_record_that_cannot_be_stored_leaves_every_file_written() {
     assert_eq!(writer.bytes("CLAUDE.md").as_deref(), Some(WRAPPER));
     let project = derive_project_identity(&FakeHasher, &workspace);
     assert!(fixture.records.list(&project).unwrap().is_empty());
+}
+
+#[test]
+fn a_run_that_wrote_every_file_but_never_recorded_reruns_as_a_no_op_and_stays_unrecorded() {
+    let dir = TempDir::new("unrecorded");
+    let workspace = dir.workspace();
+    let writer = InMemoryDefinitionWriter::new().with_file("CLAUDE.md", TEXT);
+    let tree = WriterTree::new(&writer);
+    let options = PlanOptions::default();
+    let id = plan_id(&tree, &workspace, None, options);
+    let mut fixture = Fixture::new();
+    fixture.failing_records = true;
+    let error = fixture
+        .apply(&tree, &writer, &workspace, None, options, &id)
+        .expect_err("the record fails");
+    assert!(matches!(error, DefinitionError::Record(_)));
+    assert_eq!(writer.writes().len(), 2, "every planned file was written");
+
+    // A rerun plans again from the disk: nothing is left to do.
+    fixture.failing_records = false;
+    let fresh = plan_id(&tree, &workspace, None, options);
+    let outcome = fixture
+        .apply(&tree, &writer, &workspace, None, options, &fresh)
+        .expect("rerun");
+    assert!(matches!(outcome, ApplyOutcome::NoOp { .. }), "{outcome:?}");
+    assert_eq!(writer.writes().len(), 2, "the rerun wrote nothing");
+    assert_eq!(writer.bytes("AGENTS.md").as_deref(), Some(TEXT));
+    assert_eq!(writer.bytes("CLAUDE.md").as_deref(), Some(WRAPPER));
+    let project = derive_project_identity(&FakeHasher, &workspace);
+    assert!(
+        fixture.records.list(&project).unwrap().is_empty(),
+        "the apply stays unrecorded"
+    );
+    assert_eq!(
+        fixture
+            .snapshots
+            .list_definitions(&project, Some("."))
+            .unwrap()
+            .len(),
+        1,
+        "its snapshot remains as evidence"
+    );
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &FakeHasher,
+    };
+    let report = verify(&ports, &workspace, ".").expect("verify");
+    assert!(report.canonical, "{:?}", report.problems);
 }
 
 #[test]

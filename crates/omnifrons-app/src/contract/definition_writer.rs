@@ -5,6 +5,7 @@
 //! disk would give. Digests use `FakeHasher`.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -244,12 +245,13 @@ pub struct CrashingWriter<W> {
 
 impl<W: DefinitionWriter> CrashingWriter<W> {
     /// A writer that crashes before the `crash_before`th write
-    /// (1-based). `crash_before` of 1 crashes before any file changes.
+    /// (1-based, hence non-zero). A `crash_before` of 1 crashes before
+    /// any file changes.
     #[must_use]
-    pub fn crashing_before(inner: W, crash_before: usize) -> Self {
+    pub fn crashing_before(inner: W, crash_before: NonZeroUsize) -> Self {
         Self {
             inner,
-            crash_before: Some(crash_before),
+            crash_before: Some(crash_before.get()),
             attempted: AtomicUsize::new(0),
             performed: AtomicUsize::new(0),
         }
@@ -337,7 +339,8 @@ mod tests {
     #[test]
     fn the_crashing_writer_forwards_until_its_write_and_then_leaves_the_target_alone() {
         let inner = InMemoryDefinitionWriter::new().with_file("CLAUDE.md", b"old\n");
-        let writer = CrashingWriter::crashing_before(inner, 2);
+        let writer =
+            CrashingWriter::crashing_before(inner, NonZeroUsize::new(2).expect("non-zero"));
         let request = |path, bytes, expected| WriteRequest {
             path,
             bytes,

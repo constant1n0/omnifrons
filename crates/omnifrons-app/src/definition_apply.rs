@@ -65,9 +65,20 @@
 //! `skills` block pending. The tests `definition_apply_crash_fs` (every
 //! crash point over the real adapters, each followed by a rerun) and
 //! `a_crash_before_the_second_write_leaves_one_file_and_no_record` (the
-//! same contract over the in-memory doubles) are the proof. The rerun
+//! same contract over the in-memory doubles) are the proof. A rerun
 //! names a winning side with `canonical_from` only while the files still
 //! disagree: the planner refuses it for any other state.
+//!
+//! One state is not a crash point of any write: every planned file
+//! written and the record never stored (the process dies after the last
+//! write, or the record store fails). It is a bounded residual, left open
+//! by the decision record's crash-window question. From there a rerun
+//! plans from the disk, finds nothing to do, and returns
+//! [`ApplyOutcome::NoOp`], so that apply stays unrecorded while its
+//! snapshots remain as evidence. Recording a provisional manifest before
+//! the writes is the alternative, for a later slice. The test
+//! `a_run_that_wrote_every_file_but_never_recorded_reruns_as_a_no_op_and_stays_unrecorded`
+//! pins it.
 
 use std::collections::BTreeMap;
 

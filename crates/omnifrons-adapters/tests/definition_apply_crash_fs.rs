@@ -10,6 +10,7 @@
 //! far; and planning again and applying that new plan converges to the
 //! bytes an uncrashed run produces.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -181,9 +182,9 @@ struct Expect {
     /// (a block fixture reports it at every crash point: it is written
     /// last).
     block_pending: &'static [bool],
-    /// The snapshots on disk after that crash: the snapshot of a file is
-    /// taken before its write is attempted, so the crashed write's own
-    /// snapshot is included.
+    /// The snapshots on disk after that crash: a snapshot precedes each
+    /// write of a file that exists, so the crashed write's own snapshot
+    /// is included, and a file that was absent at plan time has none.
     snapshots: &'static [usize],
     /// The snapshots after the rerun converged.
     snapshots_after_rerun: &'static [usize],
@@ -235,11 +236,21 @@ fn crash_before_every_write(
     observed: &mut Vec<RootState>,
 ) -> usize {
     let reference = uncrashed(label, files, options);
-    assert_eq!(expect.states.len(), reference.writes, "{label}: table size");
+    for (name, len) in [
+        ("states", expect.states.len()),
+        ("block_pending", expect.block_pending.len()),
+        ("snapshots", expect.snapshots.len()),
+        ("snapshots_after_rerun", expect.snapshots_after_rerun.len()),
+    ] {
+        assert_eq!(len, reference.writes, "{label}: {name} table size");
+    }
     for crash_point in 1..=reference.writes {
         let at = format!("{label}: crash before write {crash_point}");
         let mut env = Env::new(&format!("{label}-{crash_point}"), files);
-        let crashing = CrashingWriter::crashing_before(FsDefinitionWriter, crash_point);
+        let crashing = CrashingWriter::crashing_before(
+            FsDefinitionWriter,
+            NonZeroUsize::new(crash_point).expect("crash points start at 1"),
+        );
         let error = env
             .apply_through(&crashing, options)
             .expect_err("the simulated crash stops the run");
@@ -387,7 +398,10 @@ fn a_crash_before_the_block_write_leaves_the_root_canonical_with_the_block_pendi
     // After the last crash the identity files are canonical and the
     // block is the only thing left to do; the rerun plans exactly that.
     let mut env = Env::new("block-rerun", files);
-    let crashing = CrashingWriter::crashing_before(FsDefinitionWriter, writes);
+    let crashing = CrashingWriter::crashing_before(
+        FsDefinitionWriter,
+        NonZeroUsize::new(writes).expect("at least one write"),
+    );
     env.apply_through(&crashing, PlanOptions::default())
         .expect_err("crash before the block");
     assert_eq!(env.read("CLAUDE.md").as_deref(), Some(WRAPPER));
