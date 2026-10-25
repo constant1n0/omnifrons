@@ -2091,10 +2091,8 @@ export type DefinitionFingerprint =
 export type DefinitionOperationTag = 'write-agents' | 'write-wrapper' | 'write-block'
 
 /**
- * How a planned block write treats the block already in the file. The shell
- * serializes it as a plain string (the closed set lives in the domain crate,
- * not in `dto.rs`), so this union is not covered by the `dto.rs` mirror
- * test.
+ * How a planned block write treats the block already in the file; mirrors
+ * `dto.rs`'s `BlockModeDto`.
  */
 export type DefinitionBlockMode = 'append' | 'replace' | 'migrate-legacy'
 

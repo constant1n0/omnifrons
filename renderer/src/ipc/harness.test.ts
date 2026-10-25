@@ -93,6 +93,7 @@ import {
   type DefinitionAgent,
   type DefinitionApply,
   type DefinitionApplyOutcomeKind,
+  type DefinitionBlockMode,
   type DefinitionFingerprintKind,
   type DefinitionNoticeKind,
   type DefinitionOperationTag,
@@ -3588,6 +3589,8 @@ const DEFINITION_WARNING_CODES = [
 const DEFINITION_FINGERPRINT_KINDS = ['sha256', 'symlink', 'irregular', 'absent'] as const
 /** Every token {@link DefinitionOperationTag} declares. */
 const DEFINITION_OPERATION_TAGS = ['write-agents', 'write-wrapper', 'write-block'] as const
+/** Every token {@link DefinitionBlockMode} declares. */
+const DEFINITION_BLOCK_MODES = ['append', 'replace', 'migrate-legacy'] as const
 /** Every token {@link DefinitionNoticeKind} declares. */
 const DEFINITION_NOTICE_KINDS = ['portable-agent-folder'] as const
 /** Every token {@link DefinitionPreviewOutcomeKind} declares. */
@@ -3627,10 +3630,12 @@ const _assertions: [
   CoversExactly<DefinitionWarningCode, typeof DEFINITION_WARNING_CODES>,
   CoversExactly<DefinitionFingerprintKind, typeof DEFINITION_FINGERPRINT_KINDS>,
   CoversExactly<DefinitionOperationTag, typeof DEFINITION_OPERATION_TAGS>,
+  CoversExactly<DefinitionBlockMode, typeof DEFINITION_BLOCK_MODES>,
   CoversExactly<DefinitionNoticeKind, typeof DEFINITION_NOTICE_KINDS>,
   CoversExactly<DefinitionPreviewOutcomeKind, typeof DEFINITION_PREVIEW_OUTCOME_KINDS>,
   CoversExactly<DefinitionApplyOutcomeKind, typeof DEFINITION_APPLY_OUTCOME_KINDS>,
 ] = [
+  true,
   true,
   true,
   true,
@@ -3701,6 +3706,7 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['WarningCodeTag', DEFINITION_WARNING_CODES],
   ['FingerprintDto', DEFINITION_FINGERPRINT_KINDS],
   ['OperationDto', DEFINITION_OPERATION_TAGS],
+  ['BlockModeDto', DEFINITION_BLOCK_MODES],
   ['NoticeDto', DEFINITION_NOTICE_KINDS],
   ['DefinitionPreviewOutcomeDto', DEFINITION_PREVIEW_OUTCOME_KINDS],
   ['DefinitionApplyOutcomeDto', DEFINITION_APPLY_OUTCOME_KINDS],
@@ -3735,6 +3741,6 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(32)
+    expect(enums).toHaveLength(33)
   })
 })

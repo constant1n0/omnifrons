@@ -1205,12 +1205,90 @@ describe('DefinitionSection apply (ADR-0005 slice 2, sub-slice 2f)', () => {
     await screen.findByLabelText('Preview')
   })
 
+  function deferredApply(): { resolve: () => void; ipc: () => Promise<PlanIpc> } {
+    let release: ((value: DefinitionApply) => void) | undefined
+    return {
+      resolve: () => release!(APPLIED),
+      ipc: () =>
+        renderPlanSection({
+          apply: () =>
+            new Promise((resolve) => {
+              release = resolve as (value: DefinitionApply) => void
+            }),
+        }),
+    }
+  }
+
+  it('keeps Rescan disabled and definition_status uncalled while an apply is pending, then rescans once and keeps the result', async () => {
+    const pending = deferredApply()
+    const ipc = await pending.ipc()
+    await previewRoot()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    const rescan = screen.getByRole('button', { name: 'Rescan' }) as HTMLButtonElement
+    await waitFor(() => expect(rescan.disabled).toBe(true))
+    expect(ipc.statusCalls()).toBe(1)
+
+    await act(async () => {
+      pending.resolve()
+    })
+
+    await screen.findByLabelText('Apply')
+    await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+    expect(ipc.statusCalls()).toBe(2)
+    expect(screen.getByLabelText('Apply')).toBeTruthy()
+    expect(rescan.disabled).toBe(false)
+  })
+
+  it('refuses a Rescan click dispatched in the same tick as Apply, before the disabled attribute renders', async () => {
+    const pending = deferredApply()
+    const ipc = await pending.ipc()
+    await previewRoot()
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+    })
+    expect(ipc.statusCalls()).toBe(1)
+
+    await act(async () => {
+      pending.resolve()
+    })
+    await screen.findByLabelText('Apply')
+    await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+  })
+
+  it('renders an applied file whose after is null and whose before is irregular', async () => {
+    await renderPlanSection({
+      apply: () => ({
+        ...APPLIED,
+        outcome: {
+          kind: 'applied',
+          planId: H(7),
+          record: 'rec-2.json',
+          files: [{ path: 'odd.md', before: { kind: 'irregular' }, after: null, snapshot: null }],
+        },
+      }),
+    })
+    await previewRoot()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    const result = await screen.findByLabelText('Apply')
+    expect(within(within(result).getByLabelText('Applied files')).getByRole('listitem').textContent).toBe(
+      'odd.md: irregular -> none (no snapshot)',
+    )
+  })
+
   it('clears both panels when Rescan is clicked', async () => {
     const ipc = await renderPlanSection()
     await previewRoot()
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     await screen.findByLabelText('Apply')
     await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+    // Preview stays disabled until the post-apply scan has settled.
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     await previewRoot()
 
     fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))

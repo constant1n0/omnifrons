@@ -2417,6 +2417,29 @@ impl From<&InputFingerprint> for FingerprintDto {
     }
 }
 
+/// How a planned block write treats the block already in the file; the
+/// tokens are the domain's own [`omnifrons_domain::definition_plan::BlockMode::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BlockModeDto {
+    #[serde(rename = "append")]
+    Append,
+    #[serde(rename = "replace")]
+    Replace,
+    #[serde(rename = "migrate-legacy")]
+    MigrateLegacy,
+}
+
+impl From<omnifrons_domain::definition_plan::BlockMode> for BlockModeDto {
+    fn from(mode: omnifrons_domain::definition_plan::BlockMode) -> Self {
+        use omnifrons_domain::definition_plan::BlockMode;
+        match mode {
+            BlockMode::Append => Self::Append,
+            BlockMode::Replace => Self::Replace,
+            BlockMode::MigrateLegacy => Self::MigrateLegacy,
+        }
+    }
+}
+
 /// One planned write. `before` is what the file must still look like when
 /// the write runs; `after` is the SHA-256 of the whole file afterwards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2438,7 +2461,7 @@ pub enum OperationDto {
     #[serde(rename = "write-block")]
     Block {
         path: String,
-        mode: String,
+        mode: BlockModeDto,
         body: String,
         before: FingerprintDto,
         after: String,
@@ -2464,7 +2487,7 @@ impl From<&Operation> for OperationDto {
             },
             Operation::WriteBlock { mode, body, .. } => Self::Block {
                 path,
-                mode: mode.as_str().to_string(),
+                mode: (*mode).into(),
                 body: body.to_hex(),
                 before,
                 after,
@@ -5024,6 +5047,18 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn block_mode_dto_serializes_to_the_domain_token_for_every_mode() {
+        use omnifrons_domain::definition_plan::BlockMode;
+
+        for mode in BlockMode::ALL {
+            assert_eq!(
+                json(&super::BlockModeDto::from(mode)),
+                serde_json::json!(mode.as_str())
+            );
+        }
     }
 
     #[test]
