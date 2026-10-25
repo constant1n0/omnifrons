@@ -14,6 +14,8 @@ import {
   candidatesList,
   catalogRepair,
   catalogRepairPreview,
+  definitionApply,
+  definitionPreview,
   definitionStatus,
   definitionVerify,
   executableApprove,
@@ -89,6 +91,14 @@ import {
   type WrongRootReason,
   type WrongRootStatus,
   type DefinitionAgent,
+  type DefinitionApply,
+  type DefinitionApplyOutcomeKind,
+  type DefinitionFingerprintKind,
+  type DefinitionNoticeKind,
+  type DefinitionOperationTag,
+  type DefinitionPlanRequest,
+  type DefinitionPreview,
+  type DefinitionPreviewOutcomeKind,
   type DefinitionAncestor,
   type DefinitionIdentityFile,
   type DefinitionParent,
@@ -3237,6 +3247,102 @@ describe('definitionVerify (ADR-0005 sub-slice 1i)', () => {
  * the wire before a guard like this one could read it.
  */
 
+const H7 = '07'.repeat(32)
+
+const DEFINITION_PREVIEW_PLANNED: DefinitionPreview = {
+  schema: 'omnifrons.definition-preview/1',
+  agent: '/workspace',
+  outcome: {
+    kind: 'planned',
+    planId: H7,
+    workspace: '/ws',
+    operations: [
+      { op: 'write-agents', path: 'AGENTS.md', source: 'CLAUDE.md', before: { kind: 'absent' }, after: '01'.repeat(32) },
+      { op: 'write-wrapper', path: 'CLAUDE.md', before: { kind: 'sha256', hex: '03'.repeat(32) }, after: '02'.repeat(32) },
+      {
+        op: 'write-block',
+        path: 'AGENTS.md',
+        mode: 'append',
+        body: '04'.repeat(32),
+        before: { kind: 'symlink', target: 'elsewhere' },
+        after: '05'.repeat(32),
+      },
+    ],
+    blockDiff: { path: 'AGENTS.md', before: [], after: ['<!-- begin -->'] },
+    notices: [{ kind: 'portable-agent-folder', path: '.backup' }],
+  },
+}
+
+const DEFINITION_REQUEST: DefinitionPlanRequest = {
+  agent: 'sub/agent',
+  nestedConsent: true,
+  canonicalFrom: 'AGENTS.md',
+  withGemini: true,
+}
+
+describe('definitionPreview and definitionApply (ADR-0005 slice 2, sub-slice 2f)', () => {
+  it('invokes definition_preview with exactly the four camelCase request arguments and returns the payload verbatim', async () => {
+    const mock = mockCommand('definition_preview', () => DEFINITION_PREVIEW_PLANNED)
+
+    const preview = await definitionPreview(DEFINITION_REQUEST)
+
+    expect(mock.args()).toEqual({
+      agent: 'sub/agent',
+      nestedConsent: true,
+      canonicalFrom: 'AGENTS.md',
+      withGemini: true,
+    })
+    expect(preview).toEqual(DEFINITION_PREVIEW_PLANNED)
+  })
+
+  it('passes a null canonicalFrom through as null, not as a missing key', async () => {
+    const mock = mockCommand('definition_preview', () => DEFINITION_PREVIEW_PLANNED)
+
+    await definitionPreview({ agent: '.', nestedConsent: false, canonicalFrom: null, withGemini: false })
+
+    expect(mock.args()).toEqual({ agent: '.', nestedConsent: false, canonicalFrom: null, withGemini: false })
+  })
+
+  it('invokes definition_apply with the request arguments plus planId', async () => {
+    const applied: DefinitionApply = {
+      schema: 'omnifrons.definition-apply/1',
+      agent: '/workspace',
+      outcome: {
+        kind: 'applied',
+        planId: H7,
+        record: 'rec-1.json',
+        files: [
+          { path: 'AGENTS.md', before: { kind: 'absent' }, after: '01'.repeat(32), snapshot: null },
+          { path: 'CLAUDE.md', before: { kind: 'irregular' }, after: null, snapshot: '00000000000000ff' },
+        ],
+      },
+    }
+    const mock = mockCommand('definition_apply', () => applied)
+
+    const result = await definitionApply(DEFINITION_REQUEST, H7)
+
+    expect(mock.args()).toEqual({
+      agent: 'sub/agent',
+      nestedConsent: true,
+      canonicalFrom: 'AGENTS.md',
+      withGemini: true,
+      planId: H7,
+    })
+    expect(result).toEqual(applied)
+  })
+
+  it('narrows the noop and refused apply outcomes through the kind discriminant', () => {
+    const noop: DefinitionApply = JSON.parse(
+      `{"schema":"omnifrons.definition-apply/1","agent":"/w","outcome":{"kind":"noop","planId":"${H7}"}}`,
+    ) as DefinitionApply
+    expect(noop.outcome.kind === 'noop' && noop.outcome.planId).toBe(H7)
+    const refused: DefinitionApply = JSON.parse(
+      '{"schema":"omnifrons.definition-apply/1","agent":"/w","outcome":{"kind":"refused","code":"unsafe","message":"a link"}}',
+    ) as DefinitionApply
+    expect(refused.outcome.kind === 'refused' && refused.outcome.code).toBe('unsafe')
+  })
+})
+
 /**
  * The attribute block and the body of one `pub enum` in the shell's own
  * `dto.rs`, read as text through Vite's `?raw`.
@@ -3478,6 +3584,16 @@ const DEFINITION_WARNING_CODES = [
   'size-antigravity',
   'generated-state-dir',
 ] as const
+/** Every token {@link DefinitionFingerprintKind} declares. */
+const DEFINITION_FINGERPRINT_KINDS = ['sha256', 'symlink', 'irregular', 'absent'] as const
+/** Every token {@link DefinitionOperationTag} declares. */
+const DEFINITION_OPERATION_TAGS = ['write-agents', 'write-wrapper', 'write-block'] as const
+/** Every token {@link DefinitionNoticeKind} declares. */
+const DEFINITION_NOTICE_KINDS = ['portable-agent-folder'] as const
+/** Every token {@link DefinitionPreviewOutcomeKind} declares. */
+const DEFINITION_PREVIEW_OUTCOME_KINDS = ['planned', 'refused'] as const
+/** Every token {@link DefinitionApplyOutcomeKind} declares. */
+const DEFINITION_APPLY_OUTCOME_KINDS = ['applied', 'noop', 'refused'] as const
 
 // Compile-time, enforced by `tsc -b` in `pnpm -r build` and not by vitest:
 // each array covers its union exactly -- no member missing, no extra.
@@ -3509,7 +3625,17 @@ const _assertions: [
   CoversExactly<RefusalReason, typeof REFUSAL_REASONS>,
   CoversExactly<RootState, typeof ROOT_STATES>,
   CoversExactly<DefinitionWarningCode, typeof DEFINITION_WARNING_CODES>,
+  CoversExactly<DefinitionFingerprintKind, typeof DEFINITION_FINGERPRINT_KINDS>,
+  CoversExactly<DefinitionOperationTag, typeof DEFINITION_OPERATION_TAGS>,
+  CoversExactly<DefinitionNoticeKind, typeof DEFINITION_NOTICE_KINDS>,
+  CoversExactly<DefinitionPreviewOutcomeKind, typeof DEFINITION_PREVIEW_OUTCOME_KINDS>,
+  CoversExactly<DefinitionApplyOutcomeKind, typeof DEFINITION_APPLY_OUTCOME_KINDS>,
 ] = [
+  true,
+  true,
+  true,
+  true,
+  true,
   true,
   true,
   true,
@@ -3573,6 +3699,11 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['RepairRefusalTag', REFUSAL_REASONS],
   ['RootStateTag', ROOT_STATES],
   ['WarningCodeTag', DEFINITION_WARNING_CODES],
+  ['FingerprintDto', DEFINITION_FINGERPRINT_KINDS],
+  ['OperationDto', DEFINITION_OPERATION_TAGS],
+  ['NoticeDto', DEFINITION_NOTICE_KINDS],
+  ['DefinitionPreviewOutcomeDto', DEFINITION_PREVIEW_OUTCOME_KINDS],
+  ['DefinitionApplyOutcomeDto', DEFINITION_APPLY_OUTCOME_KINDS],
 ]
 
 describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103)', () => {
@@ -3604,6 +3735,6 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(27)
+    expect(enums).toHaveLength(32)
   })
 })

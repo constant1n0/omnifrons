@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
+  definitionApply,
+  definitionPreview,
   definitionStatus,
   definitionVerify,
   isShellError,
   type DefinitionAgent,
   type DefinitionAncestor,
+  type DefinitionApply,
+  type DefinitionAppliedFile,
+  type DefinitionFingerprint,
   type DefinitionIdentityFile,
+  type DefinitionOperation,
+  type DefinitionPlanRequest,
+  type DefinitionPreview,
   type DefinitionStatus,
   type DefinitionVerify,
   type DefinitionWarning,
@@ -76,13 +84,194 @@ function DefinitionWarningRow({ warning }: { warning: DefinitionWarning }) {
   )
 }
 
+/** How many hex characters of a digest a line shows; the plan id is always shown whole. */
+const SHORT_HEX_LENGTH = 12
+
+function shortHex(hex: string): string {
+  return hex.slice(0, SHORT_HEX_LENGTH)
+}
+
+function fingerprintText(fingerprint: DefinitionFingerprint): string {
+  switch (fingerprint.kind) {
+    case 'sha256':
+      return `sha256 ${shortHex(fingerprint.hex)}`
+    case 'symlink':
+      return `symlink ${fingerprint.target}`
+    case 'irregular':
+    case 'absent':
+      return fingerprint.kind
+  }
+}
+
+function operationText(operation: DefinitionOperation): string {
+  const before = fingerprintText(operation.before)
+  const after = shortHex(operation.after)
+  switch (operation.op) {
+    case 'write-agents':
+      return `${operation.op} ${operation.path} from ${operation.source}; before: ${before}; after: ${after}`
+    case 'write-wrapper':
+      return `${operation.op} ${operation.path}; before: ${before}; after: ${after}`
+    case 'write-block':
+      return `${operation.op} ${operation.path} (${operation.mode}); before: ${before}; after: ${after}`
+  }
+}
+
+function appliedFileText(file: DefinitionAppliedFile): string {
+  const after = file.after === null ? 'none' : shortHex(file.after)
+  const snapshot = file.snapshot === null ? 'no snapshot' : `snapshot ${file.snapshot}`
+  return `${file.path}: ${fingerprintText(file.before)} -> ${after} (${snapshot})`
+}
+
+/** The hint a stale plan gets in place of the shell's own wording. */
+const PLAN_STALE_HINT = 'the plan no longer matches the definition; preview again'
+
+interface DefinitionPreviewPanelProps {
+  target: string | null
+  preview: DefinitionPreview
+  /** Disables Apply: a scan, verify, preview or apply is in flight. */
+  busy: boolean
+  onApply: () => void
+}
+
+function DefinitionPreviewPanel({ target, preview, busy, onApply }: DefinitionPreviewPanelProps) {
+  const { outcome } = preview
+  return (
+    <div aria-label="Preview">
+      {target !== null && (
+        <p>
+          target: <PlainTextLine text={target} /> (<PlainTextLine text={preview.agent} />)
+        </p>
+      )}
+      {outcome.kind === 'refused' ? (
+        <p>
+          <strong>
+            <PlainTextLine text={outcome.code} />
+          </strong>
+          {': '}
+          <PlainTextLine text={outcome.message} />
+        </p>
+      ) : (
+        <>
+          <p>
+            plan id: <code>{outcome.planId}</code>
+          </p>
+          <ul aria-label="Operations">
+            {outcome.operations.map((operation, index) => (
+              <li key={index}>
+                <PlainTextLine text={operationText(operation)} />
+              </li>
+            ))}
+          </ul>
+          {outcome.blockDiff !== null && (
+            <>
+              <p>
+                block diff: <PlainTextLine text={outcome.blockDiff.path} />
+              </p>
+              <p>before</p>
+              <ul aria-label="Block before">
+                {outcome.blockDiff.before.map((line, index) => (
+                  <li key={index}>
+                    <PlainTextLine text={line} />
+                  </li>
+                ))}
+              </ul>
+              <p>after</p>
+              <ul aria-label="Block after">
+                {outcome.blockDiff.after.map((line, index) => (
+                  <li key={index}>
+                    <PlainTextLine text={line} />
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {outcome.notices.length > 0 && (
+            <ul aria-label="Notices">
+              {outcome.notices.map((notice, index) => (
+                <li key={index}>
+                  <PlainTextLine text={`portable agent folder: ${notice.path}`} />
+                </li>
+              ))}
+            </ul>
+          )}
+          <button type="button" onClick={onApply} disabled={busy}>
+            Apply
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
+function DefinitionApplyPanel({ result }: { result: DefinitionApply }) {
+  const { outcome } = result
+  return (
+    <div aria-label="Apply">
+      {outcome.kind === 'applied' && (
+        <>
+          <p>
+            applied plan <code>{outcome.planId}</code>
+          </p>
+          <p>
+            record: <PlainTextLine text={outcome.record} />
+          </p>
+          <ul aria-label="Applied files">
+            {outcome.files.map((file, index) => (
+              <li key={index}>
+                <PlainTextLine text={appliedFileText(file)} />
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {outcome.kind === 'noop' && (
+        <p>
+          nothing to apply: the definition already matches plan <code>{outcome.planId}</code>
+        </p>
+      )}
+      {outcome.kind === 'refused' && (
+        <p>
+          <strong>
+            <PlainTextLine text={outcome.code} />
+          </strong>
+          {': '}
+          <PlainTextLine text={outcome.message} />
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** The preview and apply state the report renders, and the handlers that change it. */
+interface DefinitionPlanView {
+  withGemini: boolean
+  /** Paths of the nested rows whose own consent box is checked. */
+  consented: ReadonlySet<string>
+  /** True while a scan, verify, preview or apply is in flight: disables every Preview and Apply. */
+  busy: boolean
+  /** True while an apply is in flight: a rescan would hide what it is writing. */
+  applying: boolean
+  /** The relative target the shown preview (or its error) was planned for. */
+  previewTarget: string | null
+  preview: DefinitionPreview | null
+  previewError: DefinitionSectionError | null
+  applyResult: DefinitionApply | null
+  applyError: DefinitionSectionError | null
+  onWithGeminiChange: (checked: boolean) => void
+  onConsentChange: (path: string, checked: boolean) => void
+  onPreview: (target: string) => void
+  onApply: () => void
+}
+
 interface DefinitionAgentRowProps {
   agent: DefinitionAgent
   verifyPending: boolean
   onVerify: (target: string) => void
+  plan: DefinitionPlanView
 }
 
-function DefinitionAgentRow({ agent, verifyPending, onVerify }: DefinitionAgentRowProps) {
+function DefinitionAgentRow({ agent, verifyPending, onVerify, plan }: DefinitionAgentRowProps) {
+  const consented = plan.consented.has(agent.path)
   return (
     <li aria-label="Agent root">
       <p>
@@ -94,7 +283,28 @@ function DefinitionAgentRow({ agent, verifyPending, onVerify }: DefinitionAgentR
           disabled={verifyPending}
         >
           Verify
+        </button>{' '}
+        <button
+          type="button"
+          aria-label={`Preview ${agent.path}`}
+          onClick={() => plan.onPreview(agent.path)}
+          disabled={plan.busy || (agent.consentRequired && !consented)}
+        >
+          Preview
         </button>
+        {agent.consentRequired && (
+          <>
+            {' '}
+            <label>
+              <input
+                type="checkbox"
+                checked={consented}
+                onChange={(event) => plan.onConsentChange(agent.path, event.target.checked)}
+              />{' '}
+              Adapt <PlainTextLine text={agent.path} /> on its own
+            </label>
+          </>
+        )}
       </p>
       {agent.title !== null && (
         <p>
@@ -186,6 +396,7 @@ interface DefinitionReportProps {
   verifyPending: boolean
   onRescan: () => void
   onVerify: (target: string) => void
+  plan: DefinitionPlanView
 }
 
 /**
@@ -203,12 +414,21 @@ export function DefinitionReport({
   verifyPending,
   onRescan,
   onVerify,
+  plan,
 }: DefinitionReportProps) {
   return (
     <section aria-label="Definition">
-      <button type="button" onClick={onRescan} disabled={loading}>
+      <button type="button" onClick={onRescan} disabled={loading || plan.applying}>
         Rescan
-      </button>
+      </button>{' '}
+      <label>
+        <input
+          type="checkbox"
+          checked={plan.withGemini}
+          onChange={(event) => plan.onWithGeminiChange(event.target.checked)}
+        />{' '}
+        Also write GEMINI.md
+      </label>
       {loading && <p role="status">scanning</p>}
       {error && (
         <div role="alert" data-testid="definition-error">
@@ -224,6 +444,9 @@ export function DefinitionReport({
                 {' '}
                 <button type="button" aria-label="Verify ." onClick={() => onVerify('.')} disabled={verifyPending}>
                   Verify
+                </button>{' '}
+                <button type="button" aria-label="Preview ." onClick={() => plan.onPreview('.')} disabled={plan.busy}>
+                  Preview
                 </button>
               </>
             )}
@@ -237,7 +460,13 @@ export function DefinitionReport({
           )}
           <ul aria-label="Agents">
             {status.agents.map((agent) => (
-              <DefinitionAgentRow key={agent.path} agent={agent} verifyPending={verifyPending} onVerify={onVerify} />
+              <DefinitionAgentRow
+                key={agent.path}
+                agent={agent}
+                verifyPending={verifyPending}
+                onVerify={onVerify}
+                plan={plan}
+              />
             ))}
           </ul>
         </>
@@ -269,6 +498,29 @@ export function DefinitionReport({
           )}
         </div>
       )}
+      {plan.previewError && (
+        <div role="alert" data-testid="definition-preview-error">
+          <DefinitionErrorLine error={plan.previewError} />
+        </div>
+      )}
+      {plan.preview && (
+        <DefinitionPreviewPanel
+          target={plan.previewTarget}
+          preview={plan.preview}
+          busy={plan.busy}
+          onApply={plan.onApply}
+        />
+      )}
+      {plan.applyError && (
+        <div role="alert" data-testid="definition-apply-error">
+          {plan.applyError !== 'unexpected' && plan.applyError.code === 'plan-stale' ? (
+            PLAN_STALE_HINT
+          ) : (
+            <DefinitionErrorLine error={plan.applyError} />
+          )}
+        </div>
+      )}
+      {plan.applyResult && <DefinitionApplyPanel result={plan.applyResult} />}
     </section>
   )
 }
@@ -287,6 +539,16 @@ export function DefinitionSection() {
   const [verifyError, setVerifyError] = useState<DefinitionSectionError | null>(null)
   const [verifying, setVerifying] = useState(false)
   const [verifyTarget, setVerifyTarget] = useState<string | null>(null)
+  const [withGemini, setWithGemini] = useState(false)
+  const [consented, setConsented] = useState<ReadonlySet<string>>(() => new Set())
+  const [preview, setPreview] = useState<DefinitionPreview | null>(null)
+  const [previewError, setPreviewError] = useState<DefinitionSectionError | null>(null)
+  const [previewing, setPreviewing] = useState(false)
+  /** The request the shown preview was planned from: an apply repeats it, whatever the boxes say now. */
+  const [previewRequest, setPreviewRequest] = useState<DefinitionPlanRequest | null>(null)
+  const [applyResult, setApplyResult] = useState<DefinitionApply | null>(null)
+  const [applyError, setApplyError] = useState<DefinitionSectionError | null>(null)
+  const [applying, setApplying] = useState(false)
 
   /** Guards every async continuation below against a post-unmount state update (mirrors `AgentPanel`'s own `mountedRef`). */
   const mountedRef = useRef(true)
@@ -326,6 +588,17 @@ export function DefinitionSection() {
    * that scan in flight.
    */
   const scanningRef = useRef(false)
+
+  /**
+   * One preview and one apply at a time, and neither beside a verify or a
+   * scan. Refs, for the reason `scanningRef` and `verifyingRef` are: two
+   * clicks in one tick both read the last committed state. Like a verify,
+   * a preview superseded by a rescan still clears its own flag when it
+   * settles; only its result is dropped. An apply is never superseded --
+   * `rescan` refuses while one runs, so its outcome is always shown.
+   */
+  const previewingRef = useRef(false)
+  const applyingRef = useRef(false)
 
   /**
    * Scans the active workspace. `surfaceError` mirrors `AgentPanel`'s own
@@ -466,13 +739,18 @@ export function DefinitionSection() {
    * still in flight.
    */
   const rescan = useCallback(() => {
-    if (scanningRef.current) return
+    if (scanningRef.current || applyingRef.current) return
     scanningRef.current = true
     setLoading(true)
     setError(null)
     setVerify(null)
     setVerifyError(null)
     setVerifyTarget(null)
+    setConsented(new Set())
+    setPreview(null)
+    setPreviewError(null)
+    setApplyResult(null)
+    setApplyError(null)
     scan(true)
   }, [scan])
 
@@ -517,7 +795,7 @@ export function DefinitionSection() {
    * `setVerifyError` only run when this is still the latest generation.
    */
   const runVerify = useCallback((target: string) => {
-    if (verifyingRef.current || scanningRef.current) return
+    if (verifyingRef.current || scanningRef.current || previewingRef.current || applyingRef.current) return
     verifyingRef.current = true
     const generation = ++generationRef.current
     setVerifying(true)
@@ -543,6 +821,105 @@ export function DefinitionSection() {
     )
   }, [])
 
+  /**
+   * A preview of one target. Refused while anything else is in flight, like
+   * `runVerify`; replaces the shown preview, and drops the apply result of
+   * the previous one. Takes a generation like a verify does, so a rescan
+   * that lands first wins and the late preview is never shown beside the
+   * report it was not planned against.
+   */
+  const runPreview = useCallback((request: DefinitionPlanRequest) => {
+    if (previewingRef.current || applyingRef.current || verifyingRef.current || scanningRef.current) return
+    previewingRef.current = true
+    const generation = ++generationRef.current
+    setPreviewing(true)
+    setPreview(null)
+    setPreviewError(null)
+    setPreviewRequest(request)
+    setApplyResult(null)
+    setApplyError(null)
+    definitionPreview(request).then(
+      (result) => {
+        previewingRef.current = false
+        if (!mountedRef.current) return
+        setPreviewing(false)
+        if (generationRef.current !== generation) return
+        setPreview(result)
+      },
+      (reason: unknown) => {
+        previewingRef.current = false
+        if (!mountedRef.current) return
+        setPreviewing(false)
+        if (generationRef.current !== generation) return
+        setPreviewError(toSectionError(reason))
+      },
+    )
+  }, [])
+
+  const onPreview = useCallback(
+    (target: string) => {
+      runPreview({ agent: target, nestedConsent: consented.has(target), canonicalFrom: null, withGemini })
+    },
+    [runPreview, consented, withGemini],
+  )
+
+  /**
+   * The apply of the shown plan, bound to its id and to the request it was
+   * planned from. After an applied outcome the section rescans so the rows
+   * show the new state; unlike a user's "Rescan" that keeps the apply
+   * result on screen. A stale plan is dropped (its Apply would only fail
+   * again); any other failure keeps the preview so the user can retry.
+   */
+  const runApply = useCallback(() => {
+    if (applyingRef.current || previewingRef.current || verifyingRef.current || scanningRef.current) return
+    if (preview === null || preview.outcome.kind !== 'planned' || previewRequest === null) return
+    const planId = preview.outcome.planId
+    applyingRef.current = true
+    const generation = ++generationRef.current
+    setApplying(true)
+    setApplyResult(null)
+    setApplyError(null)
+    definitionApply(previewRequest, planId).then(
+      (result) => {
+        applyingRef.current = false
+        if (!mountedRef.current) return
+        setApplying(false)
+        if (generationRef.current !== generation) return
+        setApplyResult(result)
+        if (result.outcome.kind === 'refused') return
+        setPreview(null)
+        if (result.outcome.kind === 'noop') return
+        scanningRef.current = true
+        setLoading(true)
+        setError(null)
+        setVerify(null)
+        setVerifyError(null)
+        setVerifyTarget(null)
+        setConsented(new Set())
+        scan(true)
+      },
+      (reason: unknown) => {
+        applyingRef.current = false
+        if (!mountedRef.current) return
+        setApplying(false)
+        if (generationRef.current !== generation) return
+        setApplyError(toSectionError(reason))
+        if (isShellError(reason) && reason.code === 'plan-stale') setPreview(null)
+      },
+    )
+  }, [preview, previewRequest, scan])
+
+  const onConsentChange = useCallback((path: string, checked: boolean) => {
+    setConsented((current) => {
+      const next = new Set(current)
+      if (checked) next.add(path)
+      else next.delete(path)
+      return next
+    })
+  }, [])
+
+  const busy = loading || verifying || previewing || applying
+
   return (
     <DefinitionReport
       status={status}
@@ -551,9 +928,24 @@ export function DefinitionSection() {
       verify={verify}
       verifyError={verifyError}
       verifyTarget={verifyTarget}
-      verifyPending={verifying || loading}
+      verifyPending={busy}
       onRescan={rescan}
       onVerify={runVerify}
+      plan={{
+        withGemini,
+        consented,
+        busy,
+        applying,
+        previewTarget: previewRequest?.agent ?? null,
+        preview,
+        previewError,
+        applyResult,
+        applyError,
+        onWithGeminiChange: setWithGemini,
+        onConsentChange,
+        onPreview,
+        onApply: runApply,
+      }}
     />
   )
 }

@@ -2076,3 +2076,152 @@ export async function definitionStatus(): Promise<DefinitionStatus> {
 export async function definitionVerify(agent: string = '.'): Promise<DefinitionVerify> {
   return invoke('definition_verify', { agent })
 }
+
+/** `dto.rs`'s `FingerprintDto` tags: one input or target file's state as a plan fingerprinted it. */
+export type DefinitionFingerprintKind = 'sha256' | 'symlink' | 'irregular' | 'absent'
+
+/** Mirrors `FingerprintDto`: tagged by `kind`. */
+export type DefinitionFingerprint =
+  | { kind: 'sha256'; hex: string }
+  | { kind: 'symlink'; target: string }
+  | { kind: 'irregular' }
+  | { kind: 'absent' }
+
+/** `dto.rs`'s `OperationDto` tags: the three writes a plan can hold. */
+export type DefinitionOperationTag = 'write-agents' | 'write-wrapper' | 'write-block'
+
+/**
+ * How a planned block write treats the block already in the file. The shell
+ * serializes it as a plain string (the closed set lives in the domain crate,
+ * not in `dto.rs`), so this union is not covered by the `dto.rs` mirror
+ * test.
+ */
+export type DefinitionBlockMode = 'append' | 'replace' | 'migrate-legacy'
+
+/** Mirrors `OperationDto`: tagged by `op`. `after` and `body` are SHA-256 hex digests. */
+export type DefinitionOperation =
+  | { op: 'write-agents'; path: string; source: string; before: DefinitionFingerprint; after: string }
+  | { op: 'write-wrapper'; path: string; before: DefinitionFingerprint; after: string }
+  | {
+      op: 'write-block'
+      path: string
+      mode: DefinitionBlockMode
+      body: string
+      before: DefinitionFingerprint
+      after: string
+    }
+
+/** Mirrors `BlockDiffDto`: the lines of the block a plan adds, replaces or migrates. */
+export interface DefinitionBlockDiff {
+  path: string
+  before: string[]
+  after: string[]
+}
+
+/** `dto.rs`'s `NoticeDto` tags. */
+export type DefinitionNoticeKind = 'portable-agent-folder'
+
+/** Mirrors `NoticeDto`: something a dry run reports without acting on it. */
+export type DefinitionNotice = { kind: 'portable-agent-folder'; path: string }
+
+/** `dto.rs`'s `DefinitionPreviewOutcomeDto` tags. */
+export type DefinitionPreviewOutcomeKind = 'planned' | 'refused'
+
+/** Mirrors `DefinitionPreviewOutcomeDto`. */
+export type DefinitionPreviewOutcome =
+  | {
+      kind: 'planned'
+      planId: string
+      workspace: string
+      operations: DefinitionOperation[]
+      blockDiff: DefinitionBlockDiff | null
+      notices: DefinitionNotice[]
+    }
+  | { kind: 'refused'; code: string; message: string }
+
+/**
+ * `definitionPreview`'s payload, schema `"omnifrons.definition-preview/1"`.
+ * `agent` is the target's absolute display path.
+ */
+export interface DefinitionPreview {
+  schema: string
+  agent: string
+  outcome: DefinitionPreviewOutcome
+}
+
+/** `dto.rs`'s `DefinitionApplyOutcomeDto` tags. */
+export type DefinitionApplyOutcomeKind = 'applied' | 'noop' | 'refused'
+
+/** Mirrors `AppliedFileDto`: one file an apply wrote; `snapshot` is the way back. */
+export interface DefinitionAppliedFile {
+  path: string
+  before: DefinitionFingerprint
+  after: string | null
+  snapshot: string | null
+}
+
+/** Mirrors `DefinitionApplyOutcomeDto`. */
+export type DefinitionApplyOutcome =
+  | { kind: 'applied'; planId: string; record: string; files: DefinitionAppliedFile[] }
+  | { kind: 'noop'; planId: string }
+  | { kind: 'refused'; code: string; message: string }
+
+/** `definitionApply`'s payload, schema `"omnifrons.definition-apply/1"`. */
+export interface DefinitionApply {
+  schema: string
+  agent: string
+  outcome: DefinitionApplyOutcome
+}
+
+/**
+ * The request a preview is planned from, and an apply must repeat: the
+ * shell re-plans from it and compares the result with the plan id.
+ */
+export interface DefinitionPlanRequest {
+  /** A clean relative POSIX path inside the active workspace; `"."` is the root itself. */
+  agent: string
+  /** The explicit consent a nested definition needs. */
+  nestedConsent: boolean
+  /** Which file wins a conflict; `null` leaves the choice unmade. */
+  canonicalFrom: 'CLAUDE.md' | 'AGENTS.md' | null
+  /** Also write a `GEMINI.md` wrapper. */
+  withGemini: boolean
+}
+
+/**
+ * A dry run of adapting one agent directory (ADR-0005 decision 3): the
+ * operations, the block diff and the plan id an apply must name. Nothing is
+ * written. Invokes `definition_preview` with the request's four fields.
+ *
+ * A refused plan resolves with `outcome.kind === 'refused'`; only a request
+ * the shell cannot answer at all rejects.
+ *
+ * # Errors
+ * As {@link definitionVerify}, plus `run-active` and `snapshot-unavailable`.
+ */
+export async function definitionPreview(request: DefinitionPlanRequest): Promise<DefinitionPreview> {
+  return invoke('definition_preview', {
+    agent: request.agent,
+    nestedConsent: request.nestedConsent,
+    canonicalFrom: request.canonicalFrom,
+    withGemini: request.withGemini,
+  })
+}
+
+/**
+ * The write a preview described, bound to its `planId`. The request must be
+ * the one the preview was planned from; the shell re-plans and refuses with
+ * `plan-stale` when the definition no longer matches the id.
+ *
+ * # Errors
+ * As {@link definitionPreview}, plus `plan-stale`.
+ */
+export async function definitionApply(request: DefinitionPlanRequest, planId: string): Promise<DefinitionApply> {
+  return invoke('definition_apply', {
+    agent: request.agent,
+    nestedConsent: request.nestedConsent,
+    canonicalFrom: request.canonicalFrom,
+    withGemini: request.withGemini,
+    planId,
+  })
+}
