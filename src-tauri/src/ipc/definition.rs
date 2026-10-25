@@ -893,8 +893,8 @@ mod tests {
     /// A project with a device directory holding the work area.
     struct Fixture {
         project: TempDir,
-        // Kept alive so the work area outlives the test body.
-        _device: TempDir,
+        // Holds the work area; kept alive for the test body.
+        device: TempDir,
         publication: PublicationState,
     }
 
@@ -905,7 +905,7 @@ mod tests {
             let publication = PublicationState::under(device.path());
             Self {
                 project,
-                _device: device,
+                device,
                 publication,
             }
         }
@@ -1173,6 +1173,99 @@ mod tests {
         .expect_err("a run is live");
         assert_eq!(error.code, ShellErrorCode::RunActive);
         assert!(!fixture.project.path().join("AGENTS.md").exists());
+    }
+
+    /// Every file below `dir`, recursively.
+    fn files_below(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_below(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    fn with_gemini() -> DefinitionPlanRequest {
+        DefinitionPlanRequest {
+            with_gemini: true,
+            ..request(None)
+        }
+    }
+
+    #[test]
+    fn preview_with_gemini_adds_a_third_wrapper_operation_and_without_it_lists_two() {
+        let fixture = Fixture::claude_only("preview-gemini");
+        let workspace = fixture.workspace();
+
+        let plain = to_json(&definition_preview_for(&workspace, &request(None)).expect("plain"));
+        assert_eq!(plain["outcome"]["operations"].as_array().unwrap().len(), 2);
+
+        let gemini = to_json(&definition_preview_for(&workspace, &with_gemini()).expect("gemini"));
+        let operations = gemini["outcome"]["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 3);
+        assert_eq!(operations[2]["op"], "write-wrapper");
+        assert_eq!(operations[2]["path"], "GEMINI.md");
+        assert_eq!(
+            operations[2]["before"],
+            serde_json::json!({"kind": "absent"})
+        );
+        assert_eq!(operations[2].as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn apply_with_gemini_writes_three_files_including_the_gemini_wrapper() {
+        let fixture = Fixture::claude_only("apply-gemini");
+        let workspace = fixture.workspace();
+        let id = planned_id(&to_json(
+            &definition_preview_for(&workspace, &with_gemini()).expect("preview"),
+        ));
+
+        let applied = to_json(
+            &definition_apply_for(&workspace, &fixture.publication, &Idle, &with_gemini(), &id)
+                .expect("apply succeeds"),
+        );
+
+        assert_eq!(applied["outcome"]["kind"], "applied");
+        let files = applied["outcome"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|file| file["path"] == "GEMINI.md"));
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("GEMINI.md")).expect("GEMINI.md"),
+            omnifrons_domain::definition::WRAPPER
+        );
+    }
+
+    #[test]
+    fn apply_after_an_identity_file_changed_since_the_preview_is_plan_stale_and_writes_nothing() {
+        let fixture = Fixture::claude_only("apply-changed-since-preview");
+        let workspace = fixture.workspace();
+        let id = planned_id(&to_json(
+            &definition_preview_for(&workspace, &request(None)).expect("preview"),
+        ));
+        let edited: &[u8] = b"# Fixture\n\nYou are Fixture, edited after the preview.\n";
+        write(fixture.project.path(), "CLAUDE.md", edited);
+
+        let error =
+            definition_apply_for(&workspace, &fixture.publication, &Idle, &request(None), &id)
+                .expect_err("the definition moved on");
+
+        assert_eq!(error.code, ShellErrorCode::PlanStale);
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("CLAUDE.md")).expect("CLAUDE.md"),
+            edited
+        );
+        assert!(!fixture.project.path().join("AGENTS.md").exists());
+        assert!(
+            files_below(fixture.device.path()).is_empty(),
+            "no record or snapshot was stored"
+        );
     }
 
     #[test]
