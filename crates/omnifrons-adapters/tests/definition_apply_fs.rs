@@ -12,8 +12,8 @@ use omnifrons_adapters::{
 };
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::apply_record::ApplyRecordStore;
+use omnifrons_app::clock::Clock;
 use omnifrons_app::content_hasher::{ContentHasher, derive_project_identity};
-use omnifrons_app::contract::approval_store::FixedClock;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts};
 use omnifrons_app::definition_apply::{ApplyOutcome, ApplyPorts, apply};
 use omnifrons_app::definition_plan::{PlanOutcome, plan};
@@ -21,7 +21,7 @@ use omnifrons_app::definition_tree::{DefinitionTree, DefinitionTreeError, TreeSn
 use omnifrons_app::snapshot_store::DefinitionSnapshotStore;
 use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::definition::{IdentityKind, WRAPPER};
-use omnifrons_domain::definition_plan::{PlanId, PlanOptions};
+use omnifrons_domain::definition_plan::{InputFingerprint, PlanId, PlanOptions};
 use omnifrons_domain::publication::ProjectIdentity;
 
 const TEXT: &[u8] = b"# Rules\n\nBe kind.\n";
@@ -53,6 +53,15 @@ impl Drop for TempDir {
     }
 }
 
+/// A clock the test moves forward by hand.
+struct StepClock(Cell<u64>);
+
+impl Clock for StepClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(self.0.get())
+    }
+}
+
 /// A tree that runs a hook just before its `n`th read (1-based), to
 /// stand in for a concurrent editor.
 struct HookedTree<'a> {
@@ -81,7 +90,7 @@ struct Env {
     workspace: WorkspaceRoot,
     snapshots: FsSnapshotStore,
     records: FsApplyRecordStore,
-    clock: FixedClock,
+    clock: StepClock,
 }
 
 impl Env {
@@ -95,7 +104,7 @@ impl Env {
             root: workspace.path().to_path_buf(),
             snapshots: FsSnapshotStore::open(&work_area),
             records: FsApplyRecordStore::open(&work_area),
-            clock: FixedClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(5_000)),
+            clock: StepClock(Cell::new(5_000)),
             workspace,
             _workspace_dir: workspace_dir,
             _base: base,
@@ -211,9 +220,11 @@ fn a_second_run_is_a_no_op_and_a_restored_file_adds_no_snapshot() {
     assert_eq!((env.snapshot_count(), env.record_count()), (1, 1));
 
     // The user puts the original CLAUDE.md back and removes AGENTS.md:
-    // the same file state is snapshotted again, and the store keeps one.
+    // the same file state is snapshotted again at a later instant, and the
+    // store, which dedups by content and not by id, keeps one.
     env.write("CLAUDE.md", TEXT);
     std::fs::remove_file(env.root.join("AGENTS.md")).expect("remove");
+    env.clock.0.set(9_000);
     assert_eq!(applied(&env.apply(None, options)), 2);
     assert_eq!((env.snapshot_count(), env.record_count()), (1, 2));
 }
@@ -479,4 +490,37 @@ fn file_modes_are_never_widened() {
         "a created file takes its source's bits"
     );
     assert_eq!(mode("CLAUDE.md") & !0o600, 0, "the wrapper is not wider");
+}
+
+#[test]
+fn a_file_written_twice_has_one_snapshot_and_one_record_entry() {
+    let mut env = Env::new("twice");
+    env.write("AGENTS.md", TEXT);
+    env.write("CLAUDE.md", OTHER);
+    env.write(
+        "skills/sample/SKILL.md",
+        b"---\nname: sample\ndescription: Sample skill.\n---\n",
+    );
+    let options = PlanOptions {
+        canonical_from: Some(IdentityKind::Claude),
+        ..PlanOptions::default()
+    };
+    let outcome = env.apply(None, options);
+    let ApplyOutcome::Applied { files, .. } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    // AGENTS.md (text, then block) and the CLAUDE.md wrapper.
+    assert_eq!(files.len(), 2);
+    let agents = &files[0];
+    assert_eq!(agents.path, "AGENTS.md");
+    assert_eq!(
+        agents.before,
+        InputFingerprint::Sha256(Sha2Hasher.sha256(TEXT))
+    );
+    let written = env.read("AGENTS.md").expect("AGENTS.md");
+    assert!(String::from_utf8_lossy(&written).contains("skills/sample/SKILL.md"));
+    assert_eq!(agents.after, Some(Sha2Hasher.sha256(&written)));
+    assert_eq!(env.snapshot_count(), 2, "AGENTS.md once, CLAUDE.md once");
+    assert_eq!(env.snapshot_bytes(".", "AGENTS.md").as_deref(), Some(TEXT));
+    assert_eq!(env.record_count(), 1);
 }

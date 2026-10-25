@@ -27,14 +27,17 @@
 //!    prototype: `AGENTS.md` and a wrapper take no wider bits than the
 //!    file their text came from, and the block rewrite keeps the file's
 //!    own;
-//! 4. every input is read again, so a concurrent edit of any file the
-//!    plan depends on, not only the one just written, stops the run
-//!    before the next write.
+//! 4. every input is read again, so a concurrent edit of any identity
+//!    file the plan fingerprints, not only the one just written, stops
+//!    the run before the next write.
 //!
 //! The re-read is one [`crate::definition_tree::DefinitionTree`]
 //! snapshot of the whole workspace per check, compared as a whole: a
 //! changed digest, a file that appeared, and a file that vanished are all
-//! stale. A file written twice in one run (`AGENTS.md`, then its block)
+//! stale. Only identity files are fingerprinted: the `skills` block is
+//! written from the bytes planned at the start, so a skill file added or
+//! edited during the run is not detected, the block does not index it,
+//! and the next plan picks it up (the ADR's stated cost). A file written twice in one run (`AGENTS.md`, then its block)
 //! is snapshotted once, before its first write, and its record entry
 //! keeps the first `before` and the last `after`.
 //!
@@ -130,6 +133,11 @@ pub enum ApplyOutcome {
 /// [`DefinitionError::Write`] for a write that fails for any other
 /// reason; and [`DefinitionError::Record`] when the record cannot be
 /// stored. See the module documentation for what each leaves behind.
+///
+/// # Panics
+///
+/// If the planner returns a different number of writes than operations,
+/// which is a defect in the planner, not a condition of the workspace.
 pub fn apply(
     ports: &mut ApplyPorts<'_>,
     workspace: &WorkspaceRoot,
@@ -163,6 +171,11 @@ pub fn apply(
         workspace,
         plan: &plan,
     };
+    assert_eq!(
+        plan.operations.len(),
+        writes.len(),
+        "the planner pairs every operation with its bytes"
+    );
     for (operation, write) in plan.operations.iter().zip(&writes) {
         run.step(operation, write)?;
     }

@@ -127,7 +127,10 @@ pub enum DefinitionError {
     /// apply was running (`actual` is `None`: no new plan was made).
     /// Nothing is written for a mismatch found before the first write;
     /// for a change found later, the files already written stay written
-    /// (see [`crate::definition_apply`]).
+    /// (see [`crate::definition_apply`]). When the writer itself refuses
+    /// a file as changed, the snapshot taken of that file just before is
+    /// left in the store: harmless, because the store skips a state it
+    /// already holds when the rerun snapshots the file again.
     #[error("the plan no longer matches the definition")]
     StalePlan {
         /// The id the caller applied.
