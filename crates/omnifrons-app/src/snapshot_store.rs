@@ -540,8 +540,11 @@ mod tests {
 
     const PROJECT: ProjectIdentity = ProjectIdentity(Sha256Digest([1; 32]));
 
+    /// A multiple of 100 ns, which is the resolution of `SystemTime` on
+    /// Windows; a finer fixture would round there and break the layout
+    /// assertion below.
     fn instant() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::new(1, 2)
+        SystemTime::UNIX_EPOCH + Duration::new(1, 200)
     }
 
     #[test]
@@ -554,7 +557,7 @@ mod tests {
         expected.extend_from_slice(&4_u32.to_be_bytes());
         expected.extend_from_slice(b"C.md");
         expected.extend_from_slice(&[2; 32]);
-        expected.extend_from_slice(&1_000_000_002_u128.to_be_bytes());
+        expected.extend_from_slice(&1_000_000_200_u128.to_be_bytes());
         assert_eq!(
             definition_snapshot_id_preimage(&PROJECT, &subject("a/b", "C.md"), &digest, instant()),
             expected
