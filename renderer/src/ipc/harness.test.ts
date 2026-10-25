@@ -1577,6 +1577,7 @@ describe('slice 5b closed sets', () => {
         case 'repair-refused':
         case 'recovery-unknown':
         case 'definition-invalid':
+        case 'plan-stale':
           return code
         default: {
           const unreachable: never = code
@@ -1632,8 +1633,9 @@ describe('slice 5b closed sets', () => {
       'repair-refused',
       'recovery-unknown',
       'definition-invalid',
+      'plan-stale',
     ]
-    expect(new Set(codes).size).toBe(46)
+    expect(new Set(codes).size).toBe(47)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
@@ -3389,6 +3391,7 @@ const SHELL_ERROR_CODES = [
   'repair-refused',
   'recovery-unknown',
   'definition-invalid',
+  'plan-stale',
 ] as const
 /** Every token {@link ApprovalStatus} declares. */
 const APPROVAL_STATUSES = ['active', 'revoked'] as const

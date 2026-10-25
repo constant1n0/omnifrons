@@ -4,6 +4,9 @@
 //! harness kind, a terminal state, an error code, a frame's stream) is a
 //! fixed `kebab-case` token.
 
+use omnifrons_app::definition_apply::ApplyOutcome;
+use omnifrons_app::definition_plan::PlanOutcome;
+use omnifrons_domain::definition_plan::{InputFingerprint, Notice, Operation, PlanRefusal};
 use serde::{Deserialize, Serialize};
 
 /// The closed set of harness kinds a caller may request, as it crosses
@@ -1776,6 +1779,12 @@ pub enum ShellErrorCode {
     /// from an ordinary workspace (ADR-0005 sub-slice 1h). Carries
     /// [`ShellErrorDetail::DefinitionReason`].
     DefinitionInvalid,
+    /// `definition_apply` named a plan id that the definition no longer
+    /// produces: a file changed since the preview, an input changed during
+    /// the run, or the id was never a plan for this root. Nothing further
+    /// is written; the caller previews again (ADR-0005 decision 3).
+    /// Carries [`ShellErrorDetail::DefinitionReason`].
+    PlanStale,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -1799,7 +1808,8 @@ pub enum ShellErrorDetail {
         catalog_id: String,
     },
     /// [`ShellErrorCode::ScanFailed`] from a definition-tree read failure,
-    /// or [`ShellErrorCode::DefinitionInvalid`]: the wrapped
+    /// [`ShellErrorCode::DefinitionInvalid`], or
+    /// [`ShellErrorCode::PlanStale`]: the wrapped
     /// [`omnifrons_app::definition::DefinitionError`]'s own fixed reason
     /// token (ADR-0005 sub-slice 1h; never a path -- see its own `reason`
     /// method).
@@ -2379,6 +2389,273 @@ fn display_agent_path(workspace: &std::path::Path, target: &str) -> std::path::P
         }
     }
     path
+}
+
+/// One input or target file's state, as the plan fingerprinted it. The
+/// tokens match the apply record's own file shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FingerprintDto {
+    Sha256 { hex: String },
+    Symlink { target: String },
+    Irregular,
+    Absent,
+}
+
+impl From<&InputFingerprint> for FingerprintDto {
+    fn from(fingerprint: &InputFingerprint) -> Self {
+        match fingerprint {
+            InputFingerprint::Sha256(digest) => Self::Sha256 {
+                hex: digest.to_hex(),
+            },
+            InputFingerprint::Symlink(target) => Self::Symlink {
+                target: target.clone(),
+            },
+            InputFingerprint::Irregular => Self::Irregular,
+            InputFingerprint::Absent => Self::Absent,
+        }
+    }
+}
+
+/// One planned write. `before` is what the file must still look like when
+/// the write runs; `after` is the SHA-256 of the whole file afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "op", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+pub enum OperationDto {
+    #[serde(rename = "write-agents")]
+    Agents {
+        path: String,
+        source: String,
+        before: FingerprintDto,
+        after: String,
+    },
+    #[serde(rename = "write-wrapper")]
+    Wrapper {
+        path: String,
+        before: FingerprintDto,
+        after: String,
+    },
+    #[serde(rename = "write-block")]
+    Block {
+        path: String,
+        mode: String,
+        body: String,
+        before: FingerprintDto,
+        after: String,
+    },
+}
+
+impl From<&Operation> for OperationDto {
+    fn from(operation: &Operation) -> Self {
+        let path = operation.path().to_string();
+        let before = operation.before().into();
+        let after = operation.after().to_hex();
+        match operation {
+            Operation::WriteAgents { source, .. } => Self::Agents {
+                path,
+                source: source.file_name().to_string(),
+                before,
+                after,
+            },
+            Operation::WriteWrapper { .. } => Self::Wrapper {
+                path,
+                before,
+                after,
+            },
+            Operation::WriteBlock { mode, body, .. } => Self::Block {
+                path,
+                mode: mode.as_str().to_string(),
+                body: body.to_hex(),
+                before,
+                after,
+            },
+        }
+    }
+}
+
+/// The lines of the block a plan adds, replaces or migrates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockDiffDto {
+    pub path: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+}
+
+/// Something a dry run reports without acting on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum NoticeDto {
+    PortableAgentFolder { path: String },
+}
+
+impl From<&Notice> for NoticeDto {
+    fn from(notice: &Notice) -> Self {
+        match notice {
+            Notice::PortableAgentFolder { path } => {
+                Self::PortableAgentFolder { path: path.clone() }
+            }
+        }
+    }
+}
+
+/// What a preview concluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DefinitionPreviewOutcomeDto {
+    Planned {
+        plan_id: String,
+        workspace: String,
+        operations: Vec<OperationDto>,
+        block_diff: Option<BlockDiffDto>,
+        notices: Vec<NoticeDto>,
+    },
+    Refused {
+        code: String,
+        message: String,
+    },
+}
+
+/// `definition_preview`'s payload: what an apply would write, and the id
+/// it must name. `agent` is the display path, built like
+/// [`DefinitionVerifyDto`]'s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionPreviewDto {
+    pub schema: String,
+    pub agent: String,
+    pub outcome: DefinitionPreviewOutcomeDto,
+}
+
+impl DefinitionPreviewDto {
+    /// Builds the payload for `outcome`, planned at `target` (a clean
+    /// relative POSIX path, `"."` for the workspace root) below
+    /// `workspace`.
+    #[must_use]
+    pub fn from_outcome(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        outcome: &PlanOutcome,
+    ) -> Self {
+        let outcome = match outcome {
+            PlanOutcome::Planned(plan) => DefinitionPreviewOutcomeDto::Planned {
+                plan_id: plan.id.to_string(),
+                workspace: plan.workspace.clone(),
+                operations: plan.operations.iter().map(Into::into).collect(),
+                block_diff: plan.block_diff.as_ref().map(|diff| BlockDiffDto {
+                    path: diff.path.to_string(),
+                    before: diff.before.clone(),
+                    after: diff.after.clone(),
+                }),
+                notices: plan.notices.iter().map(Into::into).collect(),
+            },
+            PlanOutcome::Refused(refusal) => refused_preview(refusal),
+        };
+        Self {
+            schema: "omnifrons.definition-preview/1".to_string(),
+            agent: display_agent_path(workspace.path(), target)
+                .to_string_lossy()
+                .into_owned(),
+            outcome,
+        }
+    }
+}
+
+fn refused_preview(refusal: &PlanRefusal) -> DefinitionPreviewOutcomeDto {
+    DefinitionPreviewOutcomeDto::Refused {
+        code: refusal.code().to_string(),
+        message: refusal.message().to_string(),
+    }
+}
+
+/// One file an apply wrote, as recorded: the snapshot is the way back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedFileDto {
+    pub path: String,
+    pub before: FingerprintDto,
+    pub after: Option<String>,
+    pub snapshot: Option<String>,
+}
+
+/// What an apply did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DefinitionApplyOutcomeDto {
+    Applied {
+        plan_id: String,
+        record: String,
+        files: Vec<AppliedFileDto>,
+    },
+    #[serde(rename = "noop")]
+    NoOp {
+        plan_id: String,
+    },
+    Refused {
+        code: String,
+        message: String,
+    },
+}
+
+/// `definition_apply`'s payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionApplyDto {
+    pub schema: String,
+    pub agent: String,
+    pub outcome: DefinitionApplyOutcomeDto,
+}
+
+impl DefinitionApplyDto {
+    /// Builds the payload for `outcome`, applied at `target`.
+    #[must_use]
+    pub fn from_outcome(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        outcome: &ApplyOutcome,
+    ) -> Self {
+        let outcome = match outcome {
+            ApplyOutcome::Applied {
+                plan_id,
+                record,
+                files,
+            } => DefinitionApplyOutcomeDto::Applied {
+                plan_id: plan_id.to_string(),
+                record: record.to_string(),
+                files: files
+                    .iter()
+                    .map(|file| AppliedFileDto {
+                        path: file.path.clone(),
+                        before: (&file.before).into(),
+                        after: file.after.map(|digest| digest.to_hex()),
+                        snapshot: file.snapshot.map(|id| id.to_hex()),
+                    })
+                    .collect(),
+            },
+            ApplyOutcome::NoOp { plan_id } => DefinitionApplyOutcomeDto::NoOp {
+                plan_id: plan_id.to_string(),
+            },
+            ApplyOutcome::Refused(refusal) => DefinitionApplyOutcomeDto::Refused {
+                code: refusal.code().to_string(),
+                message: refusal.message().to_string(),
+            },
+        };
+        Self {
+            schema: "omnifrons.definition-apply/1".to_string(),
+            agent: display_agent_path(workspace.path(), target)
+                .to_string_lossy()
+                .into_owned(),
+            outcome,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4247,6 +4524,7 @@ mod tests {
             (ShellErrorCode::CatalogChanged, "catalog-changed"),
             (ShellErrorCode::RepairRefused, "repair-refused"),
             (ShellErrorCode::RecoveryUnknown, "recovery-unknown"),
+            (ShellErrorCode::PlanStale, "plan-stale"),
         ];
         for (code, token) in cases {
             let error = ShellError::new(code, "message");
@@ -4669,6 +4947,178 @@ mod tests {
         assert_eq!(
             keys.into_iter().collect::<Vec<_>>(),
             vec!["agent", "canonical", "problems", "schema", "state"]
+        );
+    }
+
+    fn sha(byte: u8) -> Sha256Digest {
+        Sha256Digest([byte; 32])
+    }
+
+    #[test]
+    fn definition_preview_dto_serializes_a_planned_outcome_to_a_pinned_shape() {
+        use omnifrons_app::definition_plan::PlanOutcome;
+        use omnifrons_domain::definition::IdentityKind;
+        use omnifrons_domain::definition_plan::{
+            BlockDiff, BlockMode, InputFingerprint, Notice, Operation, Plan, PlanId,
+        };
+        use omnifrons_domain::guidance::ManagedFileKind;
+
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let plan = Plan {
+            workspace: "/ws".to_string(),
+            agent: ".".to_string(),
+            inputs: std::collections::BTreeMap::new(),
+            operations: vec![
+                Operation::WriteAgents {
+                    source: IdentityKind::Claude,
+                    after: sha(1),
+                    before: InputFingerprint::Absent,
+                },
+                Operation::WriteWrapper {
+                    kind: IdentityKind::Claude,
+                    after: sha(2),
+                    before: InputFingerprint::Sha256(sha(3)),
+                },
+                Operation::WriteBlock {
+                    kind: ManagedFileKind::Skills,
+                    mode: BlockMode::Append,
+                    body: sha(4),
+                    after: sha(5),
+                    before: InputFingerprint::Symlink("elsewhere".to_string()),
+                },
+            ],
+            block_diff: Some(BlockDiff {
+                path: "AGENTS.md",
+                before: vec![],
+                after: vec!["<!-- begin -->".to_string()],
+            }),
+            notices: vec![Notice::PortableAgentFolder {
+                path: ".backup".to_string(),
+            }],
+            id: PlanId([7; 32]),
+        };
+        let dto =
+            super::DefinitionPreviewDto::from_outcome(&workspace, ".", &PlanOutcome::Planned(plan));
+        let h = |b: u8| format!("{b:02x}").repeat(32);
+        assert_eq!(
+            json(&dto),
+            serde_json::json!({
+                "schema": "omnifrons.definition-preview/1",
+                "agent": workspace.path().to_string_lossy(),
+                "outcome": {
+                    "kind": "planned",
+                    "planId": h(7),
+                    "workspace": "/ws",
+                    "operations": [
+                        {"op": "write-agents", "path": "AGENTS.md", "source": "CLAUDE.md",
+                         "before": {"kind": "absent"}, "after": h(1)},
+                        {"op": "write-wrapper", "path": "CLAUDE.md",
+                         "before": {"kind": "sha256", "hex": h(3)}, "after": h(2)},
+                        {"op": "write-block", "path": "AGENTS.md", "mode": "append",
+                         "body": h(4), "before": {"kind": "symlink", "target": "elsewhere"},
+                         "after": h(5)},
+                    ],
+                    "blockDiff": {"path": "AGENTS.md", "before": [], "after": ["<!-- begin -->"]},
+                    "notices": [{"kind": "portable-agent-folder", "path": ".backup"}],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn definition_preview_dto_serializes_a_refusal_and_the_other_fingerprints() {
+        use omnifrons_app::definition_plan::PlanOutcome;
+        use omnifrons_domain::definition_plan::{InputFingerprint, PlanRefusal};
+
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let dto = super::DefinitionPreviewDto::from_outcome(
+            &workspace,
+            "child",
+            &PlanOutcome::Refused(PlanRefusal::Conflict("the files differ".to_string())),
+        );
+        assert_eq!(
+            json(&dto)["outcome"],
+            serde_json::json!({
+                "kind": "refused", "code": "conflict", "message": "the files differ"
+            })
+        );
+        assert_eq!(
+            json(&super::FingerprintDto::from(&InputFingerprint::Irregular)),
+            serde_json::json!({"kind": "irregular"})
+        );
+    }
+
+    #[test]
+    fn definition_apply_dto_serializes_each_outcome_to_a_pinned_shape() {
+        use omnifrons_app::apply_record::{AppliedFile, ApplyRecordId};
+        use omnifrons_app::definition_apply::ApplyOutcome;
+        use omnifrons_app::snapshot_store::SnapshotId;
+        use omnifrons_domain::definition_plan::{InputFingerprint, PlanId, PlanRefusal};
+
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let h = |b: u8| format!("{b:02x}").repeat(32);
+        let applied = super::DefinitionApplyDto::from_outcome(
+            &workspace,
+            ".",
+            &ApplyOutcome::Applied {
+                plan_id: PlanId([7; 32]),
+                record: ApplyRecordId("rec-1.json".to_string()),
+                files: vec![
+                    AppliedFile {
+                        path: "AGENTS.md".to_string(),
+                        before: InputFingerprint::Absent,
+                        after: Some(sha(1)),
+                        snapshot: None,
+                    },
+                    AppliedFile {
+                        path: "CLAUDE.md".to_string(),
+                        before: InputFingerprint::Sha256(sha(3)),
+                        after: Some(sha(2)),
+                        snapshot: Some(SnapshotId(255)),
+                    },
+                ],
+            },
+        );
+        assert_eq!(
+            json(&applied),
+            serde_json::json!({
+                "schema": "omnifrons.definition-apply/1",
+                "agent": workspace.path().to_string_lossy(),
+                "outcome": {
+                    "kind": "applied",
+                    "planId": h(7),
+                    "record": "rec-1.json",
+                    "files": [
+                        {"path": "AGENTS.md", "before": {"kind": "absent"},
+                         "after": h(1), "snapshot": null},
+                        {"path": "CLAUDE.md", "before": {"kind": "sha256", "hex": h(3)},
+                         "after": h(2), "snapshot": "00000000000000ff"},
+                    ],
+                },
+            })
+        );
+        let noop = super::DefinitionApplyDto::from_outcome(
+            &workspace,
+            ".",
+            &ApplyOutcome::NoOp {
+                plan_id: PlanId([7; 32]),
+            },
+        );
+        assert_eq!(
+            json(&noop)["outcome"],
+            serde_json::json!({"kind": "noop", "planId": h(7)})
+        );
+        let refused = super::DefinitionApplyDto::from_outcome(
+            &workspace,
+            ".",
+            &ApplyOutcome::Refused(PlanRefusal::Unsafe("a link".to_string())),
+        );
+        assert_eq!(
+            json(&refused)["outcome"],
+            serde_json::json!({"kind": "refused", "code": "unsafe", "message": "a link"})
         );
     }
 }

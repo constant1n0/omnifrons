@@ -1,32 +1,53 @@
-//! The agent-definition commands (ADR-0005 sub-slice 1h): `definition_status`
-//! and `definition_verify`, registered next to the guidance and wrong-root
+//! The agent-definition commands (ADR-0005 sub-slices 1h and 2f):
+//! `definition_status`, `definition_verify`, `definition_preview` and
+//! `definition_apply`, registered next to the guidance and wrong-root
 //! commands. Each is a thin wrapper over a pure body tested here without a
 //! Tauri runtime, composing the application services
 //! (`omnifrons_app::definition`) with the real filesystem adapters: a
 //! no-follow directory walk rooted at the active workspace, and SHA-256
 //! over identity file bytes.
 //!
-//! Both commands read; neither writes, locks the publication surface, or
-//! is frozen while a run is active -- the prototype's own `scan` and
-//! `verify_agent` are themselves read-only, and the ports they compose
-//! over (`omnifrons_app::definition::{scan, verify}`) never touch a
-//! filesystem except through the adapters they are given.
+//! Status, verify and preview read; none writes, locks the publication
+//! surface, or is frozen while a run is active -- the prototype's own
+//! `scan` and `verify_agent` are themselves read-only, and the ports they
+//! compose over (`omnifrons_app::definition::{scan, verify}`,
+//! `omnifrons_app::definition_plan::plan`) never touch a filesystem
+//! except through the adapters they are given.
+//!
+//! `definition_apply` writes: it takes the surface lock and refuses with
+//! `run-active` while a run is live, like the guidance installer. It
+//! takes the plan id a preview returned and nothing else the caller
+//! could forge: the application plans again from the disk and refuses
+//! with `plan-stale` when the id no longer matches.
 //!
 //! `definition_verify` takes an optional agent directory below the
 //! workspace (the prototype's own `verify --agent <path>`), defaulting
 //! to the workspace root; it reports no pending snapshots (`backups`),
 //! which belong to the write path.
 
-use omnifrons_adapters::{FsDefinitionTree, Sha2Hasher};
+use omnifrons_adapters::{
+    FsApplyRecordStore, FsDefinitionTree, FsDefinitionWriter, FsSnapshotStore, Sha2Hasher,
+};
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
+use omnifrons_app::definition_apply::{ApplyPorts, apply};
+use omnifrons_app::definition_plan::plan;
+use omnifrons_app::work_area::WorkAreaRoot;
+use omnifrons_domain::definition::IdentityKind;
+use omnifrons_domain::definition_plan::{PlanId, PlanOptions};
+use omnifrons_domain::executable::Sha256Digest;
 use omnifrons_domain::nesting;
-use tauri::AppHandle;
+use omnifrons_supervisor::TokioProcessSupervisor;
+use tauri::{AppHandle, Manager as _};
 
+use crate::executable_state::SystemClock;
 use crate::ipc::commands::active_workspace;
 use crate::ipc::dto::{
-    DefinitionStatusDto, DefinitionVerifyDto, ShellError, ShellErrorCode, ShellErrorDetail,
+    DefinitionApplyDto, DefinitionPreviewDto, DefinitionStatusDto, DefinitionVerifyDto, ShellError,
+    ShellErrorCode, ShellErrorDetail,
 };
+use crate::ipc::publication::{RunActivity, run_active};
+use crate::publication_state::PublicationState;
 
 impl From<DefinitionError> for ShellError {
     /// Maps every scan/verify failure to its closed code with a fixed,
@@ -40,16 +61,15 @@ impl From<DefinitionError> for ShellError {
     /// | `DuplicateIdentityKind` | `definition-invalid` | `duplicate-identity-kind` |
     /// | `DuplicateSnapshotPath` | `definition-invalid` | `duplicate-snapshot-path` |
     /// | `InvalidCanonicalChoice` | `invalid-request` | `invalid-canonical-choice` |
-    /// | `StalePlan` | `invalid-request` | `stale-plan` |
+    /// | `StalePlan` | `plan-stale` | `stale-plan` |
     /// | `Write` | `definition-invalid` | the write error's own token |
     /// | `Snapshot`, `Record` | `snapshot-unavailable` | the store error's own token |
     fn from(error: DefinitionError) -> Self {
         let reason = error.reason().to_string();
         let code = match &error {
             DefinitionError::Tree(_) => ShellErrorCode::ScanFailed,
-            DefinitionError::InvalidCanonicalChoice { .. } | DefinitionError::StalePlan { .. } => {
-                ShellErrorCode::InvalidRequest
-            }
+            DefinitionError::InvalidCanonicalChoice { .. } => ShellErrorCode::InvalidRequest,
+            DefinitionError::StalePlan { .. } => ShellErrorCode::PlanStale,
             DefinitionError::Nesting(_)
             | DefinitionError::DuplicateIdentityKind(_)
             | DefinitionError::DuplicateSnapshotPath { .. }
@@ -189,6 +209,142 @@ pub fn definition_verify_for(
     Ok(DefinitionVerifyDto::from_report(workspace, target, &report))
 }
 
+/// What `definition_preview` and `definition_apply` plan: the agent
+/// directory below the workspace (`None` is the workspace root) and the
+/// flags that change what a plan may do.
+#[derive(Debug, Clone, Default)]
+pub struct DefinitionPlanRequest {
+    /// A clean relative directory below the workspace.
+    pub agent: Option<String>,
+    /// The agent's own consent to be adapted when it sits below another.
+    pub nested_consent: bool,
+    /// `"CLAUDE.md"` or `"AGENTS.md"`: the winning side of a conflict.
+    pub canonical_from: Option<String>,
+    /// Also write the `GEMINI.md` wrapper.
+    pub with_gemini: bool,
+}
+
+impl DefinitionPlanRequest {
+    /// The checked target and plan options.
+    ///
+    /// # Errors
+    ///
+    /// `invalid-request` for an agent that is not a plain directory of
+    /// the workspace, or a canonical choice that is neither `CLAUDE.md`
+    /// nor `AGENTS.md`.
+    fn resolve(&self, workspace: &WorkspaceRoot) -> Result<(String, PlanOptions), ShellError> {
+        let target = self.agent.as_deref().unwrap_or(".").to_string();
+        require_workspace_directory(workspace, &target)?;
+        let canonical_from = match self.canonical_from.as_deref() {
+            None => None,
+            Some("CLAUDE.md") => Some(IdentityKind::Claude),
+            Some("AGENTS.md") => Some(IdentityKind::Agents),
+            Some(_) => {
+                return Err(ShellError::new(
+                    ShellErrorCode::InvalidRequest,
+                    "the canonical file must be CLAUDE.md or AGENTS.md",
+                ));
+            }
+        };
+        Ok((
+            target,
+            PlanOptions {
+                nested_consent: self.nested_consent,
+                canonical_from,
+                with_gemini: self.with_gemini,
+            },
+        ))
+    }
+}
+
+/// Parses a plan id: exactly 64 lowercase hex characters.
+fn parse_plan_id(text: &str) -> Result<PlanId, ShellError> {
+    let lowercase_hex = text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    Sha256Digest::from_hex(text)
+        .filter(|_| lowercase_hex)
+        .map(PlanId::from_digest)
+        .ok_or_else(|| {
+            ShellError::new(
+                ShellErrorCode::InvalidRequest,
+                "the plan id is not 64 lowercase hex characters",
+            )
+        })
+}
+
+/// The proposal (`definition_preview`): the operations an apply would
+/// run, the block diff, and the id the apply must name. Writes nothing.
+///
+/// # Errors
+///
+/// `invalid-request` for an agent that is not an existing, non-symlink
+/// directory under `workspace` or a canonical choice other than
+/// `CLAUDE.md` or `AGENTS.md`; otherwise as [`definition_verify_for`].
+/// A root the plan cannot adapt is an outcome (`refused`), not an error.
+pub fn definition_preview_for(
+    workspace: &WorkspaceRoot,
+    request: &DefinitionPlanRequest,
+) -> Result<DefinitionPreviewDto, ShellError> {
+    let (target, options) = request.resolve(workspace)?;
+    let tree = FsDefinitionTree::from_environment();
+    let hasher = Sha2Hasher::new();
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+    let outcome = plan(&ports, workspace, Some(&target), &options)?;
+    Ok(DefinitionPreviewDto::from_outcome(
+        workspace, &target, &outcome,
+    ))
+}
+
+/// The approved write (`definition_apply`), bound to `plan_id`: the
+/// application plans again from the disk and writes only when the id
+/// still matches.
+///
+/// # Errors
+///
+/// `run-active` while a run is live; `invalid-request` for a malformed
+/// plan id, and [`definition_preview_for`]'s request errors;
+/// `plan-stale` when the id no longer matches the definition;
+/// `work-area-invalid` and `snapshot-unavailable` for the work area;
+/// `definition-invalid` for a write that fails. A root the plan cannot
+/// adapt is an outcome (`refused`), not an error.
+pub fn definition_apply_for(
+    workspace: &WorkspaceRoot,
+    publication: &PublicationState,
+    run_activity: &dyn RunActivity,
+    request: &DefinitionPlanRequest,
+    plan_id: &str,
+) -> Result<DefinitionApplyDto, ShellError> {
+    let _surface = publication.lock_surface();
+    if run_activity.any_running() {
+        return Err(run_active());
+    }
+    let (target, options) = request.resolve(workspace)?;
+    let expected = parse_plan_id(plan_id)?;
+    let work_area = WorkAreaRoot::open(&publication.work_area, &[workspace])?;
+    let tree = FsDefinitionTree::from_environment();
+    let hasher = Sha2Hasher::new();
+    let writer = FsDefinitionWriter::new();
+    let mut snapshots = FsSnapshotStore::open(&work_area);
+    let records = FsApplyRecordStore::open(&work_area);
+    let clock = SystemClock;
+    let mut ports = ApplyPorts {
+        tree: &tree,
+        hasher: &hasher,
+        writer: &writer,
+        snapshots: &mut snapshots,
+        records: &records,
+        clock: &clock,
+    };
+    let outcome = apply(&mut ports, workspace, Some(&target), &options, &expected)?;
+    Ok(DefinitionApplyDto::from_outcome(
+        workspace, &target, &outcome,
+    ))
+}
+
 /// The active workspace's agent-definition scan.
 ///
 /// # Errors
@@ -223,6 +379,73 @@ pub async fn definition_verify(
     .expect("the blocking definition-verify task panicked")
 }
 
+/// The proposal for the active workspace's root, or for `agent`, a
+/// directory below it: what `definition_apply` would write.
+///
+/// # Errors
+///
+/// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active, and
+/// [`definition_preview_for`]'s errors.
+#[tauri::command]
+pub async fn definition_preview(
+    app: AppHandle,
+    agent: Option<String>,
+    nested_consent: bool,
+    canonical_from: Option<String>,
+    with_gemini: bool,
+) -> Result<DefinitionPreviewDto, ShellError> {
+    let workspace = active_workspace(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        definition_preview_for(
+            &workspace,
+            &DefinitionPlanRequest {
+                agent,
+                nested_consent,
+                canonical_from,
+                with_gemini,
+            },
+        )
+    })
+    .await
+    .expect("the blocking definition-preview task panicked")
+}
+
+/// The approved write, bound to `planId`.
+///
+/// # Errors
+///
+/// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active, and
+/// [`definition_apply_for`]'s errors.
+#[tauri::command]
+pub async fn definition_apply(
+    app: AppHandle,
+    agent: Option<String>,
+    nested_consent: bool,
+    canonical_from: Option<String>,
+    with_gemini: bool,
+    plan_id: String,
+) -> Result<DefinitionApplyDto, ShellError> {
+    let workspace = active_workspace(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let publication = app.state::<PublicationState>();
+        let supervisor = app.state::<TokioProcessSupervisor>().inner().clone();
+        definition_apply_for(
+            &workspace,
+            &publication,
+            &supervisor,
+            &DefinitionPlanRequest {
+                agent,
+                nested_consent,
+                canonical_from,
+                with_gemini,
+            },
+            &plan_id,
+        )
+    })
+    .await
+    .expect("the blocking definition-apply task panicked")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -238,8 +461,13 @@ mod tests {
     use omnifrons_domain::definition_plan::PlanId;
     use omnifrons_domain::nesting::NestingError;
 
-    use super::{definition_status_for, definition_verify_for};
+    use super::{
+        DefinitionPlanRequest, definition_apply_for, definition_preview_for, definition_status_for,
+        definition_verify_for,
+    };
     use crate::ipc::dto::{ShellError, ShellErrorCode, ShellErrorDetail};
+    use crate::ipc::publication::RunActivity;
+    use crate::publication_state::PublicationState;
 
     /// A fixture agent body: content-bearing, never import-only.
     const AGENT_BODY: &[u8] = b"# Fixture\n\nYou are Fixture, a test agent.\n";
@@ -346,7 +574,7 @@ mod tests {
                     expected: PlanId([1; 32]),
                     actual: Some(PlanId([2; 32])),
                 },
-                ShellErrorCode::InvalidRequest,
+                ShellErrorCode::PlanStale,
                 "stale-plan",
             ),
             (
@@ -642,5 +870,335 @@ mod tests {
             expected.push(target);
             assert_eq!(verify.agent, expected.to_string_lossy());
         }
+    }
+
+    /// No supervised process is running.
+    struct Idle;
+
+    impl RunActivity for Idle {
+        fn any_running(&self) -> bool {
+            false
+        }
+    }
+
+    /// A supervised process is running.
+    struct Busy;
+
+    impl RunActivity for Busy {
+        fn any_running(&self) -> bool {
+            true
+        }
+    }
+
+    /// A project with a device directory holding the work area.
+    struct Fixture {
+        project: TempDir,
+        // Kept alive so the work area outlives the test body.
+        _device: TempDir,
+        publication: PublicationState,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let project = TempDir::new(label);
+            let device = TempDir::new(&format!("{label}-device"));
+            let publication = PublicationState::under(device.path());
+            Self {
+                project,
+                _device: device,
+                publication,
+            }
+        }
+
+        fn workspace(&self) -> WorkspaceRoot {
+            self.project.workspace()
+        }
+
+        /// A root holding only a content-bearing `CLAUDE.md`.
+        fn claude_only(label: &str) -> Self {
+            let fixture = Self::new(label);
+            write(fixture.project.path(), "CLAUDE.md", AGENT_BODY);
+            fixture
+        }
+    }
+
+    fn request(agent: Option<&str>) -> DefinitionPlanRequest {
+        DefinitionPlanRequest {
+            agent: agent.map(str::to_string),
+            ..DefinitionPlanRequest::default()
+        }
+    }
+
+    fn to_json(value: &impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(value).expect("serializes")
+    }
+
+    /// The plan id of a `planned` preview, asserting it is 64 lowercase
+    /// hex characters.
+    fn planned_id(preview: &serde_json::Value) -> String {
+        assert_eq!(preview["outcome"]["kind"], "planned");
+        let id = preview["outcome"]["planId"]
+            .as_str()
+            .expect("a plan id")
+            .to_string();
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        id
+    }
+
+    #[test]
+    fn preview_of_a_claude_only_root_plans_the_two_identity_operations() {
+        let fixture = Fixture::claude_only("preview-claude-only");
+        let preview =
+            definition_preview_for(&fixture.workspace(), &request(None)).expect("preview succeeds");
+        let value = to_json(&preview);
+
+        assert_eq!(value["schema"], "omnifrons.definition-preview/1");
+        assert_eq!(
+            value["agent"],
+            fixture.workspace().path().to_string_lossy().as_ref()
+        );
+        planned_id(&value);
+        let operations = value["outcome"]["operations"]
+            .as_array()
+            .expect("operations");
+        let ops: Vec<(&str, &str)> = operations
+            .iter()
+            .map(|op| (op["op"].as_str().unwrap(), op["path"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("write-agents", "AGENTS.md"),
+                ("write-wrapper", "CLAUDE.md")
+            ]
+        );
+        assert_eq!(operations[0]["source"], "CLAUDE.md");
+        assert_eq!(
+            operations[0]["before"],
+            serde_json::json!({"kind": "absent"})
+        );
+        assert_eq!(value["outcome"]["blockDiff"], serde_json::Value::Null);
+        // A preview writes nothing.
+        assert!(!fixture.project.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn apply_writes_the_planned_files_then_a_second_preview_is_empty_and_its_apply_a_noop() {
+        let fixture = Fixture::claude_only("apply-claude-only");
+        let workspace = fixture.workspace();
+        let id = planned_id(&to_json(
+            &definition_preview_for(&workspace, &request(None)).expect("preview"),
+        ));
+
+        let applied = to_json(
+            &definition_apply_for(&workspace, &fixture.publication, &Idle, &request(None), &id)
+                .expect("apply succeeds"),
+        );
+
+        assert_eq!(applied["schema"], "omnifrons.definition-apply/1");
+        assert_eq!(applied["outcome"]["kind"], "applied");
+        assert_eq!(applied["outcome"]["planId"], id.as_str());
+        let files = applied["outcome"]["files"].as_array().expect("files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"], "AGENTS.md");
+        assert_eq!(files[1]["path"], "CLAUDE.md");
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("AGENTS.md")).expect("AGENTS.md"),
+            AGENT_BODY
+        );
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("CLAUDE.md")).expect("CLAUDE.md"),
+            omnifrons_domain::definition::WRAPPER
+        );
+
+        let second = to_json(&definition_preview_for(&workspace, &request(None)).expect("again"));
+        let second_id = planned_id(&second);
+        assert_eq!(second["outcome"]["operations"], serde_json::json!([]));
+        let noop = to_json(
+            &definition_apply_for(
+                &workspace,
+                &fixture.publication,
+                &Idle,
+                &request(None),
+                &second_id,
+            )
+            .expect("noop"),
+        );
+        assert_eq!(
+            noop["outcome"],
+            serde_json::json!({"kind": "noop", "planId": second_id})
+        );
+    }
+
+    #[test]
+    fn apply_with_a_wrong_plan_id_is_plan_stale_and_writes_nothing() {
+        let fixture = Fixture::claude_only("apply-stale");
+        let wrong = "0".repeat(64);
+        let error = definition_apply_for(
+            &fixture.workspace(),
+            &fixture.publication,
+            &Idle,
+            &request(None),
+            &wrong,
+        )
+        .expect_err("the id matches no plan");
+        assert_eq!(error.code, ShellErrorCode::PlanStale);
+        assert_eq!(
+            error.detail,
+            Some(ShellErrorDetail::DefinitionReason {
+                reason: "stale-plan".to_string()
+            })
+        );
+        assert!(!fixture.project.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn a_conflicting_root_previews_as_refused_with_the_conflict_code() {
+        let fixture = Fixture::new("preview-conflict");
+        write(
+            fixture.project.path(),
+            "CLAUDE.md",
+            b"# One\n\nFirst voice.\n",
+        );
+        write(
+            fixture.project.path(),
+            "AGENTS.md",
+            b"# Two\n\nSecond voice.\n",
+        );
+        let value = to_json(
+            &definition_preview_for(&fixture.workspace(), &request(None)).expect("preview"),
+        );
+        assert_eq!(value["outcome"]["kind"], "refused");
+        assert_eq!(value["outcome"]["code"], "conflict");
+        assert!(
+            !value["outcome"]["message"]
+                .as_str()
+                .expect("message")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_nested_target_is_refused_without_its_own_consent_and_planned_with_it() {
+        let fixture = Fixture::new("preview-nested");
+        write(fixture.project.path(), "AGENTS.md", AGENT_BODY);
+        write(fixture.project.path(), "child/CLAUDE.md", AGENT_BODY);
+        let workspace = fixture.workspace();
+
+        let refused =
+            to_json(&definition_preview_for(&workspace, &request(Some("child"))).expect("preview"));
+        assert_eq!(refused["outcome"]["kind"], "refused");
+        assert_eq!(refused["outcome"]["code"], "nested_agent");
+        assert_eq!(
+            refused["agent"],
+            workspace.path().join("child").to_string_lossy().as_ref()
+        );
+
+        let consenting = DefinitionPlanRequest {
+            nested_consent: true,
+            ..request(Some("child"))
+        };
+        let planned = to_json(&definition_preview_for(&workspace, &consenting).expect("preview"));
+        planned_id(&planned);
+    }
+
+    #[test]
+    fn a_bad_canonical_choice_or_plan_id_or_agent_is_invalid_request() {
+        let fixture = Fixture::claude_only("invalid-requests");
+        let workspace = fixture.workspace();
+        let bad_choice = DefinitionPlanRequest {
+            canonical_from: Some("GEMINI.md".to_string()),
+            ..request(None)
+        };
+        let error = definition_preview_for(&workspace, &bad_choice).expect_err("only two choices");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+
+        let malformed = [
+            String::new(),
+            "abc".to_string(),
+            "g".repeat(64),
+            "A".repeat(64),
+            "0".repeat(63),
+            "+".repeat(64),
+        ];
+        for id in &malformed {
+            let error =
+                definition_apply_for(&workspace, &fixture.publication, &Idle, &request(None), id)
+                    .expect_err("malformed id");
+            assert_eq!(error.code, ShellErrorCode::InvalidRequest, "{id}");
+        }
+
+        let error = definition_preview_for(&workspace, &request(Some("missing")))
+            .expect_err("no such directory");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn a_canonical_choice_names_the_winning_side_of_a_conflict() {
+        let fixture = Fixture::new("preview-canonical");
+        write(
+            fixture.project.path(),
+            "CLAUDE.md",
+            b"# One\n\nFirst voice.\n",
+        );
+        write(
+            fixture.project.path(),
+            "AGENTS.md",
+            b"# Two\n\nSecond voice.\n",
+        );
+        let choose = DefinitionPlanRequest {
+            canonical_from: Some("AGENTS.md".to_string()),
+            ..request(None)
+        };
+        let value =
+            to_json(&definition_preview_for(&fixture.workspace(), &choose).expect("preview"));
+        planned_id(&value);
+    }
+
+    #[test]
+    fn apply_refuses_while_a_run_is_active_and_writes_nothing() {
+        let fixture = Fixture::claude_only("apply-run-active");
+        let id = "0".repeat(64);
+        let error = definition_apply_for(
+            &fixture.workspace(),
+            &fixture.publication,
+            &Busy,
+            &request(None),
+            &id,
+        )
+        .expect_err("a run is live");
+        assert_eq!(error.code, ShellErrorCode::RunActive);
+        assert!(!fixture.project.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn a_refused_apply_reports_the_refusal_not_an_error() {
+        let fixture = Fixture::new("apply-refused");
+        write(
+            fixture.project.path(),
+            "CLAUDE.md",
+            b"# One\n\nFirst voice.\n",
+        );
+        write(
+            fixture.project.path(),
+            "AGENTS.md",
+            b"# Two\n\nSecond voice.\n",
+        );
+        let value = to_json(
+            &definition_apply_for(
+                &fixture.workspace(),
+                &fixture.publication,
+                &Idle,
+                &request(None),
+                &"0".repeat(64),
+            )
+            .expect("a refusal is an outcome"),
+        );
+        assert_eq!(value["outcome"]["kind"], "refused");
+        assert_eq!(value["outcome"]["code"], "conflict");
     }
 }

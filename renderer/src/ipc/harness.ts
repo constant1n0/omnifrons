@@ -445,6 +445,13 @@ export type ShellErrorCode =
    * {@link DefinitionReasonDetail} (ADR-0005 sub-slice 1h).
    */
   | 'definition-invalid'
+  /**
+   * The plan an apply names no longer matches the definition on disk: the
+   * files changed since the preview, or the id was never a plan for this
+   * root. Nothing further is written; preview again (ADR-0005 decision 3).
+   * Carries the reason token in {@link DefinitionReasonDetail}.
+   */
+  | 'plan-stale'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {
@@ -503,7 +510,11 @@ export type ShellError =
   | {
       code: Exclude<
         ShellErrorCode,
-        'changed-since-approval' | 'duplicate-publication' | 'definition-invalid' | 'scan-failed'
+        | 'changed-since-approval'
+        | 'duplicate-publication'
+        | 'definition-invalid'
+        | 'plan-stale'
+        | 'scan-failed'
       >
       message: string
       detail?: undefined
@@ -511,6 +522,7 @@ export type ShellError =
   | { code: 'changed-since-approval'; message: string; detail?: ChangedSinceApprovalDetail }
   | { code: 'duplicate-publication'; message: string; detail?: DuplicatePublicationDetail }
   | { code: 'definition-invalid'; message: string; detail?: DefinitionReasonDetail }
+  | { code: 'plan-stale'; message: string; detail?: DefinitionReasonDetail }
   | { code: 'scan-failed'; message: string; detail?: DefinitionReasonDetail }
 
 /** Type guard for a rejected `invoke`'s error value being a {@link ShellError}. */
