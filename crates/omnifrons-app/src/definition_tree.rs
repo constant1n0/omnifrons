@@ -228,6 +228,11 @@ pub enum DefinitionTreeError {
     /// displayed path.
     #[error("a reported path is not valid Unicode")]
     PathNotUnicode,
+    /// The directory a create targets does not exist. Only
+    /// [`DefinitionTree::locate`] reports it, so a missing target is told
+    /// apart from a workspace root that cannot be read.
+    #[error("the target directory does not exist")]
+    TargetMissing,
     /// The implementation does not answer [`DefinitionTree::probe`] or
     /// [`DefinitionTree::locate`], which a create needs.
     #[error("the tree cannot probe paths")]
@@ -243,6 +248,7 @@ impl DefinitionTreeError {
             Self::WalkFailed => "walk-failed",
             Self::EntryTooLarge => "entry-too-large",
             Self::PathNotUnicode => "path-not-unicode",
+            Self::TargetMissing => "target-missing",
             Self::ProbeUnsupported => "probe-unsupported",
         }
     }
@@ -321,8 +327,9 @@ pub trait DefinitionTree {
     ///
     /// # Errors
     ///
-    /// Returns [`DefinitionTreeError`] naming why the location could not
-    /// be resolved (for example, the directory does not exist).
+    /// [`DefinitionTreeError::TargetMissing`] when the directory does not
+    /// exist; otherwise another [`DefinitionTreeError`] naming why the
+    /// location could not be resolved.
     fn locate(
         &self,
         root: &WorkspaceRoot,

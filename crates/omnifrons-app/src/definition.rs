@@ -171,6 +171,7 @@ impl DefinitionError {
                 DefinitionTreeError::WalkFailed => "tree(walk-failed)",
                 DefinitionTreeError::EntryTooLarge => "tree(entry-too-large)",
                 DefinitionTreeError::PathNotUnicode => "tree(path-not-unicode)",
+                DefinitionTreeError::TargetMissing => "tree(target-missing)",
                 DefinitionTreeError::ProbeUnsupported => "tree(probe-unsupported)",
             },
             Self::Nesting(error) => match error {

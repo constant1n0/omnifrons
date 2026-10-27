@@ -909,6 +909,25 @@ fn source_refusal(
     Ok(None)
 }
 
+/// Why `entry` is not a plain path relative to the target, judged on the
+/// text alone and before anything is probed: the plan target's own rules
+/// ([`nesting::relate`]), `.` itself, a NUL byte everywhere, and a
+/// backslash or colon on Windows.
+fn malformed_source(entry: &str) -> Option<String> {
+    if entry.contains('\0') {
+        return Some("it holds a NUL byte".to_string());
+    }
+    if cfg!(windows) && entry.contains(['\\', ':']) {
+        return Some("it holds a backslash or a colon".to_string());
+    }
+    if entry == "." {
+        return Some("it names the target itself".to_string());
+    }
+    nesting::relate(&[entry], &[])
+        .err()
+        .map(|error| error.to_string())
+}
+
 /// Why `entry` (a path relative to `target`) is not a real source: each
 /// part must exist and not be a symlink, and neither the entry nor
 /// anything above it may be a child agent, nor may the entry hold one.
@@ -919,6 +938,9 @@ fn source_problem(
     entry: &str,
     children: &[String],
 ) -> Result<Option<SourceProblem>, DefinitionError> {
+    if let Some(reason) = malformed_source(entry) {
+        return Ok(Some(SourceProblem::Malformed { reason }));
+    }
     let mut current = String::new();
     for part in entry.split('/') {
         if !current.is_empty() {

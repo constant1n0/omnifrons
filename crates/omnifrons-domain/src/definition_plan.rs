@@ -503,6 +503,14 @@ pub enum SourceProblem {
         /// The child agent's relative path.
         child: String,
     },
+    /// The entry is not a plain path relative to the target (absolute,
+    /// with a `..` or `.` component, an empty component or a trailing
+    /// slash, or holding a character no path may hold); `reason` says
+    /// which.
+    Malformed {
+        /// What is wrong with the entry.
+        reason: String,
+    },
     /// The entry holds the child agent `child`.
     ContainsChild {
         /// The child agent's relative path.
@@ -516,6 +524,9 @@ impl SourceProblem {
     #[must_use]
     pub fn refusal(&self, index: usize, entry: &str, directory: &str) -> PlanRefusal {
         let reason = match self {
+            Self::Malformed { reason } => {
+                format!("{entry} must be a plain relative path inside {directory}: {reason}")
+            }
             Self::Missing => format!("{entry} does not exist in {directory}"),
             Self::Symlink { shown } => {
                 format!("{shown} is a symlink; sources are never read through symlinks")

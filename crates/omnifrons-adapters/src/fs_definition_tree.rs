@@ -253,14 +253,22 @@ impl DefinitionTree for FsDefinitionTree {
 
     /// The canonical path of the directory, as hosts see it (they start
     /// from the physical working directory), and whether it is the home
-    /// directory given to [`FsDefinitionTree::new`].
+    /// directory given to [`FsDefinitionTree::new`]. Home was
+    /// canonicalised there, once, so both sides of the comparison are
+    /// canonical paths. A directory that does not exist is
+    /// [`DefinitionTreeError::TargetMissing`].
     fn locate(
         &self,
         root: &WorkspaceRoot,
         relative: &str,
     ) -> Result<TargetLocation, DefinitionTreeError> {
-        let physical = std::fs::canonicalize(root.path().join(relative))
-            .map_err(|_| DefinitionTreeError::RootUnreadable)?;
+        let physical = std::fs::canonicalize(root.path().join(relative)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                DefinitionTreeError::TargetMissing
+            } else {
+                DefinitionTreeError::RootUnreadable
+            }
+        })?;
         let mut components = Vec::new();
         for part in physical.components() {
             if let std::path::Component::Normal(name) = part {

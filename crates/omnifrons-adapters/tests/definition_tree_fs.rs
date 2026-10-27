@@ -1693,7 +1693,13 @@ fn locate_resolves_the_physical_path_and_the_home_rule() {
     #[cfg(unix)]
     std::os::unix::fs::symlink("real", dir.path().join("link")).expect("symlink");
     let workspace = dir.workspace();
-    let tree = FsDefinitionTree::new(Some(dir.path().join("real")));
+    // Home is given through the symlink, so only a canonical comparison
+    // finds it equal to `real`.
+    #[cfg(unix)]
+    let given = dir.path().join("link");
+    #[cfg(not(unix))]
+    let given = dir.path().join("real");
+    let tree = FsDefinitionTree::new(Some(given));
     let inner = tree.locate(&workspace, "real/inner").expect("locate");
     assert!(!inner.home);
     assert_eq!(
@@ -1711,6 +1717,6 @@ fn locate_resolves_the_physical_path_and_the_home_rule() {
     }
     assert_eq!(
         tree.locate(&workspace, "missing"),
-        Err(DefinitionTreeError::RootUnreadable)
+        Err(DefinitionTreeError::TargetMissing)
     );
 }

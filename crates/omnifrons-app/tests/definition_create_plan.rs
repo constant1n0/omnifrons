@@ -818,6 +818,39 @@ fn a_source_beside_a_child_agent_is_allowed() {
 }
 
 #[test]
+fn a_source_that_is_not_a_plain_relative_path_is_refused_before_any_probe() {
+    for entry in [
+        "../x", "/abs", "a/./b", "a//b", "a/", "./a", "..", ".", "a/../b",
+    ] {
+        // Everything the entry could name is present, so only the shape
+        // of the entry can refuse it.
+        let outcome = with_sources(&[entry], empty().build(), |tree, root| {
+            let mut tree = tree;
+            for probe in [
+                "../x", "/abs", "a", "a/b", "a/.", "a/./b", "a//b", "a/", "./a", "..", ".", "b",
+            ] {
+                tree = tree.with_probe(root, probe, PathProbe::Present);
+            }
+            tree
+        });
+        let result = refusal(outcome);
+        assert_eq!(result.code(), "invalid_source", "{entry}");
+        assert!(
+            result.message().contains("sources[0].text"),
+            "{entry}: {result}"
+        );
+        assert!(
+            result.message().contains("plain relative path"),
+            "{entry}: {result}"
+        );
+        assert!(
+            !result.message().contains("does not exist"),
+            "{entry}: {result}"
+        );
+    }
+}
+
+#[test]
 fn sources_are_resolved_below_the_target() {
     let outcome = create_with(
         empty().build(),

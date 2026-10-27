@@ -18,6 +18,7 @@ use omnifrons_app::contract::definition_writer::CrashingWriter;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, verify};
 use omnifrons_app::definition_apply::{ApplyOutcome, ApplyPorts, apply_create};
 use omnifrons_app::definition_plan::{PlanOutcome, plan_create};
+use omnifrons_app::definition_tree::DefinitionTreeError;
 use omnifrons_app::definition_writer::DefinitionWriter;
 use omnifrons_app::snapshot_store::DefinitionSnapshotStore;
 use omnifrons_app::work_area::WorkAreaRoot;
@@ -74,7 +75,11 @@ fn item(body: &str) -> RawValue {
     ])
 }
 
-fn answers_with(role: &str) -> Answers {
+fn answers_pairs() -> Vec<(String, RawValue)> {
+    answers_pairs_with("a scheduling assistant")
+}
+
+fn answers_pairs_with(role: &str) -> Vec<(String, RawValue)> {
     let pairs = vec![
         ("name", item("Harbor")),
         ("role", item(role)),
@@ -85,13 +90,14 @@ fn answers_with(role: &str) -> Answers {
         ),
         ("work_language", item("the language of each user")),
     ];
-    let raw = RawValue::Object(
-        pairs
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect(),
-    );
-    Answers::validate(&raw).expect("valid answers")
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+}
+
+fn answers_with(role: &str) -> Answers {
+    Answers::validate(&RawValue::Object(answers_pairs_with(role))).expect("valid answers")
 }
 
 fn answers() -> Answers {
@@ -468,7 +474,15 @@ fn a_host_configuration_target_is_refused_at_any_depth() {
 fn the_home_directory_is_refused() {
     let env = Env::new("home");
     std::fs::create_dir_all(env.root.join("me")).expect("home dir");
-    let tree = FsDefinitionTree::new(Some(env.root.join("me")));
+    // Home is given by a path that is not canonical: through a symlink and
+    // with a `.` component. The adapter canonicalises it when it learns it.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("me", env.root.join("alias")).expect("symlink");
+    #[cfg(unix)]
+    let home = env.root.join("alias").join(".");
+    #[cfg(not(unix))]
+    let home = env.root.join("me");
+    let tree = FsDefinitionTree::new(Some(home));
     let refusal = refused(env.plan_under(&tree, "me", &answers()));
     assert_eq!(refusal.code(), "unsafe_target");
     assert!(refusal.message().contains("home directory"), "{refusal}");
@@ -477,4 +491,52 @@ fn the_home_directory_is_refused() {
     let PlanOutcome::Planned(_) = env.plan_under(&tree, "me/project", &answers()) else {
         panic!("a folder below home is allowed");
     };
+}
+
+#[test]
+fn a_nonexistent_target_is_a_missing_target_and_nothing_is_written() {
+    let env = Env::new("missing");
+    let tree = FsDefinitionTree::new(None);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &Sha2Hasher,
+    };
+    let result = plan_create(
+        &ports,
+        &env.workspace,
+        Some("nowhere"),
+        &PlanOptions::default(),
+        &answers(),
+    );
+    assert_eq!(
+        result,
+        Err(DefinitionError::Tree(DefinitionTreeError::TargetMissing))
+    );
+    assert!(env.listing().is_empty());
+}
+
+#[test]
+fn a_source_that_leaves_the_workspace_is_refused_though_it_exists() {
+    let base = TempDir::new("sibling-base");
+    let outside = base.path().join("outside.md");
+    std::fs::write(&outside, b"secret").expect("sibling file");
+    let workspace_dir = base.path().join("ws");
+    std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+    let workspace = WorkspaceRoot::new(&workspace_dir).expect("workspace");
+    let tree = FsDefinitionTree::new(None);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &Sha2Hasher,
+    };
+    let mut pairs = answers_pairs();
+    pairs.push((
+        "sources".to_string(),
+        RawValue::List(vec![item("../outside.md")]),
+    ));
+    let answers = Answers::validate(&RawValue::Object(pairs)).expect("valid answers");
+    let outcome =
+        plan_create(&ports, &workspace, None, &PlanOptions::default(), &answers).expect("plan");
+    let refusal = refused(outcome);
+    assert_eq!(refusal.code(), "invalid_source");
+    assert!(refusal.message().contains("../outside.md"), "{refusal}");
 }
