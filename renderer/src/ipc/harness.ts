@@ -2235,3 +2235,177 @@ export async function definitionApply(request: DefinitionPlanRequest, planId: st
     planId,
   })
 }
+
+// -- ADR-0005 slice 3, sub-slice 3d: creating a definition from answers --
+
+/** Mirrors `DefinitionFieldDto`: one field of the create interview. */
+export interface DefinitionField {
+  /** The key of the field in the answers document. */
+  key: string
+  /** Whether the interview must get a confirmed answer. */
+  required: boolean
+  /** Whether the field holds a list of items rather than one item. */
+  list: boolean
+  /** The English question the form asks for this field. */
+  prompt: string
+}
+
+/** Whether the user stood behind an answer; an assumption is written under `## Unconfirmed`. */
+export type DefinitionAnswerStatus = 'confirmed' | 'assumption'
+
+/** One answer: the English wording written to the file, and the user's own words (never written). */
+export interface DefinitionAnswer {
+  text: string
+  said: string
+  status: DefinitionAnswerStatus
+}
+
+/** An item of `open_decisions`: the field has no status. */
+export interface DefinitionOpenDecision {
+  text: string
+  said: string
+}
+
+/**
+ * The create answers, keyed by the field keys `definitionCreateFields`
+ * returns. A field left unanswered is omitted (never `null` or an empty list).
+ */
+export interface DefinitionAnswers {
+  role: DefinitionAnswer
+  serves?: DefinitionAnswer
+  deliverables: DefinitionAnswer[]
+  objectives?: DefinitionAnswer[]
+  authority: DefinitionAnswer[]
+  sources?: DefinitionAnswer[]
+  never_invent?: DefinitionAnswer[]
+  tone?: DefinitionAnswer
+  work_language: DefinitionAnswer
+  name: DefinitionAnswer
+  open_decisions?: DefinitionOpenDecision[]
+}
+
+/** Mirrors `AnswerProblemDto`: one refused part of the answers. */
+export interface DefinitionAnswerProblem {
+  /** The field key, an unknown key, or `answers` for the whole document. */
+  field: string
+  /** The item index of a list field. */
+  index: number | null
+  /** The item key (`text`, `said`, `status`, or an unknown key). */
+  part: string | null
+  /** A stable token for the problem. */
+  reason: string
+  /** The problem as a sentence. */
+  message: string
+}
+
+/** Mirrors `ProvenanceDto`: a generated line and the user's words behind it. */
+export interface DefinitionProvenance {
+  line: string
+  said: string[]
+}
+
+/** `dto.rs`'s `DefinitionCreatePreviewOutcomeDto` tags. */
+export type DefinitionCreatePreviewOutcomeKind = 'planned' | 'refused' | 'invalid'
+
+/** Mirrors `DefinitionCreatePreviewOutcomeDto`. */
+export type DefinitionCreatePreviewOutcome =
+  | {
+      kind: 'planned'
+      planId: string
+      workspace: string
+      operations: DefinitionOperation[]
+      notices: DefinitionNotice[]
+      provenance: DefinitionProvenance[]
+    }
+  | { kind: 'refused'; code: string; message: string }
+  | { kind: 'invalid'; problems: DefinitionAnswerProblem[] }
+
+/** `definitionCreatePreview`'s payload, schema `"omnifrons.definition-create-preview/1"`. */
+export interface DefinitionCreatePreview {
+  schema: string
+  agent: string
+  outcome: DefinitionCreatePreviewOutcome
+}
+
+/** `dto.rs`'s `DefinitionCreateApplyOutcomeDto` tags. */
+export type DefinitionCreateApplyOutcomeKind = 'applied' | 'noop' | 'refused' | 'invalid'
+
+/** Mirrors `DefinitionCreateApplyOutcomeDto`. */
+export type DefinitionCreateApplyOutcome =
+  | { kind: 'applied'; planId: string; record: string; files: DefinitionAppliedFile[] }
+  | { kind: 'noop'; planId: string }
+  | { kind: 'refused'; code: string; message: string }
+  | { kind: 'invalid'; problems: DefinitionAnswerProblem[] }
+
+/** `definitionCreateApply`'s payload, schema `"omnifrons.definition-create-apply/1"`. */
+export interface DefinitionCreateApply {
+  schema: string
+  agent: string
+  outcome: DefinitionCreateApplyOutcome
+}
+
+/**
+ * The request a create preview is planned from, and a create apply must
+ * repeat with the same answers: the shell re-plans from it and compares the
+ * result with the plan id.
+ */
+export interface DefinitionCreateRequest {
+  /** A clean relative POSIX path inside the active workspace; `"."` is the root itself. */
+  agent: string
+  /** The explicit consent a nested definition needs. */
+  nestedConsent: boolean
+  /** Also write a `GEMINI.md` wrapper. */
+  withGemini: boolean
+  answers: DefinitionAnswers
+}
+
+/**
+ * The create interview's fields, in interview order. Invokes
+ * `definition_create_fields` with no arguments.
+ */
+export async function definitionCreateFields(): Promise<DefinitionField[]> {
+  return invoke('definition_create_fields')
+}
+
+/**
+ * A dry run of creating a definition from the answers (ADR-0005 decision
+ * 6): the operations, the user's words beside each generated line and the
+ * plan id an apply must name. Nothing is written, and the shell keeps no
+ * answers. Invokes `definition_create_preview` with the request's four fields.
+ *
+ * Answers that do not validate resolve with `outcome.kind === 'invalid'`
+ * and a refused target with `'refused'`; only a request the shell cannot
+ * answer at all rejects.
+ *
+ * # Errors
+ * As {@link definitionVerify}.
+ */
+export async function definitionCreatePreview(request: DefinitionCreateRequest): Promise<DefinitionCreatePreview> {
+  return invoke('definition_create_preview', {
+    agent: request.agent,
+    nestedConsent: request.nestedConsent,
+    withGemini: request.withGemini,
+    answers: request.answers,
+  })
+}
+
+/**
+ * The write a create preview described, bound to its `planId`. The request
+ * must be the one the preview was planned from; the shell re-plans and
+ * refuses with `plan-stale` when the definition no longer matches the id.
+ *
+ * # Errors
+ * As {@link definitionCreatePreview}, plus `run-active`, `plan-stale` and `snapshot-unavailable`.
+ */
+export async function definitionCreateApply(
+  request: DefinitionCreateRequest,
+  planId: string,
+): Promise<DefinitionCreateApply> {
+  return invoke('definition_create_apply', {
+    agent: request.agent,
+    nestedConsent: request.nestedConsent,
+    withGemini: request.withGemini,
+    answers: request.answers,
+    planId,
+  })
+}

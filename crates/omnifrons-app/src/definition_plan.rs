@@ -53,8 +53,8 @@ use omnifrons_domain::definition::{
     FileShape, IdentityFile, IdentityKind, RootState, WRAPPER, is_import_only,
 };
 use omnifrons_domain::definition_create::{
-    Answers, CREATE_TEMPLATE_VERSION, CreateContext, CreationState, Field, answers_canonical,
-    creation_state, render,
+    Answers, CREATE_TEMPLATE_VERSION, CreateContext, CreationState, Field, ProvenanceEntry,
+    answers_canonical, creation_state, provenance, render,
 };
 use omnifrons_domain::definition_plan::{
     BlockDiff, InputFingerprint, Notice, Operation, Plan, PlanId, PlanOptions, PlanRefusal,
@@ -175,6 +175,33 @@ pub fn plan_create_with_writes(
     answers: &Answers,
 ) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
     plan_for(ports, workspace, target, *options, Some(answers))
+}
+
+/// The lines of the file a create from `answers` would write that are
+/// built from them, each with the user's own words behind it, in file
+/// order: what the preview shows beside the generated text.
+///
+/// It reads the same tree the planner reads and builds the same
+/// [`CreateContext`] (the child agents below `target` and whether another
+/// agent encloses it). When that context cannot be built the planner
+/// refuses the target, and there are no lines to show: the result is empty.
+///
+/// # Errors
+///
+/// The errors [`plan_create`] documents for reading the tree.
+pub fn create_provenance(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: Option<&str>,
+    answers: &Answers,
+) -> Result<Vec<ProvenanceEntry>, DefinitionError> {
+    let target = target.unwrap_or(".");
+    let loaded = load_target(ports, workspace, target)?;
+    let site = create_site(&loaded.snapshot, target)?;
+    Ok(
+        CreateContext::new(site.children.clone(), site.parent.is_some())
+            .map_or_else(|_| Vec::new(), |context| provenance(answers, &context)),
+    )
 }
 
 /// The planner behind [`plan_with_writes`] and [`plan_create_with_writes`]:

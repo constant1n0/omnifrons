@@ -30,10 +30,11 @@ use omnifrons_adapters::{
 };
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
-use omnifrons_app::definition_apply::{ApplyPorts, apply};
-use omnifrons_app::definition_plan::plan;
+use omnifrons_app::definition_apply::{ApplyPorts, apply, apply_create};
+use omnifrons_app::definition_plan::{PlanOutcome, create_provenance, plan, plan_create};
 use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::definition::IdentityKind;
+use omnifrons_domain::definition_create::{Answers, RawValue};
 use omnifrons_domain::definition_plan::{PlanId, PlanOptions};
 use omnifrons_domain::executable::Sha256Digest;
 use omnifrons_domain::nesting;
@@ -43,8 +44,9 @@ use tauri::{AppHandle, Manager as _};
 use crate::executable_state::SystemClock;
 use crate::ipc::commands::active_workspace;
 use crate::ipc::dto::{
-    DefinitionApplyDto, DefinitionPreviewDto, DefinitionStatusDto, DefinitionVerifyDto, ShellError,
-    ShellErrorCode, ShellErrorDetail,
+    DefinitionApplyDto, DefinitionCreateApplyDto, DefinitionCreatePreviewDto, DefinitionFieldDto,
+    DefinitionPreviewDto, DefinitionStatusDto, DefinitionVerifyDto, ShellError, ShellErrorCode,
+    ShellErrorDetail,
 };
 use crate::ipc::publication::{RunActivity, run_active};
 use crate::publication_state::PublicationState;
@@ -345,6 +347,172 @@ pub fn definition_apply_for(
     ))
 }
 
+/// What `definition_create_preview` and `definition_create_apply` plan:
+/// the new agent's directory below the workspace (`None` is the workspace
+/// root) and the flags that change what a create may do.
+#[derive(Debug, Clone, Default)]
+pub struct DefinitionCreateRequest {
+    /// A clean relative directory below the workspace.
+    pub agent: Option<String>,
+    /// The agent's own consent to be created when it sits below another.
+    pub nested_consent: bool,
+    /// Also write the `GEMINI.md` wrapper.
+    pub with_gemini: bool,
+}
+
+impl DefinitionCreateRequest {
+    /// The checked target and plan options.
+    ///
+    /// # Errors
+    ///
+    /// `invalid-request` for an agent that is not a plain directory of
+    /// the workspace.
+    fn resolve(&self, workspace: &WorkspaceRoot) -> Result<(String, PlanOptions), ShellError> {
+        let target = self.agent.as_deref().unwrap_or(".").to_string();
+        require_workspace_directory(workspace, &target)?;
+        Ok((
+            target,
+            PlanOptions {
+                nested_consent: self.nested_consent,
+                canonical_from: None,
+                with_gemini: self.with_gemini,
+            },
+        ))
+    }
+}
+
+/// The loosely typed document `Answers::validate` reads, from the JSON
+/// the form sent: objects keep the order the JSON value holds them in,
+/// and a number or a boolean is `Other`.
+fn raw_answers(value: &serde_json::Value) -> RawValue {
+    match value {
+        serde_json::Value::Null => RawValue::Null,
+        serde_json::Value::String(text) => RawValue::Text(text.clone()),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => RawValue::Other,
+        serde_json::Value::Array(items) => RawValue::List(items.iter().map(raw_answers).collect()),
+        serde_json::Value::Object(pairs) => RawValue::Object(
+            pairs
+                .iter()
+                .map(|(key, value)| (key.clone(), raw_answers(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// The create interview's fields, in interview order, so the form does
+/// not hardcode them.
+#[tauri::command]
+#[must_use]
+pub fn definition_create_fields() -> Vec<DefinitionFieldDto> {
+    DefinitionFieldDto::catalogue()
+}
+
+/// The proposal for a new definition (`definition_create_preview`): the
+/// operations a create apply would run, the user's own words beside each
+/// generated line, and the id the apply must name. Writes nothing and
+/// keeps nothing of the answers.
+///
+/// # Errors
+///
+/// `invalid-request` for an agent that is not an existing, non-symlink
+/// directory under `workspace`; otherwise as [`definition_verify_for`].
+/// Answers that do not validate are an outcome (`invalid`), and so is a
+/// target the plan cannot create in (`refused`).
+pub fn definition_create_preview_for(
+    workspace: &WorkspaceRoot,
+    request: &DefinitionCreateRequest,
+    answers: &serde_json::Value,
+) -> Result<DefinitionCreatePreviewDto, ShellError> {
+    let (target, options) = request.resolve(workspace)?;
+    let answers = match Answers::validate(&raw_answers(answers)) {
+        Ok(answers) => answers,
+        Err(problems) => {
+            return Ok(DefinitionCreatePreviewDto::invalid(
+                workspace, &target, &problems,
+            ));
+        }
+    };
+    let tree = FsDefinitionTree::from_environment();
+    let hasher = Sha2Hasher::new();
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+    let outcome = plan_create(&ports, workspace, Some(&target), &options, &answers)?;
+    let provenance = match &outcome {
+        PlanOutcome::Planned(_) => create_provenance(&ports, workspace, Some(&target), &answers)?,
+        PlanOutcome::Refused(_) => Vec::new(),
+    };
+    Ok(DefinitionCreatePreviewDto::from_outcome(
+        workspace,
+        &target,
+        &outcome,
+        &provenance,
+    ))
+}
+
+/// The approved create (`definition_create_apply`), bound to `plan_id`:
+/// the application plans again from the disk and the answers, and writes
+/// only when the id still matches.
+///
+/// # Errors
+///
+/// `run-active` while a run is live; `invalid-request` for a malformed
+/// plan id, and [`definition_create_preview_for`]'s request errors;
+/// `plan-stale` when the id no longer matches; `work-area-invalid` and
+/// `snapshot-unavailable` for the work area; `definition-invalid` for a
+/// write that fails. Invalid answers (`invalid`) and a target the plan
+/// cannot create in (`refused`) are outcomes.
+pub fn definition_create_apply_for(
+    workspace: &WorkspaceRoot,
+    publication: &PublicationState,
+    run_activity: &dyn RunActivity,
+    request: &DefinitionCreateRequest,
+    answers: &serde_json::Value,
+    plan_id: &str,
+) -> Result<DefinitionCreateApplyDto, ShellError> {
+    let _surface = publication.lock_surface();
+    if run_activity.any_running() {
+        return Err(run_active());
+    }
+    let (target, options) = request.resolve(workspace)?;
+    let expected = parse_plan_id(plan_id)?;
+    let answers = match Answers::validate(&raw_answers(answers)) {
+        Ok(answers) => answers,
+        Err(problems) => {
+            return Ok(DefinitionCreateApplyDto::invalid(
+                workspace, &target, &problems,
+            ));
+        }
+    };
+    let work_area = WorkAreaRoot::open(&publication.work_area, &[workspace])?;
+    let tree = FsDefinitionTree::from_environment();
+    let hasher = Sha2Hasher::new();
+    let writer = FsDefinitionWriter::new();
+    let mut snapshots = FsSnapshotStore::open(&work_area);
+    let records = FsApplyRecordStore::open(&work_area);
+    let clock = SystemClock;
+    let mut ports = ApplyPorts {
+        tree: &tree,
+        hasher: &hasher,
+        writer: &writer,
+        snapshots: &mut snapshots,
+        records: &records,
+        clock: &clock,
+    };
+    let outcome = apply_create(
+        &mut ports,
+        workspace,
+        Some(&target),
+        &options,
+        &answers,
+        &expected,
+    )?;
+    Ok(DefinitionCreateApplyDto::from_outcome(
+        workspace, &target, &outcome,
+    ))
+}
+
 /// The active workspace's agent-definition scan.
 ///
 /// # Errors
@@ -446,6 +614,74 @@ pub async fn definition_apply(
     .expect("the blocking definition-apply task panicked")
 }
 
+/// The proposal for a new agent in the active workspace's root, or in
+/// `agent`, a directory below it. The answers are validated, used for the
+/// plan and dropped: the shell stores and logs none of them.
+///
+/// # Errors
+///
+/// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active, and
+/// [`definition_create_preview_for`]'s errors.
+#[tauri::command]
+pub async fn definition_create_preview(
+    app: AppHandle,
+    agent: Option<String>,
+    nested_consent: bool,
+    with_gemini: bool,
+    answers: serde_json::Value,
+) -> Result<DefinitionCreatePreviewDto, ShellError> {
+    let workspace = active_workspace(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        definition_create_preview_for(
+            &workspace,
+            &DefinitionCreateRequest {
+                agent,
+                nested_consent,
+                with_gemini,
+            },
+            &answers,
+        )
+    })
+    .await
+    .expect("the blocking definition-create-preview task panicked")
+}
+
+/// The approved create, bound to `planId`.
+///
+/// # Errors
+///
+/// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active, and
+/// [`definition_create_apply_for`]'s errors.
+#[tauri::command]
+pub async fn definition_create_apply(
+    app: AppHandle,
+    agent: Option<String>,
+    nested_consent: bool,
+    with_gemini: bool,
+    answers: serde_json::Value,
+    plan_id: String,
+) -> Result<DefinitionCreateApplyDto, ShellError> {
+    let workspace = active_workspace(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let publication = app.state::<PublicationState>();
+        let supervisor = app.state::<TokioProcessSupervisor>().inner().clone();
+        definition_create_apply_for(
+            &workspace,
+            &publication,
+            &supervisor,
+            &DefinitionCreateRequest {
+                agent,
+                nested_consent,
+                with_gemini,
+            },
+            &answers,
+            &plan_id,
+        )
+    })
+    .await
+    .expect("the blocking definition-create-apply task panicked")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -458,12 +694,14 @@ mod tests {
     use omnifrons_app::definition_writer::DefinitionWriteError;
     use omnifrons_app::snapshot_store::SnapshotStoreError;
     use omnifrons_domain::definition::{DuplicateIdentityKindError, IdentityKind};
+    use omnifrons_domain::definition_create::{Answers, CreateContext, render};
     use omnifrons_domain::definition_plan::PlanId;
     use omnifrons_domain::nesting::NestingError;
 
     use super::{
-        DefinitionPlanRequest, definition_apply_for, definition_preview_for, definition_status_for,
-        definition_verify_for,
+        DefinitionCreateRequest, DefinitionPlanRequest, definition_apply_for,
+        definition_create_apply_for, definition_create_preview_for, definition_preview_for,
+        definition_status_for, definition_verify_for,
     };
     use crate::ipc::dto::{ShellError, ShellErrorCode, ShellErrorDetail};
     use crate::ipc::publication::RunActivity;
@@ -1293,5 +1531,384 @@ mod tests {
         );
         assert_eq!(value["outcome"]["kind"], "refused");
         assert_eq!(value["outcome"]["code"], "conflict");
+    }
+
+    // -- create (ADR-0005 slice 3, sub-slice 3d) --
+
+    fn create_request(agent: Option<&str>) -> DefinitionCreateRequest {
+        DefinitionCreateRequest {
+            agent: agent.map(str::to_string),
+            ..DefinitionCreateRequest::default()
+        }
+    }
+
+    fn item(text: &str, said: &str) -> serde_json::Value {
+        serde_json::json!({"text": text, "said": said, "status": "confirmed"})
+    }
+
+    /// The smallest valid answers: the five required fields.
+    fn minimal_answers() -> serde_json::Value {
+        serde_json::json!({
+            "name": item("Harbor", "call it Harbor"),
+            "role": item("a scheduling assistant", "it schedules things"),
+            "deliverables": [item("Propose slots.", "slots, please")],
+            "authority": [item("Draft and advise only.", "only advise")],
+            "work_language": item("the language of each user", "whatever they speak"),
+        })
+    }
+
+    /// The `AGENTS.md` the domain renders for `answers` in a folder with no
+    /// child agents and no enclosing one.
+    fn rendered(answers: &serde_json::Value) -> Vec<u8> {
+        let raw = super::raw_answers(answers);
+        let validated = Answers::validate(&raw).expect("valid answers");
+        let context = CreateContext::new(Vec::new(), false).expect("a plain context");
+        render(&validated, &context).into_bytes()
+    }
+
+    #[test]
+    fn create_preview_of_an_empty_folder_plans_the_generated_write_with_provenance() {
+        let fixture = Fixture::new("create-preview");
+        let preview = definition_create_preview_for(
+            &fixture.workspace(),
+            &create_request(None),
+            &minimal_answers(),
+        )
+        .expect("preview succeeds");
+        let value = to_json(&preview);
+
+        assert_eq!(value["schema"], "omnifrons.definition-create-preview/1");
+        planned_id(&value);
+        let operations = value["outcome"]["operations"]
+            .as_array()
+            .expect("operations");
+        let ops: Vec<(&str, &str)> = operations
+            .iter()
+            .map(|op| (op["op"].as_str().unwrap(), op["path"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("write-generated", "AGENTS.md"),
+                ("write-wrapper", "CLAUDE.md")
+            ]
+        );
+        let provenance = value["outcome"]["provenance"]
+            .as_array()
+            .expect("provenance");
+        let said: Vec<&str> = provenance
+            .iter()
+            .flat_map(|entry| entry["said"].as_array().unwrap())
+            .map(|said| said.as_str().unwrap())
+            .collect();
+        for words in [
+            "call it Harbor",
+            "it schedules things",
+            "slots, please",
+            "only advise",
+            "whatever they speak",
+        ] {
+            assert!(said.contains(&words), "{words} is shown beside a line");
+        }
+        let lines: Vec<&str> = provenance
+            .iter()
+            .map(|entry| entry["line"].as_str().unwrap())
+            .collect();
+        assert!(
+            lines.iter().all(|line| !line.contains("call it Harbor")),
+            "the user's words are not the generated lines"
+        );
+        let file = String::from_utf8(rendered(&minimal_answers())).unwrap();
+        for entry in provenance {
+            assert!(file.contains(entry["line"].as_str().unwrap()));
+        }
+        // A preview writes nothing.
+        assert!(files_below(fixture.project.path()).is_empty());
+        assert!(files_below(fixture.device.path()).is_empty());
+    }
+
+    #[test]
+    fn create_preview_of_invalid_answers_lists_each_problem_and_touches_nothing() {
+        let fixture = Fixture::new("create-invalid");
+        let answers = serde_json::json!({
+            "name": item("Harbor.", "call it Harbor"),
+            "role": {"text": "a scheduling assistant", "said": "x", "status": "assumption"},
+            "deliverables": [item("Propose slots.", "slots, please")],
+            "authority": [item("Draft and advise only.", "only advise")],
+            "work_language": item("the language of each user", "whatever they speak"),
+            "mystery": "x",
+        });
+        let value = to_json(
+            &definition_create_preview_for(&fixture.workspace(), &create_request(None), &answers)
+                .expect("an invalid answer is an outcome"),
+        );
+        assert_eq!(value["outcome"]["kind"], "invalid");
+        let problems: Vec<(&str, &str)> = value["outcome"]["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .map(|p| (p["field"].as_str().unwrap(), p["reason"].as_str().unwrap()))
+            .collect();
+        assert!(problems.contains(&("mystery", "unknown_field")));
+        assert!(problems.contains(&("name", "name_sentence_end")));
+        assert!(problems.contains(&("role", "required_not_confirmed")));
+        assert!(
+            value["outcome"]["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| !p["message"].as_str().unwrap().is_empty())
+        );
+        assert!(files_below(fixture.project.path()).is_empty());
+    }
+
+    #[test]
+    fn create_apply_writes_the_rendered_file_and_the_wrapper_and_nothing_else() {
+        let fixture = Fixture::new("create-apply");
+        let workspace = fixture.workspace();
+        let answers = minimal_answers();
+        let id = planned_id(&to_json(
+            &definition_create_preview_for(&workspace, &create_request(None), &answers)
+                .expect("preview"),
+        ));
+
+        let applied = to_json(
+            &definition_create_apply_for(
+                &workspace,
+                &fixture.publication,
+                &Idle,
+                &create_request(None),
+                &answers,
+                &id,
+            )
+            .expect("apply succeeds"),
+        );
+
+        assert_eq!(applied["schema"], "omnifrons.definition-create-apply/1");
+        assert_eq!(applied["outcome"]["kind"], "applied");
+        assert_eq!(applied["outcome"]["planId"], id.as_str());
+        let files = applied["outcome"]["files"].as_array().expect("files");
+        let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["AGENTS.md", "CLAUDE.md"]);
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("AGENTS.md")).expect("AGENTS.md"),
+            rendered(&answers)
+        );
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("CLAUDE.md")).expect("CLAUDE.md"),
+            omnifrons_domain::definition::WRAPPER
+        );
+        assert_eq!(
+            files_below(fixture.project.path()).len(),
+            2,
+            "no skills or other file was written"
+        );
+    }
+
+    #[test]
+    fn a_second_create_preview_is_empty_its_apply_a_noop_and_other_answers_are_refused() {
+        let fixture = Fixture::new("create-converged");
+        let workspace = fixture.workspace();
+        let answers = minimal_answers();
+        let id = planned_id(&to_json(
+            &definition_create_preview_for(&workspace, &create_request(None), &answers)
+                .expect("preview"),
+        ));
+        definition_create_apply_for(
+            &workspace,
+            &fixture.publication,
+            &Idle,
+            &create_request(None),
+            &answers,
+            &id,
+        )
+        .expect("apply");
+
+        let again = to_json(
+            &definition_create_preview_for(&workspace, &create_request(None), &answers)
+                .expect("second preview"),
+        );
+        let again_id = planned_id(&again);
+        assert_eq!(again["outcome"]["operations"], serde_json::json!([]));
+        let noop = to_json(
+            &definition_create_apply_for(
+                &workspace,
+                &fixture.publication,
+                &Idle,
+                &create_request(None),
+                &answers,
+                &again_id,
+            )
+            .expect("second apply"),
+        );
+        assert_eq!(
+            noop["outcome"],
+            serde_json::json!({"kind": "noop", "planId": again_id})
+        );
+
+        let mut other = minimal_answers();
+        other["name"] = item("Lighthouse", "call it Lighthouse");
+        let refused = to_json(
+            &definition_create_preview_for(&workspace, &create_request(None), &other)
+                .expect("a refusal is an outcome"),
+        );
+        assert_eq!(refused["outcome"]["kind"], "refused");
+        assert_eq!(refused["outcome"]["code"], "identity_exists");
+    }
+
+    #[test]
+    fn a_nested_create_target_needs_consent() {
+        let fixture = Fixture::new("create-nested");
+        write(fixture.project.path(), "AGENTS.md", AGENT_BODY);
+        std::fs::create_dir(fixture.project.path().join("child")).expect("child");
+        let workspace = fixture.workspace();
+
+        let refused = to_json(
+            &definition_create_preview_for(
+                &workspace,
+                &create_request(Some("child")),
+                &minimal_answers(),
+            )
+            .expect("a refusal is an outcome"),
+        );
+        assert_eq!(refused["outcome"]["kind"], "refused");
+        assert_eq!(refused["outcome"]["code"], "nested_agent");
+
+        let consenting = DefinitionCreateRequest {
+            nested_consent: true,
+            ..create_request(Some("child"))
+        };
+        let planned = to_json(
+            &definition_create_preview_for(&workspace, &consenting, &minimal_answers())
+                .expect("preview"),
+        );
+        planned_id(&planned);
+    }
+
+    #[test]
+    fn create_apply_refuses_a_malformed_plan_id_and_a_live_run() {
+        let fixture = Fixture::new("create-apply-refusals");
+        let workspace = fixture.workspace();
+        let answers = minimal_answers();
+
+        let malformed = definition_create_apply_for(
+            &workspace,
+            &fixture.publication,
+            &Idle,
+            &create_request(None),
+            &answers,
+            "ABC",
+        )
+        .expect_err("not a plan id");
+        assert_eq!(malformed.code, ShellErrorCode::InvalidRequest);
+
+        let busy = definition_create_apply_for(
+            &workspace,
+            &fixture.publication,
+            &Busy,
+            &create_request(None),
+            &answers,
+            &"0".repeat(64),
+        )
+        .expect_err("a run is live");
+        assert_eq!(busy.code, ShellErrorCode::RunActive);
+        assert!(files_below(fixture.project.path()).is_empty());
+    }
+
+    #[test]
+    fn create_apply_of_invalid_answers_is_an_outcome_and_writes_nothing() {
+        let fixture = Fixture::new("create-apply-invalid");
+        let value = to_json(
+            &definition_create_apply_for(
+                &fixture.workspace(),
+                &fixture.publication,
+                &Idle,
+                &create_request(None),
+                &serde_json::json!([]),
+                &"0".repeat(64),
+            )
+            .expect("an invalid answer is an outcome"),
+        );
+        assert_eq!(value["outcome"]["kind"], "invalid");
+        assert_eq!(value["outcome"]["problems"][0]["field"], "answers");
+        assert_eq!(
+            value["outcome"]["problems"][0]["reason"],
+            "not_an_object_document"
+        );
+        assert!(files_below(fixture.project.path()).is_empty());
+    }
+
+    #[test]
+    fn create_requests_check_the_target_like_the_adapt_requests() {
+        let fixture = Fixture::new("create-target");
+        let error = definition_create_preview_for(
+            &fixture.workspace(),
+            &create_request(Some("../outside")),
+            &minimal_answers(),
+        )
+        .expect_err("not a workspace directory");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn raw_answers_keeps_objects_lists_and_text_and_reads_other_scalars_as_other() {
+        use omnifrons_domain::definition_create::RawValue;
+
+        let raw = super::raw_answers(&serde_json::json!({
+            "a": ["x", null, 1, true, {"b": "y"}],
+        }));
+        assert_eq!(
+            raw,
+            RawValue::Object(vec![(
+                "a".to_string(),
+                RawValue::List(vec![
+                    RawValue::Text("x".to_string()),
+                    RawValue::Null,
+                    RawValue::Other,
+                    RawValue::Other,
+                    RawValue::Object(vec![("b".to_string(), RawValue::Text("y".to_string()))]),
+                ])
+            )])
+        );
+    }
+
+    #[test]
+    fn the_field_catalogue_pins_the_eleven_keys_in_interview_order() {
+        let catalogue = to_json(&super::definition_create_fields());
+        let rows: Vec<(&str, bool, bool)> = catalogue
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|row| {
+                (
+                    row["key"].as_str().unwrap(),
+                    row["required"].as_bool().unwrap(),
+                    row["list"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("role", true, false),
+                ("serves", false, false),
+                ("deliverables", true, true),
+                ("objectives", false, true),
+                ("authority", true, true),
+                ("sources", false, true),
+                ("never_invent", false, true),
+                ("tone", false, false),
+                ("work_language", true, false),
+                ("name", true, false),
+                ("open_decisions", false, true),
+            ]
+        );
+        assert!(
+            catalogue
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| !row["prompt"].as_str().unwrap().is_empty())
+        );
     }
 }

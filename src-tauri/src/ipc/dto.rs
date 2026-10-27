@@ -2700,6 +2700,259 @@ impl DefinitionApplyDto {
     }
 }
 
+/// One refused part of the create answers, for the form to mark: the
+/// field (or the unknown key, or `answers` for the whole document), the
+/// item index of a list field, the item key, the problem's stable token
+/// and its sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerProblemDto {
+    pub field: String,
+    pub index: Option<usize>,
+    pub part: Option<String>,
+    pub reason: String,
+    pub message: String,
+}
+
+impl From<&omnifrons_domain::definition_create::AnswerError> for AnswerProblemDto {
+    fn from(error: &omnifrons_domain::definition_create::AnswerError) -> Self {
+        Self {
+            field: error.field.clone(),
+            index: error.index,
+            part: error.part.clone(),
+            reason: error.problem.reason().to_string(),
+            message: error.problem.to_string(),
+        }
+    }
+}
+
+/// One generated line of the file and the words the user said behind it.
+/// The words are shown beside the line and never enter the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenanceDto {
+    pub line: String,
+    pub said: Vec<String>,
+}
+
+/// One field of the create interview, as the form asks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionFieldDto {
+    pub key: String,
+    pub required: bool,
+    pub list: bool,
+    pub prompt: String,
+}
+
+impl DefinitionFieldDto {
+    /// Every field of the interview, in interview order.
+    #[must_use]
+    pub fn catalogue() -> Vec<Self> {
+        omnifrons_domain::definition_create::Field::ALL
+            .into_iter()
+            .map(|field| Self {
+                key: field.key().to_string(),
+                required: field.required(),
+                list: field.is_list(),
+                prompt: field.prompt().to_string(),
+            })
+            .collect()
+    }
+}
+
+/// What a create preview concluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DefinitionCreatePreviewOutcomeDto {
+    Planned {
+        plan_id: String,
+        workspace: String,
+        operations: Vec<OperationDto>,
+        notices: Vec<NoticeDto>,
+        provenance: Vec<ProvenanceDto>,
+    },
+    Refused {
+        code: String,
+        message: String,
+    },
+    Invalid {
+        problems: Vec<AnswerProblemDto>,
+    },
+}
+
+/// `definition_create_preview`'s payload: the file a create would write,
+/// the user's words beside each generated line, and the id the apply must
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionCreatePreviewDto {
+    pub schema: String,
+    pub agent: String,
+    pub outcome: DefinitionCreatePreviewOutcomeDto,
+}
+
+impl DefinitionCreatePreviewDto {
+    /// Builds the payload for `outcome`, planned at `target`, with the
+    /// `provenance` of the generated lines.
+    #[must_use]
+    pub fn from_outcome(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        outcome: &PlanOutcome,
+        provenance: &[omnifrons_domain::definition_create::ProvenanceEntry],
+    ) -> Self {
+        let outcome = match outcome {
+            PlanOutcome::Planned(plan) => DefinitionCreatePreviewOutcomeDto::Planned {
+                plan_id: plan.id.to_string(),
+                workspace: plan.workspace.clone(),
+                operations: plan.operations.iter().map(Into::into).collect(),
+                notices: plan.notices.iter().map(Into::into).collect(),
+                provenance: provenance
+                    .iter()
+                    .map(|entry| ProvenanceDto {
+                        line: entry.line.clone(),
+                        said: entry.said.clone(),
+                    })
+                    .collect(),
+            },
+            PlanOutcome::Refused(refusal) => DefinitionCreatePreviewOutcomeDto::Refused {
+                code: refusal.code().to_string(),
+                message: refusal.message().to_string(),
+            },
+        };
+        Self::with(workspace, target, outcome)
+    }
+
+    /// The payload for answers that did not validate: nothing was planned.
+    #[must_use]
+    pub fn invalid(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        problems: &[omnifrons_domain::definition_create::AnswerError],
+    ) -> Self {
+        Self::with(
+            workspace,
+            target,
+            DefinitionCreatePreviewOutcomeDto::Invalid {
+                problems: problems.iter().map(Into::into).collect(),
+            },
+        )
+    }
+
+    fn with(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        outcome: DefinitionCreatePreviewOutcomeDto,
+    ) -> Self {
+        Self {
+            schema: "omnifrons.definition-create-preview/1".to_string(),
+            agent: display_agent_path(workspace.path(), target)
+                .to_string_lossy()
+                .into_owned(),
+            outcome,
+        }
+    }
+}
+
+/// What a create apply did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DefinitionCreateApplyOutcomeDto {
+    Applied {
+        plan_id: String,
+        record: String,
+        files: Vec<AppliedFileDto>,
+    },
+    #[serde(rename = "noop")]
+    NoOp {
+        plan_id: String,
+    },
+    Refused {
+        code: String,
+        message: String,
+    },
+    Invalid {
+        problems: Vec<AnswerProblemDto>,
+    },
+}
+
+/// `definition_create_apply`'s payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionCreateApplyDto {
+    pub schema: String,
+    pub agent: String,
+    pub outcome: DefinitionCreateApplyOutcomeDto,
+}
+
+impl DefinitionCreateApplyDto {
+    /// Builds the payload for `outcome`, applied at `target`.
+    #[must_use]
+    pub fn from_outcome(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        outcome: &ApplyOutcome,
+    ) -> Self {
+        let outcome = match DefinitionApplyDto::from_outcome(workspace, target, outcome).outcome {
+            DefinitionApplyOutcomeDto::Applied {
+                plan_id,
+                record,
+                files,
+            } => DefinitionCreateApplyOutcomeDto::Applied {
+                plan_id,
+                record,
+                files,
+            },
+            DefinitionApplyOutcomeDto::NoOp { plan_id } => {
+                DefinitionCreateApplyOutcomeDto::NoOp { plan_id }
+            }
+            DefinitionApplyOutcomeDto::Refused { code, message } => {
+                DefinitionCreateApplyOutcomeDto::Refused { code, message }
+            }
+        };
+        Self::with(workspace, target, outcome)
+    }
+
+    /// The payload for answers that did not validate: nothing was applied.
+    #[must_use]
+    pub fn invalid(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        problems: &[omnifrons_domain::definition_create::AnswerError],
+    ) -> Self {
+        Self::with(
+            workspace,
+            target,
+            DefinitionCreateApplyOutcomeDto::Invalid {
+                problems: problems.iter().map(Into::into).collect(),
+            },
+        )
+    }
+
+    fn with(
+        workspace: &omnifrons_app::WorkspaceRoot,
+        target: &str,
+        outcome: DefinitionCreateApplyOutcomeDto,
+    ) -> Self {
+        Self {
+            schema: "omnifrons.definition-create-apply/1".to_string(),
+            agent: display_agent_path(workspace.path(), target)
+                .to_string_lossy()
+                .into_owned(),
+            outcome,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5173,6 +5426,207 @@ mod tests {
         assert_eq!(
             json(&refused)["outcome"],
             serde_json::json!({"kind": "refused", "code": "unsafe", "message": "a link"})
+        );
+    }
+
+    #[test]
+    fn definition_create_preview_dto_serializes_each_outcome_to_a_pinned_shape() {
+        use omnifrons_app::definition_plan::PlanOutcome;
+        use omnifrons_domain::definition_create::{AnswerError, AnswerProblem, ProvenanceEntry};
+        use omnifrons_domain::definition_plan::{
+            InputFingerprint, Notice, Operation, Plan, PlanId, PlanRefusal,
+        };
+
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let h = |b: u8| format!("{b:02x}").repeat(32);
+        let plan = Plan {
+            workspace: "/ws".to_string(),
+            agent: ".".to_string(),
+            inputs: std::collections::BTreeMap::new(),
+            operations: vec![Operation::WriteGenerated {
+                template_version: "adr-0005-create-v1".to_string(),
+                answers_digest: sha(8),
+                after: sha(1),
+                before: InputFingerprint::Absent,
+            }],
+            block_diff: None,
+            notices: vec![Notice::PortableAgentFolder {
+                path: ".backup".to_string(),
+            }],
+            id: PlanId([7; 32]),
+        };
+        let provenance = vec![ProvenanceEntry {
+            line: "- Your name is Harbor.".to_string(),
+            said: vec!["call it Harbor".to_string()],
+        }];
+        let planned = super::DefinitionCreatePreviewDto::from_outcome(
+            &workspace,
+            ".",
+            &PlanOutcome::Planned(plan),
+            &provenance,
+        );
+        assert_eq!(
+            json(&planned),
+            serde_json::json!({
+                "schema": "omnifrons.definition-create-preview/1",
+                "agent": workspace.path().to_string_lossy(),
+                "outcome": {
+                    "kind": "planned",
+                    "planId": h(7),
+                    "workspace": "/ws",
+                    "operations": [
+                        {"op": "write-generated", "path": "AGENTS.md",
+                         "templateVersion": "adr-0005-create-v1", "answersDigest": h(8),
+                         "before": {"kind": "absent"}, "after": h(1)},
+                    ],
+                    "notices": [{"kind": "portable-agent-folder", "path": ".backup"}],
+                    "provenance": [
+                        {"line": "- Your name is Harbor.", "said": ["call it Harbor"]},
+                    ],
+                },
+            })
+        );
+        let refused = super::DefinitionCreatePreviewDto::from_outcome(
+            &workspace,
+            ".",
+            &PlanOutcome::Refused(PlanRefusal::IdentityExists("it exists".to_string())),
+            &[],
+        );
+        assert_eq!(
+            json(&refused)["outcome"],
+            serde_json::json!({
+                "kind": "refused", "code": "identity_exists", "message": "it exists"
+            })
+        );
+        let invalid = super::DefinitionCreatePreviewDto::invalid(
+            &workspace,
+            ".",
+            &[
+                AnswerError {
+                    field: "deliverables".to_string(),
+                    index: Some(1),
+                    part: Some("text".to_string()),
+                    problem: AnswerProblem::Blank,
+                },
+                AnswerError {
+                    field: "mystery".to_string(),
+                    index: None,
+                    part: None,
+                    problem: AnswerProblem::UnknownField,
+                },
+            ],
+        );
+        assert_eq!(
+            json(&invalid)["outcome"],
+            serde_json::json!({
+                "kind": "invalid",
+                "problems": [
+                    {"field": "deliverables", "index": 1, "part": "text",
+                     "reason": "blank", "message": "must not be blank"},
+                    {"field": "mystery", "index": null, "part": null,
+                     "reason": "unknown_field", "message": "unknown field"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn definition_create_apply_dto_serializes_each_outcome_to_a_pinned_shape() {
+        use omnifrons_app::apply_record::{AppliedFile, ApplyRecordId};
+        use omnifrons_app::definition_apply::ApplyOutcome;
+        use omnifrons_domain::definition_create::{AnswerError, AnswerProblem};
+        use omnifrons_domain::definition_plan::{InputFingerprint, PlanId, PlanRefusal};
+
+        let workspace = omnifrons_app::WorkspaceRoot::new(std::env::temp_dir())
+            .expect("the temp directory is a valid workspace root");
+        let h = |b: u8| format!("{b:02x}").repeat(32);
+        let applied = super::DefinitionCreateApplyDto::from_outcome(
+            &workspace,
+            ".",
+            &ApplyOutcome::Applied {
+                plan_id: PlanId([7; 32]),
+                record: ApplyRecordId("rec-1.json".to_string()),
+                files: vec![AppliedFile {
+                    path: "AGENTS.md".to_string(),
+                    before: InputFingerprint::Absent,
+                    after: Some(sha(1)),
+                    snapshot: None,
+                }],
+            },
+        );
+        assert_eq!(
+            json(&applied),
+            serde_json::json!({
+                "schema": "omnifrons.definition-create-apply/1",
+                "agent": workspace.path().to_string_lossy(),
+                "outcome": {
+                    "kind": "applied",
+                    "planId": h(7),
+                    "record": "rec-1.json",
+                    "files": [
+                        {"path": "AGENTS.md", "before": {"kind": "absent"},
+                         "after": h(1), "snapshot": null},
+                    ],
+                },
+            })
+        );
+        let noop = super::DefinitionCreateApplyDto::from_outcome(
+            &workspace,
+            ".",
+            &ApplyOutcome::NoOp {
+                plan_id: PlanId([7; 32]),
+            },
+        );
+        assert_eq!(
+            json(&noop)["outcome"],
+            serde_json::json!({"kind": "noop", "planId": h(7)})
+        );
+        let refused = super::DefinitionCreateApplyDto::from_outcome(
+            &workspace,
+            ".",
+            &ApplyOutcome::Refused(PlanRefusal::NestedAgent("under another".to_string())),
+        );
+        assert_eq!(
+            json(&refused)["outcome"],
+            serde_json::json!({
+                "kind": "refused", "code": "nested_agent", "message": "under another"
+            })
+        );
+        let invalid = super::DefinitionCreateApplyDto::invalid(
+            &workspace,
+            ".",
+            &[AnswerError {
+                field: "answers".to_string(),
+                index: None,
+                part: None,
+                problem: AnswerProblem::NotAnObjectDocument,
+            }],
+        );
+        assert_eq!(
+            json(&invalid)["outcome"],
+            serde_json::json!({
+                "kind": "invalid",
+                "problems": [
+                    {"field": "answers", "index": null, "part": null,
+                     "reason": "not_an_object_document", "message": "must be a JSON object"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn definition_field_dto_serializes_the_catalogue_row_shape() {
+        let catalogue = super::DefinitionFieldDto::catalogue();
+        assert_eq!(catalogue.len(), 11);
+        assert_eq!(
+            json(&catalogue[2]),
+            serde_json::json!({
+                "key": "deliverables",
+                "required": true,
+                "list": true,
+                "prompt": "What are the main deliverables the agent produces?",
+            })
         );
     }
 }

@@ -15,6 +15,9 @@ import {
   catalogRepair,
   catalogRepairPreview,
   definitionApply,
+  definitionCreateApply,
+  definitionCreateFields,
+  definitionCreatePreview,
   definitionPreview,
   definitionStatus,
   definitionVerify,
@@ -93,7 +96,14 @@ import {
   type DefinitionAgent,
   type DefinitionApply,
   type DefinitionApplyOutcomeKind,
+  type DefinitionAnswers,
   type DefinitionBlockMode,
+  type DefinitionCreateApply,
+  type DefinitionCreateApplyOutcomeKind,
+  type DefinitionCreatePreview,
+  type DefinitionCreatePreviewOutcomeKind,
+  type DefinitionCreateRequest,
+  type DefinitionField,
   type DefinitionFingerprintKind,
   type DefinitionNoticeKind,
   type DefinitionOperationTag,
@@ -3344,6 +3354,112 @@ describe('definitionPreview and definitionApply (ADR-0005 slice 2, sub-slice 2f)
   })
 })
 
+const DEFINITION_CREATE_ANSWERS: DefinitionAnswers = {
+  name: { text: 'Harbor', said: 'call it Harbor', status: 'confirmed' },
+  role: { text: 'a scheduling assistant', said: 'it schedules things', status: 'confirmed' },
+  deliverables: [{ text: 'Propose slots.', said: 'slots, please', status: 'confirmed' }],
+  authority: [{ text: 'Draft and advise only.', said: 'only advise', status: 'confirmed' }],
+  work_language: { text: 'the language of each user', said: 'whatever they speak', status: 'confirmed' },
+  open_decisions: [{ text: 'Whether it may book rooms.', said: 'not sure about rooms' }],
+}
+
+const DEFINITION_CREATE_REQUEST: DefinitionCreateRequest = {
+  agent: 'sub/agent',
+  nestedConsent: true,
+  withGemini: true,
+  answers: DEFINITION_CREATE_ANSWERS,
+}
+
+describe('definitionCreate wrappers (ADR-0005 slice 3, sub-slice 3d)', () => {
+  it('invokes definition_create_fields with no arguments and returns the catalogue verbatim', async () => {
+    const fields: DefinitionField[] = [
+      { key: 'role', required: true, list: false, prompt: 'What role will the agent have, and within what scope?' },
+      { key: 'sources', required: false, list: true, prompt: 'Which local sources are reliable?' },
+    ]
+    let invoked = 0
+    mockIPC((cmd, args) => {
+      if (cmd !== 'definition_create_fields') throw new Error(`unexpected command: ${cmd}`)
+      invoked += 1
+      expect(args ?? {}).toEqual({})
+      return fields
+    })
+
+    expect(await definitionCreateFields()).toEqual(fields)
+    expect(invoked).toBe(1)
+  })
+
+  it('invokes definition_create_preview with exactly the four camelCase arguments, the answers untouched', async () => {
+    const planned: DefinitionCreatePreview = {
+      schema: 'omnifrons.definition-create-preview/1',
+      agent: '/workspace',
+      outcome: {
+        kind: 'planned',
+        planId: H7,
+        workspace: '/ws',
+        operations: [
+          {
+            op: 'write-generated',
+            path: 'AGENTS.md',
+            templateVersion: 'adr-0005-create-v1',
+            answersDigest: '08'.repeat(32),
+            before: { kind: 'absent' },
+            after: '01'.repeat(32),
+          },
+        ],
+        notices: [],
+        provenance: [{ line: '- Your name is Harbor.', said: ['call it Harbor'] }],
+      },
+    }
+    const mock = mockCommand('definition_create_preview', () => planned)
+
+    const preview = await definitionCreatePreview(DEFINITION_CREATE_REQUEST)
+
+    expect(mock.args()).toEqual({
+      agent: 'sub/agent',
+      nestedConsent: true,
+      withGemini: true,
+      answers: DEFINITION_CREATE_ANSWERS,
+    })
+    expect(preview).toEqual(planned)
+  })
+
+  it('invokes definition_create_apply with the request arguments plus planId', async () => {
+    const applied: DefinitionCreateApply = {
+      schema: 'omnifrons.definition-create-apply/1',
+      agent: '/workspace',
+      outcome: {
+        kind: 'applied',
+        planId: H7,
+        record: 'rec-1.json',
+        files: [{ path: 'AGENTS.md', before: { kind: 'absent' }, after: '01'.repeat(32), snapshot: null }],
+      },
+    }
+    const mock = mockCommand('definition_create_apply', () => applied)
+
+    const result = await definitionCreateApply(DEFINITION_CREATE_REQUEST, H7)
+
+    expect(mock.args()).toEqual({
+      agent: 'sub/agent',
+      nestedConsent: true,
+      withGemini: true,
+      answers: DEFINITION_CREATE_ANSWERS,
+      planId: H7,
+    })
+    expect(result).toEqual(applied)
+  })
+
+  it('narrows the invalid and refused outcomes through the kind discriminant', () => {
+    const invalid = JSON.parse(
+      '{"schema":"omnifrons.definition-create-preview/1","agent":"/w","outcome":{"kind":"invalid","problems":[{"field":"deliverables","index":1,"part":"text","reason":"blank","message":"must not be blank"}]}}',
+    ) as DefinitionCreatePreview
+    expect(invalid.outcome.kind === 'invalid' && invalid.outcome.problems[0]?.index).toBe(1)
+    const refused = JSON.parse(
+      '{"schema":"omnifrons.definition-create-apply/1","agent":"/w","outcome":{"kind":"refused","code":"identity_exists","message":"it exists"}}',
+    ) as DefinitionCreateApply
+    expect(refused.outcome.kind === 'refused' && refused.outcome.code).toBe('identity_exists')
+  })
+})
+
 /**
  * The attribute block and the body of one `pub enum` in the shell's own
  * `dto.rs`, read as text through Vite's `?raw`.
@@ -3602,6 +3718,10 @@ const DEFINITION_NOTICE_KINDS = ['portable-agent-folder'] as const
 const DEFINITION_PREVIEW_OUTCOME_KINDS = ['planned', 'refused'] as const
 /** Every token {@link DefinitionApplyOutcomeKind} declares. */
 const DEFINITION_APPLY_OUTCOME_KINDS = ['applied', 'noop', 'refused'] as const
+/** Every token {@link DefinitionCreatePreviewOutcomeKind} declares. */
+const DEFINITION_CREATE_PREVIEW_OUTCOME_KINDS = ['planned', 'refused', 'invalid'] as const
+/** Every token {@link DefinitionCreateApplyOutcomeKind} declares. */
+const DEFINITION_CREATE_APPLY_OUTCOME_KINDS = ['applied', 'noop', 'refused', 'invalid'] as const
 
 // Compile-time, enforced by `tsc -b` in `pnpm -r build` and not by vitest:
 // each array covers its union exactly -- no member missing, no extra.
@@ -3639,7 +3759,11 @@ const _assertions: [
   CoversExactly<DefinitionNoticeKind, typeof DEFINITION_NOTICE_KINDS>,
   CoversExactly<DefinitionPreviewOutcomeKind, typeof DEFINITION_PREVIEW_OUTCOME_KINDS>,
   CoversExactly<DefinitionApplyOutcomeKind, typeof DEFINITION_APPLY_OUTCOME_KINDS>,
+  CoversExactly<DefinitionCreatePreviewOutcomeKind, typeof DEFINITION_CREATE_PREVIEW_OUTCOME_KINDS>,
+  CoversExactly<DefinitionCreateApplyOutcomeKind, typeof DEFINITION_CREATE_APPLY_OUTCOME_KINDS>,
 ] = [
+  true,
+  true,
   true,
   true,
   true,
@@ -3715,6 +3839,8 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['NoticeDto', DEFINITION_NOTICE_KINDS],
   ['DefinitionPreviewOutcomeDto', DEFINITION_PREVIEW_OUTCOME_KINDS],
   ['DefinitionApplyOutcomeDto', DEFINITION_APPLY_OUTCOME_KINDS],
+  ['DefinitionCreatePreviewOutcomeDto', DEFINITION_CREATE_PREVIEW_OUTCOME_KINDS],
+  ['DefinitionCreateApplyOutcomeDto', DEFINITION_CREATE_APPLY_OUTCOME_KINDS],
 ]
 
 describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103)', () => {
@@ -3746,6 +3872,6 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(33)
+    expect(enums).toHaveLength(35)
   })
 })
