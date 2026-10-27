@@ -336,6 +336,10 @@ pub enum AnswerProblem {
     SkillLink,
     /// A joined list item ends a sentence by itself.
     SentenceEnd,
+    /// A name ends with `.`, `!` or `?`; the introduction writes a comma after it.
+    NameSentenceEnd,
+    /// A text holds a backtick; sources and assumed claims are written inside code spans.
+    Backtick,
     /// A status that is neither `confirmed` nor `assumption`.
     BadStatus,
     /// A required field whose status is not `confirmed`.
@@ -368,6 +372,8 @@ impl AnswerProblem {
             Self::Import { .. } => "import",
             Self::SkillLink => "skill_link",
             Self::SentenceEnd => "sentence_end",
+            Self::NameSentenceEnd => "name_sentence_end",
+            Self::Backtick => "backtick",
             Self::BadStatus => "bad_status",
             Self::RequiredNotConfirmed => "required_not_confirmed",
         }
@@ -415,6 +421,14 @@ impl fmt::Display for AnswerProblem {
             Self::SentenceEnd => f.write_str(
                 "must not end with '.', '!' or '?': the items are joined into one sentence \
                  (\"including a, b and c.\"); drop the final punctuation",
+            ),
+            Self::NameSentenceEnd => f.write_str(
+                "must not end with '.', '!' or '?': the introduction writes a comma after the \
+                 name (\"You are Name, a role.\"); drop the final punctuation",
+            ),
+            Self::Backtick => f.write_str(
+                "must not contain a backtick (`): sources and assumed claims are written \
+                 inside code spans, so a backtick would break them",
             ),
             Self::BadStatus => f.write_str("must be \"confirmed\" or \"assumption\""),
             Self::RequiredNotConfirmed => f.write_str("required fields must be confirmed"),
@@ -635,6 +649,9 @@ fn check_text(
     if field == Field::NeverInvent && body.ends_with(SENTENCE_ENDS) {
         problems.push(AnswerProblem::SentenceEnd);
     }
+    if field == Field::Name && body.ends_with(SENTENCE_ENDS) {
+        problems.push(AnswerProblem::NameSentenceEnd);
+    }
     let clean = problems.is_empty();
     errors.extend(
         problems
@@ -735,18 +752,138 @@ fn text_problems(body: &str) -> Vec<AnswerProblem> {
     if !indexed_skill_targets(body.as_bytes(), "").is_empty() {
         problems.push(AnswerProblem::SkillLink);
     }
+    if body.contains('`') {
+        problems.push(AnswerProblem::Backtick);
+    }
     problems
 }
 
 /// What the folder around the target looks like: the only context the
 /// template needs besides the answers.
+///
+/// Build it with [`CreateContext::new`]: each child path is written
+/// verbatim inside a code span of [`CHILD_LINE`], so [`render`] relies on
+/// the constructor having refused a child that is empty, has a line
+/// break, holds a backtick or holds the `{child}` placeholder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateContext {
-    /// The direct child agents, as paths relative to the target
-    /// (for example `sales` or `area/inner`), in the order to render.
-    pub children: Vec<String>,
+    children: Vec<String>,
+    enclosed: bool,
+}
+
+/// Why a child path cannot be written into the template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextError {
+    /// The path is empty.
+    Empty,
+    /// The path holds a line break or another control character.
+    LineBreak {
+        /// The offending path.
+        child: String,
+    },
+    /// The path holds a backtick.
+    Backtick {
+        /// The offending path.
+        child: String,
+    },
+    /// The path holds the `{child}` placeholder of the template.
+    Placeholder {
+        /// The offending path.
+        child: String,
+    },
+}
+
+impl ContextError {
+    /// A stable token for the problem.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::LineBreak { .. } => "line_break",
+            Self::Backtick { .. } => "backtick",
+            Self::Placeholder { .. } => "placeholder",
+        }
+    }
+
+    /// The offending path (empty for [`Self::Empty`]).
+    #[must_use]
+    pub fn child(&self) -> &str {
+        match self {
+            Self::Empty => "",
+            Self::LineBreak { child } | Self::Backtick { child } | Self::Placeholder { child } => {
+                child
+            }
+        }
+    }
+}
+
+impl fmt::Display for ContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("a child path must not be empty"),
+            Self::LineBreak { child } => {
+                write!(
+                    f,
+                    "child path {child:?} must not hold a line break or control character"
+                )
+            }
+            Self::Backtick { child } => {
+                write!(f, "child path {child:?} must not hold a backtick")
+            }
+            Self::Placeholder { child } => {
+                write!(
+                    f,
+                    "child path {child:?} must not hold the {{child}} placeholder"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ContextError {}
+
+impl CreateContext {
+    /// A context for a target with these direct child agents (paths
+    /// relative to the target, for example `sales` or `area/inner`, in the
+    /// order to render) and whether an ancestor agent encloses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first child path that cannot be written into the
+    /// template.
+    pub fn new(children: Vec<String>, enclosed: bool) -> Result<Self, ContextError> {
+        for child in &children {
+            if child.is_empty() {
+                return Err(ContextError::Empty);
+            }
+            let child = child.clone();
+            if child
+                .chars()
+                .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+            {
+                return Err(ContextError::LineBreak { child });
+            }
+            if child.contains('`') {
+                return Err(ContextError::Backtick { child });
+            }
+            if child.contains("{child}") {
+                return Err(ContextError::Placeholder { child });
+            }
+        }
+        Ok(Self { children, enclosed })
+    }
+
+    /// The direct child agents, as given.
+    #[must_use]
+    pub fn children(&self) -> &[String] {
+        &self.children
+    }
+
     /// Whether an ancestor agent encloses the target.
-    pub enclosed: bool,
+    #[must_use]
+    pub const fn enclosed(&self) -> bool {
+        self.enclosed
+    }
 }
 
 /// One generated line and the user's words behind it.

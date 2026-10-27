@@ -595,7 +595,6 @@ fn answer_texts_allow_plain_mentions() {
     let allowed = [
         "Review C# and F# snippets.",
         "Write to team@example.md style addresses.",
-        "Quote `AGENTS.md` only as inline code.",
         "Link [the guide](docs/guide.md) when useful.",
         "Mention SKILL.md files by name without linking them.",
         "Compare a -> b and b <- c.",
@@ -850,17 +849,11 @@ You are Harbor, a scheduling assistant for the front desk. You serve the front d
 ";
 
 fn nested() -> CreateContext {
-    CreateContext {
-        children: vec![],
-        enclosed: true,
-    }
+    CreateContext::new(vec![], true).unwrap()
 }
 
 fn parent_of(children: &[&str]) -> CreateContext {
-    CreateContext {
-        children: children.iter().map(ToString::to_string).collect(),
-        enclosed: false,
-    }
+    CreateContext::new(children.iter().map(ToString::to_string).collect(), false).unwrap()
 }
 
 #[test]
@@ -908,10 +901,7 @@ fn renders_a_parent_with_children_byte_exact() {
         golden
     );
     // Children come before the enclosing line when both apply.
-    let both = CreateContext {
-        children: vec!["alpha".to_string()],
-        enclosed: true,
-    };
+    let both = CreateContext::new(vec!["alpha".to_string()], true).unwrap();
     let text = rendered(minimal(), &both);
     let child_at = text.find("`alpha/`").unwrap();
     let enclosing_at = text.find("An enclosing folder").unwrap();
@@ -1011,10 +1001,7 @@ fn rendered_lines_are_template_constants_answers_or_paths() {
         RawValue::List(vec![ok("docs/overview.md", "S1.")]),
     );
     let answers = accepted(&doc(pairs));
-    let context = CreateContext {
-        children: vec!["crew".to_string()],
-        enclosed: true,
-    };
+    let context = CreateContext::new(vec!["crew".to_string()], true).unwrap();
     let text = render(&answers, &context);
     let mut skeleton = text.clone();
     let mut texts: Vec<String> = Field::ALL
@@ -1209,4 +1196,166 @@ fn the_users_words_never_enter_the_render() {
     );
     let text = rendered(pairs, &CreateContext::default());
     assert!(!text.contains("@brief.md") && !text.contains("freely"));
+}
+
+// ------------------------------------------------------------- correction
+
+fn reasons_at(raw: &RawValue, location: &str) -> Vec<&'static str> {
+    Answers::validate(raw)
+        .unwrap_err()
+        .iter()
+        .filter(|error| error.to_string().starts_with(location))
+        .map(|error| error.problem.reason())
+        .collect()
+}
+
+#[test]
+fn a_backtick_is_refused_in_any_text() {
+    let mut sourced = full();
+    set(
+        &mut sourced,
+        "sources",
+        RawValue::List(vec![ok("docs/over`view.md", "S.")]),
+    );
+    assert_eq!(reasons_at(&doc(sourced), "sources[0].text: "), ["backtick"]);
+    assert_refused(
+        &with_deliverable("Run `make` first."),
+        &["deliverables[0].text: "],
+    );
+    assert_eq!(
+        reasons_at(
+            &with_deliverable("Run `make` first."),
+            "deliverables[0].text: "
+        ),
+        ["backtick"]
+    );
+    let mut named = minimal();
+    set(&mut named, "name", ok("Har`bor", "H."));
+    assert_eq!(reasons_at(&doc(named), "name.text: "), ["backtick"]);
+    let message = errors_of(&with_deliverable("a`b")).remove(0);
+    assert!(
+        message.contains("backtick") && message.contains('`'),
+        "{message}"
+    );
+    // The `said` words may hold one.
+    let mut said = full();
+    set(&mut said, "role", ok("a helper", "It is a `helper`."));
+    accepted(&doc(said));
+}
+
+#[test]
+fn every_problem_is_returned_at_once_in_a_fixed_order() {
+    let mut answers = minimal();
+    unset(&mut answers, "role");
+    set(&mut answers, "skills", ok("A skill.", "S."));
+    set(
+        &mut answers,
+        "deliverables",
+        RawValue::List(vec![
+            ok("Fine.", "F."),
+            ok("# Bad", "B."),
+            ok(&"x".repeat(MAX_TEXT_CHARS + 1), "L."),
+        ]),
+    );
+    set(
+        &mut answers,
+        "tone",
+        object(vec![
+            ("text", text("Warm.")),
+            ("said", text("W.")),
+            ("status", text("confirmed")),
+            ("note", text("extra")),
+        ]),
+    );
+    let errors = errors_of(&doc(answers));
+    assert_eq!(
+        errors,
+        [
+            "skills: unknown field".to_string(),
+            "role: required".to_string(),
+            "deliverables[1].text: must not be a Markdown heading".to_string(),
+            "deliverables[2].text: must be at most 300 characters (has 301)".to_string(),
+            "tone.note: unknown key".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn the_first_of_a_repeated_key_wins() {
+    let mut pairs = minimal();
+    pairs.push(("name".to_string(), ok("# Duplicate", "D.")));
+    let answers = accepted(&doc(pairs));
+    assert_eq!(answers.items(Field::Name)[0].text, "Harbor");
+
+    let mut bad_first = minimal();
+    bad_first.insert(0, ("name".to_string(), ok("# Duplicate", "D.")));
+    assert_refused(
+        &doc(bad_first),
+        &["name.text: must not be a Markdown heading"],
+    );
+
+    let repeated_item = |first: &str, second: &str| {
+        let mut pairs = minimal();
+        set(
+            &mut pairs,
+            "tone",
+            object(vec![
+                ("text", text(first)),
+                ("text", text(second)),
+                ("said", text("W.")),
+                ("status", text("confirmed")),
+            ]),
+        );
+        doc(pairs)
+    };
+    let answers = accepted(&repeated_item("Warm.", "# Duplicate"));
+    assert_eq!(answers.items(Field::Tone)[0].text, "Warm.");
+    assert_refused(&repeated_item("# Duplicate", "Warm."), &["tone.text: "]);
+}
+
+#[test]
+fn a_name_must_not_end_with_sentence_punctuation() {
+    for name in ["Harbor.", "Harbor!", "Harbor?"] {
+        let mut pairs = minimal();
+        set(&mut pairs, "name", ok(name, "H."));
+        assert_eq!(
+            reasons_at(&doc(pairs), "name.text: "),
+            ["name_sentence_end"],
+            "{name}"
+        );
+    }
+    let mut pairs = minimal();
+    set(&mut pairs, "name", ok("Harbor.", "H."));
+    assert_refused(&doc(pairs), &["name.text: must not end with"]);
+    let mut dotted = minimal();
+    set(&mut dotted, "name", ok("Harbor v2.0", "H."));
+    accepted(&doc(dotted));
+}
+
+#[test]
+fn a_context_accepts_plain_relative_children_and_refuses_the_rest() {
+    let context =
+        CreateContext::new(vec!["alpha".to_string(), "area/inner".to_string()], true).unwrap();
+    assert_eq!(context.children(), ["alpha", "area/inner"]);
+    assert!(context.enclosed());
+    assert_eq!(
+        CreateContext::new(vec![], false).unwrap(),
+        CreateContext::default()
+    );
+    let refused = [
+        ("line feed", "a\nb", "line_break"),
+        ("carriage return", "a\rb", "line_break"),
+        ("line separator", "a\u{2028}b", "line_break"),
+        ("backtick", "a`b", "backtick"),
+        ("placeholder", "{child}", "placeholder"),
+        ("embedded placeholder", "x/{child}", "placeholder"),
+        ("empty", "", "empty"),
+    ];
+    for (label, child, reason) in refused {
+        let error = CreateContext::new(vec!["alpha".to_string(), child.to_string()], false)
+            .expect_err(label);
+        assert_eq!(error.reason(), reason, "{label}");
+        assert_eq!(error.child(), child, "{label}");
+        assert!(!error.to_string().is_empty(), "{label}");
+    }
 }
