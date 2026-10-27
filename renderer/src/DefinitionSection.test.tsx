@@ -1106,9 +1106,9 @@ describe('DefinitionSection apply (ADR-0005 slice 2, sub-slice 2f)', () => {
     expect(screen.getByLabelText('Preview')).toBeTruthy()
   })
 
-  it('answers plan-stale with the preview-again hint, drops the stale plan and re-enables Preview', async () => {
+  it('answers plan-stale with the preview-again hint, drops the stale plan, rescans once and re-enables Preview', async () => {
     const error: ShellError = { code: 'plan-stale', message: 'internal wording' }
-    await renderPlanSection({ apply: () => Promise.reject(error) })
+    const ipc = await renderPlanSection({ apply: () => Promise.reject(error) })
     await previewRoot()
 
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
@@ -1116,12 +1116,40 @@ describe('DefinitionSection apply (ADR-0005 slice 2, sub-slice 2f)', () => {
     const banner = await screen.findByTestId('definition-apply-error')
     expect(within(banner).getByText('the plan no longer matches the definition; preview again')).toBeTruthy()
     expect(screen.queryByLabelText('Preview')).toBeNull()
+    await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+    expect(ipc.statusCalls()).toBe(2)
+    expect(screen.getByTestId('definition-apply-error')).toBeTruthy()
     expect((screen.getByRole('button', { name: 'Preview .' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it.each([
+    ['definition-invalid', 'a writer failed after the first file'],
+    ['snapshot-unavailable', 'the apply record could not be stored'],
+  ] as const)(
+    'drops the preview, keeps the %s alert and rescans once after a partial-apply rejection',
+    async (code, message) => {
+      const error: ShellError = { code, message }
+      const ipc = await renderPlanSection({ apply: () => Promise.reject(error) })
+      await previewRoot()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+      const banner = await screen.findByTestId('definition-apply-error')
+      expect(within(banner).getByText(code)).toBeTruthy()
+      expect(within(banner).getByText(new RegExp(message))).toBeTruthy()
+      expect(screen.queryByLabelText('Preview')).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
+      await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+      await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+      expect(ipc.statusCalls()).toBe(2)
+      expect(screen.getByTestId('definition-apply-error')).toBeTruthy()
+    },
+  )
+
   it('renders the code and message of a run-active rejection and keeps the preview', async () => {
     const error: ShellError = { code: 'run-active', message: 'a supervised process is running' }
-    await renderPlanSection({ apply: () => Promise.reject(error) })
+    const ipc = await renderPlanSection({ apply: () => Promise.reject(error) })
     await previewRoot()
 
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
@@ -1130,6 +1158,7 @@ describe('DefinitionSection apply (ADR-0005 slice 2, sub-slice 2f)', () => {
     expect(within(banner).getByText('run-active')).toBeTruthy()
     expect(within(banner).getByText(/a supervised process is running/)).toBeTruthy()
     expect(screen.getByLabelText('Preview')).toBeTruthy()
+    expect(ipc.statusCalls()).toBe(1)
   })
 
   it('starts one preview and one apply even when two clicks land in the same tick', async () => {

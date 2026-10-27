@@ -864,6 +864,23 @@ export function DefinitionSection() {
   )
 
   /**
+   * The scan that follows an apply that wrote, or may have written: unlike a
+   * user's "Rescan" it keeps the apply result or error on screen, and it
+   * drops the verification and the consent boxes, which described the rows
+   * as they were.
+   */
+  const rescanAfterApply = useCallback(() => {
+    scanningRef.current = true
+    setLoading(true)
+    setError(null)
+    setVerify(null)
+    setVerifyError(null)
+    setVerifyTarget(null)
+    setConsented(new Set())
+    scan(true)
+  }, [scan])
+
+  /**
    * The apply of the shown plan, bound to its id and to the request it was
    * planned from. After an applied outcome the section rescans so the rows
    * show the new state; unlike a user's "Rescan" that keeps the apply
@@ -889,14 +906,7 @@ export function DefinitionSection() {
         if (result.outcome.kind === 'refused') return
         setPreview(null)
         if (result.outcome.kind === 'noop') return
-        scanningRef.current = true
-        setLoading(true)
-        setError(null)
-        setVerify(null)
-        setVerifyError(null)
-        setVerifyTarget(null)
-        setConsented(new Set())
-        scan(true)
+        rescanAfterApply()
       },
       (reason: unknown) => {
         applyingRef.current = false
@@ -904,10 +914,15 @@ export function DefinitionSection() {
         setApplying(false)
         if (generationRef.current !== generation) return
         setApplyError(toSectionError(reason))
-        if (isShellError(reason) && reason.code === 'plan-stale') setPreview(null)
+        // `run-active` is refused before any write, so the plan still holds
+        // and Apply can be retried. Any other failure may have happened after
+        // some writes: the plan no longer holds, and the rows are re-read.
+        if (isShellError(reason) && reason.code === 'run-active') return
+        setPreview(null)
+        rescanAfterApply()
       },
     )
-  }, [preview, previewRequest, scan])
+  }, [preview, previewRequest, rescanAfterApply])
 
   const onConsentChange = useCallback((path: string, checked: boolean) => {
     setConsented((current) => {
