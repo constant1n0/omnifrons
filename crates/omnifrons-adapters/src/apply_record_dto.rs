@@ -410,4 +410,54 @@ mod tests {
             assert!(!decodes(&value), "{pointer} accepted a bad value");
         }
     }
+
+    fn generated_record() -> ApplyRecord {
+        ApplyRecord {
+            operations: vec![Operation::WriteGenerated {
+                template_version: "adr-0005-create-v1".to_string(),
+                answers_digest: Sha256Digest([6; 32]),
+                after: Sha256Digest([7; 32]),
+                before: InputFingerprint::Absent,
+            }],
+            ..record()
+        }
+    }
+
+    #[test]
+    fn a_generated_write_serialises_to_the_pinned_fragment_and_decodes_back() {
+        let value = serde_json::to_value(ApplyRecordDto::from(&generated_record())).unwrap();
+        assert_eq!(
+            value["operations"][0],
+            json!({
+                "op": "write-generated",
+                "path": "AGENTS.md",
+                "templateVersion": "adr-0005-create-v1",
+                "answersDigest": "06".repeat(32),
+                "after": "07".repeat(32),
+                "before": {"kind": "absent"},
+            })
+        );
+        let dto: ApplyRecordDto = serde_json::from_value(value).expect("parse");
+        assert_eq!(ApplyRecord::try_from(dto), Ok(generated_record()));
+    }
+
+    #[test]
+    fn a_generated_write_with_another_path_or_a_bad_digest_is_corrupt() {
+        let base = serde_json::to_value(ApplyRecordDto::from(&generated_record())).unwrap();
+        for (pointer, replacement) in [
+            ("/operations/0/path", json!("CLAUDE.md")),
+            ("/operations/0/answersDigest", json!("not-hex")),
+            ("/operations/0/answersDigest", json!("abcd")),
+            ("/operations/0/after", json!("zz")),
+        ] {
+            let mut value = base.clone();
+            *value.pointer_mut(pointer).expect("field") = replacement.clone();
+            let dto: ApplyRecordDto = serde_json::from_value(value).expect("the shape is complete");
+            assert_eq!(
+                ApplyRecord::try_from(dto),
+                Err(super::Corrupt),
+                "{pointer} = {replacement}"
+            );
+        }
+    }
 }

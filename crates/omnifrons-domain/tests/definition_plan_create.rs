@@ -125,7 +125,7 @@ fn a_generated_write_has_its_own_canonical_line() {
     assert_eq!(
         operation.canonical(),
         format!(
-            "write-generated path=AGENTS.md template=adr-0005-create-v1 answers={} after={} \
+            "write-generated path=AGENTS.md template=18:adr-0005-create-v1 answers={} after={} \
              before=absent",
             "11".repeat(32),
             "22".repeat(32)
@@ -700,4 +700,40 @@ fn the_plan_text_changes_with_the_template_version_and_the_before_fingerprint() 
     let base_text = plan_text(&[base], &BTreeMap::new());
     assert_ne!(base_text, plan_text(&[other_template], &BTreeMap::new()));
     assert_ne!(base_text, plan_text(&[other_before], &BTreeMap::new()));
+}
+
+#[test]
+fn a_template_version_with_a_space_or_a_newline_cannot_blur_the_line() {
+    let make = |version: &str| Operation::WriteGenerated {
+        template_version: version.to_string(),
+        answers_digest: Sha256Digest([1; 32]),
+        after: Sha256Digest([2; 32]),
+        before: InputFingerprint::Absent,
+    };
+    let hex = "01".repeat(32);
+    // Unframed, this version would make two lines of the plan text read the same.
+    let version = format!("v1 answers={hex} after=x\nwrite-block");
+    let line = make(&version).canonical();
+    let framed = format!("template={}:{version} answers=", version.len());
+    assert!(line.contains(&framed), "{line}");
+    assert_ne!(make("a b").canonical(), make("a").canonical());
+    assert!(make("a b").canonical().contains("template=3:a b answers="));
+}
+
+#[test]
+fn the_block_write_frames_its_template_version() {
+    let operation = Operation::WriteBlock {
+        kind: omnifrons_domain::guidance::ManagedFileKind::Skills,
+        mode: omnifrons_domain::definition_plan::BlockMode::Append,
+        body: Sha256Digest([3; 32]),
+        after: Sha256Digest([4; 32]),
+        before: InputFingerprint::Absent,
+    };
+    assert!(
+        operation
+            .canonical()
+            .contains(" version=18:adr-0005-skills-v1 mode=append "),
+        "{}",
+        operation.canonical()
+    );
 }

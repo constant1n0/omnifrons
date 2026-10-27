@@ -222,9 +222,10 @@ impl Operation {
                 after,
                 before,
             } => format!(
-                "write-generated path={} template={template_version} answers={} after={} \
+                "write-generated path={} template={}:{template_version} answers={} after={} \
                  before={}",
                 self.path(),
+                template_version.len(),
                 answers_digest.to_hex(),
                 after.to_hex(),
                 before.canonical()
@@ -246,10 +247,11 @@ impl Operation {
                 after,
                 before,
             } => format!(
-                "write-block path={} kind={} version={SKILLS_TEMPLATE_VERSION} mode={} \
+                "write-block path={} kind={} version={}:{SKILLS_TEMPLATE_VERSION} mode={} \
                  body={} after={} before={}",
                 self.path(),
                 block_kind_token(*kind),
+                SKILLS_TEMPLATE_VERSION.len(),
                 mode.as_str(),
                 body.to_hex(),
                 after.to_hex(),
@@ -607,10 +609,14 @@ pub struct Plan {
 ///
 /// ```text
 /// write-agents source=<file> after=<hex> before=<fingerprint>
-/// write-generated path=<file> template=<version> answers=<hex> after=<hex> before=<fingerprint>
+/// write-generated path=<file> template=<len>:<version> answers=<hex> after=<hex> before=<fingerprint>
 /// write-wrapper path=<file> after=<hex> before=<fingerprint>
-/// write-block path=<file> kind=skills version=<template version> mode=<mode> body=<hex> after=<hex> before=<fingerprint>
+/// write-block path=<file> kind=skills version=<len>:<template version> mode=<mode> body=<hex> after=<hex> before=<fingerprint>
 /// ```
+///
+/// A template version is framed as `<len>:<text>` (its length in bytes),
+/// so a version holding a space or a line break cannot read as another
+/// field or line.
 ///
 /// A block operation therefore changes the id when the block's body, the
 /// template version, the mode or the resulting file changes. The diff
