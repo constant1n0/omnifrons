@@ -33,7 +33,7 @@ use std::fmt::{self, Write as _};
 use crate::definition::IdentityKind;
 use crate::executable::Sha256Digest;
 use crate::guidance::{ManagedFileKind, SKILLS_TEMPLATE_VERSION};
-use crate::hosts::HOST_CONFIG_DIRS;
+use crate::hosts::{HOST_CONFIG_DIRS, SKIP_DIRS};
 
 /// The first line of every [`canonical_bytes`] text. Changing the layout
 /// of that text means changing this tag, so an old id can never match a
@@ -420,6 +420,38 @@ pub fn host_config_index(components: &[&str]) -> Option<usize> {
 #[must_use]
 pub fn host_config_folder(components: &[&str]) -> bool {
     host_config_index(components).is_some()
+}
+
+/// The index of the first component of `components` that names a
+/// directory the tree walk prunes ([`SKIP_DIRS`]), compared without case
+/// like [`host_config_index`]. Nothing below such a directory is ever
+/// listed, so an agent created there could not be seen again.
+#[must_use]
+pub fn pruned_directory_index(components: &[&str]) -> Option<usize> {
+    components.iter().position(|component| {
+        let folded = component.to_lowercase();
+        SKIP_DIRS.iter().any(|name| name.to_lowercase() == folded)
+    })
+}
+
+/// The refusal message for a target below a directory the tree walk
+/// prunes: `name` is that directory's name.
+#[must_use]
+pub fn pruned_target_message(directory: &str, name: &str) -> String {
+    format!(
+        "{directory} is below {name}/, which the scan never enters; an agent created there \
+         could not be found again. Choose a folder outside it"
+    )
+}
+
+/// The refusal message for a target reached through a symlinked folder:
+/// `component` is the linked path and `link` where it points.
+#[must_use]
+pub fn linked_component_message(directory: &str, component: &str, link: &str) -> String {
+    format!(
+        "{directory} is reached through {component}, a symlink to {link}; pass the real folder \
+         (new agents are never written through a symlink)"
+    )
 }
 
 /// The refusal message for a target that is itself a symlink.

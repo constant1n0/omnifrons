@@ -697,6 +697,116 @@ fn the_unsafe_target_gate_outranks_an_existing_agent() {
     assert_eq!(refusal(outcome).code(), "unsafe_target");
 }
 
+#[test]
+fn a_target_below_a_pruned_directory_is_refused() {
+    for target in ["node_modules/pkg", ".git/hooks", "a/.Git/b"] {
+        let result = unsafe_target(target, |tree, _| tree);
+        assert_eq!(result.code(), "unsafe_target", "{target}");
+        assert!(
+            result.message().contains("never enters"),
+            "{target}: {result}"
+        );
+    }
+    let result = unsafe_target("node_modules/pkg", |tree, _| tree);
+    assert!(result.message().contains("node_modules/"), "{result}");
+}
+
+/// The physical components of `root` followed by `below`.
+fn under_root(root: &WorkspaceRoot, below: &[&str]) -> Vec<String> {
+    let mut components: Vec<String> = root
+        .path()
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    components.extend(below.iter().map(ToString::to_string));
+    components
+}
+
+#[test]
+fn a_pruned_directory_below_the_root_in_the_physical_path_is_refused() {
+    let result = unsafe_target("t", |tree, root| {
+        let components = under_root(root, &["__pycache__", "x"]);
+        tree.with_location(
+            root,
+            "t",
+            TargetLocation {
+                components,
+                home: false,
+            },
+        )
+    });
+    assert_eq!(result.code(), "unsafe_target");
+    assert!(result.message().contains("__pycache__/"), "{result}");
+}
+
+#[test]
+fn a_root_that_sits_under_a_pruned_name_still_plans_a_create() {
+    let outcome = create_with(
+        empty().build(),
+        "t",
+        PlanOptions::default(),
+        &answers(),
+        |tree, root| {
+            let mut above = under_root(root, &["t"]);
+            above.insert(0, "node_modules".to_string());
+            let root_only = {
+                let mut parts = under_root(root, &[]);
+                parts.insert(0, "node_modules".to_string());
+                parts
+            };
+            tree.with_location(
+                root,
+                ".",
+                TargetLocation {
+                    components: root_only,
+                    home: false,
+                },
+            )
+            .with_location(
+                root,
+                "t",
+                TargetLocation {
+                    components: above,
+                    home: false,
+                },
+            )
+        },
+    );
+    planned(outcome);
+}
+
+#[test]
+fn a_name_that_only_resembles_a_pruned_directory_is_accepted() {
+    let outcome = create_with(
+        empty().build(),
+        "node-modules",
+        PlanOptions::default(),
+        &answers(),
+        |tree, _| tree,
+    );
+    planned(outcome);
+}
+
+#[test]
+fn a_target_reached_through_a_linked_folder_is_refused() {
+    let result = unsafe_target("alias/child", |tree, root| {
+        tree.with_probe(
+            root,
+            "alias",
+            PathProbe::Symlink {
+                link: "real".to_string(),
+            },
+        )
+        .with_probe(root, "alias/child", PathProbe::Present)
+    });
+    assert_eq!(result.code(), "unsafe_target");
+    assert!(result.message().contains("alias"), "{result}");
+    assert!(result.message().contains("symlink to real"), "{result}");
+}
+
 // ------------------------------------------------------------- sources
 
 fn with_sources(

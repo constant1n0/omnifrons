@@ -475,6 +475,35 @@ fn a_host_configuration_target_is_refused_at_any_depth() {
 }
 
 #[test]
+fn a_target_below_a_pruned_directory_is_refused_and_nothing_is_written() {
+    let env = Env::new("pruned");
+    std::fs::create_dir_all(env.root.join(".git/hooks")).expect("dir");
+    let before = env.listing();
+    let refusal = refused(env.plan(".git/hooks", &answers()));
+    assert_eq!(refusal.code(), "unsafe_target");
+    assert!(refusal.message().contains(".git/"), "{refusal}");
+    assert_eq!(env.listing(), before);
+    assert!(!env.root.join(".git/hooks/AGENTS.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_target_through_a_symlinked_folder_is_refused_and_nothing_is_written() {
+    let env = Env::new("linked-parent");
+    std::fs::create_dir_all(env.root.join("real/child")).expect("dirs");
+    std::os::unix::fs::symlink("real", env.root.join("alias")).expect("symlink");
+    let before = env.listing();
+    let refusal = refused(env.plan("alias/child", &answers()));
+    assert_eq!(refusal.code(), "unsafe_target");
+    assert!(refusal.message().contains("alias"), "{refusal}");
+    assert_eq!(env.listing(), before);
+    // The same folder by its real path still plans.
+    let PlanOutcome::Planned(_) = env.plan("real/child", &answers()) else {
+        panic!("the real path plans");
+    };
+}
+
+#[test]
 fn the_home_directory_is_refused() {
     let env = Env::new("home");
     std::fs::create_dir_all(env.root.join("me")).expect("home dir");

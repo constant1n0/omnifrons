@@ -60,7 +60,8 @@ use omnifrons_domain::definition_plan::{
     BlockDiff, InputFingerprint, Notice, Operation, Plan, PlanId, PlanOptions, PlanRefusal,
     SourceProblem, canonical_bytes, home_target_message, host_config_index,
     host_config_target_message, identity_exists_message, inside_host_config_message,
-    nested_create_message, symlink_target_message,
+    linked_component_message, nested_create_message, pruned_directory_index, pruned_target_message,
+    symlink_target_message,
 };
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock, ManagedFileKind};
 use omnifrons_domain::nesting::{self, Parent};
@@ -770,17 +771,60 @@ fn unsafe_target(
     workspace: &WorkspaceRoot,
     target: &str,
 ) -> Result<Option<PlanRefusal>, DefinitionError> {
-    let probe = tree
-        .probe(workspace, target)
-        .map_err(DefinitionError::Tree)?;
-    if let PathProbe::Symlink { link } = probe {
-        let message = symlink_target_message(target, &link);
+    let given: Vec<&str> = target
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if let Some(index) = pruned_directory_index(&given) {
+        let message = pruned_target_message(target, given[index]);
         return Ok(Some(PlanRefusal::UnsafeTarget(message)));
+    }
+    let mut prefix = String::new();
+    for (index, part) in given.iter().enumerate() {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        let probe = tree
+            .probe(workspace, &prefix)
+            .map_err(DefinitionError::Tree)?;
+        if let PathProbe::Symlink { link } = probe {
+            let message = if index + 1 == given.len() {
+                symlink_target_message(target, &link)
+            } else {
+                linked_component_message(target, &prefix, &link)
+            };
+            return Ok(Some(PlanRefusal::UnsafeTarget(message)));
+        }
+    }
+    if given.is_empty() {
+        let probe = tree
+            .probe(workspace, target)
+            .map_err(DefinitionError::Tree)?;
+        if let PathProbe::Symlink { link } = probe {
+            let message = symlink_target_message(target, &link);
+            return Ok(Some(PlanRefusal::UnsafeTarget(message)));
+        }
     }
     let location = tree
         .locate(workspace, target)
         .map_err(DefinitionError::Tree)?;
     let names: Vec<&str> = location.components.iter().map(String::as_str).collect();
+    // The walk starts at the workspace root, so only the components below
+    // it are ever pruned: strip the root's own physical components, which
+    // the root's location reports in the same form.
+    let root_names = tree
+        .locate(workspace, ".")
+        .map_err(DefinitionError::Tree)?
+        .components;
+    let offset = if names.len() >= root_names.len()
+        && names.iter().zip(&root_names).all(|(a, b)| *a == b.as_str())
+    {
+        root_names.len()
+    } else {
+        0
+    };
+    let below_root = pruned_directory_index(&names[offset..]).map(|index| (offset, index));
     let physical = |end: usize| format!("/{}", names[..end].join("/"));
     let message = match host_config_index(&names) {
         Some(index) if index + 1 == names.len() => {
@@ -792,6 +836,10 @@ fn unsafe_target(
             names[index],
             &physical(index),
         ),
+        None if below_root.is_some() => {
+            let (offset, index) = below_root.unwrap_or_default();
+            pruned_target_message(&physical(names.len()), names[offset + index])
+        }
         None if location.home => home_target_message(&physical(names.len())),
         None => return Ok(None),
     };
