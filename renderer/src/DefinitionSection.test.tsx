@@ -6,7 +6,7 @@
 
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { StrictMode } from 'react'
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { DefinitionSection } from './DefinitionSection'
@@ -1362,5 +1362,146 @@ describe('DefinitionSection apply (ADR-0005 slice 2, sub-slice 2f)', () => {
     await screen.findByLabelText('Apply')
     expect(ipc.previews).toHaveLength(1)
     expect(ipc.applies).toHaveLength(1)
+  })
+})
+
+// ADR-0005 slice 3, sub-slice 3e: the create entry point and its form.
+
+/** A scan with no "." row: the workspace root has no definition yet. */
+const CREATE_STATUS: DefinitionStatus = {
+  ...FIXTURE_STATUS,
+  agents: [{ ...NESTED_AGENT, consentRequired: false }],
+}
+
+const CREATE_FIELDS = [{ key: 'name', required: true, list: false, prompt: 'What is the agent called?' }]
+
+const CREATE_APPLIED = {
+  schema: 'omnifrons.definition-create-apply/1',
+  agent: '.',
+  outcome: {
+    kind: 'applied',
+    planId: H(9),
+    record: 'rec-9.json',
+    files: [{ path: 'AGENTS.md', before: { kind: 'absent' }, after: H(1), snapshot: null }],
+  },
+}
+
+const CREATE_PLANNED = {
+  schema: 'omnifrons.definition-create-preview/1',
+  agent: '.',
+  outcome: {
+    kind: 'planned',
+    planId: H(9),
+    workspace: '/ws',
+    operations: [],
+    notices: [],
+    provenance: [{ line: 'Name: Scout', said: ['Scout'] }],
+  },
+}
+
+interface CreateSectionIpc {
+  createApplies: unknown[]
+  statusCalls: () => number
+}
+
+async function renderCreateSection(
+  status: DefinitionStatus = CREATE_STATUS,
+  applyError?: ShellError,
+): Promise<CreateSectionIpc> {
+  let statusCalls = 0
+  const ipc: CreateSectionIpc = { createApplies: [], statusCalls: () => statusCalls }
+  mockIPC((cmd, args) => {
+    if (cmd === 'definition_status') {
+      statusCalls += 1
+      return status
+    }
+    if (cmd === 'definition_create_fields') return CREATE_FIELDS
+    if (cmd === 'definition_create_preview') return CREATE_PLANNED
+    if (cmd === 'definition_create_apply') {
+      ipc.createApplies.push(args)
+      if (applyError) throw applyError
+      return CREATE_APPLIED
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  render(<DefinitionSection />)
+  await screen.findByText('/workspace')
+  return ipc
+}
+
+describe('DefinitionSection create (ADR-0005 slice 3, sub-slice 3e)', () => {
+  it('offers Create . only when the scan has no "." row', async () => {
+    await renderCreateSection(PLAN_STATUS)
+    expect(screen.queryByRole('button', { name: 'Create .' })).toBeNull()
+    cleanup()
+
+    await renderCreateSection()
+    expect(screen.getByRole('button', { name: 'Create .' })).toBeTruthy()
+  })
+
+  it('opens the form on Create . and closes it, discarding the answers, on Cancel', async () => {
+    await renderCreateSection()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create .' }))
+    expect(await screen.findByText('What is the agent called?')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('What is the agent called?'), { target: { value: 'Scout' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByText('What is the agent called?')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Create .' }))
+    const input = (await screen.findByLabelText('What is the agent called?')) as HTMLInputElement
+    expect(input.value).toBe('')
+  })
+
+  it('passes the GEMINI.md box to the create preview and apply, shows the result and rescans once', async () => {
+    const ipc = await renderCreateSection()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Also write GEMINI.md' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create .' }))
+    fireEvent.change(await screen.findByLabelText('What is the agent called?'), { target: { value: 'Scout' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    await screen.findByLabelText('Create preview')
+    expect(ipc.statusCalls()).toBe(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    const result = await screen.findByLabelText('Create apply')
+    expect(within(result).getByText('rec-9.json')).toBeTruthy()
+    expect(
+      within(within(result).getByLabelText('Applied files'))
+        .getAllByRole('listitem')
+        .map((item) => item.textContent),
+    ).toEqual(['AGENTS.md: absent -> 010101010101 (no snapshot)'])
+    await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+    expect(screen.queryByLabelText('Create definition')).toBeNull()
+    expect(ipc.createApplies).toEqual([
+      expect.objectContaining({ agent: '.', withGemini: true, nestedConsent: false, planId: H(9) }),
+    ])
+  })
+
+  it('rescans once after a failed create apply and keeps the form open with its answers', async () => {
+    const ipc = await renderCreateSection(CREATE_STATUS, { code: 'run-active', message: 'a run is active' } as ShellError)
+    fireEvent.click(screen.getByRole('button', { name: 'Create .' }))
+    fireEvent.change(await screen.findByLabelText('What is the agent called?'), { target: { value: 'Scout' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    await screen.findByLabelText('Create preview')
+    expect(ipc.statusCalls()).toBe(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(ipc.statusCalls()).toBe(2))
+    expect((await screen.findByRole('alert')).textContent).toBe('run-active: a run is active')
+    const input = screen.getByLabelText('What is the agent called?') as HTMLInputElement
+    expect(input.value).toBe('Scout')
+    expect(screen.queryByLabelText('Create preview')).toBeNull()
+  })
+
+  it('drops the form when a rescan supersedes it', async () => {
+    await renderCreateSection()
+    fireEvent.click(screen.getByRole('button', { name: 'Create .' }))
+    await screen.findByText('What is the agent called?')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rescan' }))
+
+    await waitFor(() => expect(screen.queryByLabelText('Create definition')).toBeNull())
   })
 })

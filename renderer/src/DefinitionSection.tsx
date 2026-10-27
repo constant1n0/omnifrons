@@ -9,18 +9,18 @@ import {
   type DefinitionAgent,
   type DefinitionAncestor,
   type DefinitionApply,
-  type DefinitionAppliedFile,
-  type DefinitionFingerprint,
+  type DefinitionCreateApply,
   type DefinitionIdentityFile,
-  type DefinitionOperation,
   type DefinitionPlanRequest,
   type DefinitionPreview,
   type DefinitionStatus,
   type DefinitionVerify,
   type DefinitionWarning,
-  type ShellError,
 } from './ipc/harness'
 import { PlainTextLine } from './PlainTextLine'
+import { DefinitionCreateForm, type DefinitionCreatePending } from './DefinitionCreateForm'
+import { DefinitionErrorLine, type DefinitionSectionError } from './DefinitionErrorLine'
+import { appliedFileText, operationText, PLAN_STALE_HINT, toSectionError } from './definitionText'
 
 /**
  * ADR-0005 sub-slice 1i: the renderer surface for the agent-definition
@@ -29,32 +29,6 @@ import { PlainTextLine } from './PlainTextLine'
  * owns the fetches and all loading/error/data state; {@link
  * DefinitionReport} only renders what it is given.
  */
-
-/** A scan or verify rejection: a typed shell error, or `'unexpected'` for any rejection that isn't `ShellError`-shaped -- mirrors `AgentPanel`'s own `PanelError`. */
-type DefinitionSectionError = ShellError | 'unexpected'
-
-function toSectionError(reason: unknown): DefinitionSectionError {
-  return isShellError(reason) ? reason : 'unexpected'
-}
-
-/**
- * Renders one {@link DefinitionSectionError} the way the rest of this panel
- * renders a `ShellError` (`AgentPanel`'s own error banner): the closed code
- * in `<strong>`, the message through {@link PlainTextLine} -- never the raw
- * object.
- */
-function DefinitionErrorLine({ error }: { error: DefinitionSectionError }) {
-  if (error === 'unexpected') return <strong>unexpected error</strong>
-  return (
-    <>
-      <strong>
-        <PlainTextLine text={error.code} />
-      </strong>
-      {': '}
-      <PlainTextLine text={error.message} />
-    </>
-  )
-}
 
 function DefinitionIdentityFileRow({ file }: { file: DefinitionIdentityFile }) {
   return (
@@ -84,48 +58,6 @@ function DefinitionWarningRow({ warning }: { warning: DefinitionWarning }) {
   )
 }
 
-/** How many hex characters of a digest a line shows; the plan id is always shown whole. */
-const SHORT_HEX_LENGTH = 12
-
-function shortHex(hex: string): string {
-  return hex.slice(0, SHORT_HEX_LENGTH)
-}
-
-function fingerprintText(fingerprint: DefinitionFingerprint): string {
-  switch (fingerprint.kind) {
-    case 'sha256':
-      return `sha256 ${shortHex(fingerprint.hex)}`
-    case 'symlink':
-      return `symlink ${fingerprint.target}`
-    case 'irregular':
-    case 'absent':
-      return fingerprint.kind
-  }
-}
-
-function operationText(operation: DefinitionOperation): string {
-  const before = fingerprintText(operation.before)
-  const after = shortHex(operation.after)
-  switch (operation.op) {
-    case 'write-agents':
-      return `${operation.op} ${operation.path} from ${operation.source}; before: ${before}; after: ${after}`
-    case 'write-generated':
-      return `${operation.op} ${operation.path} (${operation.templateVersion}); before: ${before}; after: ${after}`
-    case 'write-wrapper':
-      return `${operation.op} ${operation.path}; before: ${before}; after: ${after}`
-    case 'write-block':
-      return `${operation.op} ${operation.path} (${operation.mode}); before: ${before}; after: ${after}`
-  }
-}
-
-function appliedFileText(file: DefinitionAppliedFile): string {
-  const after = file.after === null ? 'none' : shortHex(file.after)
-  const snapshot = file.snapshot === null ? 'no snapshot' : `snapshot ${file.snapshot}`
-  return `${file.path}: ${fingerprintText(file.before)} -> ${after} (${snapshot})`
-}
-
-/** The hint a stale plan gets in place of the shell's own wording. */
-const PLAN_STALE_HINT = 'the plan no longer matches the definition; preview again'
 
 interface DefinitionPreviewPanelProps {
   target: string | null
@@ -244,6 +176,37 @@ function DefinitionApplyPanel({ result }: { result: DefinitionApply }) {
   )
 }
 
+/** The applied or noop result of a create, shown once the form has closed. */
+function DefinitionCreateApplyPanel({ result }: { result: DefinitionCreateApply }) {
+const { outcome } = result
+return (
+  <div aria-label="Create apply">
+    {outcome.kind === 'applied' && (
+      <>
+        <p>
+          created plan <code>{outcome.planId}</code>
+        </p>
+        <p>
+          record: <PlainTextLine text={outcome.record} />
+        </p>
+        <ul aria-label="Applied files">
+          {outcome.files.map((file, index) => (
+            <li key={index}>
+              <PlainTextLine text={appliedFileText(file)} />
+            </li>
+          ))}
+        </ul>
+      </>
+    )}
+    {outcome.kind === 'noop' && (
+      <p>
+        nothing to create: the definition already exists as planned (plan <code>{outcome.planId}</code>)
+      </p>
+    )}
+  </div>
+)
+}
+
 /** The preview and apply state the report renders, and the handlers that change it. */
 interface DefinitionPlanView {
   withGemini: boolean
@@ -263,6 +226,26 @@ interface DefinitionPlanView {
   onConsentChange: (path: string, checked: boolean) => void
   onPreview: (target: string) => void
   onApply: () => void
+  create: DefinitionCreateView
+}
+
+/**
+ * The create interview's state and handlers. The workspace root is the only
+ * target it can create for: a "Create" entry for any other folder is out of
+ * scope for this slice.
+ */
+interface DefinitionCreateView {
+  open: boolean
+  /** The applied or noop result of the last create, shown once the form has closed. */
+  result: DefinitionCreateApply | null
+  /** A scan, verify, adapt preview or adapt apply is in flight (the form's own calls are not counted). */
+  blocked: boolean
+  onOpen: () => void
+  onCancel: () => void
+  onPendingChange: (pending: DefinitionCreatePending) => void
+  onFinished: (result: DefinitionCreateApply) => void
+  /** A create apply failed after it may have written: re-read the rows, keep the form open. */
+  onApplyFailed: () => void
 }
 
 interface DefinitionAgentRowProps {
@@ -290,7 +273,7 @@ function DefinitionAgentRow({ agent, verifyPending, onVerify, plan }: Definition
           type="button"
           aria-label={`Preview ${agent.path}`}
           onClick={() => plan.onPreview(agent.path)}
-          disabled={plan.busy || (agent.consentRequired && !consented)}
+          disabled={plan.busy || plan.create.open || (agent.consentRequired && !consented)}
         >
           Preview
         </button>
@@ -447,8 +430,21 @@ export function DefinitionReport({
                 <button type="button" aria-label="Verify ." onClick={() => onVerify('.')} disabled={verifyPending}>
                   Verify
                 </button>{' '}
-                <button type="button" aria-label="Preview ." onClick={() => plan.onPreview('.')} disabled={plan.busy}>
+                <button
+                  type="button"
+                  aria-label="Preview ."
+                  onClick={() => plan.onPreview('.')}
+                  disabled={plan.busy || plan.create.open}
+                >
                   Preview
+                </button>{' '}
+                <button
+                  type="button"
+                  aria-label="Create ."
+                  onClick={plan.create.onOpen}
+                  disabled={plan.busy || plan.create.open}
+                >
+                  Create
                 </button>
               </>
             )}
@@ -500,29 +496,43 @@ export function DefinitionReport({
           )}
         </div>
       )}
-      {plan.previewError && (
-        <div role="alert" data-testid="definition-preview-error">
-          <DefinitionErrorLine error={plan.previewError} />
-        </div>
-      )}
-      {plan.preview && (
-        <DefinitionPreviewPanel
-          target={plan.previewTarget}
-          preview={plan.preview}
-          busy={plan.busy}
-          onApply={plan.onApply}
+      {plan.create.open ? (
+        <DefinitionCreateForm
+          withGemini={plan.withGemini}
+          blocked={plan.create.blocked}
+          onCancel={plan.create.onCancel}
+          onPendingChange={plan.create.onPendingChange}
+          onFinished={plan.create.onFinished}
+          onApplyFailed={plan.create.onApplyFailed}
         />
-      )}
-      {plan.applyError && (
-        <div role="alert" data-testid="definition-apply-error">
-          {plan.applyError !== 'unexpected' && plan.applyError.code === 'plan-stale' ? (
-            PLAN_STALE_HINT
-          ) : (
-            <DefinitionErrorLine error={plan.applyError} />
+      ) : (
+        <>
+          {plan.previewError && (
+            <div role="alert" data-testid="definition-preview-error">
+              <DefinitionErrorLine error={plan.previewError} />
+            </div>
           )}
-        </div>
+          {plan.preview && (
+            <DefinitionPreviewPanel
+              target={plan.previewTarget}
+              preview={plan.preview}
+              busy={plan.busy}
+              onApply={plan.onApply}
+            />
+          )}
+          {plan.applyError && (
+            <div role="alert" data-testid="definition-apply-error">
+              {plan.applyError !== 'unexpected' && plan.applyError.code === 'plan-stale' ? (
+                PLAN_STALE_HINT
+              ) : (
+                <DefinitionErrorLine error={plan.applyError} />
+              )}
+            </div>
+          )}
+          {plan.applyResult && <DefinitionApplyPanel result={plan.applyResult} />}
+          {plan.create.result && <DefinitionCreateApplyPanel result={plan.create.result} />}
+        </>
       )}
-      {plan.applyResult && <DefinitionApplyPanel result={plan.applyResult} />}
     </section>
   )
 }
@@ -551,6 +561,9 @@ export function DefinitionSection() {
   const [applyResult, setApplyResult] = useState<DefinitionApply | null>(null)
   const [applyError, setApplyError] = useState<DefinitionSectionError | null>(null)
   const [applying, setApplying] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createResult, setCreateResult] = useState<DefinitionCreateApply | null>(null)
+  const [createPending, setCreatePending] = useState<DefinitionCreatePending>(null)
 
   /** Guards every async continuation below against a post-unmount state update (mirrors `AgentPanel`'s own `mountedRef`). */
   const mountedRef = useRef(true)
@@ -601,6 +614,12 @@ export function DefinitionSection() {
    */
   const previewingRef = useRef(false)
   const applyingRef = useRef(false)
+  /**
+   * What the create form has in flight. A create preview may be superseded by
+   * a rescan (which closes the form, so its result is dropped on unmount); a
+   * create apply never is, like an adapt apply.
+   */
+  const createPendingRef = useRef<DefinitionCreatePending>(null)
 
   /**
    * Scans the active workspace. `surfaceError` mirrors `AgentPanel`'s own
@@ -741,7 +760,7 @@ export function DefinitionSection() {
    * still in flight.
    */
   const rescan = useCallback(() => {
-    if (scanningRef.current || applyingRef.current) return
+    if (scanningRef.current || applyingRef.current || createPendingRef.current === 'apply') return
     scanningRef.current = true
     setLoading(true)
     setError(null)
@@ -749,6 +768,10 @@ export function DefinitionSection() {
     setVerifyError(null)
     setVerifyTarget(null)
     setConsented(new Set())
+    setCreateOpen(false)
+    setCreateResult(null)
+    createPendingRef.current = null
+    setCreatePending(null)
     setPreview(null)
     setPreviewError(null)
     setApplyResult(null)
@@ -797,7 +820,14 @@ export function DefinitionSection() {
    * `setVerifyError` only run when this is still the latest generation.
    */
   const runVerify = useCallback((target: string) => {
-    if (verifyingRef.current || scanningRef.current || previewingRef.current || applyingRef.current) return
+    if (
+      verifyingRef.current ||
+      scanningRef.current ||
+      previewingRef.current ||
+      applyingRef.current ||
+      createPendingRef.current !== null
+    )
+      return
     verifyingRef.current = true
     const generation = ++generationRef.current
     setVerifying(true)
@@ -831,7 +861,14 @@ export function DefinitionSection() {
    * report it was not planned against.
    */
   const runPreview = useCallback((request: DefinitionPlanRequest) => {
-    if (previewingRef.current || applyingRef.current || verifyingRef.current || scanningRef.current) return
+    if (
+      previewingRef.current ||
+      applyingRef.current ||
+      verifyingRef.current ||
+      scanningRef.current ||
+      createPendingRef.current !== null
+    )
+      return
     previewingRef.current = true
     const generation = ++generationRef.current
     setPreviewing(true)
@@ -890,7 +927,14 @@ export function DefinitionSection() {
    * again); any other failure keeps the preview so the user can retry.
    */
   const runApply = useCallback(() => {
-    if (applyingRef.current || previewingRef.current || verifyingRef.current || scanningRef.current) return
+    if (
+      applyingRef.current ||
+      previewingRef.current ||
+      verifyingRef.current ||
+      scanningRef.current ||
+      createPendingRef.current !== null
+    )
+      return
     if (preview === null || preview.outcome.kind !== 'planned' || previewRequest === null) return
     const planId = preview.outcome.planId
     applyingRef.current = true
@@ -935,7 +979,49 @@ export function DefinitionSection() {
     })
   }, [])
 
-  const busy = loading || verifying || previewing || applying
+  const openCreate = useCallback(() => {
+    if (
+      scanningRef.current ||
+      verifyingRef.current ||
+      previewingRef.current ||
+      applyingRef.current ||
+      createPendingRef.current !== null
+    )
+      return
+    setCreateOpen(true)
+    setCreateResult(null)
+    setPreview(null)
+    setPreviewError(null)
+    setApplyResult(null)
+    setApplyError(null)
+  }, [])
+
+  const cancelCreate = useCallback(() => {
+    if (createPendingRef.current === 'apply') return
+    createPendingRef.current = null
+    setCreatePending(null)
+    setCreateOpen(false)
+  }, [])
+
+  const onCreatePendingChange = useCallback((pending: DefinitionCreatePending) => {
+    createPendingRef.current = pending
+    setCreatePending(pending)
+  }, [])
+
+  /** An applied or noop create: the form closes, its result stays on screen, and the rows are re-read. */
+  const onCreateFinished = useCallback(
+    (result: DefinitionCreateApply) => {
+      createPendingRef.current = null
+      setCreatePending(null)
+      setCreateOpen(false)
+      setCreateResult(result)
+      rescanAfterApply()
+    },
+    [rescanAfterApply],
+  )
+
+  const sectionBusy = loading || verifying || previewing || applying
+  const busy = sectionBusy || createPending !== null
 
   return (
     <DefinitionReport
@@ -952,7 +1038,7 @@ export function DefinitionSection() {
         withGemini,
         consented,
         busy,
-        applying,
+        applying: applying || createPending === 'apply',
         previewTarget: previewRequest?.agent ?? null,
         preview,
         previewError,
@@ -962,6 +1048,16 @@ export function DefinitionSection() {
         onConsentChange,
         onPreview,
         onApply: runApply,
+        create: {
+          open: createOpen,
+          result: createResult,
+          blocked: sectionBusy,
+          onOpen: openCreate,
+          onCancel: cancelCreate,
+          onPendingChange: onCreatePendingChange,
+          onFinished: onCreateFinished,
+          onApplyFailed: rescanAfterApply,
+        },
       }}
     />
   )
