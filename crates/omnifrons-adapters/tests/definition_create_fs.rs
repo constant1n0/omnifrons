@@ -153,11 +153,15 @@ impl Env {
         fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
                 let path = entry.path();
+                // Joined with `/` on every platform, so the listings the
+                // tests pin read the same on Windows.
                 out.push(
                     path.strip_prefix(base)
                         .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                 );
                 if entry.file_type().expect("type").is_dir() {
                     walk(&path, base, out);
