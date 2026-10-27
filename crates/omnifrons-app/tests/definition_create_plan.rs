@@ -16,7 +16,9 @@ use omnifrons_app::content_hasher::ContentHasher;
 use omnifrons_app::contract::definition::{InMemoryDefinitionTree, TreeSnapshotBuilder};
 use omnifrons_app::contract::publication::FakeHasher;
 use omnifrons_app::definition::DefinitionPorts;
-use omnifrons_app::definition_plan::{PlanOutcome, PlannedWrite, plan, plan_create_with_writes};
+use omnifrons_app::definition_plan::{
+    PlanOutcome, PlannedWrite, plan, plan_create_preview, plan_create_with_writes,
+};
 use omnifrons_app::definition_tree::{PathProbe, TargetLocation, TreeSnapshot};
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind, WRAPPER};
 use omnifrons_domain::definition_create::{
@@ -1028,4 +1030,96 @@ fn a_tree_that_cannot_probe_is_an_error_not_an_empty_answer() {
         tree.probe(&workspace, "."),
         Err(DefinitionTreeError::ProbeUnsupported)
     );
+}
+
+// ------------------------------------------------- one observation
+
+/// A tree that counts how often it is read.
+struct CountingTree {
+    inner: InMemoryDefinitionTree,
+    snapshots: AtomicUsize,
+}
+
+impl omnifrons_app::definition_tree::DefinitionTree for CountingTree {
+    fn snapshot(
+        &self,
+        root: &WorkspaceRoot,
+    ) -> Result<TreeSnapshot, omnifrons_app::definition_tree::DefinitionTreeError> {
+        self.snapshots.fetch_add(1, Ordering::SeqCst);
+        self.inner.snapshot(root)
+    }
+
+    fn probe(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<PathProbe, omnifrons_app::definition_tree::DefinitionTreeError> {
+        self.inner.probe(root, relative)
+    }
+
+    fn locate(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<TargetLocation, omnifrons_app::definition_tree::DefinitionTreeError> {
+        self.inner.locate(root, relative)
+    }
+}
+
+#[test]
+fn the_preview_reads_the_tree_once_and_returns_the_provenance_of_that_read() {
+    let (_guard, workspace) = TempRoot::new("preview-once");
+    let tree = CountingTree {
+        inner: InMemoryDefinitionTree::new().with_snapshot(&workspace, empty().build()),
+        snapshots: AtomicUsize::new(0),
+    };
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &FakeHasher,
+    };
+    let (outcome, lines) = plan_create_preview(
+        &ports,
+        &workspace,
+        None,
+        &PlanOptions::default(),
+        &answers(),
+    )
+    .expect("preview");
+    assert!(matches!(outcome, PlanOutcome::Planned(_)));
+    assert_eq!(tree.snapshots.load(Ordering::SeqCst), 1);
+    assert!(!lines.is_empty());
+    assert!(lines.iter().all(|entry| !entry.said.is_empty()));
+    let file = render(
+        &answers(),
+        &CreateContext::new(Vec::new(), false).expect("a plain context"),
+    );
+    assert!(lines.iter().all(|entry| file.contains(&entry.line)));
+}
+
+#[test]
+fn a_refused_preview_has_no_provenance() {
+    let (_guard, workspace) = TempRoot::new("preview-refused");
+    let snapshot = empty()
+        .directory(
+            ".",
+            vec![regular(IdentityKind::Agents, b"# Other\n")],
+            vec![],
+            vec![],
+        )
+        .build();
+    let tree = InMemoryDefinitionTree::new().with_snapshot(&workspace, snapshot);
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &FakeHasher,
+    };
+    let (outcome, lines) = plan_create_preview(
+        &ports,
+        &workspace,
+        None,
+        &PlanOptions::default(),
+        &answers(),
+    )
+    .expect("preview");
+    assert!(matches!(outcome, PlanOutcome::Refused(_)));
+    assert!(lines.is_empty());
 }

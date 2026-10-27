@@ -177,31 +177,31 @@ pub fn plan_create_with_writes(
     plan_for(ports, workspace, target, *options, Some(answers))
 }
 
-/// The lines of the file a create from `answers` would write that are
-/// built from them, each with the user's own words behind it, in file
-/// order: what the preview shows beside the generated text.
+/// [`plan_create`], together with the lines of the file that are built from
+/// `answers`, each with the user's own words behind it, in file order: what
+/// the preview shows beside the generated text.
 ///
-/// It reads the same tree the planner reads and builds the same
-/// [`CreateContext`] (the child agents below `target` and whether another
-/// agent encloses it). When that context cannot be built the planner
-/// refuses the target, and there are no lines to show: the result is empty.
+/// The target is read once: the plan and the lines come from the same
+/// loaded tree, so they always describe the same observation. A refused
+/// outcome has no lines.
 ///
 /// # Errors
 ///
-/// The errors [`plan_create`] documents for reading the tree.
-pub fn create_provenance(
+/// The errors [`plan_create`] documents.
+pub fn plan_create_preview(
     ports: &DefinitionPorts<'_>,
     workspace: &WorkspaceRoot,
     target: Option<&str>,
+    options: &PlanOptions,
     answers: &Answers,
-) -> Result<Vec<ProvenanceEntry>, DefinitionError> {
+) -> Result<(PlanOutcome, Vec<ProvenanceEntry>), DefinitionError> {
     let target = target.unwrap_or(".");
     let loaded = load_target(ports, workspace, target)?;
-    let site = create_site(&loaded.snapshot, target)?;
-    Ok(
-        CreateContext::new(site.children.clone(), site.parent.is_some())
-            .map_or_else(|_| Vec::new(), |context| provenance(answers, &context)),
-    )
+    let mut lines = Vec::new();
+    let (outcome, _) = plan_new_definition(
+        ports, workspace, target, *options, answers, &loaded, &mut lines,
+    )?;
+    Ok((outcome, lines))
 }
 
 /// The planner behind [`plan_with_writes`] and [`plan_create_with_writes`]:
@@ -216,7 +216,10 @@ pub(crate) fn plan_for(
     let target = target.unwrap_or(".");
     let loaded = load_target(ports, workspace, target)?;
     if let Some(answers) = create {
-        return plan_new_definition(ports, workspace, target, options, answers, &loaded);
+        let mut lines = Vec::new();
+        return plan_new_definition(
+            ports, workspace, target, options, answers, &loaded, &mut lines,
+        );
     }
     plan_existing(ports, workspace, target, options, loaded)
 }
@@ -713,6 +716,7 @@ fn plan_new_definition(
     options: PlanOptions,
     answers: &Answers,
     loaded: &LoadedTarget,
+    lines: &mut Vec<ProvenanceEntry>,
 ) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
     let hasher = ports.hasher;
     let files = &loaded.identity_files;
@@ -730,6 +734,7 @@ fn plan_new_definition(
         Err(error) => return Ok(refused(PlanRefusal::UnsafeTarget(error.to_string()))),
     };
     let body = render(answers, &context).into_bytes();
+    let provenance_lines = provenance(answers, &context);
     let full = match with_skills_block(
         ports,
         workspace,
@@ -762,6 +767,7 @@ fn plan_new_definition(
         None,
         &loaded.snapshot,
     );
+    *lines = provenance_lines;
     Ok((PlanOutcome::Planned(plan), writes))
 }
 

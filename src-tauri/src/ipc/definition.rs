@@ -31,7 +31,7 @@ use omnifrons_adapters::{
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
 use omnifrons_app::definition_apply::{ApplyPorts, apply, apply_create};
-use omnifrons_app::definition_plan::{PlanOutcome, create_provenance, plan, plan_create};
+use omnifrons_app::definition_plan::{plan, plan_create_preview};
 use omnifrons_app::work_area::WorkAreaRoot;
 use omnifrons_domain::definition::IdentityKind;
 use omnifrons_domain::definition_create::{Answers, RawValue};
@@ -382,8 +382,11 @@ impl DefinitionCreateRequest {
 }
 
 /// The loosely typed document `Answers::validate` reads, from the JSON
-/// the form sent: objects keep the order the JSON value holds them in,
-/// and a number or a boolean is `Other`.
+/// the form sent: an object's entries are converted in the order the JSON
+/// value iterates them (key order with this workspace's `serde_json`,
+/// which does not preserve the document's order), and a number or a
+/// boolean is `Other`. Whether the answers are valid does not depend on
+/// that order.
 fn raw_answers(value: &serde_json::Value) -> RawValue {
     match value {
         serde_json::Value::Null => RawValue::Null,
@@ -438,11 +441,8 @@ pub fn definition_create_preview_for(
         tree: &tree,
         hasher: &hasher,
     };
-    let outcome = plan_create(&ports, workspace, Some(&target), &options, &answers)?;
-    let provenance = match &outcome {
-        PlanOutcome::Planned(_) => create_provenance(&ports, workspace, Some(&target), &answers)?,
-        PlanOutcome::Refused(_) => Vec::new(),
-    };
+    let (outcome, provenance) =
+        plan_create_preview(&ports, workspace, Some(&target), &options, &answers)?;
     Ok(DefinitionCreatePreviewDto::from_outcome(
         workspace,
         &target,
@@ -1910,5 +1910,75 @@ mod tests {
                 .iter()
                 .all(|row| !row["prompt"].as_str().unwrap().is_empty())
         );
+    }
+
+    #[test]
+    fn create_apply_with_a_different_well_formed_id_is_plan_stale_and_writes_nothing() {
+        let fixture = Fixture::new("create-stale");
+        let workspace = fixture.workspace();
+        let answers = minimal_answers();
+        let id = planned_id(&to_json(
+            &definition_create_preview_for(&workspace, &create_request(None), &answers)
+                .expect("preview"),
+        ));
+        let other = if id.starts_with('0') {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+
+        let error = definition_create_apply_for(
+            &workspace,
+            &fixture.publication,
+            &Idle,
+            &create_request(None),
+            &answers,
+            &other,
+        )
+        .expect_err("the id names another plan");
+
+        assert_eq!(error.code, ShellErrorCode::PlanStale);
+        assert!(files_below(fixture.project.path()).is_empty());
+        assert!(files_below(fixture.device.path()).is_empty());
+    }
+
+    #[test]
+    fn create_with_gemini_plans_and_writes_the_gemini_wrapper_too() {
+        let fixture = Fixture::new("create-gemini");
+        let workspace = fixture.workspace();
+        let answers = minimal_answers();
+        let request = DefinitionCreateRequest {
+            with_gemini: true,
+            ..create_request(None)
+        };
+        let preview = to_json(
+            &definition_create_preview_for(&workspace, &request, &answers).expect("preview"),
+        );
+        let id = planned_id(&preview);
+        let paths: Vec<&str> = preview["outcome"]["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .map(|op| op["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"GEMINI.md"), "{paths:?}");
+
+        let applied = to_json(
+            &definition_create_apply_for(
+                &workspace,
+                &fixture.publication,
+                &Idle,
+                &request,
+                &answers,
+                &id,
+            )
+            .expect("apply"),
+        );
+        assert_eq!(applied["outcome"]["kind"], "applied");
+        assert_eq!(
+            std::fs::read(fixture.project.path().join("GEMINI.md")).expect("GEMINI.md"),
+            omnifrons_domain::definition::WRAPPER
+        );
+        assert_eq!(files_below(fixture.project.path()).len(), 3);
     }
 }
