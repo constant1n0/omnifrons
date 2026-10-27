@@ -2087,8 +2087,12 @@ export type DefinitionFingerprint =
   | { kind: 'irregular' }
   | { kind: 'absent' }
 
-/** `dto.rs`'s `OperationDto` tags: the three writes a plan can hold. */
-export type DefinitionOperationTag = 'write-agents' | 'write-wrapper' | 'write-block'
+/** `dto.rs`'s `OperationDto` tags: the four writes a plan can hold. */
+export type DefinitionOperationTag =
+  | 'write-agents'
+  | 'write-generated'
+  | 'write-wrapper'
+  | 'write-block'
 
 /**
  * How a planned block write treats the block already in the file; mirrors
@@ -2099,6 +2103,14 @@ export type DefinitionBlockMode = 'append' | 'replace' | 'migrate-legacy'
 /** Mirrors `OperationDto`: tagged by `op`. `after` and `body` are SHA-256 hex digests. */
 export type DefinitionOperation =
   | { op: 'write-agents'; path: string; source: string; before: DefinitionFingerprint; after: string }
+  | {
+      op: 'write-generated'
+      path: string
+      templateVersion: string
+      answersDigest: string
+      before: DefinitionFingerprint
+      after: string
+    }
   | { op: 'write-wrapper'; path: string; before: DefinitionFingerprint; after: string }
   | {
       op: 'write-block'

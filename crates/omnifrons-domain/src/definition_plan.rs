@@ -33,11 +33,12 @@ use std::fmt::{self, Write as _};
 use crate::definition::IdentityKind;
 use crate::executable::Sha256Digest;
 use crate::guidance::{ManagedFileKind, SKILLS_TEMPLATE_VERSION};
+use crate::hosts::HOST_CONFIG_DIRS;
 
 /// The first line of every [`canonical_bytes`] text. Changing the layout
 /// of that text means changing this tag, so an old id can never match a
 /// new layout.
-pub const CANONICAL_FORM_TAG: &str = "omnifrons-plan-v3";
+pub const CANONICAL_FORM_TAG: &str = "omnifrons-plan-v4";
 
 /// What a plan knows about one input file when it was planned. A later
 /// apply compares the file's current fingerprint against this one and
@@ -130,6 +131,23 @@ pub enum Operation {
         /// What the file must still look like when this runs.
         before: InputFingerprint,
     },
+    /// Create `AGENTS.md` from the create interview: the fixed template
+    /// rendered from the answers, followed by the `skills` block when the
+    /// folder holds skills. It only ever creates a new file, so on a
+    /// fresh create `before` is [`InputFingerprint::Absent`]; a rerun
+    /// that finds the file already holding these bytes plans nothing.
+    WriteGenerated {
+        /// The version of the template the bytes were rendered from
+        /// ([`crate::definition_create::CREATE_TEMPLATE_VERSION`]).
+        template_version: String,
+        /// The SHA-256 of the canonical form of the answers
+        /// ([`crate::definition_create::answers_canonical`]).
+        answers_digest: Sha256Digest,
+        /// The SHA-256 of the bytes to write.
+        after: Sha256Digest,
+        /// What `AGENTS.md` must still look like when this runs.
+        before: InputFingerprint,
+    },
     /// Write the `skills` block into the canonical `AGENTS.md`. It
     /// follows the identity-file operations, so `before` is the file as
     /// it is when this runs: the current `AGENTS.md`, or the bytes
@@ -155,7 +173,9 @@ impl Operation {
     #[must_use]
     pub const fn path(&self) -> &'static str {
         match self {
-            Self::WriteAgents { .. } | Self::WriteBlock { .. } => IdentityKind::Agents.file_name(),
+            Self::WriteAgents { .. } | Self::WriteGenerated { .. } | Self::WriteBlock { .. } => {
+                IdentityKind::Agents.file_name()
+            }
             Self::WriteWrapper { kind, .. } => kind.file_name(),
         }
     }
@@ -165,6 +185,7 @@ impl Operation {
     pub const fn before(&self) -> &InputFingerprint {
         match self {
             Self::WriteAgents { before, .. }
+            | Self::WriteGenerated { before, .. }
             | Self::WriteWrapper { before, .. }
             | Self::WriteBlock { before, .. } => before,
         }
@@ -175,6 +196,7 @@ impl Operation {
     pub const fn after(&self) -> &Sha256Digest {
         match self {
             Self::WriteAgents { after, .. }
+            | Self::WriteGenerated { after, .. }
             | Self::WriteWrapper { after, .. }
             | Self::WriteBlock { after, .. } => after,
         }
@@ -191,6 +213,19 @@ impl Operation {
             } => format!(
                 "write-agents source={} after={} before={}",
                 source.file_name(),
+                after.to_hex(),
+                before.canonical()
+            ),
+            Self::WriteGenerated {
+                template_version,
+                answers_digest,
+                after,
+                before,
+            } => format!(
+                "write-generated path={} template={template_version} answers={} after={} \
+                 before={}",
+                self.path(),
+                answers_digest.to_hex(),
                 after.to_hex(),
                 before.canonical()
             ),
@@ -299,6 +334,17 @@ pub enum PlanRefusal {
     /// An unmanaged byte copy of the source would stop matching once
     /// the skills block is written.
     DivergingCopy(String),
+    /// A create target that must not receive a new agent: a symlink, the
+    /// home directory, or a host configuration folder (or a folder
+    /// inside one). The message names which.
+    UnsafeTarget(String),
+    /// A create target that already holds identity files other than this
+    /// writer's own result: it is an existing agent, to be adapted
+    /// instead. The message names the files.
+    IdentityExists(String),
+    /// A `sources` entry that is missing, a symlink, or inside or around
+    /// a child agent. The message names it.
+    InvalidSource(String),
 }
 
 impl PlanRefusal {
@@ -314,6 +360,9 @@ impl PlanRefusal {
             Self::BlockLayout(_) => "block_layout",
             Self::UnsafeSkillMetadata(_) => "unsafe_skill_metadata",
             Self::DivergingCopy(_) => "diverging_copy",
+            Self::UnsafeTarget(_) => "unsafe_target",
+            Self::IdentityExists(_) => "identity_exists",
+            Self::InvalidSource(_) => "invalid_source",
         }
     }
 
@@ -328,7 +377,10 @@ impl PlanRefusal {
             | Self::EditedBlock(message)
             | Self::BlockLayout(message)
             | Self::UnsafeSkillMetadata(message)
-            | Self::DivergingCopy(message) => message,
+            | Self::DivergingCopy(message)
+            | Self::UnsafeTarget(message)
+            | Self::IdentityExists(message)
+            | Self::InvalidSource(message) => message,
         }
     }
 }
@@ -336,6 +388,147 @@ impl PlanRefusal {
 impl fmt::Display for PlanRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "refused ({}): {}", self.code(), self.message())
+    }
+}
+
+/// Host configuration folder names a create target may not lie in or
+/// under, beyond [`HOST_CONFIG_DIRS`]. This is the create script's own
+/// list; the scan's [`HOST_CONFIG_DIRS`] stays as it is. Cursor loads
+/// Markdown from `.cursor/rules` as configuration of the folder above it.
+pub const EXTRA_HOST_CONFIG_DIRS: &[&str] = &[".cursor"];
+
+/// The index of the deepest component of `components` that names a host
+/// configuration folder, compared without case (case-insensitive file
+/// systems treat `.Claude` as `.claude`). The components are the
+/// target's physical path, one name per entry, from the root down.
+#[must_use]
+pub fn host_config_index(components: &[&str]) -> Option<usize> {
+    components.iter().rposition(|component| {
+        let folded = component.to_lowercase();
+        HOST_CONFIG_DIRS
+            .iter()
+            .chain(EXTRA_HOST_CONFIG_DIRS)
+            .any(|name| name.to_lowercase() == folded)
+    })
+}
+
+/// Whether a create target lies in a host configuration folder: the
+/// target itself or any folder above it is one. The application supplies
+/// the physical path.
+#[must_use]
+pub fn host_config_folder(components: &[&str]) -> bool {
+    host_config_index(components).is_some()
+}
+
+/// The refusal message for a target that is itself a symlink.
+#[must_use]
+pub fn symlink_target_message(directory: &str, link: &str) -> String {
+    format!(
+        "{directory} is a symlink to {link}; pass the real folder (new agents are never \
+         written through a symlink)"
+    )
+}
+
+/// The refusal message for a target that is a host configuration folder.
+#[must_use]
+pub fn host_config_target_message(directory: &str, name: &str) -> String {
+    format!(
+        "{directory} is a host configuration folder ({name}/); its CLAUDE.md or AGENTS.md \
+         belongs to the folder above it"
+    )
+}
+
+/// The refusal message for a target inside a host configuration folder:
+/// `folder` is that folder's path, `name` its name and `above` the
+/// folder that holds it.
+#[must_use]
+pub fn inside_host_config_message(
+    directory: &str,
+    folder: &str,
+    name: &str,
+    above: &str,
+) -> String {
+    format!(
+        "{directory} is inside the host configuration folder {folder} ({name}/); hosts load \
+         files there as configuration of {above}, so the new identity would leak into that \
+         project. Choose a folder outside it"
+    )
+}
+
+/// The refusal message for a target that is the home directory.
+#[must_use]
+pub fn home_target_message(directory: &str) -> String {
+    format!(
+        "{directory} is the home directory; an agent there would enclose every project below it"
+    )
+}
+
+/// The refusal message for a target that already holds identity files.
+/// `files` are their names; `why` is empty or starts with a space.
+#[must_use]
+pub fn identity_exists_message(agent: &str, files: &[&str], why: &str) -> String {
+    format!(
+        "{agent} already has identity files ({}), so it is an existing agent{why}; adapt it \
+         instead",
+        files.join(", ")
+    )
+}
+
+/// The refusal message for a create target below another agent that has
+/// no consent of its own.
+#[must_use]
+pub fn nested_create_message(directory: &str, parent: &str) -> String {
+    format!(
+        "{directory} is inside the agent at {parent}; create it separately with its own consent"
+    )
+}
+
+/// Why a `sources` entry is not a real entry of the new agent's
+/// workspace. `Display` is the text of the [`PlanRefusal::InvalidSource`]
+/// message after the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceProblem {
+    /// The entry does not exist in the folder.
+    Missing,
+    /// The entry, or a folder on its way, is a symlink; `shown` is the
+    /// relative path of the link.
+    Symlink {
+        /// The relative path of the symlink.
+        shown: String,
+    },
+    /// The entry lies inside the child agent `child`.
+    InsideChild {
+        /// The child agent's relative path.
+        child: String,
+    },
+    /// The entry holds the child agent `child`.
+    ContainsChild {
+        /// The child agent's relative path.
+        child: String,
+    },
+}
+
+impl SourceProblem {
+    /// The [`PlanRefusal::InvalidSource`] for `entry` (the source's
+    /// relative path) at position `index` of the sources.
+    #[must_use]
+    pub fn refusal(&self, index: usize, entry: &str, directory: &str) -> PlanRefusal {
+        let reason = match self {
+            Self::Missing => format!("{entry} does not exist in {directory}"),
+            Self::Symlink { shown } => {
+                format!("{shown} is a symlink; sources are never read through symlinks")
+            }
+            Self::InsideChild { child } => format!(
+                "{entry} is inside the child agent {child}/; a child agent's workspace is \
+                 excluded from this agent and must not be handled"
+            ),
+            Self::ContainsChild { child } => format!(
+                "{entry} contains the child agent {child}/; a child agent's workspace is \
+                 excluded from this agent and must not be handled (name the files or folders \
+                 beside it instead)"
+            ),
+        };
+        PlanRefusal::InvalidSource(format!("sources[{index}].text: {reason}"))
     }
 }
 
@@ -396,7 +589,7 @@ pub struct Plan {
 /// so no two different plans share a text:
 ///
 /// ```text
-/// omnifrons-plan-v3
+/// omnifrons-plan-v4
 /// workspace <len>:<canonical workspace root, raw platform bytes>
 /// agent <len>:<path>
 /// inputs <count>
@@ -414,6 +607,7 @@ pub struct Plan {
 ///
 /// ```text
 /// write-agents source=<file> after=<hex> before=<fingerprint>
+/// write-generated path=<file> template=<version> answers=<hex> after=<hex> before=<fingerprint>
 /// write-wrapper path=<file> after=<hex> before=<fingerprint>
 /// write-block path=<file> kind=skills version=<template version> mode=<mode> body=<hex> after=<hex> before=<fingerprint>
 /// ```
@@ -474,7 +668,7 @@ mod tests {
         let text = String::from_utf8(canonical_bytes(b"/w", ".", &inputs, &[])).unwrap();
         assert_eq!(
             text,
-            "omnifrons-plan-v3\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
+            "omnifrons-plan-v4\nworkspace 2:/w\nagent 1:.\ninputs 2\ninput 9:AGENTS.md symlink 3:a\nb\n\
              input 9:CLAUDE.md irregular\noperations 0\n"
         );
     }
@@ -484,12 +678,12 @@ mod tests {
         let none = BTreeMap::new();
         let high = canonical_bytes(b"/w\xff", ".", &none, &[]);
         let low = canonical_bytes(b"/w\xfe", ".", &none, &[]);
-        let header = b"omnifrons-plan-v3\nworkspace 3:/w\xff\nagent 1:.\n";
+        let header = b"omnifrons-plan-v4\nworkspace 3:/w\xff\nagent 1:.\n";
         assert!(high.starts_with(header), "{high:?}");
         assert_ne!(high, low);
         // The prefix counts raw bytes, not the lossy text's characters.
         let lossy = canonical_bytes("/w\u{fffd}".as_bytes(), ".", &none, &[]);
-        assert!(lossy.starts_with(b"omnifrons-plan-v3\nworkspace 5:"));
+        assert!(lossy.starts_with(b"omnifrons-plan-v4\nworkspace 5:"));
         assert_ne!(high, lossy);
     }
 

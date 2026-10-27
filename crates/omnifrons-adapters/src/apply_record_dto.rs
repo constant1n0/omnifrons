@@ -62,6 +62,14 @@ enum OperationDto {
         after: String,
         before: FingerprintDto,
     },
+    #[serde(rename = "write-generated")]
+    Generated {
+        path: String,
+        template_version: String,
+        answers_digest: String,
+        after: String,
+        before: FingerprintDto,
+    },
     #[serde(rename = "write-wrapper")]
     Wrapper {
         path: String,
@@ -122,6 +130,18 @@ impl From<&Operation> for OperationDto {
                 after: after.to_hex(),
                 before: before.into(),
             },
+            Operation::WriteGenerated {
+                template_version,
+                answers_digest,
+                after,
+                before,
+            } => Self::Generated {
+                path: operation.path().to_string(),
+                template_version: template_version.clone(),
+                answers_digest: answers_digest.to_hex(),
+                after: after.to_hex(),
+                before: before.into(),
+            },
             Operation::WriteWrapper {
                 kind,
                 after,
@@ -162,6 +182,23 @@ impl TryFrom<OperationDto> for Operation {
                 after: digest(&after)?,
                 before: before.try_into()?,
             },
+            OperationDto::Generated {
+                path,
+                template_version,
+                answers_digest,
+                after,
+                before,
+            } => {
+                if path != IdentityKind::Agents.file_name() {
+                    return Err(Corrupt);
+                }
+                Self::WriteGenerated {
+                    template_version,
+                    answers_digest: digest(&answers_digest)?,
+                    after: digest(&after)?,
+                    before: before.try_into()?,
+                }
+            }
             OperationDto::Wrapper {
                 path,
                 after,

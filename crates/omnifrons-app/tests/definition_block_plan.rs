@@ -222,6 +222,7 @@ const END: &str = "<!-- omnifrons:end skills -->";
 fn after_of(operation: &Operation) -> omnifrons_domain::executable::Sha256Digest {
     match operation {
         Operation::WriteAgents { after, .. }
+        | Operation::WriteGenerated { after, .. }
         | Operation::WriteWrapper { after, .. }
         | Operation::WriteBlock { after, .. } => *after,
     }

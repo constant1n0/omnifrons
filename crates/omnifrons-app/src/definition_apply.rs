@@ -355,7 +355,7 @@ fn mode_policy(agent: &str, operation: &Operation) -> ModePolicy {
         Operation::WriteWrapper { .. } => ModePolicy::NoWiderThan {
             source: within(agent, IdentityKind::Agents.file_name()),
         },
-        Operation::WriteBlock { .. } => ModePolicy::Keep,
+        Operation::WriteGenerated { .. } | Operation::WriteBlock { .. } => ModePolicy::Keep,
     }
 }
 

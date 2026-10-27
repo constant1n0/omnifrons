@@ -44,8 +44,10 @@
 //! agent encloses the folder ([`CreateContext`]).
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
+use crate::definition::{FileShape, IdentityFile, IdentityKind, WRAPPER};
+use crate::publication::is_bidi_control;
 use crate::skills_index::indexed_skill_targets;
 use crate::skills_safety::unsafe_at_tokens;
 
@@ -340,6 +342,12 @@ pub enum AnswerProblem {
     NameSentenceEnd,
     /// A text holds a backtick; sources and assumed claims are written inside code spans.
     Backtick,
+    /// A text holds a bidirectional control, which can reorder or hide
+    /// the fixed text around it.
+    BidiControl {
+        /// The first such character.
+        character: char,
+    },
     /// A status that is neither `confirmed` nor `assumption`.
     BadStatus,
     /// A required field whose status is not `confirmed`.
@@ -374,6 +382,7 @@ impl AnswerProblem {
             Self::SentenceEnd => "sentence_end",
             Self::NameSentenceEnd => "name_sentence_end",
             Self::Backtick => "backtick",
+            Self::BidiControl { .. } => "bidi_control",
             Self::BadStatus => "bad_status",
             Self::RequiredNotConfirmed => "required_not_confirmed",
         }
@@ -429,6 +438,12 @@ impl fmt::Display for AnswerProblem {
             Self::Backtick => f.write_str(
                 "must not contain a backtick (`): sources and assumed claims are written \
                  inside code spans, so a backtick would break them",
+            ),
+            Self::BidiControl { character } => write!(
+                f,
+                "must not contain the bidirectional control U+{:04X}: it can reorder or hide \
+                 the text around it",
+                u32::from(*character)
             ),
             Self::BadStatus => f.write_str("must be \"confirmed\" or \"assumption\""),
             Self::RequiredNotConfirmed => f.write_str("required fields must be confirmed"),
@@ -755,6 +770,9 @@ fn text_problems(body: &str) -> Vec<AnswerProblem> {
     if body.contains('`') {
         problems.push(AnswerProblem::Backtick);
     }
+    if let Some(character) = body.chars().find(|c| is_bidi_control(*c)) {
+        problems.push(AnswerProblem::BidiControl { character });
+    }
     problems
 }
 
@@ -791,6 +809,21 @@ pub enum ContextError {
         /// The offending path.
         child: String,
     },
+    /// The path holds an `@` a host may load as an import.
+    Import {
+        /// The offending path.
+        child: String,
+        /// The word around the first such `@`, shortened.
+        token: String,
+    },
+    /// The path holds a bidirectional control, which can reorder or hide
+    /// the text around it.
+    BidiControl {
+        /// The offending path.
+        child: String,
+        /// The first such character.
+        character: char,
+    },
 }
 
 impl ContextError {
@@ -802,6 +835,8 @@ impl ContextError {
             Self::LineBreak { .. } => "line_break",
             Self::Backtick { .. } => "backtick",
             Self::Placeholder { .. } => "placeholder",
+            Self::Import { .. } => "import",
+            Self::BidiControl { .. } => "bidi_control",
         }
     }
 
@@ -810,9 +845,11 @@ impl ContextError {
     pub fn child(&self) -> &str {
         match self {
             Self::Empty => "",
-            Self::LineBreak { child } | Self::Backtick { child } | Self::Placeholder { child } => {
-                child
-            }
+            Self::LineBreak { child }
+            | Self::Backtick { child }
+            | Self::Placeholder { child }
+            | Self::Import { child, .. }
+            | Self::BidiControl { child, .. } => child,
         }
     }
 }
@@ -836,6 +873,18 @@ impl fmt::Display for ContextError {
                     "child path {child:?} must not hold the {{child}} placeholder"
                 )
             }
+            Self::Import { child, token } => write!(
+                f,
+                "child path {child:?} must not contain \"{token}\": hosts such as Claude Code \
+                 may load an @ that follows a space, a symbol or nothing as an @ import; rename \
+                 the folder"
+            ),
+            Self::BidiControl { child, character } => write!(
+                f,
+                "child path {child:?} must not contain the bidirectional control U+{:04X}: it \
+                 can reorder or hide the text around it",
+                u32::from(*character)
+            ),
         }
     }
 }
@@ -868,6 +917,13 @@ impl CreateContext {
             }
             if child.contains("{child}") {
                 return Err(ContextError::Placeholder { child });
+            }
+            if let Some(character) = child.chars().find(|c| is_bidi_control(*c)) {
+                return Err(ContextError::BidiControl { child, character });
+            }
+            // The child is written inside a code span that template text follows.
+            if let Some(token) = unsafe_at_tokens(&child, true).into_iter().next() {
+                return Err(ContextError::Import { child, token });
             }
         }
         Ok(Self { children, enclosed })
@@ -1099,4 +1155,106 @@ pub fn provenance(answers: &Answers, context: &CreateContext) -> Vec<ProvenanceE
             said: line.said,
         })
         .collect()
+}
+
+/// The first line of [`answers_canonical`]. A change to that form means
+/// a new tag.
+pub const ANSWERS_FORM_TAG: &str = "omnifrons-answers-v1";
+
+/// The canonical bytes of `answers`, which the application hashes into
+/// the digest a create plan covers.
+///
+/// The form is line-based and every text is length-prefixed, so no two
+/// different answers share bytes:
+///
+/// ```text
+/// omnifrons-answers-v1
+/// field <key> <count>                  (every field, in Field::ALL order)
+/// item <len>:<text> <confirmed|assumption>
+/// ```
+///
+/// Only [`AnswerItem::text`] and [`AnswerItem::status`] enter it. The
+/// user's own words ([`AnswerItem::said`]) never do: they do not reach
+/// the file, so rewording them changes nothing a plan writes. The form
+/// does not depend on the order in which the fields were given.
+#[must_use]
+pub fn answers_canonical(answers: &Answers) -> Vec<u8> {
+    let mut out = format!("{ANSWERS_FORM_TAG}\n");
+    for field in Field::ALL {
+        let items = answers.items(field);
+        let _ = writeln!(out, "field {} {}", field.key(), items.len());
+        for item in items {
+            let status = match item.status {
+                AnswerStatus::Confirmed => "confirmed",
+                AnswerStatus::Assumption => "assumption",
+            };
+            let _ = writeln!(out, "item {}:{} {status}", item.text.len(), item.text);
+        }
+    }
+    out.into_bytes()
+}
+
+/// How far this writer's own result already exists in a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationState {
+    /// No identity file exists: the create writes `AGENTS.md` and the
+    /// wrapper.
+    New,
+    /// `AGENTS.md` holds exactly the rendered bytes and no other
+    /// identity file exists: a previous run stopped before the wrapper,
+    /// so the create writes only the wrapper.
+    WrapperMissing,
+    /// `AGENTS.md` holds the rendered bytes and `CLAUDE.md` is the
+    /// wrapper: a rerun that changes nothing.
+    AlreadyCreated,
+    /// Some identity file is not this writer's own result: the folder
+    /// is an existing agent, to be adapted instead.
+    IdentityExists,
+}
+
+impl CreationState {
+    /// This state's stable token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::WrapperMissing => "wrapper_missing",
+            Self::AlreadyCreated => "already_created",
+            Self::IdentityExists => "identity_exists",
+        }
+    }
+}
+
+/// The creation state of a folder holding `files` (every identity kind
+/// found, one entry each) when the answers render to `rendered`, the
+/// bytes of the whole `AGENTS.md` (body and skills block).
+///
+/// Only a regular `AGENTS.md` equal to `rendered`, alone or beside a
+/// regular `CLAUDE.md` equal to the exact wrapper, is this writer's own
+/// result. Every other identity file, of any kind, makes the folder an
+/// existing agent.
+#[must_use]
+pub fn creation_state(files: &[IdentityFile], rendered: &[u8]) -> CreationState {
+    if files.is_empty() {
+        return CreationState::New;
+    }
+    let regular = |kind: IdentityKind| {
+        files
+            .iter()
+            .find(|file| file.kind == kind && matches!(file.shape, FileShape::Regular))
+    };
+    let own_only = files
+        .iter()
+        .all(|file| matches!(file.kind, IdentityKind::Agents | IdentityKind::Claude));
+    let agents_match = regular(IdentityKind::Agents).is_some_and(|file| file.bytes == rendered);
+    if !own_only || !agents_match {
+        return CreationState::IdentityExists;
+    }
+    match files.iter().find(|file| file.kind == IdentityKind::Claude) {
+        None => CreationState::WrapperMissing,
+        Some(claude) if matches!(claude.shape, FileShape::Regular) && claude.bytes == WRAPPER => {
+            CreationState::AlreadyCreated
+        }
+        Some(_) => CreationState::IdentityExists,
+    }
 }

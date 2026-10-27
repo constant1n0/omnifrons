@@ -3588,7 +3588,12 @@ const DEFINITION_WARNING_CODES = [
 /** Every token {@link DefinitionFingerprintKind} declares. */
 const DEFINITION_FINGERPRINT_KINDS = ['sha256', 'symlink', 'irregular', 'absent'] as const
 /** Every token {@link DefinitionOperationTag} declares. */
-const DEFINITION_OPERATION_TAGS = ['write-agents', 'write-wrapper', 'write-block'] as const
+const DEFINITION_OPERATION_TAGS = [
+  'write-agents',
+  'write-generated',
+  'write-wrapper',
+  'write-block',
+] as const
 /** Every token {@link DefinitionBlockMode} declares. */
 const DEFINITION_BLOCK_MODES = ['append', 'replace', 'migrate-legacy'] as const
 /** Every token {@link DefinitionNoticeKind} declares. */

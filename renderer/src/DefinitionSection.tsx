@@ -109,6 +109,8 @@ function operationText(operation: DefinitionOperation): string {
   switch (operation.op) {
     case 'write-agents':
       return `${operation.op} ${operation.path} from ${operation.source}; before: ${before}; after: ${after}`
+    case 'write-generated':
+      return `${operation.op} ${operation.path} (${operation.templateVersion}); before: ${before}; after: ${after}`
     case 'write-wrapper':
       return `${operation.op} ${operation.path}; before: ${before}; after: ${after}`
     case 'write-block':

@@ -2452,6 +2452,14 @@ pub enum OperationDto {
         before: FingerprintDto,
         after: String,
     },
+    #[serde(rename = "write-generated")]
+    Generated {
+        path: String,
+        template_version: String,
+        answers_digest: String,
+        before: FingerprintDto,
+        after: String,
+    },
     #[serde(rename = "write-wrapper")]
     Wrapper {
         path: String,
@@ -2477,6 +2485,17 @@ impl From<&Operation> for OperationDto {
             Operation::WriteAgents { source, .. } => Self::Agents {
                 path,
                 source: source.file_name().to_string(),
+                before,
+                after,
+            },
+            Operation::WriteGenerated {
+                template_version,
+                answers_digest,
+                ..
+            } => Self::Generated {
+                path,
+                template_version: template_version.clone(),
+                answers_digest: answers_digest.to_hex(),
                 before,
                 after,
             },

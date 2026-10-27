@@ -1359,3 +1359,56 @@ fn a_context_accepts_plain_relative_children_and_refuses_the_rest() {
         assert!(!error.to_string().is_empty(), "{label}");
     }
 }
+
+// ------------------------------------------- child imports and bidi controls
+
+fn child_error(child: &str) -> omnifrons_domain::definition_create::ContextError {
+    CreateContext::new(vec![child.to_string()], false).unwrap_err()
+}
+
+#[test]
+fn a_child_path_with_an_import_like_token_is_refused_naming_it() {
+    for child in ["area/@rules.md", "@rules", "area/ @x", "a/(@x)"] {
+        let error = child_error(child);
+        assert_eq!(error.reason(), "import", "{child}");
+        assert_eq!(error.child(), child);
+        assert!(error.to_string().contains('@'), "{error}");
+    }
+    let message = child_error("area/@rules.md").to_string();
+    assert!(message.contains("@rules.md"), "{message}");
+}
+
+#[test]
+fn a_child_path_with_an_at_after_a_letter_stays_accepted() {
+    for child in ["ops@example.com", "team/ops@example.com", "plain/inner"] {
+        CreateContext::new(vec![child.to_string()], false).unwrap();
+    }
+}
+
+#[test]
+fn bidirectional_controls_are_refused_in_a_child_path() {
+    for character in ['\u{202e}', '\u{2066}', '\u{202a}', '\u{2069}'] {
+        let child = format!("area{character}inner");
+        let error = child_error(&child);
+        assert_eq!(error.reason(), "bidi_control", "{character:?}");
+        assert_eq!(error.child(), child);
+        let shown = format!("U+{:04X}", u32::from(character));
+        assert!(error.to_string().contains(&shown), "{error}");
+    }
+}
+
+#[test]
+fn bidirectional_controls_are_refused_in_an_answer_text() {
+    for (character, shown) in [('\u{202e}', "U+202E"), ('\u{2066}', "U+2066")] {
+        let mut named = minimal();
+        set(&mut named, "name", ok(&format!("Har{character}bor"), "H."));
+        assert_eq!(reasons_at(&doc(named), "name.text: "), ["bidi_control"]);
+        let raw = with_deliverable(&format!("Run {character}this first"));
+        assert_eq!(reasons_at(&raw, "deliverables[0].text: "), ["bidi_control"]);
+        assert_refused(&raw, &[shown]);
+    }
+    // The user's own words may hold one: they never enter the file.
+    let mut said = full();
+    set(&mut said, "role", ok("a helper", "It is \u{202e}a helper."));
+    accepted(&doc(said));
+}
