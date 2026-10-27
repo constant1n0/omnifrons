@@ -1387,7 +1387,9 @@ fn a_child_path_with_an_at_after_a_letter_stays_accepted() {
 
 #[test]
 fn bidirectional_controls_are_refused_in_a_child_path() {
-    for character in ['\u{202e}', '\u{2066}', '\u{202a}', '\u{2069}'] {
+    for character in [
+        '\u{202e}', '\u{2066}', '\u{202a}', '\u{2069}', '\u{200f}', '\u{200e}', '\u{061c}',
+    ] {
         let child = format!("area{character}inner");
         let error = child_error(&child);
         assert_eq!(error.reason(), "bidi_control", "{character:?}");
@@ -1399,7 +1401,12 @@ fn bidirectional_controls_are_refused_in_a_child_path() {
 
 #[test]
 fn bidirectional_controls_are_refused_in_an_answer_text() {
-    for (character, shown) in [('\u{202e}', "U+202E"), ('\u{2066}', "U+2066")] {
+    for (character, shown) in [
+        ('\u{202e}', "U+202E"),
+        ('\u{2066}', "U+2066"),
+        ('\u{200f}', "U+200F"),
+        ('\u{061c}', "U+061C"),
+    ] {
         let mut named = minimal();
         set(&mut named, "name", ok(&format!("Har{character}bor"), "H."));
         assert_eq!(reasons_at(&doc(named), "name.text: "), ["bidi_control"]);

@@ -228,6 +228,10 @@ pub enum DefinitionTreeError {
     /// displayed path.
     #[error("a reported path is not valid Unicode")]
     PathNotUnicode,
+    /// The implementation does not answer [`DefinitionTree::probe`] or
+    /// [`DefinitionTree::locate`], which a create needs.
+    #[error("the tree cannot probe paths")]
+    ProbeUnsupported,
 }
 
 impl DefinitionTreeError {
@@ -239,8 +243,38 @@ impl DefinitionTreeError {
             Self::WalkFailed => "walk-failed",
             Self::EntryTooLarge => "entry-too-large",
             Self::PathNotUnicode => "path-not-unicode",
+            Self::ProbeUnsupported => "probe-unsupported",
         }
     }
+}
+
+/// What sits at one path of the workspace, looked at without following a
+/// symlink at its last component (the prototype's `lexists` and
+/// `is_symlink`). Anything that keeps the path from being read, a
+/// permission error included, counts as [`Self::Absent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathProbe {
+    /// Nothing is there, or it cannot be read.
+    Absent,
+    /// A symlink; `link` is its target text.
+    Symlink {
+        /// The text the link points to.
+        link: String,
+    },
+    /// Anything else that exists: a file, a directory or a special file.
+    Present,
+}
+
+/// Where a create target physically is: its real path (every symlink
+/// resolved) and whether that path is the user's home directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetLocation {
+    /// The names of the physical path, from the filesystem root down to
+    /// the target itself (no root or drive entry).
+    pub components: Vec<String>,
+    /// Whether the physical path is the home directory the
+    /// implementation was built with.
+    pub home: bool,
 }
 
 /// A port over one read-only pass of a workspace's agent definition
@@ -255,4 +289,46 @@ pub trait DefinitionTree {
     /// Returns [`DefinitionTreeError`] naming why the walk could not be
     /// completed.
     fn snapshot(&self, root: &WorkspaceRoot) -> Result<TreeSnapshot, DefinitionTreeError>;
+
+    /// What sits at `relative` (a clean POSIX path below `root`; `"."`
+    /// names `root` itself), without following a symlink at its last
+    /// component. A create uses it for the target itself and for each
+    /// part of each `sources` entry, which the snapshot does not list.
+    ///
+    /// The default refuses with [`DefinitionTreeError::ProbeUnsupported`]:
+    /// an implementation that cannot answer must not be mistaken for one
+    /// that found nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DefinitionTreeError`] naming why the path could not be
+    /// looked at.
+    fn probe(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<PathProbe, DefinitionTreeError> {
+        let _ = (root, relative);
+        Err(DefinitionTreeError::ProbeUnsupported)
+    }
+
+    /// The physical location of the directory `relative` below `root`,
+    /// with the home directory rule applied. A create refuses a host
+    /// configuration folder or the home directory, judged on the real
+    /// path, as hosts see it.
+    ///
+    /// The default refuses with [`DefinitionTreeError::ProbeUnsupported`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DefinitionTreeError`] naming why the location could not
+    /// be resolved (for example, the directory does not exist).
+    fn locate(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<TargetLocation, DefinitionTreeError> {
+        let _ = (root, relative);
+        Err(DefinitionTreeError::ProbeUnsupported)
+    }
 }

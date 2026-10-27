@@ -12,7 +12,8 @@ use omnifrons_domain::definition::IdentityFile;
 use omnifrons_domain::nesting::Ancestor;
 
 use crate::definition_tree::{
-    DefinitionTree, DefinitionTreeError, DirectoryEntry, SkillFile, TreeSnapshot,
+    DefinitionTree, DefinitionTreeError, DirectoryEntry, PathProbe, SkillFile, TargetLocation,
+    TreeSnapshot,
 };
 use crate::harness_adapter::WorkspaceRoot;
 
@@ -21,6 +22,8 @@ use crate::harness_adapter::WorkspaceRoot;
 #[derive(Debug, Default)]
 pub struct InMemoryDefinitionTree {
     snapshots: HashMap<PathBuf, TreeSnapshot>,
+    probes: HashMap<(PathBuf, String), PathProbe>,
+    locations: HashMap<(PathBuf, String), TargetLocation>,
 }
 
 impl InMemoryDefinitionTree {
@@ -36,6 +39,46 @@ impl InMemoryDefinitionTree {
         self.snapshots.insert(root.path().to_path_buf(), snapshot);
         self
     }
+
+    /// Prepares what [`DefinitionTree::probe`] answers for `relative`
+    /// below `root`. A path never prepared is [`PathProbe::Absent`].
+    #[must_use]
+    pub fn with_probe(
+        mut self,
+        root: &WorkspaceRoot,
+        relative: impl Into<String>,
+        probe: PathProbe,
+    ) -> Self {
+        self.probes
+            .insert((root.path().to_path_buf(), relative.into()), probe);
+        self
+    }
+
+    /// Prepares `relative` and every folder on its way as present, so a
+    /// `sources` entry names a real file.
+    #[must_use]
+    pub fn with_file(mut self, root: &WorkspaceRoot, relative: &str) -> Self {
+        let parts: Vec<&str> = relative.split('/').collect();
+        for end in 1..=parts.len() {
+            self = self.with_probe(root, parts[..end].join("/"), PathProbe::Present);
+        }
+        self
+    }
+
+    /// Prepares what [`DefinitionTree::locate`] answers for `relative`
+    /// below `root`. A directory never prepared is located at `root`'s
+    /// own path plus `relative`, and is not the home directory.
+    #[must_use]
+    pub fn with_location(
+        mut self,
+        root: &WorkspaceRoot,
+        relative: impl Into<String>,
+        location: TargetLocation,
+    ) -> Self {
+        self.locations
+            .insert((root.path().to_path_buf(), relative.into()), location);
+        self
+    }
 }
 
 impl DefinitionTree for InMemoryDefinitionTree {
@@ -44,6 +87,41 @@ impl DefinitionTree for InMemoryDefinitionTree {
             .get(root.path())
             .cloned()
             .ok_or(DefinitionTreeError::RootUnreadable)
+    }
+
+    fn probe(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<PathProbe, DefinitionTreeError> {
+        let key = (root.path().to_path_buf(), relative.to_string());
+        Ok(self.probes.get(&key).cloned().unwrap_or(PathProbe::Absent))
+    }
+
+    fn locate(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<TargetLocation, DefinitionTreeError> {
+        let key = (root.path().to_path_buf(), relative.to_string());
+        if let Some(location) = self.locations.get(&key) {
+            return Ok(location.clone());
+        }
+        let mut components: Vec<String> = root
+            .path()
+            .components()
+            .filter_map(|part| match part {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        if relative != "." {
+            components.extend(relative.split('/').map(str::to_string));
+        }
+        Ok(TargetLocation {
+            components,
+            home: false,
+        })
     }
 }
 

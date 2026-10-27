@@ -51,6 +51,16 @@ use crate::publication::is_bidi_control;
 use crate::skills_index::indexed_skill_targets;
 use crate::skills_safety::unsafe_at_tokens;
 
+/// Whether `c` steers bidirectional ordering: the shared
+/// [`is_bidi_control`] set (overrides, embeddings, isolates) plus the
+/// directional marks U+061C, U+200E and U+200F. This is the create's own,
+/// wider rule: English answer texts and child paths have no use for the
+/// marks, while other users of the shared predicate keep their narrower
+/// rule.
+const fn is_bidi_steering(c: char) -> bool {
+    is_bidi_control(c) || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}')
+}
+
 /// The version of the fixed English template this module renders.
 pub const CREATE_TEMPLATE_VERSION: &str = "adr-0005-create-v1";
 
@@ -770,7 +780,7 @@ fn text_problems(body: &str) -> Vec<AnswerProblem> {
     if body.contains('`') {
         problems.push(AnswerProblem::Backtick);
     }
-    if let Some(character) = body.chars().find(|c| is_bidi_control(*c)) {
+    if let Some(character) = body.chars().find(|c| is_bidi_steering(*c)) {
         problems.push(AnswerProblem::BidiControl { character });
     }
     problems
@@ -918,7 +928,7 @@ impl CreateContext {
             if child.contains("{child}") {
                 return Err(ContextError::Placeholder { child });
             }
-            if let Some(character) = child.chars().find(|c| is_bidi_control(*c)) {
+            if let Some(character) = child.chars().find(|c| is_bidi_steering(*c)) {
                 return Err(ContextError::BidiControl { child, character });
             }
             // The child is written inside a code span that template text follows.

@@ -136,8 +136,8 @@ use std::path::{Path, PathBuf};
 
 use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::definition_tree::{
-    DefinitionTree, DefinitionTreeError, DirectoryEntry, MAX_DEFINITION_ENTRY_BYTES, SkillFile,
-    TreeSnapshot,
+    DefinitionTree, DefinitionTreeError, DirectoryEntry, MAX_DEFINITION_ENTRY_BYTES, PathProbe,
+    SkillFile, TargetLocation, TreeSnapshot,
 };
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind};
 use omnifrons_domain::hosts::{EXTRA_READERS, GENERATED_STATE_DIRS, HOST_CONFIG_DIRS, SKIP_DIRS};
@@ -231,6 +231,45 @@ impl DefinitionTree for FsDefinitionTree {
             skills: collected.skills,
             ancestors,
         })
+    }
+
+    /// The lenient `lexists` and `is_symlink` of the prototype: a path
+    /// that cannot be read at all is absent, never an error.
+    fn probe(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<PathProbe, DefinitionTreeError> {
+        let path = root.path().join(relative);
+        let Some(metadata) = lexists_or_absent(&path) else {
+            return Ok(PathProbe::Absent);
+        };
+        if metadata.file_type().is_symlink() {
+            let link = read_link_text(&path, false)?;
+            return Ok(PathProbe::Symlink { link });
+        }
+        Ok(PathProbe::Present)
+    }
+
+    /// The canonical path of the directory, as hosts see it (they start
+    /// from the physical working directory), and whether it is the home
+    /// directory given to [`FsDefinitionTree::new`].
+    fn locate(
+        &self,
+        root: &WorkspaceRoot,
+        relative: &str,
+    ) -> Result<TargetLocation, DefinitionTreeError> {
+        let physical = std::fs::canonicalize(root.path().join(relative))
+            .map_err(|_| DefinitionTreeError::RootUnreadable)?;
+        let mut components = Vec::new();
+        for part in physical.components() {
+            if let std::path::Component::Normal(name) = part {
+                let name = name.to_str().ok_or(DefinitionTreeError::PathNotUnicode)?;
+                components.push(name.to_string());
+            }
+        }
+        let home = self.home.as_deref() == Some(physical.as_path());
+        Ok(TargetLocation { components, home })
     }
 }
 

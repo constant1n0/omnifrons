@@ -171,6 +171,7 @@ impl DefinitionError {
                 DefinitionTreeError::WalkFailed => "tree(walk-failed)",
                 DefinitionTreeError::EntryTooLarge => "tree(entry-too-large)",
                 DefinitionTreeError::PathNotUnicode => "tree(path-not-unicode)",
+                DefinitionTreeError::ProbeUnsupported => "tree(probe-unsupported)",
             },
             Self::Nesting(error) => match error {
                 NestingError::AbsolutePath(_) => "nesting(absolute-path)",
@@ -334,7 +335,7 @@ pub(crate) fn absolute_posix(workspace: &WorkspaceRoot, relative: &str) -> Strin
 /// scan-root-relative convention instead of real filesystem paths):
 /// every caller already established that `path` equals `root` or sits
 /// below it, through [`nesting::nearest_root`] or a [`RootRelation`].
-fn relative_within(root: &str, path: &str) -> String {
+pub(crate) fn relative_within(root: &str, path: &str) -> String {
     if root == "." {
         return path.to_string();
     }
@@ -346,7 +347,7 @@ fn relative_within(root: &str, path: &str) -> String {
 
 /// The parent directory of a clean, scan-root-relative POSIX `path` (the
 /// prototype's `skill.parent`): `"."` for a top-level entry.
-fn parent_directory(path: &str) -> &str {
+pub(crate) fn parent_directory(path: &str) -> &str {
     path.rfind('/').map_or(".", |index| &path[..index])
 }
 

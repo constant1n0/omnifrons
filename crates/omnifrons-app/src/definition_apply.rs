@@ -2,7 +2,8 @@
 //! the plan a caller approved, one file at a time.
 //!
 //! [`apply`] takes only the plan id. It plans again from what is on disk
-//! now with the same options ([`crate::definition_plan::plan_with_writes`]),
+//! now with the same options ([`crate::definition_plan::plan_with_writes`],
+//! or its create twin when the apply is a create),
 //! so the bytes it writes are never the caller's: a plan whose id differs
 //! from the recomputed one is [`DefinitionError::StalePlan`] and nothing
 //! is written. A root that is already canonical plans no operation and
@@ -83,6 +84,7 @@
 use std::collections::BTreeMap;
 
 use omnifrons_domain::definition::{FileShape, IdentityFile, IdentityKind};
+use omnifrons_domain::definition_create::Answers;
 use omnifrons_domain::definition_plan::{
     InputFingerprint, Operation, Plan, PlanId, PlanOptions, PlanRefusal,
 };
@@ -93,7 +95,7 @@ use crate::apply_record::{AppliedFile, ApplyRecord, ApplyRecordId, ApplyRecordSt
 use crate::clock::Clock;
 use crate::content_hasher::{ContentHasher, derive_project_identity};
 use crate::definition::{DefinitionError, DefinitionPorts, load_target};
-use crate::definition_plan::{PlanOutcome, PlannedWrite, input_fingerprints, plan_with_writes};
+use crate::definition_plan::{PlanOutcome, PlannedWrite, input_fingerprints, plan_for};
 use crate::definition_tree::DefinitionTree;
 use crate::definition_writer::{DefinitionWriteError, DefinitionWriter, ModePolicy, WriteRequest};
 use crate::harness_adapter::WorkspaceRoot;
@@ -165,11 +167,49 @@ pub fn apply(
     options: &PlanOptions,
     expected: &PlanId,
 ) -> Result<ApplyOutcome, DefinitionError> {
+    apply_for(ports, workspace, target, *options, None, expected)
+}
+
+/// [`apply`] for a create: plans `target` again from the validated
+/// `answers` ([`crate::definition_plan::plan_create_with_writes`]) and
+/// applies it when the id still matches `expected`.
+///
+/// A create only ever adds files, so every operation has an absent
+/// `before`, takes no snapshot, and the file keeps the default mode. The
+/// apply is recorded like any other; the answers are not.
+///
+/// # Errors
+///
+/// The errors [`apply`] documents, and those of
+/// [`crate::definition_plan::plan_create`].
+///
+/// # Panics
+///
+/// As [`apply`].
+pub fn apply_create(
+    ports: &mut ApplyPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: Option<&str>,
+    options: &PlanOptions,
+    answers: &Answers,
+    expected: &PlanId,
+) -> Result<ApplyOutcome, DefinitionError> {
+    apply_for(ports, workspace, target, *options, Some(answers), expected)
+}
+
+fn apply_for(
+    ports: &mut ApplyPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: Option<&str>,
+    options: PlanOptions,
+    create: Option<&Answers>,
+    expected: &PlanId,
+) -> Result<ApplyOutcome, DefinitionError> {
     let definition = DefinitionPorts {
         tree: ports.tree,
         hasher: ports.hasher,
     };
-    let (outcome, writes) = plan_with_writes(&definition, workspace, target, options)?;
+    let (outcome, writes) = plan_for(&definition, workspace, target, options, create)?;
     let plan = match outcome {
         PlanOutcome::Refused(refusal) => return Ok(ApplyOutcome::Refused(refusal)),
         PlanOutcome::Planned(plan) => plan,

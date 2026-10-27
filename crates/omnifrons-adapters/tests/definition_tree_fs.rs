@@ -14,7 +14,7 @@ use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::contract::definition::definition_tree_contract;
 use omnifrons_app::definition::{AgentReport, DefinitionPorts, ScanReport, scan};
 use omnifrons_app::definition_tree::{
-    DefinitionTree, DefinitionTreeError, MAX_DEFINITION_ENTRY_BYTES,
+    DefinitionTree, DefinitionTreeError, MAX_DEFINITION_ENTRY_BYTES, PathProbe,
 };
 use omnifrons_domain::definition::RootState;
 #[cfg(unix)]
@@ -1650,4 +1650,67 @@ fn nothing_below_the_portable_agent_folder_is_visited() {
         .map(|d| d.path.as_str())
         .collect();
     assert_eq!(paths, vec!["."]);
+}
+
+// ------------------------------------------------------ probe and locate
+
+#[test]
+fn probe_tells_absent_present_and_symlink_apart() {
+    let dir = TempDir::new("probe");
+    std::fs::create_dir_all(dir.path().join("docs")).expect("dir");
+    std::fs::write(dir.path().join("docs/brief.md"), b"x").expect("file");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("docs", dir.path().join("link")).expect("symlink");
+    let workspace = dir.workspace();
+    let tree = FsDefinitionTree::new(None);
+    assert_eq!(tree.probe(&workspace, "."), Ok(PathProbe::Present));
+    assert_eq!(tree.probe(&workspace, "docs"), Ok(PathProbe::Present));
+    assert_eq!(
+        tree.probe(&workspace, "docs/brief.md"),
+        Ok(PathProbe::Present)
+    );
+    assert_eq!(
+        tree.probe(&workspace, "docs/gone.md"),
+        Ok(PathProbe::Absent)
+    );
+    assert_eq!(
+        tree.probe(&workspace, "nothing/below"),
+        Ok(PathProbe::Absent)
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        tree.probe(&workspace, "link"),
+        Ok(PathProbe::Symlink {
+            link: "docs".to_string()
+        })
+    );
+}
+
+#[test]
+fn locate_resolves_the_physical_path_and_the_home_rule() {
+    let dir = TempDir::new("locate");
+    std::fs::create_dir_all(dir.path().join("real/inner")).expect("dir");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real", dir.path().join("link")).expect("symlink");
+    let workspace = dir.workspace();
+    let tree = FsDefinitionTree::new(Some(dir.path().join("real")));
+    let inner = tree.locate(&workspace, "real/inner").expect("locate");
+    assert!(!inner.home);
+    assert_eq!(
+        inner.components[inner.components.len() - 2..],
+        ["real", "inner"]
+    );
+    let home = tree.locate(&workspace, "real").expect("locate");
+    assert!(home.home);
+    #[cfg(unix)]
+    {
+        // A symlink resolves to the folder it names, home included.
+        let through = tree.locate(&workspace, "link/inner").expect("locate");
+        assert_eq!(through.components, inner.components);
+        assert!(tree.locate(&workspace, "link").expect("locate").home);
+    }
+    assert_eq!(
+        tree.locate(&workspace, "missing"),
+        Err(DefinitionTreeError::RootUnreadable)
+    );
 }

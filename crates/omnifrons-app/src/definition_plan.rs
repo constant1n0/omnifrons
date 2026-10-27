@@ -52,9 +52,15 @@ use std::collections::BTreeMap;
 use omnifrons_domain::definition::{
     FileShape, IdentityFile, IdentityKind, RootState, WRAPPER, is_import_only,
 };
+use omnifrons_domain::definition_create::{
+    Answers, CREATE_TEMPLATE_VERSION, CreateContext, CreationState, Field, answers_canonical,
+    creation_state, render,
+};
 use omnifrons_domain::definition_plan::{
     BlockDiff, InputFingerprint, Notice, Operation, Plan, PlanId, PlanOptions, PlanRefusal,
-    canonical_bytes,
+    SourceProblem, canonical_bytes, home_target_message, host_config_index,
+    host_config_target_message, identity_exists_message, inside_host_config_message,
+    nested_create_message, symlink_target_message,
 };
 use omnifrons_domain::guidance::{LineEnding, ManagedBlock, ManagedFileKind};
 use omnifrons_domain::nesting::{self, Parent};
@@ -62,9 +68,10 @@ use omnifrons_domain::nesting::{self, Parent};
 use crate::content_hasher::ContentHasher;
 use crate::definition::{
     BlockAnalysis, BlockRefusal, BlockRefusalCode, DefinitionError, DefinitionPorts, LoadedTarget,
-    PendingBlock, absolute_posix, agent_root_paths, block_analysis, load_target,
+    PendingBlock, absolute_posix, agent_root_paths, block_analysis, load_target, parent_directory,
+    relative_within,
 };
-use crate::definition_tree::TreeSnapshot;
+use crate::definition_tree::{DefinitionTree, PathProbe, TreeSnapshot};
 use crate::harness_adapter::WorkspaceRoot;
 
 /// The bytes one planned operation would write.
@@ -126,12 +133,79 @@ pub fn plan_with_writes(
     target: Option<&str>,
     options: &PlanOptions,
 ) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
+    plan_for(ports, workspace, target, *options, None)
+}
+
+/// [`plan`] for a create: what writing a new definition from the
+/// validated `answers` into `target` would do, without doing it.
+///
+/// The answers are never kept: the plan covers their digest (the
+/// operation's `answers_digest`) and the digest of the bytes rendered
+/// from them. `canonical_from` plays no part in a create.
+///
+/// # Errors
+///
+/// The errors [`plan`] documents, except
+/// [`DefinitionError::InvalidCanonicalChoice`]; plus
+/// [`DefinitionError::Tree`] when the tree cannot probe paths or the
+/// target directory cannot be located.
+pub fn plan_create(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: Option<&str>,
+    options: &PlanOptions,
+    answers: &Answers,
+) -> Result<PlanOutcome, DefinitionError> {
+    plan_create_with_writes(ports, workspace, target, options, answers).map(|(outcome, _)| outcome)
+}
+
+/// [`plan_create`], together with the bytes each planned operation would
+/// write, index-aligned with the operations as [`plan_with_writes`]
+/// documents. The apply service consumes this pair.
+///
+/// # Errors
+///
+/// The errors [`plan_create`] documents.
+pub fn plan_create_with_writes(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: Option<&str>,
+    options: &PlanOptions,
+    answers: &Answers,
+) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
+    plan_for(ports, workspace, target, *options, Some(answers))
+}
+
+/// The planner behind [`plan_with_writes`] and [`plan_create_with_writes`]:
+/// with `create` answers, the target is planned as a new definition.
+pub(crate) fn plan_for(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: Option<&str>,
+    options: PlanOptions,
+    create: Option<&Answers>,
+) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
     let target = target.unwrap_or(".");
+    let loaded = load_target(ports, workspace, target)?;
+    if let Some(answers) = create {
+        return plan_new_definition(ports, workspace, target, options, answers, &loaded);
+    }
+    plan_existing(ports, workspace, target, options, loaded)
+}
+
+/// The adapt planner over an already loaded `target`.
+fn plan_existing(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: &str,
+    options: PlanOptions,
+    loaded: LoadedTarget,
+) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
     let LoadedTarget {
         snapshot,
         identity_files,
         classification,
-    } = load_target(ports, workspace, target)?;
+    } = loaded;
     let hasher = ports.hasher;
     let inputs = input_fingerprints(hasher, &identity_files);
 
@@ -577,6 +651,353 @@ fn block_refusal(refusal: BlockRefusal) -> PlanRefusal {
         BlockRefusalCode::BlockLayout => PlanRefusal::BlockLayout(detail),
         BlockRefusalCode::UnsafeSkillMetadata => PlanRefusal::UnsafeSkillMetadata(detail),
     }
+}
+
+// ------------------------------------------------------------- create
+
+/// What a create reads from the snapshot besides the identity files:
+/// every agent root (the target among them), the target's direct child
+/// agents, and the agent that encloses it.
+struct CreateSite<'a> {
+    roots: Vec<&'a str>,
+    children: Vec<String>,
+    parent: Option<Parent>,
+}
+
+/// Plans `target` as a new definition rendered from `answers`.
+///
+/// The gates run in the prototype's order, each refusing before the next
+/// reads anything: an unsafe target (a symlink, a host configuration
+/// folder or a folder inside one, the home directory); an existing agent
+/// (any identity file that is not this writer's own result); a child path
+/// the template cannot hold; the skill refusals of the adapt path; an
+/// `AGENTS.md` that is not what the answers render; a nested target
+/// without its own consent; a `sources` entry that is missing, a symlink,
+/// or inside or around a child agent.
+///
+/// The enclosing agent's files are not fingerprinted in the plan inputs: a
+/// parent appearing or vanishing changes the rendered body (the enclosing
+/// line) and so the plan id.
+fn plan_new_definition(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    target: &str,
+    options: PlanOptions,
+    answers: &Answers,
+    loaded: &LoadedTarget,
+) -> Result<(PlanOutcome, Vec<PlannedWrite>), DefinitionError> {
+    let hasher = ports.hasher;
+    let files = &loaded.identity_files;
+    if let Some(refusal) = unsafe_target(ports.tree, workspace, target)? {
+        return Ok(refused(refusal));
+    }
+    let own = own_files(files, options.with_gemini);
+    let existing = find(&own, IdentityKind::Agents).map_or(&[][..], |file| &file.bytes[..]);
+    if creation_state(&own, existing) == CreationState::IdentityExists {
+        return Ok(refused(existing_agent(target, files, "")));
+    }
+    let site = create_site(&loaded.snapshot, target)?;
+    let context = match CreateContext::new(site.children.clone(), site.parent.is_some()) {
+        Ok(context) => context,
+        Err(error) => return Ok(refused(PlanRefusal::UnsafeTarget(error.to_string()))),
+    };
+    let body = render(answers, &context).into_bytes();
+    let full = match with_skills_block(
+        ports,
+        workspace,
+        &loaded.snapshot,
+        &site.roots,
+        target,
+        body,
+    ) {
+        Ok(full) => full,
+        Err(refusal) => return Ok(refused(refusal)),
+    };
+    if creation_state(&own, &full) == CreationState::IdentityExists {
+        let why = " whose AGENTS.md is not what these answers render";
+        return Ok(refused(existing_agent(target, files, why)));
+    }
+    if let Some(refusal) = nested_create_refusal(options, &site, target) {
+        return Ok(refused(refusal));
+    }
+    if let Some(refusal) = source_refusal(ports.tree, workspace, target, answers, &site.children)? {
+        return Ok(refused(refusal));
+    }
+    let (operations, writes) = create_operations(hasher, answers, files, full, options.with_gemini);
+    let inputs = input_fingerprints(hasher, files);
+    let plan = finish(
+        hasher,
+        workspace,
+        target,
+        inputs,
+        operations,
+        None,
+        &loaded.snapshot,
+    );
+    Ok((PlanOutcome::Planned(plan), writes))
+}
+
+/// The identity files a create judges: all of them, except a regular
+/// `GEMINI.md` that already is the wrapper when the caller asked for the
+/// Gemini wrapper (a previous run of this same create wrote it).
+///
+/// So a rerun of a create that asked for the Gemini wrapper converges: a
+/// finished one plans nothing, and one stopped before `GEMINI.md` plans
+/// only that wrapper.
+fn own_files(files: &[IdentityFile], with_gemini: bool) -> Vec<IdentityFile> {
+    files
+        .iter()
+        .filter(|file| {
+            !(with_gemini
+                && file.kind == IdentityKind::Gemini
+                && is_regular(file)
+                && file.bytes == WRAPPER)
+        })
+        .cloned()
+        .collect()
+}
+
+fn existing_agent(target: &str, files: &[IdentityFile], why: &str) -> PlanRefusal {
+    let names: Vec<&str> = files.iter().map(|file| file.kind.file_name()).collect();
+    PlanRefusal::IdentityExists(identity_exists_message(target, &names, why))
+}
+
+/// The refusal for a create target that is a symlink, lies in or is a host
+/// configuration folder, or is the home directory, judged on the physical
+/// path as hosts see it.
+fn unsafe_target(
+    tree: &dyn DefinitionTree,
+    workspace: &WorkspaceRoot,
+    target: &str,
+) -> Result<Option<PlanRefusal>, DefinitionError> {
+    let probe = tree
+        .probe(workspace, target)
+        .map_err(DefinitionError::Tree)?;
+    if let PathProbe::Symlink { link } = probe {
+        let message = symlink_target_message(target, &link);
+        return Ok(Some(PlanRefusal::UnsafeTarget(message)));
+    }
+    let location = tree
+        .locate(workspace, target)
+        .map_err(DefinitionError::Tree)?;
+    let names: Vec<&str> = location.components.iter().map(String::as_str).collect();
+    let physical = |end: usize| format!("/{}", names[..end].join("/"));
+    let message = match host_config_index(&names) {
+        Some(index) if index + 1 == names.len() => {
+            host_config_target_message(&physical(names.len()), names[index])
+        }
+        Some(index) => inside_host_config_message(
+            &physical(names.len()),
+            &physical(index + 1),
+            names[index],
+            &physical(index),
+        ),
+        None if location.home => home_target_message(&physical(names.len())),
+        None => return Ok(None),
+    };
+    Ok(Some(PlanRefusal::UnsafeTarget(message)))
+}
+
+/// The roots, child agents and enclosing agent of a create `target`.
+fn create_site<'a>(
+    snapshot: &'a TreeSnapshot,
+    target: &'a str,
+) -> Result<CreateSite<'a>, DefinitionError> {
+    let mut roots = agent_root_paths(&snapshot.directories);
+    if !roots.contains(&target) {
+        roots.push(target);
+    }
+    let relations =
+        nesting::relate(&roots, &snapshot.ancestors).map_err(DefinitionError::Nesting)?;
+    let parent = relations
+        .into_iter()
+        .find(|relation| relation.root == target)
+        .and_then(|relation| relation.parent);
+    let children = child_agents(&roots, target);
+    Ok(CreateSite {
+        roots,
+        children,
+        parent,
+    })
+}
+
+/// The agents directly below `target`, relative to it and sorted by path
+/// component: every deeper agent belongs to one of them.
+fn child_agents(roots: &[&str], target: &str) -> Vec<String> {
+    let prefix = format!("{target}/");
+    let below: Vec<&str> = roots
+        .iter()
+        .copied()
+        .filter(|root| *root != target && (target == "." || root.starts_with(&prefix)))
+        .collect();
+    let mut children: Vec<String> = below
+        .iter()
+        .filter(|root| nesting::nearest_root(&below, parent_directory(root)).is_none())
+        .map(|root| relative_within(target, root))
+        .collect();
+    children.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+    children
+}
+
+/// The whole `AGENTS.md` a create writes: `body`, followed by one blank
+/// line and the skills block when the folder holds local skills. The
+/// block is the adapt path's own, appended to the rendered body.
+fn with_skills_block(
+    ports: &DefinitionPorts<'_>,
+    workspace: &WorkspaceRoot,
+    snapshot: &TreeSnapshot,
+    roots: &[&str],
+    target: &str,
+    body: Vec<u8>,
+) -> Result<Vec<u8>, PlanRefusal> {
+    let agents = [IdentityFile {
+        kind: IdentityKind::Agents,
+        bytes: body,
+        shape: FileShape::Regular,
+    }];
+    let analysis = block_analysis(
+        ports,
+        workspace,
+        snapshot,
+        roots,
+        target,
+        &agents,
+        Some(IdentityKind::Agents),
+    );
+    let [agents] = agents;
+    match analysis {
+        BlockAnalysis::Refused(refusal) => Err(block_refusal(refusal)),
+        BlockAnalysis::Settled { pending: None } => Ok(agents.bytes),
+        BlockAnalysis::Settled {
+            pending: Some(pending),
+        } => plan_block(ports.hasher, &agents.bytes, &pending).map(|block| block.write.bytes),
+    }
+}
+
+/// The refusal for a create target below another agent without its own
+/// consent.
+fn nested_create_refusal(
+    options: PlanOptions,
+    site: &CreateSite<'_>,
+    target: &str,
+) -> Option<PlanRefusal> {
+    if options.nested_consent {
+        return None;
+    }
+    let parent = match site.parent.as_ref()? {
+        Parent::Root(path) | Parent::Outside(path) => path,
+    };
+    Some(PlanRefusal::NestedAgent(nested_create_message(
+        target, parent,
+    )))
+}
+
+/// The refusal for the first `sources` entry that is not a real entry of
+/// the new agent's workspace.
+fn source_refusal(
+    tree: &dyn DefinitionTree,
+    workspace: &WorkspaceRoot,
+    target: &str,
+    answers: &Answers,
+    children: &[String],
+) -> Result<Option<PlanRefusal>, DefinitionError> {
+    for (index, item) in answers.items(Field::Sources).iter().enumerate() {
+        if let Some(problem) = source_problem(tree, workspace, target, &item.text, children)? {
+            return Ok(Some(problem.refusal(index, &item.text, target)));
+        }
+    }
+    Ok(None)
+}
+
+/// Why `entry` (a path relative to `target`) is not a real source: each
+/// part must exist and not be a symlink, and neither the entry nor
+/// anything above it may be a child agent, nor may the entry hold one.
+fn source_problem(
+    tree: &dyn DefinitionTree,
+    workspace: &WorkspaceRoot,
+    target: &str,
+    entry: &str,
+    children: &[String],
+) -> Result<Option<SourceProblem>, DefinitionError> {
+    let mut current = String::new();
+    for part in entry.split('/') {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(part);
+        let path = if target == "." {
+            current.clone()
+        } else {
+            format!("{target}/{current}")
+        };
+        match tree
+            .probe(workspace, &path)
+            .map_err(DefinitionError::Tree)?
+        {
+            PathProbe::Symlink { .. } => {
+                return Ok(Some(SourceProblem::Symlink { shown: current }));
+            }
+            PathProbe::Absent => return Ok(Some(SourceProblem::Missing)),
+            PathProbe::Present => {}
+        }
+        if let Some(child) = children.iter().find(|child| **child == current) {
+            return Ok(Some(SourceProblem::InsideChild {
+                child: child.clone(),
+            }));
+        }
+    }
+    let held = format!("{current}/");
+    Ok(children
+        .iter()
+        .find(|child| child.starts_with(&held))
+        .map(|child| SourceProblem::ContainsChild {
+            child: child.clone(),
+        }))
+}
+
+/// The operations of a create, in apply order, each paired with its
+/// bytes: `AGENTS.md` when it does not exist yet, then every wrapper that
+/// does not. Nothing is overwritten, so each `before` is absent.
+fn create_operations(
+    hasher: &dyn ContentHasher,
+    answers: &Answers,
+    files: &[IdentityFile],
+    full: Vec<u8>,
+    with_gemini: bool,
+) -> (Vec<Operation>, Vec<PlannedWrite>) {
+    let mut operations = Vec::new();
+    let mut writes = Vec::new();
+    if find(files, IdentityKind::Agents).is_none() {
+        operations.push(Operation::WriteGenerated {
+            template_version: CREATE_TEMPLATE_VERSION.to_string(),
+            answers_digest: hasher.sha256(&answers_canonical(answers)),
+            after: hasher.sha256(&full),
+            before: InputFingerprint::Absent,
+        });
+        writes.push(PlannedWrite {
+            path: IdentityKind::Agents.file_name(),
+            bytes: full,
+        });
+    }
+    let wrappers: &[IdentityKind] = if with_gemini {
+        &[IdentityKind::Claude, IdentityKind::Gemini]
+    } else {
+        &[IdentityKind::Claude]
+    };
+    for kind in wrappers.iter().copied() {
+        if find(files, kind).is_none() {
+            operations.push(Operation::WriteWrapper {
+                kind,
+                after: hasher.sha256(WRAPPER),
+                before: InputFingerprint::Absent,
+            });
+            writes.push(PlannedWrite {
+                path: kind.file_name(),
+                bytes: WRAPPER.to_vec(),
+            });
+        }
+    }
+    (operations, writes)
 }
 
 #[cfg(test)]
