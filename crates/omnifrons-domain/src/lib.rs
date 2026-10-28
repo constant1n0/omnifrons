@@ -20,6 +20,7 @@ pub mod publication;
 pub mod scope;
 pub mod skills_index;
 pub mod skills_safety;
+pub mod switch_check;
 pub mod terminal;
 pub mod warnings;
 pub mod wrong_root;
