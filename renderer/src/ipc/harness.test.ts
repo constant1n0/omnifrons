@@ -20,6 +20,7 @@ import {
   definitionCreatePreview,
   definitionPreview,
   definitionStatus,
+  definitionSwitchCheck,
   definitionVerify,
   executableApprove,
   executablePickAndProbe,
@@ -115,6 +116,9 @@ import {
   type DefinitionParent,
   type DefinitionSkills,
   type DefinitionStatus,
+  type DefinitionSwitchCheck,
+  type DefinitionSwitchUncertainReason,
+  type DefinitionSwitchVerdictKind,
   type DefinitionVerify,
   type DefinitionWarning,
   type DefinitionWarningCode,
@@ -3725,6 +3729,11 @@ const DEFINITION_CREATE_APPLY_OUTCOME_KINDS = ['applied', 'noop', 'refused', 'in
 
 // Compile-time, enforced by `tsc -b` in `pnpm -r build` and not by vitest:
 // each array covers its union exactly -- no member missing, no extra.
+/** Every token {@link DefinitionSwitchVerdictKind} declares. */
+const DEFINITION_SWITCH_VERDICT_KINDS = ['reaches', 'unreached', 'uncertain'] as const
+/** Every token {@link DefinitionSwitchUncertainReason} declares. */
+const DEFINITION_SWITCH_UNCERTAIN_REASONS = ['unknown-host', 'no-host-chosen'] as const
+
 const _assertions: [
   CoversExactly<ProcessTerminalStateTag, typeof PROCESS_TERMINAL_STATE_TAGS>,
   CoversExactly<AgentPhaseTag, typeof AGENT_PHASE_TAGS>,
@@ -3761,7 +3770,11 @@ const _assertions: [
   CoversExactly<DefinitionApplyOutcomeKind, typeof DEFINITION_APPLY_OUTCOME_KINDS>,
   CoversExactly<DefinitionCreatePreviewOutcomeKind, typeof DEFINITION_CREATE_PREVIEW_OUTCOME_KINDS>,
   CoversExactly<DefinitionCreateApplyOutcomeKind, typeof DEFINITION_CREATE_APPLY_OUTCOME_KINDS>,
+  CoversExactly<DefinitionSwitchVerdictKind, typeof DEFINITION_SWITCH_VERDICT_KINDS>,
+  CoversExactly<DefinitionSwitchUncertainReason, typeof DEFINITION_SWITCH_UNCERTAIN_REASONS>,
 ] = [
+  true,
+  true,
   true,
   true,
   true,
@@ -3841,6 +3854,8 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['DefinitionApplyOutcomeDto', DEFINITION_APPLY_OUTCOME_KINDS],
   ['DefinitionCreatePreviewOutcomeDto', DEFINITION_CREATE_PREVIEW_OUTCOME_KINDS],
   ['DefinitionCreateApplyOutcomeDto', DEFINITION_CREATE_APPLY_OUTCOME_KINDS],
+  ['DefinitionSwitchVerdictDto', DEFINITION_SWITCH_VERDICT_KINDS],
+  ['SwitchUncertainReasonTag', DEFINITION_SWITCH_UNCERTAIN_REASONS],
 ]
 
 describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103)', () => {
@@ -3872,6 +3887,50 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(35)
+    expect(enums).toHaveLength(37)
+  })
+})
+
+describe('definitionSwitchCheck (ADR-0005 sub-slice 4b)', () => {
+  const REACHES: DefinitionSwitchCheck = {
+    schema: 'omnifrons.definition-switch-check/1',
+    adapter: 'claude-code',
+    host: 'Claude Code',
+    verdict: {
+      kind: 'reaches',
+      file: 'AGENTS.md',
+      line: 'Claude Code reaches the definition through AGENTS.md (row accessed 2026-09-25, verified)',
+      claim: {
+        host: 'Claude Code',
+        source: 'https://code.claude.com/docs/en/memory',
+        accessed: '2026-09-25',
+        status: 'Verified',
+      },
+    },
+    reference: { path: 'AGENTS.md', digest: '0a'.repeat(32) },
+  }
+
+  it('invokes definition_switch_check with exactly { adapterId, host } and returns the payload verbatim', async () => {
+    const mock = mockCommand('definition_switch_check', () => REACHES)
+
+    const check = await definitionSwitchCheck('pty-cli', 'Gemini CLI')
+
+    expect(mock.args()).toEqual({ adapterId: 'pty-cli', host: 'Gemini CLI' })
+    expect(check).toEqual(REACHES)
+  })
+
+  it('sends host as null when none is chosen', async () => {
+    const mock = mockCommand('definition_switch_check', () => REACHES)
+
+    await definitionSwitchCheck('claude-code')
+
+    expect(mock.args()).toEqual({ adapterId: 'claude-code', host: null })
+  })
+
+  it('rejects with the shell error verbatim for an unknown adapter', async () => {
+    const error = { code: 'invalid-request', message: 'the adapter is not known' }
+    mockCommand('definition_switch_check', () => Promise.reject(error))
+
+    await expect(definitionSwitchCheck('nope')).rejects.toMatchObject(error)
   })
 })

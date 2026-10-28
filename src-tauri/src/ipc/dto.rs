@@ -2338,6 +2338,153 @@ impl DefinitionStatusDto {
     }
 }
 
+/// The provenance of a loader-table row a switch verdict rests on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchClaimDto {
+    pub host: String,
+    pub source: String,
+    pub accessed: String,
+    pub status: String,
+}
+
+impl From<&omnifrons_domain::switch_check::Claim> for SwitchClaimDto {
+    fn from(claim: &omnifrons_domain::switch_check::Claim) -> Self {
+        Self {
+            host: claim.host.to_string(),
+            source: claim.source.to_string(),
+            accessed: claim.accessed.to_string(),
+            status: claim.status.to_string(),
+        }
+    }
+}
+
+/// The nearest ancestor file that blocks Claude Code's `AGENTS.md`
+/// fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchShadowDto {
+    pub path: String,
+    pub file: String,
+}
+
+/// Why a switch check could not decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwitchUncertainReasonTag {
+    UnknownHost,
+    NoHostChosen,
+}
+
+/// A switch verdict. `line` is the domain's own one-line text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DefinitionSwitchVerdictDto {
+    Reaches {
+        file: String,
+        line: String,
+        claim: SwitchClaimDto,
+    },
+    Unreached {
+        expected: Vec<String>,
+        shadowed_by: Option<SwitchShadowDto>,
+        line: String,
+        claim: SwitchClaimDto,
+    },
+    Uncertain {
+        reason: SwitchUncertainReasonTag,
+        name: Option<String>,
+        line: String,
+    },
+}
+
+impl From<&omnifrons_domain::switch_check::SwitchVerdict> for DefinitionSwitchVerdictDto {
+    fn from(verdict: &omnifrons_domain::switch_check::SwitchVerdict) -> Self {
+        use omnifrons_domain::switch_check::{SwitchVerdict, UncertainReason};
+        let line = verdict.to_string();
+        match verdict {
+            SwitchVerdict::Reaches { file, claim } => Self::Reaches {
+                file: file.clone(),
+                line,
+                claim: claim.into(),
+            },
+            SwitchVerdict::Unreached {
+                expected,
+                shadowed_by,
+                claim,
+            } => Self::Unreached {
+                expected: expected.iter().map(|file| (*file).to_string()).collect(),
+                shadowed_by: shadowed_by.as_ref().map(|shadow| SwitchShadowDto {
+                    path: shadow.path.clone(),
+                    file: shadow.file.to_string(),
+                }),
+                line,
+                claim: claim.into(),
+            },
+            SwitchVerdict::Uncertain { reason } => match reason {
+                UncertainReason::UnknownHost { name } => Self::Uncertain {
+                    reason: SwitchUncertainReasonTag::UnknownHost,
+                    name: Some(name.clone()),
+                    line,
+                },
+                UncertainReason::NoHostChosen { .. } => Self::Uncertain {
+                    reason: SwitchUncertainReasonTag::NoHostChosen,
+                    name: None,
+                    line,
+                },
+            },
+        }
+    }
+}
+
+/// The canonical definition's path and digest, for a startup brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionReferenceDto {
+    pub path: String,
+    pub digest: String,
+}
+
+/// `definition_switch_check`'s payload: whether the host a model switch
+/// would restart reaches the canonical definition from the workspace
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionSwitchCheckDto {
+    pub schema: String,
+    pub adapter: String,
+    pub host: Option<String>,
+    pub verdict: DefinitionSwitchVerdictDto,
+    pub reference: Option<DefinitionReferenceDto>,
+}
+
+impl DefinitionSwitchCheckDto {
+    /// Builds the payload for `check`, run for `adapter`.
+    #[must_use]
+    pub fn from_check(
+        adapter: &omnifrons_domain::adapter::AdapterId,
+        check: &omnifrons_app::switch_check::SwitchCheck,
+    ) -> Self {
+        Self {
+            schema: "omnifrons.definition-switch-check/1".to_string(),
+            adapter: adapter.as_str().to_string(),
+            host: check.host.clone(),
+            verdict: (&check.verdict).into(),
+            reference: check
+                .reference
+                .as_ref()
+                .map(|reference| DefinitionReferenceDto {
+                    path: reference.path.clone(),
+                    digest: reference.digest.clone(),
+                }),
+        }
+    }
+}
+
 /// `definition_verify`'s payload (the prototype's own `verify_agent`
 /// return value, minus `backups`: this port keeps snapshots in its own
 /// store rather than reporting them back on this wire shape).
@@ -5626,6 +5773,139 @@ mod tests {
                 "required": true,
                 "list": true,
                 "prompt": "What are the main deliverables the agent produces?",
+            })
+        );
+    }
+
+    /// One switch check as the shell serializes it, for the pinned shapes
+    /// below.
+    fn switch_check_json(
+        adapter: &str,
+        host: Option<&str>,
+        verdict: omnifrons_domain::switch_check::SwitchVerdict,
+        reference: Option<omnifrons_domain::switch_check::DefinitionReference>,
+    ) -> serde_json::Value {
+        let adapter = omnifrons_domain::adapter::AdapterId::parse(adapter).expect("a built-in");
+        let check = omnifrons_app::switch_check::SwitchCheck {
+            host: host.map(str::to_string),
+            verdict,
+            reference,
+        };
+        json(&super::DefinitionSwitchCheckDto::from_check(
+            &adapter, &check,
+        ))
+    }
+
+    fn switch_site(
+        root: &[&str],
+        ancestors: &[(&str, &[&str])],
+    ) -> omnifrons_domain::switch_check::SwitchSite {
+        omnifrons_domain::switch_check::SwitchSite {
+            root_files: root.iter().map(|name| (*name).to_string()).collect(),
+            ancestors: ancestors
+                .iter()
+                .map(
+                    |(path, files)| omnifrons_domain::switch_check::AncestorSite {
+                        path: (*path).to_string(),
+                        files: files.iter().map(|name| (*name).to_string()).collect(),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn definition_switch_check_reaches_json_literal() {
+        let verdict = omnifrons_domain::switch_check::switch_check(
+            "Claude Code",
+            &switch_site(&["CLAUDE.md"], &[]),
+        );
+        let reference = omnifrons_domain::switch_check::DefinitionReference {
+            path: "AGENTS.md".to_string(),
+            digest: "ab".repeat(32),
+        };
+        assert_eq!(
+            switch_check_json("claude-code", Some("Claude Code"), verdict, Some(reference)),
+            serde_json::json!({
+                "schema": "omnifrons.definition-switch-check/1",
+                "adapter": "claude-code",
+                "host": "Claude Code",
+                "verdict": {
+                    "kind": "reaches",
+                    "file": "CLAUDE.md",
+                    "line": "Claude Code reaches the definition through CLAUDE.md (row accessed 2026-09-25, verified)",
+                    "claim": {
+                        "host": "Claude Code",
+                        "source": "https://code.claude.com/docs/en/memory",
+                        "accessed": "2026-09-25",
+                        "status": "Verified"
+                    }
+                },
+                "reference": { "path": "AGENTS.md", "digest": "ab".repeat(32) }
+            })
+        );
+    }
+
+    #[test]
+    fn definition_switch_check_unreached_json_literal() {
+        let verdict = omnifrons_domain::switch_check::switch_check(
+            "Claude Code",
+            &switch_site(&["AGENTS.md"], &[("/outer", &["CLAUDE.md"])]),
+        );
+        assert_eq!(
+            switch_check_json("claude-code", Some("Claude Code"), verdict, None),
+            serde_json::json!({
+                "schema": "omnifrons.definition-switch-check/1",
+                "adapter": "claude-code",
+                "host": "Claude Code",
+                "verdict": {
+                    "kind": "unreached",
+                    "expected": ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"],
+                    "shadowedBy": { "path": "/outer", "file": "CLAUDE.md" },
+                    "line": "Claude Code does not reach the definition: AGENTS.md is shadowed by CLAUDE.md in /outer",
+                    "claim": {
+                        "host": "Claude Code",
+                        "source": "https://code.claude.com/docs/en/memory",
+                        "accessed": "2026-09-25",
+                        "status": "Verified"
+                    }
+                },
+                "reference": null
+            })
+        );
+    }
+
+    #[test]
+    fn definition_switch_check_uncertain_json_literals() {
+        let adapter = omnifrons_domain::adapter::AdapterId::pty_cli();
+        let no_host = omnifrons_domain::switch_check::switch_check_for_adapter(
+            &adapter,
+            None,
+            &switch_site(&[], &[]),
+        );
+        assert_eq!(
+            switch_check_json("pty-cli", None, no_host, None),
+            serde_json::json!({
+                "schema": "omnifrons.definition-switch-check/1",
+                "adapter": "pty-cli",
+                "host": null,
+                "verdict": {
+                    "kind": "uncertain",
+                    "reason": "no-host-chosen",
+                    "name": null,
+                    "line": "No host is chosen for adapter pty-cli: the check is uncertain"
+                },
+                "reference": null
+            })
+        );
+        let unknown = omnifrons_domain::switch_check::switch_check("Nope", &switch_site(&[], &[]));
+        assert_eq!(
+            switch_check_json("pty-cli", Some("Nope"), unknown, None)["verdict"],
+            serde_json::json!({
+                "kind": "uncertain",
+                "reason": "unknown-host",
+                "name": "Nope",
+                "line": "No loader row for host Nope: the check is uncertain"
             })
         );
     }

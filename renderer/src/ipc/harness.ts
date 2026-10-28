@@ -2409,3 +2409,67 @@ export async function definitionCreateApply(
     planId,
   })
 }
+
+// -- ADR-0005 slice 4, sub-slice 4b: the loader table in model switching --
+
+/** `dto.rs`'s `SwitchUncertainReasonTag` tokens: why a switch check could not decide. */
+export type DefinitionSwitchUncertainReason = 'unknown-host' | 'no-host-chosen'
+
+/** `dto.rs`'s `DefinitionSwitchVerdictDto` tags. */
+export type DefinitionSwitchVerdictKind = 'reaches' | 'unreached' | 'uncertain'
+
+/** Mirrors `SwitchClaimDto`: the loader-table row a verdict rests on. A row is a claim about a host, never a guarantee. */
+export interface DefinitionSwitchClaim {
+  host: string
+  source: string
+  /** The row's access date, ISO 8601. */
+  accessed: string
+  status: string
+}
+
+/** Mirrors `DefinitionSwitchVerdictDto`; `line` is the shell's one-line text for the verdict. */
+export type DefinitionSwitchVerdict =
+  | { kind: 'reaches'; file: string; line: string; claim: DefinitionSwitchClaim }
+  | {
+      kind: 'unreached'
+      /** The files the host loads, in the row's order. */
+      expected: string[]
+      /** The nearest ancestor file that blocks Claude Code's `AGENTS.md` fallback. */
+      shadowedBy: { path: string; file: string } | null
+      line: string
+      claim: DefinitionSwitchClaim
+    }
+  | { kind: 'uncertain'; reason: DefinitionSwitchUncertainReason; name: string | null; line: string }
+
+/** Mirrors `DefinitionReferenceDto`: the canonical definition by path and digest. */
+export interface DefinitionReference {
+  path: string
+  /** The SHA-256 of the file's bytes, hex-encoded. */
+  digest: string
+}
+
+/** `definitionSwitchCheck`'s payload, schema `"omnifrons.definition-switch-check/1"`. */
+export interface DefinitionSwitchCheck {
+  schema: string
+  adapter: string
+  /** The host the verdict is about; `null` when the adapter has none and none was chosen. */
+  host: string | null
+  verdict: DefinitionSwitchVerdict
+  /** `null` when the root holds no regular `AGENTS.md`. */
+  reference: DefinitionReference | null
+}
+
+/**
+ * Whether the host a model switch to `adapterId` would run reaches the
+ * canonical definition from the active workspace root. `host` is the
+ * loader-table host name the user chose for an adapter with none of its
+ * own; it is sent as `null` when omitted. Invokes
+ * `definition_switch_check` with `{ adapterId, host }`. Nothing is
+ * written and nothing is restarted.
+ *
+ * # Errors
+ * As {@link definitionStatus}, plus `invalid-request` for an unknown `adapterId`.
+ */
+export async function definitionSwitchCheck(adapterId: string, host?: string): Promise<DefinitionSwitchCheck> {
+  return invoke('definition_switch_check', { adapterId, host: host ?? null })
+}

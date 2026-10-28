@@ -32,7 +32,9 @@ use omnifrons_app::WorkspaceRoot;
 use omnifrons_app::definition::{DefinitionError, DefinitionPorts, scan, verify};
 use omnifrons_app::definition_apply::{ApplyPorts, apply, apply_create};
 use omnifrons_app::definition_plan::{plan, plan_create_preview};
+use omnifrons_app::switch_check::switch_check;
 use omnifrons_app::work_area::WorkAreaRoot;
+use omnifrons_domain::adapter::AdapterId;
 use omnifrons_domain::definition::IdentityKind;
 use omnifrons_domain::definition_create::{Answers, RawValue};
 use omnifrons_domain::definition_plan::{PlanId, PlanOptions};
@@ -45,8 +47,8 @@ use crate::executable_state::SystemClock;
 use crate::ipc::commands::active_workspace;
 use crate::ipc::dto::{
     DefinitionApplyDto, DefinitionCreateApplyDto, DefinitionCreatePreviewDto, DefinitionFieldDto,
-    DefinitionPreviewDto, DefinitionStatusDto, DefinitionVerifyDto, ShellError, ShellErrorCode,
-    ShellErrorDetail,
+    DefinitionPreviewDto, DefinitionStatusDto, DefinitionSwitchCheckDto, DefinitionVerifyDto,
+    ShellError, ShellErrorCode, ShellErrorDetail,
 };
 use crate::ipc::publication::{RunActivity, run_active};
 use crate::publication_state::PublicationState;
@@ -127,6 +129,33 @@ pub fn definition_status_for(workspace: &WorkspaceRoot) -> Result<DefinitionStat
     };
     let report = scan(&ports, workspace)?;
     Ok(DefinitionStatusDto::from_report(workspace, &report))
+}
+
+/// Whether the host a model switch to `adapter_id` would run reaches the
+/// canonical definition from `workspace`. `host` is the loader-table host
+/// the user chose for an adapter bound to none; it is ignored for an
+/// adapter that has its own.
+///
+/// # Errors
+///
+/// `invalid-request` if `adapter_id` names no adapter; otherwise as
+/// [`definition_status_for`].
+pub fn definition_switch_check_for(
+    workspace: &WorkspaceRoot,
+    adapter_id: &str,
+    host: Option<&str>,
+) -> Result<DefinitionSwitchCheckDto, ShellError> {
+    let adapter = AdapterId::parse(adapter_id).ok_or_else(|| {
+        ShellError::new(ShellErrorCode::InvalidRequest, "the adapter is not known")
+    })?;
+    let tree = FsDefinitionTree::from_environment();
+    let hasher = Sha2Hasher::new();
+    let ports = DefinitionPorts {
+        tree: &tree,
+        hasher: &hasher,
+    };
+    let check = switch_check(&ports, workspace, &adapter, host)?;
+    Ok(DefinitionSwitchCheckDto::from_check(&adapter, &check))
 }
 
 /// The fixed refusal for a verify target that is not a plain directory
@@ -527,6 +556,27 @@ pub async fn definition_status(app: AppHandle) -> Result<DefinitionStatusDto, Sh
         .expect("the blocking definition-status task panicked")
 }
 
+/// Whether the named adapter's host reaches the active workspace's
+/// canonical definition, before a model switch restarts it.
+///
+/// # Errors
+///
+/// [`ShellErrorCode::WorkspaceUnavailable`] if no workspace is active, and
+/// [`definition_switch_check_for`]'s errors.
+#[tauri::command]
+pub async fn definition_switch_check(
+    app: AppHandle,
+    adapter_id: String,
+    host: Option<String>,
+) -> Result<DefinitionSwitchCheckDto, ShellError> {
+    let workspace = active_workspace(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        definition_switch_check_for(&workspace, &adapter_id, host.as_deref())
+    })
+    .await
+    .expect("the blocking definition-switch-check task panicked")
+}
+
 /// The canonical-definition verification of the active workspace's
 /// root, or of `agent`, a directory below it.
 ///
@@ -701,7 +751,7 @@ mod tests {
     use super::{
         DefinitionCreateRequest, DefinitionPlanRequest, definition_apply_for,
         definition_create_apply_for, definition_create_preview_for, definition_preview_for,
-        definition_status_for, definition_verify_for,
+        definition_status_for, definition_switch_check_for, definition_verify_for,
     };
     use crate::ipc::dto::{ShellError, ShellErrorCode, ShellErrorDetail};
     use crate::ipc::publication::RunActivity;
@@ -1980,5 +2030,60 @@ mod tests {
             omnifrons_domain::definition::WRAPPER
         );
         assert_eq!(files_below(fixture.project.path()).len(), 3);
+    }
+
+    #[test]
+    fn switch_check_reports_a_reaching_root_and_the_agents_reference() {
+        let project = TempDir::new("switch-reaches");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        let dto = definition_switch_check_for(&project.workspace(), "claude-code", None)
+            .expect("check succeeds");
+        let value = serde_json::to_value(&dto).expect("serializes");
+        assert_eq!(value["schema"], "omnifrons.definition-switch-check/1");
+        assert_eq!(value["adapter"], "claude-code");
+        assert_eq!(value["host"], "Claude Code");
+        assert_eq!(value["verdict"]["kind"], "reaches");
+        assert_eq!(value["verdict"]["file"], "AGENTS.md");
+        assert_eq!(value["reference"]["path"], "AGENTS.md");
+        let digest = value["reference"]["digest"].as_str().expect("a digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn switch_check_for_a_generic_adapter_uses_the_chosen_host() {
+        let project = TempDir::new("switch-generic");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        let none = definition_switch_check_for(&project.workspace(), "pty-cli", None)
+            .expect("check succeeds");
+        assert_eq!(
+            serde_json::to_value(&none).expect("json")["verdict"]["kind"],
+            "uncertain"
+        );
+        let gemini =
+            definition_switch_check_for(&project.workspace(), "pty-cli", Some("Gemini CLI"))
+                .expect("check succeeds");
+        let value = serde_json::to_value(&gemini).expect("json");
+        assert_eq!(value["host"], "Gemini CLI");
+        assert_eq!(value["verdict"]["kind"], "unreached");
+    }
+
+    #[test]
+    fn switch_check_refuses_an_unknown_adapter_token() {
+        let project = TempDir::new("switch-unknown");
+        let error = definition_switch_check_for(&project.workspace(), "no-such-adapter", None)
+            .expect_err("an unknown adapter is refused");
+        assert_eq!(error.code, ShellErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn switch_check_without_agents_md_has_no_reference() {
+        let project = TempDir::new("switch-no-reference");
+        write(project.path(), "CLAUDE.md", AGENT_BODY);
+        let dto = definition_switch_check_for(&project.workspace(), "claude-code", None)
+            .expect("check succeeds");
+        let value = serde_json::to_value(&dto).expect("json");
+        assert_eq!(value["reference"], serde_json::Value::Null);
+        assert_eq!(value["verdict"]["kind"], "reaches");
     }
 }
