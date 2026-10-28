@@ -87,10 +87,17 @@ function buildAnswers(fields: DefinitionField[], values: Record<string, string[]
   return { answers, sentIndices, missingRequired }
 }
 
-function placeProblems(problems: DefinitionAnswerProblem[], sentIndices: Record<string, number[]>): PlacedProblem[] {
+/** A scalar field has no entries to point at: an index the shell reports for one still belongs to the whole field. */
+function placeProblems(
+  problems: DefinitionAnswerProblem[],
+  sentIndices: Record<string, number[]>,
+  fields: DefinitionField[],
+): PlacedProblem[] {
+  const lists = new Set(fields.filter((field) => field.list).map((field) => field.key))
   return problems.map((problem) => ({
     problem,
-    entry: problem.index === null ? null : (sentIndices[problem.field]?.[problem.index] ?? null),
+    entry:
+      problem.index === null || !lists.has(problem.field) ? null : (sentIndices[problem.field]?.[problem.index] ?? null),
   }))
 }
 
@@ -255,6 +262,18 @@ export function DefinitionCreateForm({
   const [callError, setCallError] = useState<DefinitionSectionError | null>(null)
   const [pending, setPending] = useState<DefinitionCreatePending>(null)
 
+  /**
+   * The GEMINI.md box belongs to the request a plan was made from: when it
+   * changes, the shown plan and refusal no longer describe what an apply
+   * would do, so the user previews again.
+   */
+  const [seenWithGemini, setSeenWithGemini] = useState(withGemini)
+  if (seenWithGemini !== withGemini) {
+    setSeenWithGemini(withGemini)
+    setPlan(null)
+    setRefusal(null)
+  }
+
   const mountedRef = useRef(true)
   /** Read synchronously, so two clicks in one tick start one call. */
   const pendingRef = useRef<DefinitionCreatePending>(null)
@@ -294,10 +313,11 @@ export function DefinitionCreateForm({
     if (first >= 0) setStep(first)
   }
 
-  /** An edit invalidates the shown plan and the problems of the field it touched. */
+  /** An edit invalidates the shown plan, the refusal and the problems of the field it touched. */
   const edited = (key: string, next: string[]) => {
     setValues((current) => ({ ...current, [key]: next }))
     setPlan(null)
+    setRefusal(null)
     setCallError(null)
     setProblems((current) => current.filter((placed) => placed.problem.field !== key))
   }
@@ -328,7 +348,7 @@ export function DefinitionCreateForm({
           setRefusal({ code: outcome.code, message: outcome.message })
           if (outcome.code === 'nested_agent') setConsentOffered(true)
         } else {
-          showProblems(placeProblems(outcome.problems, built.sentIndices), fields)
+          showProblems(placeProblems(outcome.problems, built.sentIndices, fields), fields)
         }
       },
       (reason: unknown) => {
@@ -355,7 +375,7 @@ export function DefinitionCreateForm({
           setRefusal({ code: applied.code, message: applied.message })
         } else {
           setPlan(null)
-          showProblems(placeProblems(applied.problems, sentIndices), fields)
+          showProblems(placeProblems(applied.problems, sentIndices, fields), fields)
         }
       },
       (reason: unknown) => {

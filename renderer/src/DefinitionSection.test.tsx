@@ -1495,6 +1495,19 @@ describe('DefinitionSection create (ADR-0005 slice 3, sub-slice 3e)', () => {
     expect(screen.queryByLabelText('Create preview')).toBeNull()
   })
 
+  it('disables every adapt Preview while the create form is open', async () => {
+    await renderCreateSection()
+    expect((screen.getByRole('button', { name: 'Preview .' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: 'Preview sub/agent' }) as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create .' }))
+    await screen.findByText('What is the agent called?')
+
+    expect((screen.getByRole('button', { name: 'Preview .' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Preview sub/agent' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Create .' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('drops the form when a rescan supersedes it', async () => {
     await renderCreateSection()
     fireEvent.click(screen.getByRole('button', { name: 'Create .' }))

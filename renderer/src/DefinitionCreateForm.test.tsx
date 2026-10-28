@@ -93,15 +93,11 @@ function mockCreateIpc(
 
 function renderForm(props: Partial<Parameters<typeof DefinitionCreateForm>[0]> = {}) {
   const handlers = { onCancel: vi.fn(), onPendingChange: vi.fn(), onFinished: vi.fn(), onApplyFailed: vi.fn() }
-  render(
-    <DefinitionCreateForm
-      withGemini={false}
-      blocked={false}
-      {...handlers}
-      {...props}
-    />,
+  const element = (overrides: Partial<Parameters<typeof DefinitionCreateForm>[0]> = {}) => (
+    <DefinitionCreateForm withGemini={false} blocked={false} {...handlers} {...props} {...overrides} />
   )
-  return handlers
+  const view = render(element())
+  return { ...handlers, rerender: (overrides: Partial<Parameters<typeof DefinitionCreateForm>[0]>) => view.rerender(element(overrides)) }
 }
 
 const type = (label: string, value: string): void => {
@@ -459,5 +455,97 @@ describe('DefinitionCreateForm apply', () => {
     click('Cancel')
 
     expect(handlers.onCancel).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('DefinitionCreateForm problems, edits and gemini changes', () => {
+  /** Answers the role, then types a deliverables list `['', 'first', 'second']` and previews. */
+  async function fillWithLeadingBlank(): Promise<void> {
+    await screen.findByText('What is the role of this agent?')
+    type('What is the role of this agent?', 'Triage')
+    click('Next')
+    click('Next')
+    click('Add another')
+    click('Add another')
+    type('Entry 2', 'first')
+    type('Entry 3', 'second')
+    click('Next')
+    click('Preview')
+  }
+
+  const invalid = (...problems: Array<{ field: string; index: number | null; message: string }>) => ({
+    ...PLANNED,
+    outcome: {
+      kind: 'invalid',
+      problems: problems.map((problem) => ({ ...problem, part: 'text', reason: 'bad' })),
+    },
+  })
+
+  it('places a problem index over the sent entries back onto the typed entries', async () => {
+    mockCreateIpc({ preview: () => invalid({ field: 'deliverables', index: 1, message: 'second one is bad' }) })
+    renderForm()
+    await fillWithLeadingBlank()
+
+    expect(await screen.findByText('second one is bad')).toBeTruthy()
+    expect(screen.getByLabelText('Entry 3').parentElement?.textContent).toContain('second one is bad')
+    expect(screen.getByLabelText('Entry 2').parentElement?.textContent).not.toContain('second one is bad')
+  })
+
+  it('shows a problem that carries an index on a scalar field', async () => {
+    mockCreateIpc({ preview: () => invalid({ field: 'role', index: 0, message: 'the role is too long' }) })
+    renderForm()
+    await fillInterview()
+
+    expect(await screen.findByText('Question 1 of 4')).toBeTruthy()
+    expect(screen.getByText('the role is too long')).toBeTruthy()
+  })
+
+  it('drops the plan and places the problems of an invalid apply', async () => {
+    mockCreateIpc({
+      apply: () => ({
+        ...APPLIED,
+        outcome: {
+          kind: 'invalid',
+          problems: [{ field: 'deliverables', index: 0, part: 'text', reason: 'bad', message: 'digest is bad' }],
+        },
+      }),
+    })
+    const handlers = renderForm()
+    await fillInterview()
+    await screen.findByLabelText('Create preview')
+
+    click('Apply')
+
+    expect(await screen.findByText('digest is bad')).toBeTruthy()
+    expect(screen.getByText('Question 3 of 4')).toBeTruthy()
+    expect(screen.getByLabelText('Entry 1').parentElement?.textContent).toContain('digest is bad')
+    expect(screen.queryByLabelText('Create preview')).toBeNull()
+    expect(handlers.onFinished).not.toHaveBeenCalled()
+  })
+
+  it('clears a refusal when an answer changes', async () => {
+    mockCreateIpc({
+      preview: () => ({ ...PLANNED, outcome: { kind: 'refused', code: 'conflict', message: 'AGENTS.md exists' } }),
+    })
+    renderForm()
+    await fillInterview()
+    await screen.findByRole('alert')
+
+    click('Back')
+    type('Entry 1', 'something else')
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('drops the shown plan when the GEMINI.md box changes', async () => {
+    mockCreateIpc()
+    const view = renderForm()
+    await fillInterview()
+    await screen.findByLabelText('Create preview')
+
+    view.rerender({ withGemini: true })
+
+    expect(screen.queryByLabelText('Create preview')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
   })
 })
