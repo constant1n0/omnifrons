@@ -277,6 +277,16 @@ export function DefinitionCreateForm({
   const mountedRef = useRef(true)
   /** Read synchronously, so two clicks in one tick start one call. */
   const pendingRef = useRef<DefinitionCreatePending>(null)
+  /**
+   * Bumped by everything that changes what a plan describes: an answer edit,
+   * the GEMINI.md box, the nested consent. A response whose captured value no
+   * longer matches was planned from a request the form has moved past.
+   */
+  const generationRef = useRef(0)
+
+  useEffect(() => {
+    generationRef.current += 1
+  }, [withGemini])
 
   useEffect(() => {
     mountedRef.current = true
@@ -315,6 +325,7 @@ export function DefinitionCreateForm({
 
   /** An edit invalidates the shown plan, the refusal and the problems of the field it touched. */
   const edited = (key: string, next: string[]) => {
+    generationRef.current += 1
     setValues((current) => ({ ...current, [key]: next }))
     setPlan(null)
     setRefusal(null)
@@ -332,6 +343,7 @@ export function DefinitionCreateForm({
       withGemini,
       answers: built.answers as unknown as DefinitionCreateRequest['answers'],
     }
+    const generation = generationRef.current
     begin('preview')
     setPlan(null)
     setRefusal(null)
@@ -340,7 +352,7 @@ export function DefinitionCreateForm({
     definitionCreatePreview(request).then(
       (result) => {
         end()
-        if (!mountedRef.current) return
+        if (!mountedRef.current || generation !== generationRef.current) return
         const { outcome } = result
         if (outcome.kind === 'planned') {
           setPlan({ outcome, request, sentIndices: built.sentIndices })
@@ -353,7 +365,7 @@ export function DefinitionCreateForm({
       },
       (reason: unknown) => {
         end()
-        if (mountedRef.current) setCallError(toSectionError(reason))
+        if (mountedRef.current && generation === generationRef.current) setCallError(toSectionError(reason))
       },
     )
   }
@@ -361,6 +373,7 @@ export function DefinitionCreateForm({
   const runApply = () => {
     if (pendingRef.current !== null || blocked || plan === null || fields === null) return
     const { outcome, request, sentIndices } = plan
+    const generation = generationRef.current
     begin('apply')
     setRefusal(null)
     setCallError(null)
@@ -369,8 +382,12 @@ export function DefinitionCreateForm({
         end()
         if (!mountedRef.current) return
         const applied = result.outcome
+        // A write that happened is reported even when an edit overtook the
+        // request: hiding it would leave the rows and the result stale.
         if (applied.kind === 'applied' || applied.kind === 'noop') {
           onFinished(result)
+        } else if (generation !== generationRef.current) {
+          return
         } else if (applied.kind === 'refused') {
           setRefusal({ code: applied.code, message: applied.message })
         } else {
@@ -381,11 +398,14 @@ export function DefinitionCreateForm({
       (reason: unknown) => {
         end()
         if (!mountedRef.current) return
+        const overtaken = generation !== generationRef.current
         // A stale plan could only fail again, and any other failure may have
         // happened after a first write: either way the plan is dropped. Only
         // the latter also asks the section to re-read the rows.
-        setPlan(null)
-        setCallError(toSectionError(reason))
+        if (!overtaken) {
+          setPlan(null)
+          setCallError(toSectionError(reason))
+        }
         if (!(isShellError(reason) && reason.code === 'plan-stale')) onApplyFailed()
       },
     )
@@ -473,7 +493,12 @@ export function DefinitionCreateForm({
           <input
             type="checkbox"
             checked={nestedConsent}
-            onChange={(event) => setNestedConsent(event.target.checked)}
+            onChange={(event) => {
+              generationRef.current += 1
+              setNestedConsent(event.target.checked)
+              setPlan(null)
+              setRefusal(null)
+            }}
           />{' '}
           Create this definition on its own
         </label>

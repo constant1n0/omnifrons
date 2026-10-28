@@ -549,3 +549,66 @@ describe('DefinitionCreateForm problems, edits and gemini changes', () => {
     expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
   })
 })
+
+describe('DefinitionCreateForm overtaken responses', () => {
+  function gated(): { release: () => void; promise: Promise<void> } {
+    let release: () => void = () => {}
+    const promise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return { release, promise }
+  }
+
+  it('discards a preview that an answer edit overtook', async () => {
+    const gate = gated()
+    mockCreateIpc({ preview: () => gate.promise.then(() => PLANNED) })
+    const handlers = renderForm()
+    await fillInterview()
+    await waitFor(() => expect(handlers.onPendingChange).toHaveBeenLastCalledWith('preview'))
+
+    click('Back')
+    type('Entry 1', 'something else')
+    gate.release()
+
+    await waitFor(() => expect(handlers.onPendingChange).toHaveBeenLastCalledWith(null))
+    expect(screen.queryByLabelText('Create preview')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
+  })
+
+  it('discards a preview that a GEMINI.md change overtook', async () => {
+    const gate = gated()
+    mockCreateIpc({ preview: () => gate.promise.then(() => PLANNED) })
+    const view = renderForm()
+    await fillInterview()
+    await waitFor(() => expect(view.onPendingChange).toHaveBeenLastCalledWith('preview'))
+
+    view.rerender({ withGemini: true })
+    gate.release()
+
+    await waitFor(() => expect(view.onPendingChange).toHaveBeenLastCalledWith(null))
+    expect(screen.queryByLabelText('Create preview')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
+  })
+
+  it('drops the plan when the nested consent is revoked, and previews again without it', async () => {
+    const ipc = mockCreateIpc({
+      preview: (call) =>
+        call === 1
+          ? { ...PLANNED, outcome: { kind: 'refused', code: 'nested_agent', message: 'inside another agent' } }
+          : PLANNED,
+    })
+    renderForm()
+    await fillInterview()
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Create this definition on its own' }))
+    click('Preview')
+    await screen.findByLabelText('Create preview')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Create this definition on its own' }))
+
+    expect(screen.queryByLabelText('Create preview')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull()
+    click('Preview')
+    await screen.findByLabelText('Create preview')
+    expect(ipc.previews.map((call) => call.nestedConsent)).toEqual([false, true, false])
+  })
+})
