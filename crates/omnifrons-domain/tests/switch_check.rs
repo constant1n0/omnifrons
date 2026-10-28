@@ -39,9 +39,23 @@ fn reached_file(verdict: &SwitchVerdict) -> Option<&str> {
 #[test]
 fn every_host_reaches_a_root_holding_its_first_file() {
     for row in hosts::HOSTS {
-        let site = root(&[row.files[0]]);
+        let Some(first) = row.files.first().copied() else {
+            panic!("{} declares no primary file", row.name);
+        };
+        let site = root(&[first]);
         let verdict = switch_check(row.name, &site);
-        assert_eq!(reached_file(&verdict), Some(row.files[0]), "{}", row.name);
+        assert_eq!(reached_file(&verdict), Some(first), "{}", row.name);
+    }
+}
+
+#[test]
+fn every_row_declares_at_least_one_primary_file() {
+    for row in hosts::HOSTS {
+        assert!(
+            !row.files.is_empty(),
+            "{} declares no primary file",
+            row.name
+        );
     }
 }
 
@@ -50,7 +64,7 @@ fn a_root_with_only_agents_md_reaches_exactly_the_hosts_that_list_it() {
     let site = root(&["AGENTS.md"]);
     for row in hosts::HOSTS {
         let verdict = switch_check(row.name, &site);
-        if row.files.contains(&"AGENTS.md") || row.name == "Claude Code" {
+        if row.files.contains(&"AGENTS.md") || row.fallback_files.contains(&"AGENTS.md") {
             assert_eq!(reached_file(&verdict), Some("AGENTS.md"), "{}", row.name);
         } else {
             assert!(
@@ -121,6 +135,26 @@ fn the_shadow_names_the_exact_file_found_in_the_ancestor() {
     match switch_check("Claude Code", &both) {
         SwitchVerdict::Unreached { shadowed_by, .. } => {
             assert_eq!(shadowed_by.map(|s| s.file), Some(".claude/CLAUDE.md"));
+        }
+        other => panic!("expected Unreached, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_nearer_ancestor_holding_only_a_fallback_file_does_not_suppress_a_farther_shadow() {
+    let site = with_ancestors(
+        &["AGENTS.md"],
+        &[("..", &["AGENTS.md"]), ("../..", &["CLAUDE.md"])],
+    );
+    match switch_check("Claude Code", &site) {
+        SwitchVerdict::Unreached { shadowed_by, .. } => {
+            assert_eq!(
+                shadowed_by,
+                Some(Shadow {
+                    path: "../..".to_string(),
+                    file: "CLAUDE.md"
+                })
+            );
         }
         other => panic!("expected Unreached, got {other:?}"),
     }
@@ -222,9 +256,14 @@ fn verdict_codes_are_stable() {
 
 #[test]
 fn verdicts_read_as_one_plain_line() {
+    let row = hosts::host("Claude Code").expect("row");
     assert_eq!(
         switch_check("Claude Code", &root(&["CLAUDE.md"])).to_string(),
-        "Claude Code reaches the definition through CLAUDE.md (row accessed 2026-09-25, verified)"
+        format!(
+            "Claude Code reaches the definition through CLAUDE.md (row accessed {}, {})",
+            row.accessed,
+            row.status.to_lowercase()
+        )
     );
     assert_eq!(
         switch_check("Gemini CLI", &root(&["AGENTS.md"])).to_string(),
@@ -256,4 +295,31 @@ fn the_definition_reference_has_a_length_prefixed_canonical_line_and_a_short_dis
         "definition path=20:my project/AGENTS.md digest=32:0123456789abcdef0123456789abcdef"
     );
     assert_eq!(reference.to_string(), "my project/AGENTS.md@0123456789ab");
+}
+
+#[test]
+fn the_canonical_prefix_counts_bytes_not_characters() {
+    let reference = DefinitionReference {
+        path: "caf\u{e9}/AGENTS.md".to_string(),
+        digest: "abc".to_string(),
+    };
+    assert_eq!(reference.path.chars().count(), 14);
+    assert_eq!(
+        reference.canonical(),
+        "definition path=15:caf\u{e9}/AGENTS.md digest=3:abc"
+    );
+}
+
+#[test]
+fn the_display_keeps_the_first_twelve_digest_characters() {
+    let reference = DefinitionReference {
+        path: "AGENTS.md".to_string(),
+        digest: "abcdefghijklmnop".to_string(),
+    };
+    assert_eq!(reference.to_string(), "AGENTS.md@abcdefghijkl");
+    let short = DefinitionReference {
+        path: "AGENTS.md".to_string(),
+        digest: "abc".to_string(),
+    };
+    assert_eq!(short.to_string(), "AGENTS.md@abc");
 }
