@@ -30,6 +30,9 @@ use crate::hosts::{self, HostLoader};
 /// `Display` shows.
 const DIGEST_DISPLAY_LEN: usize = 12;
 
+/// The length of a SHA-256 digest in hex characters.
+const DIGEST_HEX_LEN: usize = 64;
+
 /// The identity-file names present at the active project root and at
 /// each ancestor folder, filled by the application from the scan.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -117,6 +120,10 @@ pub enum SwitchVerdict {
         /// `AGENTS.md` fallback; set only when `AGENTS.md` is present
         /// at the root and the host has that fallback.
         shadowed_by: Option<Shadow>,
+        /// The fallback file selected at the root (the first present in
+        /// the row's `fallback_files` order) when `shadowed_by` is set;
+        /// `None` otherwise.
+        fallback: Option<&'static str>,
         /// The row this rests on.
         claim: Claim,
     },
@@ -161,11 +168,15 @@ impl fmt::Display for SwitchVerdict {
             Self::Unreached {
                 expected,
                 shadowed_by: Some(shadow),
+                fallback,
                 claim,
             } if !expected.is_empty() => write!(
                 f,
-                "{} does not reach the definition: AGENTS.md is shadowed by {} in {}",
-                claim.host, shadow.file, shadow.path
+                "{} does not reach the definition: {} is shadowed by {} in {}",
+                claim.host,
+                fallback.unwrap_or("AGENTS.md"),
+                shadow.file,
+                shadow.path
             ),
             Self::Unreached {
                 expected, claim, ..
@@ -221,7 +232,7 @@ pub fn switch_check(host: &str, site: &SwitchSite) -> SwitchVerdict {
         };
     }
     let Some(fallback) = first_present(row.fallback_files, &site.root_files) else {
-        return unreached(row, None, claim);
+        return unreached(row, None, None, claim);
     };
     let shadow = site.ancestors.iter().find_map(|ancestor| {
         first_present(row.files, &ancestor.files).map(|file| Shadow {
@@ -234,14 +245,20 @@ pub fn switch_check(host: &str, site: &SwitchSite) -> SwitchVerdict {
             file: fallback.to_string(),
             claim,
         },
-        Some(shadow) => unreached(row, Some(shadow), claim),
+        Some(shadow) => unreached(row, Some(shadow), Some(fallback), claim),
     }
 }
 
-fn unreached(row: &'static HostLoader, shadowed_by: Option<Shadow>, claim: Claim) -> SwitchVerdict {
+fn unreached(
+    row: &'static HostLoader,
+    shadowed_by: Option<Shadow>,
+    fallback: Option<&'static str>,
+    claim: Claim,
+) -> SwitchVerdict {
     SwitchVerdict::Unreached {
         expected: row.files.to_vec(),
         shadowed_by,
+        fallback,
         claim,
     }
 }
@@ -276,18 +293,70 @@ pub fn switch_check_for_adapter(
     }
 }
 
+/// Why a [`DefinitionReference`] could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReferenceError {
+    /// The path is empty.
+    #[error("the reference path is empty")]
+    EmptyPath,
+    /// The path holds a line break or NUL, which would split the
+    /// canonical line.
+    #[error("the reference path holds a line break or NUL")]
+    PathNotSingleLine,
+    /// The digest is not exactly 64 lowercase hexadecimal characters.
+    #[error("the reference digest is not 64 lowercase hex characters")]
+    DigestNotSha256Hex,
+}
+
 /// The canonical definition file named for a startup brief: its path and
 /// the digest of its bytes. The application fills both; nothing here
-/// hashes.
+/// hashes. Construction checks the shape, so [`Self::canonical`] is one
+/// line by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionReference {
-    /// The definition's path.
-    pub path: String,
-    /// The digest of its bytes, as text.
-    pub digest: String,
+    path: String,
+    digest: String,
 }
 
 impl DefinitionReference {
+    /// A reference to `path` with the SHA-256 `digest` of its bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ReferenceError`] for an empty path, a path holding `\n`, `\r`
+    /// or NUL, or a digest that is not exactly 64 lowercase hex
+    /// characters.
+    pub fn new(path: impl Into<String>, digest: impl Into<String>) -> Result<Self, ReferenceError> {
+        let path = path.into();
+        let digest = digest.into();
+        if path.is_empty() {
+            return Err(ReferenceError::EmptyPath);
+        }
+        if path.contains(['\n', '\r', '\0']) {
+            return Err(ReferenceError::PathNotSingleLine);
+        }
+        let hex = digest.len() == DIGEST_HEX_LEN
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !hex {
+            return Err(ReferenceError::DigestNotSha256Hex);
+        }
+        Ok(Self { path, digest })
+    }
+
+    /// The definition's path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The digest of its bytes, 64 lowercase hex characters.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
     /// One line, `definition path=<len>:<path> digest=<len>:<digest>`,
     /// each value prefixed with its byte length.
     #[must_use]

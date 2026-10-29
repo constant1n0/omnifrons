@@ -2392,6 +2392,7 @@ pub enum DefinitionSwitchVerdictDto {
     Unreached {
         expected: Vec<String>,
         shadowed_by: Option<SwitchShadowDto>,
+        fallback: Option<String>,
         line: String,
         claim: SwitchClaimDto,
     },
@@ -2415,6 +2416,7 @@ impl From<&omnifrons_domain::switch_check::SwitchVerdict> for DefinitionSwitchVe
             SwitchVerdict::Unreached {
                 expected,
                 shadowed_by,
+                fallback,
                 claim,
             } => Self::Unreached {
                 expected: expected.iter().map(|file| (*file).to_string()).collect(),
@@ -2422,6 +2424,7 @@ impl From<&omnifrons_domain::switch_check::SwitchVerdict> for DefinitionSwitchVe
                     path: shadow.path.clone(),
                     file: shadow.file.to_string(),
                 }),
+                fallback: fallback.map(str::to_string),
                 line,
                 claim: claim.into(),
             },
@@ -2478,8 +2481,8 @@ impl DefinitionSwitchCheckDto {
                 .reference
                 .as_ref()
                 .map(|reference| DefinitionReferenceDto {
-                    path: reference.path.clone(),
-                    digest: reference.digest.clone(),
+                    path: reference.path().to_string(),
+                    digest: reference.digest().to_string(),
                 }),
         }
     }
@@ -5820,10 +5823,9 @@ mod tests {
             "Claude Code",
             &switch_site(&["CLAUDE.md"], &[]),
         );
-        let reference = omnifrons_domain::switch_check::DefinitionReference {
-            path: "AGENTS.md".to_string(),
-            digest: "ab".repeat(32),
-        };
+        let reference =
+            omnifrons_domain::switch_check::DefinitionReference::new("AGENTS.md", "ab".repeat(32))
+                .expect("a valid reference");
         assert_eq!(
             switch_check_json("claude-code", Some("Claude Code"), verdict, Some(reference)),
             serde_json::json!({
@@ -5862,6 +5864,7 @@ mod tests {
                     "kind": "unreached",
                     "expected": ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"],
                     "shadowedBy": { "path": "/outer", "file": "CLAUDE.md" },
+                    "fallback": "AGENTS.md",
                     "line": "Claude Code does not reach the definition: AGENTS.md is shadowed by CLAUDE.md in /outer",
                     "claim": {
                         "host": "Claude Code",

@@ -164,10 +164,10 @@ fn the_reference_carries_agents_md_and_the_sha256_of_its_bytes() {
     let result = check(snapshot, &AdapterId::claude_code(), None);
     assert_eq!(
         result.reference,
-        Some(DefinitionReference {
-            path: "AGENTS.md".to_string(),
-            digest: FakeHasher.sha256(AGENTS_BYTES).to_hex(),
-        })
+        Some(
+            DefinitionReference::new("AGENTS.md", FakeHasher.sha256(AGENTS_BYTES).to_hex())
+                .expect("a valid reference")
+        )
     );
 }
 
@@ -192,6 +192,74 @@ fn a_symlinked_agents_md_counts_as_absent_for_the_verdict_and_the_reference() {
     assert_eq!(result.reference, None);
     assert!(
         matches!(&result.verdict, SwitchVerdict::Unreached { .. }),
+        "{:?}",
+        result.verdict
+    );
+}
+
+fn irregular(kind: IdentityKind) -> IdentityFile {
+    IdentityFile {
+        kind,
+        bytes: Vec::new(),
+        shape: FileShape::Irregular,
+    }
+}
+
+#[test]
+fn an_irregular_agents_md_has_no_reference_and_counts_as_absent() {
+    let snapshot = root(vec![irregular(IdentityKind::Agents)]).build();
+    let result = check(snapshot, &AdapterId::claude_code(), None);
+    assert_eq!(result.reference, None);
+    assert!(
+        matches!(&result.verdict, SwitchVerdict::Unreached { .. }),
+        "{:?}",
+        result.verdict
+    );
+}
+
+#[test]
+fn a_bound_adapter_ignores_a_conflicting_chosen_host() {
+    let snapshot = root(vec![
+        file(IdentityKind::Agents, AGENTS_BYTES),
+        file(IdentityKind::Claude, b"@AGENTS.md\n"),
+    ])
+    .build();
+    let result = check(snapshot, &AdapterId::claude_code(), Some("Gemini CLI"));
+    assert_eq!(result.host.as_deref(), Some("Claude Code"));
+    assert!(
+        matches!(&result.verdict, SwitchVerdict::Reaches { file, claim } if file == "CLAUDE.md" && claim.host == "Claude Code"),
+        "{:?}",
+        result.verdict
+    );
+}
+
+#[test]
+fn an_ancestor_entry_spelled_as_a_kind_token_still_shadows() {
+    let snapshot = root(vec![file(IdentityKind::Agents, AGENTS_BYTES)])
+        .ancestor("/outer", vec!["claude".to_string()], Vec::new())
+        .build();
+    let result = check(snapshot, &AdapterId::claude_code(), None);
+    match &result.verdict {
+        SwitchVerdict::Unreached {
+            shadowed_by: Some(shadow),
+            fallback,
+            ..
+        } => {
+            assert_eq!(shadow.file, "CLAUDE.md");
+            assert_eq!(*fallback, Some("AGENTS.md"));
+        }
+        other => panic!("expected a shadowed verdict, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unrecognized_ancestor_entry_is_dropped_and_shadows_nothing() {
+    let snapshot = root(vec![file(IdentityKind::Agents, AGENTS_BYTES)])
+        .ancestor("/outer", vec!["NOTES.md".to_string()], Vec::new())
+        .build();
+    let result = check(snapshot, &AdapterId::claude_code(), None);
+    assert!(
+        matches!(&result.verdict, SwitchVerdict::Reaches { file, .. } if file == "AGENTS.md"),
         "{:?}",
         result.verdict
     );

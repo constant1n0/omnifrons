@@ -2086,4 +2086,17 @@ mod tests {
         assert_eq!(value["reference"], serde_json::Value::Null);
         assert_eq!(value["verdict"]["kind"], "reaches");
     }
+
+    #[test]
+    fn switch_check_for_a_bound_adapter_ignores_a_conflicting_chosen_host() {
+        let project = TempDir::new("switch-bound");
+        write(project.path(), "AGENTS.md", AGENT_BODY);
+        let dto =
+            definition_switch_check_for(&project.workspace(), "claude-code", Some("Gemini CLI"))
+                .expect("check succeeds");
+        let value = serde_json::to_value(&dto).expect("json");
+        assert_eq!(value["host"], "Claude Code");
+        assert_eq!(value["verdict"]["kind"], "reaches");
+        assert_eq!(value["verdict"]["claim"]["host"], "Claude Code");
+    }
 }

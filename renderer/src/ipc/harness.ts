@@ -2436,6 +2436,8 @@ export type DefinitionSwitchVerdict =
       expected: string[]
       /** The nearest ancestor file that blocks Claude Code's `AGENTS.md` fallback. */
       shadowedBy: { path: string; file: string } | null
+      /** The fallback file selected at the root, set when `shadowedBy` is; `null` otherwise. */
+      fallback: string | null
       line: string
       claim: DefinitionSwitchClaim
     }

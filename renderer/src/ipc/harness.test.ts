@@ -3919,6 +3919,29 @@ describe('definitionSwitchCheck (ADR-0005 sub-slice 4b)', () => {
     expect(check).toEqual(REACHES)
   })
 
+  it('returns an unreached verdict with the shadow and the selected fallback verbatim', async () => {
+    const unreached: DefinitionSwitchCheck = {
+      ...REACHES,
+      reference: null,
+      verdict: {
+        kind: 'unreached',
+        expected: ['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md'],
+        shadowedBy: { path: '../parent', file: 'CLAUDE.md' },
+        fallback: '.claude/AGENTS.md',
+        line: 'Claude Code does not reach the definition: .claude/AGENTS.md is shadowed by CLAUDE.md in ../parent',
+        claim: {
+          host: 'Claude Code',
+          source: 'https://code.claude.com/docs/en/memory',
+          accessed: '2026-09-25',
+          status: 'Verified',
+        },
+      },
+    }
+    mockCommand('definition_switch_check', () => unreached)
+
+    expect(await definitionSwitchCheck('claude-code')).toEqual(unreached)
+  })
+
   it('sends host as null when none is chosen', async () => {
     const mock = mockCommand('definition_switch_check', () => REACHES)
 

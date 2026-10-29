@@ -89,7 +89,10 @@ fn regular_file_names(agent: &AgentReport) -> Vec<String> {
 }
 
 /// An ancestor's identity entry as a file name: the port may supply
-/// either the file name or the kind's token.
+/// either the file name or the kind's token. An entry neither form
+/// recognizes is dropped. It cannot shadow anything: the loader table
+/// only ever lists the identity file names, so an unknown entry is
+/// never one a host reads.
 fn ancestor_file_name(entry: &str) -> Option<String> {
     IdentityKind::from_file_name(entry)
         .or_else(|| IdentityKind::parse(entry))
@@ -97,13 +100,18 @@ fn ancestor_file_name(entry: &str) -> Option<String> {
 }
 
 /// The reference to the root's regular `AGENTS.md`, if it has one.
+///
+/// The entry is selected by kind and by [`FileShape::Regular`] here, so
+/// a symlinked or irregular file is never named whatever the report
+/// holds for it. [`scan`] only hashes regular files, so a non-regular
+/// entry with a digest cannot be built through it. A digest that does
+/// not satisfy [`DefinitionReference::new`] (the scan always yields 64
+/// lowercase hex characters, so this cannot happen) yields no
+/// reference rather than a made-up error: no [`DefinitionError`]
+/// variant describes it, and the reference is optional by contract.
 fn reference_of(root: &AgentReport) -> Option<DefinitionReference> {
-    let agents = root
-        .identity_files
-        .iter()
-        .find(|file| file.kind == IdentityKind::Agents)?;
-    Some(DefinitionReference {
-        path: IdentityKind::Agents.file_name().to_string(),
-        digest: agents.sha256.clone()?,
-    })
+    let agents = root.identity_files.iter().find(|file| {
+        file.kind == IdentityKind::Agents && matches!(file.shape, FileShape::Regular)
+    })?;
+    DefinitionReference::new(IdentityKind::Agents.file_name(), agents.sha256.clone()?).ok()
 }

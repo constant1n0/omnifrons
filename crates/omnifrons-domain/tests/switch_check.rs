@@ -5,8 +5,8 @@
 use omnifrons_domain::adapter::AdapterId;
 use omnifrons_domain::hosts;
 use omnifrons_domain::switch_check::{
-    AncestorSite, DefinitionReference, Shadow, SwitchSite, SwitchVerdict, UncertainReason,
-    host_for_adapter, switch_check, switch_check_for_adapter,
+    AncestorSite, DefinitionReference, ReferenceError, Shadow, SwitchSite, SwitchVerdict,
+    UncertainReason, host_for_adapter, switch_check, switch_check_for_adapter,
 };
 
 fn root(files: &[&str]) -> SwitchSite {
@@ -284,42 +284,110 @@ fn verdicts_read_as_one_plain_line() {
     );
 }
 
+const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn reference(path: &str, digest: &str) -> DefinitionReference {
+    DefinitionReference::new(path, digest).expect("a valid reference")
+}
+
 #[test]
 fn the_definition_reference_has_a_length_prefixed_canonical_line_and_a_short_display() {
-    let reference = DefinitionReference {
-        path: "my project/AGENTS.md".to_string(),
-        digest: "0123456789abcdef0123456789abcdef".to_string(),
-    };
+    let reference = reference("my project/AGENTS.md", DIGEST);
+    assert_eq!(reference.path(), "my project/AGENTS.md");
+    assert_eq!(reference.digest(), DIGEST);
     assert_eq!(
         reference.canonical(),
-        "definition path=20:my project/AGENTS.md digest=32:0123456789abcdef0123456789abcdef"
+        format!("definition path=20:my project/AGENTS.md digest=64:{DIGEST}")
     );
     assert_eq!(reference.to_string(), "my project/AGENTS.md@0123456789ab");
 }
 
 #[test]
 fn the_canonical_prefix_counts_bytes_not_characters() {
-    let reference = DefinitionReference {
-        path: "caf\u{e9}/AGENTS.md".to_string(),
-        digest: "abc".to_string(),
-    };
-    assert_eq!(reference.path.chars().count(), 14);
+    let reference = reference("caf\u{e9}/AGENTS.md", DIGEST);
+    assert_eq!(reference.path().chars().count(), 14);
     assert_eq!(
         reference.canonical(),
-        "definition path=15:caf\u{e9}/AGENTS.md digest=3:abc"
+        format!("definition path=15:caf\u{e9}/AGENTS.md digest=64:{DIGEST}")
     );
 }
 
 #[test]
 fn the_display_keeps_the_first_twelve_digest_characters() {
-    let reference = DefinitionReference {
-        path: "AGENTS.md".to_string(),
-        digest: "abcdefghijklmnop".to_string(),
-    };
-    assert_eq!(reference.to_string(), "AGENTS.md@abcdefghijkl");
-    let short = DefinitionReference {
-        path: "AGENTS.md".to_string(),
-        digest: "abc".to_string(),
-    };
-    assert_eq!(short.to_string(), "AGENTS.md@abc");
+    assert_eq!(
+        reference("AGENTS.md", DIGEST).to_string(),
+        "AGENTS.md@0123456789ab"
+    );
+}
+
+#[test]
+fn a_reference_refuses_an_empty_path() {
+    assert_eq!(
+        DefinitionReference::new("", DIGEST),
+        Err(ReferenceError::EmptyPath)
+    );
+}
+
+#[test]
+fn a_reference_refuses_a_path_that_would_break_the_canonical_line() {
+    for path in ["AGENTS.md\nx", "AGENTS.md\r", "AGE\0NTS.md"] {
+        assert_eq!(
+            DefinitionReference::new(path, DIGEST),
+            Err(ReferenceError::PathNotSingleLine),
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_reference_refuses_a_digest_that_is_not_64_lowercase_hex() {
+    let upper = DIGEST.to_uppercase();
+    for digest in ["", "abc", &DIGEST[..63], &format!("{DIGEST}0"), &upper] {
+        assert_eq!(
+            DefinitionReference::new("AGENTS.md", digest),
+            Err(ReferenceError::DigestNotSha256Hex),
+            "{digest:?}"
+        );
+    }
+    let non_hex = format!("g{}", &DIGEST[1..]);
+    assert_eq!(
+        DefinitionReference::new("AGENTS.md", &non_hex),
+        Err(ReferenceError::DigestNotSha256Hex)
+    );
+}
+
+#[test]
+fn the_shadow_names_the_fallback_actually_selected_at_the_root() {
+    let site = with_ancestors(&[".claude/AGENTS.md"], &[("../parent", &["CLAUDE.md"])]);
+    let verdict = switch_check("Claude Code", &site);
+    match &verdict {
+        SwitchVerdict::Unreached { fallback, .. } => {
+            assert_eq!(*fallback, Some(".claude/AGENTS.md"));
+        }
+        other => panic!("expected Unreached, got {other:?}"),
+    }
+    assert_eq!(
+        verdict.to_string(),
+        "Claude Code does not reach the definition: .claude/AGENTS.md is shadowed by CLAUDE.md in ../parent"
+    );
+}
+
+#[test]
+fn the_selected_fallback_is_the_first_present_in_the_rows_order() {
+    let site = with_ancestors(
+        &[".claude/AGENTS.md", "AGENTS.md"],
+        &[("../parent", &["CLAUDE.md"])],
+    );
+    match switch_check("Claude Code", &site) {
+        SwitchVerdict::Unreached { fallback, .. } => assert_eq!(fallback, Some("AGENTS.md")),
+        other => panic!("expected Unreached, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unshadowed_unreached_verdict_selects_no_fallback() {
+    match switch_check("Gemini CLI", &root(&["AGENTS.md"])) {
+        SwitchVerdict::Unreached { fallback, .. } => assert_eq!(fallback, None),
+        other => panic!("expected Unreached, got {other:?}"),
+    }
 }
