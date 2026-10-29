@@ -84,7 +84,7 @@ describe('SwitchCheckLine', () => {
       calls.push(cmd)
       throw new Error(`unexpected command: ${cmd}`)
     })
-    const { container } = render(<SwitchCheckLine adapterId={null} disabled={false} />)
+    const { container } = render(<SwitchCheckLine adapterId={null} contextKey="ws-1" disabled={false} />)
     await act(async () => {})
     expect(container.innerHTML).toBe('')
     expect(calls).toEqual([])
@@ -100,7 +100,7 @@ describe('SwitchCheckLine', () => {
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="claude-code" disabled={false} />)
+    render(<SwitchCheckLine adapterId="claude-code" contextKey="ws-1" disabled={false} />)
 
     const line = await screen.findByLabelText('Switch check')
     expect((await within(line).findByText('reaches')).tagName).toBe('STRONG')
@@ -117,7 +117,7 @@ describe('SwitchCheckLine', () => {
       if (cmd === 'definition_switch_check') return UNREACHED
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="claude-code" disabled={false} />)
+    render(<SwitchCheckLine adapterId="claude-code" contextKey="ws-1" disabled={false} />)
 
     const line = await screen.findByLabelText('Switch check')
     expect((await within(line).findByText('unreached')).tagName).toBe('STRONG')
@@ -136,7 +136,7 @@ describe('SwitchCheckLine', () => {
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="pty-cli" disabled={false} />)
+    render(<SwitchCheckLine adapterId="pty-cli" contextKey="ws-1" disabled={false} />)
 
     const select = (await screen.findByLabelText('Target host')) as HTMLSelectElement
     await waitFor(() => {
@@ -168,12 +168,12 @@ describe('SwitchCheckLine', () => {
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
-    const { rerender } = render(<SwitchCheckLine adapterId="claude-code" disabled={false} />)
+    const { rerender } = render(<SwitchCheckLine adapterId="claude-code" contextKey="ws-1" disabled={false} />)
     await waitFor(() => {
       expect(screen.getByLabelText('Switch check').textContent).toContain('Checking')
     })
 
-    rerender(<SwitchCheckLine adapterId="codex-cli" disabled={false} />)
+    rerender(<SwitchCheckLine adapterId="codex-cli" contextKey="ws-1" disabled={false} />)
     expect(await screen.findByText('unreached')).toBeTruthy()
 
     await act(async () => {
@@ -189,7 +189,7 @@ describe('SwitchCheckLine', () => {
       if (cmd === 'definition_switch_check') return Promise.reject(SHELL_ERROR)
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="claude-code" disabled={false} />)
+    render(<SwitchCheckLine adapterId="claude-code" contextKey="ws-1" disabled={false} />)
 
     const line = await screen.findByLabelText('Switch check')
     await waitFor(() => {
@@ -211,7 +211,7 @@ describe('SwitchCheckLine', () => {
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="pty-cli" disabled={false} />)
+    render(<SwitchCheckLine adapterId="pty-cli" contextKey="ws-1" disabled={false} />)
 
     const alert = await screen.findByRole('alert')
     expect(alert.textContent).toContain('workspace-unavailable')
@@ -234,7 +234,7 @@ describe('SwitchCheckLine', () => {
       if (cmd === 'definition_switch_check') return Promise.reject(new Error('boom'))
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="claude-code" disabled={false} />)
+    render(<SwitchCheckLine adapterId="claude-code" contextKey="ws-1" disabled={false} />)
 
     const line = await screen.findByLabelText('Switch check')
     await waitFor(() => {
@@ -260,7 +260,7 @@ describe('SwitchCheckLine', () => {
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="pty-cli" disabled={false} />)
+    render(<SwitchCheckLine adapterId="pty-cli" contextKey="ws-1" disabled={false} />)
     const select = (await screen.findByLabelText('Target host')) as HTMLSelectElement
     await waitFor(() => {
       expect(select.options).toHaveLength(NAMES.length + 1)
@@ -291,7 +291,7 @@ describe('SwitchCheckLine', () => {
       }
       throw new Error(`unexpected command: ${cmd}`)
     })
-    render(<SwitchCheckLine adapterId="pty-cli" disabled={true} />)
+    render(<SwitchCheckLine adapterId="pty-cli" contextKey="ws-1" disabled={true} />)
 
     const select = (await screen.findByLabelText('Target host')) as HTMLSelectElement
     await screen.findByText('uncertain')
@@ -302,5 +302,83 @@ describe('SwitchCheckLine', () => {
 
     expect(requests).toEqual([{ adapterId: 'pty-cli', host: null }])
     expect(select.value).toBe('')
+  })
+
+  it('shows the loader row claim after a decisive verdict and none after an uncertain one', async () => {
+    const answers: Record<string, DefinitionSwitchCheck> = {
+      'claude-code': REACHES,
+      'codex-cli': UNREACHED,
+      'pty-cli': NO_HOST,
+    }
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_hosts') return HOSTS
+      if (cmd === 'definition_switch_check') return answers[(args as { adapterId: string }).adapterId]
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    const claim = 'claim: https://example.invalid/docs (accessed 2026-09-25, Verified)'
+    const { rerender } = render(<SwitchCheckLine adapterId="claude-code" contextKey="ws-1" disabled={false} />)
+    await screen.findByText('reaches')
+    expect(screen.getByLabelText('Switch check').textContent).toContain(claim)
+
+    rerender(<SwitchCheckLine adapterId="codex-cli" contextKey="ws-1" disabled={false} />)
+    await screen.findByText('unreached')
+    expect(screen.getByLabelText('Switch check').textContent).toContain(claim)
+
+    rerender(<SwitchCheckLine adapterId="pty-cli" contextKey="ws-1" disabled={false} />)
+    await screen.findByText('uncertain')
+    expect(screen.getByLabelText('Switch check').textContent).not.toContain('claim:')
+  })
+
+  it('checks again with the same adapter when the context key changes', async () => {
+    let calls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'definition_hosts') return HOSTS
+      if (cmd === 'definition_switch_check') {
+        calls += 1
+        return calls === 1 ? Promise.reject(SHELL_ERROR) : REACHES
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    const { rerender } = render(<SwitchCheckLine adapterId="claude-code" contextKey="0" disabled={false} />)
+    await waitFor(() => {
+      expect(screen.getByLabelText('Switch check').textContent).toContain('workspace-unavailable')
+    })
+
+    rerender(<SwitchCheckLine adapterId="claude-code" contextKey="1" disabled={false} />)
+
+    expect(await screen.findByText('reaches')).toBeTruthy()
+    expect(screen.getByLabelText('Switch check').textContent).not.toContain('workspace-unavailable')
+    expect(calls).toBe(2)
+  })
+
+  it('discards a response from the previous context key', async () => {
+    let releaseFirst: (check: DefinitionSwitchCheck) => void = () => {}
+    let calls = 0
+    mockIPC((cmd) => {
+      if (cmd === 'definition_hosts') return HOSTS
+      if (cmd === 'definition_switch_check') {
+        calls += 1
+        if (calls === 1) {
+          return new Promise<DefinitionSwitchCheck>((resolve) => {
+            releaseFirst = resolve
+          })
+        }
+        return UNREACHED
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    const { rerender } = render(<SwitchCheckLine adapterId="claude-code" contextKey="0" disabled={false} />)
+    await waitFor(() => {
+      expect(calls).toBe(1)
+    })
+
+    rerender(<SwitchCheckLine adapterId="claude-code" contextKey="1" disabled={false} />)
+    expect(await screen.findByText('unreached')).toBeTruthy()
+
+    await act(async () => {
+      releaseFirst(REACHES)
+    })
+    expect(screen.queryByText('reaches')).toBeNull()
+    expect(screen.getByText('unreached')).toBeTruthy()
   })
 })

@@ -13,6 +13,11 @@ import {
 interface SwitchCheckLineProps {
   /** The picked adapter; `null` renders nothing. */
   adapterId: string | null
+  /**
+   * What the check is about besides the adapter: the active workspace's
+   * generation (empty when none). A change asks again, like a new adapter.
+   */
+  contextKey: string
   /** A run is live or the picker is frozen: the host choice freezes with it. */
   disabled: boolean
 }
@@ -34,28 +39,29 @@ const DIGEST_SHOWN = 12
  * adapter or host asks the shell again, and an answer overtaken by a
  * later change is dropped.
  */
-export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
-  const [choice, setChoice] = useState<{ adapterId: string; host: string } | null>(null)
+export function SwitchCheckLine({ adapterId, contextKey, disabled }: SwitchCheckLineProps) {
+  const [choice, setChoice] = useState<{ scope: string; host: string } | null>(null)
   const [outcome, setOutcome] = useState<Outcome | null>(null)
   const [hosts, setHosts] = useState<DefinitionHost[] | null>(null)
   const [hostsError, setHostsError] = useState<DefinitionSectionError | null>(null)
   const [hostsAttempt, setHostsAttempt] = useState(0)
   // The adapter whose first check found no host of its own: its select stays
   // mounted from then on, whatever a re-check is doing.
-  const [pickerFor, setPickerFor] = useState<string | null>(null)
+  const [pickerFor, setPickerFor] = useState<string | null>(null) // a scope, see below
 
   // A host chosen for another adapter does not carry over.
-  const host = choice !== null && choice.adapterId === adapterId ? choice.host : ''
-  const key = adapterId === null ? null : `${adapterId}\u0000${host}`
+  const scope = adapterId === null ? null : `${contextKey}\u0000${adapterId}`
+  const host = choice !== null && choice.scope === scope ? choice.host : ''
+  const key = scope === null ? null : `${scope}\u0000${host}`
 
   useEffect(() => {
-    if (adapterId === null || key === null) return
+    if (adapterId === null || scope === null || key === null) return
     let live = true
     definitionSwitchCheck(adapterId, host === '' ? undefined : host).then(
       (check) => {
         if (!live) return
         setOutcome({ key, check })
-        if (check.verdict.kind === 'uncertain' && check.verdict.reason === 'no-host-chosen') setPickerFor(adapterId)
+        if (check.verdict.kind === 'uncertain' && check.verdict.reason === 'no-host-chosen') setPickerFor(scope)
       },
       (error: unknown) => {
         if (live) setOutcome({ key, error: isShellError(error) ? error : 'unexpected' })
@@ -64,10 +70,10 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
     return () => {
       live = false
     }
-  }, [adapterId, host, key])
+  }, [adapterId, host, key, scope])
 
   const current = outcome !== null && outcome.key === key ? outcome : null
-  const needsHost = adapterId !== null && pickerFor === adapterId
+  const needsHost = scope !== null && pickerFor === scope
 
   useEffect(() => {
     if (!needsHost || hosts !== null) return
@@ -102,7 +108,7 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
             disabled={disabled}
             onChange={(event) => {
               if (disabled) return
-              setChoice({ adapterId, host: event.target.value })
+              setChoice({ scope: scope ?? '', host: event.target.value })
             }}
           >
             <option value="">Choose a host</option>
@@ -134,6 +140,14 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
             <strong>{current.check.verdict.kind}</strong>
             {': '}
             <PlainTextLine text={current.check.verdict.line} />
+            {'claim' in current.check.verdict && (
+              <>
+                {' '}
+                <PlainTextLine
+                  text={`claim: ${current.check.verdict.claim.source} (accessed ${current.check.verdict.claim.accessed}, ${current.check.verdict.claim.status})`}
+                />
+              </>
+            )}
             {reference !== null && (
               <>
                 {' '}

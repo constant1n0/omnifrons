@@ -264,6 +264,29 @@ describe('AgentPanel', () => {
     expect(line.textContent).toContain('definition AGENTS.md@cdcdcdcdcdcd')
   })
 
+  it('asks the shell for the switch check again after a successful workspace pick', async () => {
+    let checks = 0
+    const handlers = defaultHandlers((cmd) => {
+      if (cmd === 'workspace_pick') return { displayPath: '/home/user/project', workArea: 'valid' }
+      return null
+    })
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_switch_check') checks += 1
+      return handlers(cmd, args)
+    })
+    render(<AgentPanel />)
+    await selectOption('Adapter', 'claude-code')
+    await screen.findByText('reaches')
+    expect(checks).toBe(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pick workspace' }))
+    await screen.findByText('/home/user/project')
+
+    await waitFor(() => {
+      expect(checks).toBe(2)
+    })
+  })
+
   it('freezes the switch check host select while a run is active', async () => {
     const handlers = defaultHandlers((cmd) => (cmd === 'harness_spawn' ? 7 : null))
     mockIPC((cmd, args) => {

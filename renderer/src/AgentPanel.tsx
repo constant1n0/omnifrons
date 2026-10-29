@@ -4708,7 +4708,11 @@ export function AgentPanel() {
             </option>
           ))}
         </select>
-        <SwitchCheckLine adapterId={adapterId} disabled={runActive} />
+        <SwitchCheckLine
+          adapterId={adapterId}
+          contextKey={String(definitionGeneration)}
+          disabled={runActive}
+        />
         {selectedAdapter && (
           <p>
             <PlainTextLine text={selectedAdapter.notes} />
