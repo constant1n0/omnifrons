@@ -21,7 +21,7 @@
 //!
 //! Pure data and lookups: no filesystem access and no hashing.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use crate::adapter::AdapterId;
 use crate::hosts::{self, HostLoader};
@@ -155,13 +155,37 @@ fn join_or(names: &[&str]) -> String {
     }
 }
 
+/// `text` with every control character (and U+2028/U+2029) replaced by
+/// its escaped form, so a value interpolated into a one-line text keeps
+/// it one physical line and its bytes stay visible: `\n` becomes the two
+/// characters backslash and `n`, `\r` likewise, any other as `\u{XXXX}`.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+                let _ = write!(out, "\\u{{{:04X}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The verdict as one physical line. Every value interpolated that is
+/// not a static table entry (a host name the caller chose, an ancestor
+/// path, a file name) goes through `single_line`, so a line break in
+/// it is shown escaped instead of splitting the line.
 impl fmt::Display for SwitchVerdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Reaches { file, claim } => write!(
                 f,
-                "{} reaches the definition through {file} (row accessed {}, {})",
+                "{} reaches the definition through {} (row accessed {}, {})",
                 claim.host,
+                single_line(file),
                 claim.accessed,
                 claim.status.to_lowercase()
             ),
@@ -176,7 +200,7 @@ impl fmt::Display for SwitchVerdict {
                 claim.host,
                 fallback.unwrap_or("AGENTS.md"),
                 shadow.file,
-                shadow.path
+                single_line(&shadow.path)
             ),
             Self::Unreached {
                 expected, claim, ..
@@ -195,12 +219,17 @@ impl fmt::Display for SwitchVerdict {
             },
             Self::Uncertain {
                 reason: UncertainReason::UnknownHost { name },
-            } => write!(f, "No loader row for host {name}: the check is uncertain"),
+            } => write!(
+                f,
+                "No loader row for host {}: the check is uncertain",
+                single_line(name)
+            ),
             Self::Uncertain {
                 reason: UncertainReason::NoHostChosen { adapter },
             } => write!(
                 f,
-                "No host is chosen for adapter {adapter}: the check is uncertain"
+                "No host is chosen for adapter {}: the check is uncertain",
+                single_line(&adapter.to_string())
             ),
         }
     }

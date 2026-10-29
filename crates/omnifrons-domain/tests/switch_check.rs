@@ -391,3 +391,24 @@ fn an_unshadowed_unreached_verdict_selects_no_fallback() {
         other => panic!("expected Unreached, got {other:?}"),
     }
 }
+
+#[test]
+fn an_unknown_host_name_with_a_line_break_is_escaped_on_one_line() {
+    let line = switch_check("Gem\ni\r\u{2028}x\u{7f}", &root(&[])).to_string();
+    assert_eq!(
+        line,
+        "No loader row for host Gem\\ni\\r\\u{2028}x\\u{007F}: the check is uncertain"
+    );
+    assert!(!line.contains(['\n', '\r', '\u{2028}', '\u{2029}']));
+}
+
+#[test]
+fn a_shadow_path_with_a_carriage_return_is_escaped_on_one_line() {
+    let site = with_ancestors(&["AGENTS.md"], &[("../par\rent\n", &["CLAUDE.md"])]);
+    let line = switch_check("Claude Code", &site).to_string();
+    assert_eq!(
+        line,
+        "Claude Code does not reach the definition: AGENTS.md is shadowed by CLAUDE.md in ../par\\rent\\n"
+    );
+    assert!(!line.contains(['\n', '\r']));
+}

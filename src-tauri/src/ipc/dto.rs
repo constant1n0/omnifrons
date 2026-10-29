@@ -5964,4 +5964,19 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn definition_switch_check_line_escapes_a_newline_in_the_name() {
+        let unknown =
+            omnifrons_domain::switch_check::switch_check("No\npe", &switch_site(&[], &[]));
+        assert_eq!(
+            switch_check_json("pty-cli", Some("No\npe"), unknown, None)["verdict"],
+            serde_json::json!({
+                "kind": "uncertain",
+                "reason": "unknown-host",
+                "name": "No\npe",
+                "line": "No loader row for host No\\npe: the check is uncertain"
+            })
+        );
+    }
 }

@@ -131,6 +131,12 @@ pub fn definition_status_for(workspace: &WorkspaceRoot) -> Result<DefinitionStat
     Ok(DefinitionStatusDto::from_report(workspace, &report))
 }
 
+/// Whether `ch` is a control character (C0, DEL, C1) or a line or
+/// paragraph separator.
+fn is_line_breaking_or_control(ch: char) -> bool {
+    ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}'
+}
+
 /// Whether the host a model switch to `adapter_id` would run reaches the
 /// canonical definition from `workspace`. `host` is the loader-table host
 /// the user chose for an adapter bound to none; it is ignored for an
@@ -138,7 +144,8 @@ pub fn definition_status_for(workspace: &WorkspaceRoot) -> Result<DefinitionStat
 ///
 /// # Errors
 ///
-/// `invalid-request` if `adapter_id` names no adapter; otherwise as
+/// `invalid-request` if `adapter_id` names no adapter or `host` holds a
+/// control character; otherwise as
 /// [`definition_status_for`].
 pub fn definition_switch_check_for(
     workspace: &WorkspaceRoot,
@@ -148,6 +155,12 @@ pub fn definition_switch_check_for(
     let adapter = AdapterId::parse(adapter_id).ok_or_else(|| {
         ShellError::new(ShellErrorCode::InvalidRequest, "the adapter is not known")
     })?;
+    if host.is_some_and(|name| name.chars().any(is_line_breaking_or_control)) {
+        return Err(ShellError::new(
+            ShellErrorCode::InvalidRequest,
+            "the host holds a control character",
+        ));
+    }
     let tree = FsDefinitionTree::from_environment();
     let hasher = Sha2Hasher::new();
     let ports = DefinitionPorts {
@@ -2106,5 +2119,22 @@ mod tests {
         assert_eq!(value["host"], "Claude Code");
         assert_eq!(value["verdict"]["kind"], "reaches");
         assert_eq!(value["verdict"]["claim"]["host"], "Claude Code");
+    }
+
+    #[test]
+    fn switch_check_refuses_a_chosen_host_holding_a_control_character() {
+        let project = TempDir::new("switch-control-host");
+        for host in [
+            "Gemini\nCLI",
+            "Gemini\rCLI",
+            "Gemini\0CLI",
+            "Gemini\u{7f}",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            let error = definition_switch_check_for(&project.workspace(), "pty-cli", Some(host))
+                .expect_err("a control character is refused");
+            assert_eq!(error.code, ShellErrorCode::InvalidRequest, "{host:?}");
+        }
     }
 }
