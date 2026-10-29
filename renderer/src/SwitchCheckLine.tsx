@@ -38,6 +38,11 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
   const [choice, setChoice] = useState<{ adapterId: string; host: string } | null>(null)
   const [outcome, setOutcome] = useState<Outcome | null>(null)
   const [hosts, setHosts] = useState<DefinitionHost[] | null>(null)
+  const [hostsError, setHostsError] = useState<DefinitionSectionError | null>(null)
+  const [hostsAttempt, setHostsAttempt] = useState(0)
+  // The adapter whose first check found no host of its own: its select stays
+  // mounted from then on, whatever a re-check is doing.
+  const [pickerFor, setPickerFor] = useState<string | null>(null)
 
   // A host chosen for another adapter does not carry over.
   const host = choice !== null && choice.adapterId === adapterId ? choice.host : ''
@@ -48,7 +53,9 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
     let live = true
     definitionSwitchCheck(adapterId, host === '' ? undefined : host).then(
       (check) => {
-        if (live) setOutcome({ key, check })
+        if (!live) return
+        setOutcome({ key, check })
+        if (check.verdict.kind === 'uncertain' && check.verdict.reason === 'no-host-chosen') setPickerFor(adapterId)
       },
       (error: unknown) => {
         if (live) setOutcome({ key, error: isShellError(error) ? error : 'unexpected' })
@@ -60,26 +67,25 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
   }, [adapterId, host, key])
 
   const current = outcome !== null && outcome.key === key ? outcome : null
-  const verdict = current !== null && 'check' in current ? current.check.verdict : null
-  const needsHost =
-    adapterId !== null &&
-    (host !== '' || (verdict !== null && verdict.kind === 'uncertain' && verdict.reason === 'no-host-chosen'))
+  const needsHost = adapterId !== null && pickerFor === adapterId
 
   useEffect(() => {
     if (!needsHost || hosts !== null) return
     let live = true
     definitionHosts().then(
       (rows) => {
-        if (live) setHosts(rows)
+        if (!live) return
+        setHostsError(null)
+        setHosts(rows)
       },
-      () => {
-        if (live) setHosts([])
+      (error: unknown) => {
+        if (live) setHostsError(isShellError(error) ? error : 'unexpected')
       },
     )
     return () => {
       live = false
     }
-  }, [needsHost, hosts])
+  }, [needsHost, hosts, hostsAttempt])
 
   if (adapterId === null) return null
 
@@ -106,6 +112,16 @@ export function SwitchCheckLine({ adapterId, disabled }: SwitchCheckLineProps) {
               </option>
             ))}
           </select>
+          {hostsError !== null && (
+            <>
+              <span role="alert">
+                <DefinitionErrorLine error={hostsError} />
+              </span>{' '}
+              <button type="button" onClick={() => setHostsAttempt((attempt) => attempt + 1)}>
+                Retry
+              </button>
+            </>
+          )}
         </>
       )}
       <p aria-label="Switch check">

@@ -264,6 +264,35 @@ describe('AgentPanel', () => {
     expect(line.textContent).toContain('definition AGENTS.md@cdcdcdcdcdcd')
   })
 
+  it('freezes the switch check host select while a run is active', async () => {
+    const handlers = defaultHandlers((cmd) => (cmd === 'harness_spawn' ? 7 : null))
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_switch_check') {
+        return {
+          ...SWITCH_CHECK_FIXTURE,
+          adapter: 'pty-cli',
+          host: null,
+          verdict: { kind: 'uncertain', reason: 'no-host-chosen', name: null, line: 'Choose the host this adapter runs' },
+        }
+      }
+      if (cmd === 'definition_hosts') {
+        return [{ name: 'Codex', files: ['AGENTS.md'], fallbackFiles: [], accessed: '2026-09-25', status: 'Verified', source: 'x' }]
+      }
+      return handlers(cmd, args)
+    })
+    render(<AgentPanel />)
+    await selectOption('Adapter', 'pty-cli')
+    await selectOption('Approval', '42')
+    const hostSelect = (await screen.findByLabelText('Target host')) as HTMLSelectElement
+    expect(hostSelect.disabled).toBe(false)
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+    await screen.findByText('running')
+    expect(hostSelect.disabled).toBe(true)
+  })
+
   it('calls workspace_current on mount and shows the display path through PlainTextLine', async () => {
     mockIPC((cmd) => {
       if (cmd === 'workspace_current') return { displayPath: '/home/user/project', workArea: 'valid' }

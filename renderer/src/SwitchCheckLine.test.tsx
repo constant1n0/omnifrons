@@ -197,4 +197,110 @@ describe('SwitchCheckLine', () => {
     })
     expect(line.textContent).toContain('no workspace is active')
   })
+
+  it('renders a rejected host catalogue as an error line and refetches it on retry', async () => {
+    let catalogueCalls = 0
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_hosts') {
+        catalogueCalls += 1
+        return catalogueCalls === 1 ? Promise.reject(SHELL_ERROR) : HOSTS
+      }
+      if (cmd === 'definition_switch_check') {
+        const request = args as { adapterId: string; host: string | null }
+        return request.host === null ? NO_HOST : REACHES
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    render(<SwitchCheckLine adapterId="pty-cli" disabled={false} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('workspace-unavailable')
+    expect(alert.textContent).toContain('no workspace is active')
+    const select = screen.getByLabelText('Target host') as HTMLSelectElement
+    expect(select.options).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    await waitFor(() => {
+      expect(select.options).toHaveLength(NAMES.length + 1)
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(catalogueCalls).toBe(2)
+  })
+
+  it('renders a rejection that is not a ShellError as an unexpected error', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'definition_hosts') return HOSTS
+      if (cmd === 'definition_switch_check') return Promise.reject(new Error('boom'))
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    render(<SwitchCheckLine adapterId="claude-code" disabled={false} />)
+
+    const line = await screen.findByLabelText('Switch check')
+    await waitFor(() => {
+      expect(line.textContent).toContain('unexpected error')
+    })
+    expect(line.textContent).not.toContain('boom')
+  })
+
+  it('keeps the host select mounted while a reset to the placeholder is re-checked', async () => {
+    let releaseSecond: (check: DefinitionSwitchCheck) => void = () => {}
+    let calls = 0
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_hosts') return HOSTS
+      if (cmd === 'definition_switch_check') {
+        calls += 1
+        const request = args as { host: string | null }
+        if (request.host === null && calls > 1) {
+          return new Promise<DefinitionSwitchCheck>((resolve) => {
+            releaseSecond = resolve
+          })
+        }
+        return request.host === null ? NO_HOST : REACHES
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    render(<SwitchCheckLine adapterId="pty-cli" disabled={false} />)
+    const select = (await screen.findByLabelText('Target host')) as HTMLSelectElement
+    await waitFor(() => {
+      expect(select.options).toHaveLength(NAMES.length + 1)
+    })
+    fireEvent.change(select, { target: { value: 'Gemini CLI' } })
+    await screen.findByText('reaches')
+
+    fireEvent.change(select, { target: { value: '' } })
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Switch check').textContent).toContain('Checking')
+    })
+    expect(screen.getByLabelText('Target host')).toBe(select)
+    await act(async () => {
+      releaseSecond(NO_HOST)
+    })
+    expect(await screen.findByText('uncertain')).toBeTruthy()
+    expect(screen.getByLabelText('Target host')).toBe(select)
+  })
+
+  it('freezes the host select while disabled and asks nothing more on a change', async () => {
+    const requests: unknown[] = []
+    mockIPC((cmd, args) => {
+      if (cmd === 'definition_hosts') return HOSTS
+      if (cmd === 'definition_switch_check') {
+        requests.push(args)
+        return NO_HOST
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    render(<SwitchCheckLine adapterId="pty-cli" disabled={true} />)
+
+    const select = (await screen.findByLabelText('Target host')) as HTMLSelectElement
+    await screen.findByText('uncertain')
+    expect(select.disabled).toBe(true)
+
+    fireEvent.change(select, { target: { value: 'Gemini CLI' } })
+    await act(async () => {})
+
+    expect(requests).toEqual([{ adapterId: 'pty-cli', host: null }])
+    expect(select.value).toBe('')
+  })
 })
