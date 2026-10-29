@@ -2475,3 +2475,24 @@ export interface DefinitionSwitchCheck {
 export async function definitionSwitchCheck(adapterId: string, host?: string): Promise<DefinitionSwitchCheck> {
   return invoke('definition_switch_check', { adapterId, host: host ?? null })
 }
+
+/** Mirrors `DefinitionHostDto`: one row of the loader table. */
+export interface DefinitionHost {
+  name: string
+  /** The files the host loads when present, in the row's order. */
+  files: string[]
+  /** The files the host reads only when none of `files` exists. */
+  fallbackFiles: string[]
+  /** The row's access date, ISO 8601. */
+  accessed: string
+  status: string
+  source: string
+}
+
+/**
+ * The loader table's hosts in table order, for the switch check's host
+ * picker. Invokes `definition_hosts` with no arguments.
+ */
+export async function definitionHosts(): Promise<DefinitionHost[]> {
+  return invoke('definition_hosts')
+}

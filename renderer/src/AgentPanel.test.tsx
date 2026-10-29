@@ -18,6 +18,7 @@ import type {
   ArtifactStateFrame,
   Candidate,
   CatalogRepairPreview,
+  DefinitionSwitchCheck,
   Evidence,
   GuidanceApplied,
   GuidancePreview,
@@ -122,6 +123,19 @@ const OUTBOX_NO_WORKSPACE = {
  * approval. Individual tests override `onCommand` to add `harness_spawn`/
  * `workspace_pick` handling.
  */
+const SWITCH_CHECK_FIXTURE: DefinitionSwitchCheck = {
+  schema: 'omnifrons.definition-switch-check/1',
+  adapter: 'claude-code',
+  host: 'Claude Code',
+  verdict: {
+    kind: 'reaches',
+    file: 'CLAUDE.md',
+    line: 'Claude Code reaches the definition through CLAUDE.md',
+    claim: { host: 'Claude Code', source: 'https://example.invalid/docs', accessed: '2026-09-25', status: 'Verified' },
+  },
+  reference: { path: 'AGENTS.md', digest: 'cd'.repeat(32) },
+}
+
 /**
  * Overrides for the default mock (slice 5b): `outbox` answers `outbox_status`
  * with a status instead of the no-workspace rejection -- the approval block
@@ -155,6 +169,10 @@ function defaultHandlers(
     if (cmd === 'definition_status') {
       return { schema: 'omnifrons.definition-scan/1', root: '', ancestors: [], agents: [] }
     }
+    // `SwitchCheckLine` (ADR-0005 slice 4c) asks the shell once per picked
+    // adapter; a neutral verdict keeps the other tests clear of it.
+    if (cmd === 'definition_switch_check') return SWITCH_CHECK_FIXTURE
+    if (cmd === 'definition_hosts') return []
     if (onCommand) return onCommand(cmd, args as Record<string, unknown>)
     throw new Error(`unexpected command: ${cmd}`)
   }
@@ -236,6 +254,14 @@ describe('AgentPanel', () => {
     expect(screen.getByLabelText('Prompt')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Start' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
+  })
+
+  it('renders the switch check line for the picked adapter', async () => {
+    await renderReady()
+
+    const line = await screen.findByLabelText('Switch check')
+    expect(line.textContent).toContain('Claude Code reaches the definition through CLAUDE.md')
+    expect(line.textContent).toContain('definition AGENTS.md@cdcdcdcdcdcd')
   })
 
   it('calls workspace_current on mount and shows the display path through PlainTextLine', async () => {

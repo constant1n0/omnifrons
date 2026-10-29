@@ -24,7 +24,8 @@ use ipc::commands::{
 };
 use ipc::definition::{
     definition_apply, definition_create_apply, definition_create_fields, definition_create_preview,
-    definition_preview, definition_status, definition_switch_check, definition_verify,
+    definition_hosts, definition_preview, definition_status, definition_switch_check,
+    definition_verify,
 };
 use ipc::guidance::{
     guidance_apply, guidance_pin, guidance_preview, guidance_remove, guidance_restore,
@@ -153,6 +154,7 @@ pub fn run() {
             definition_create_preview,
             definition_create_apply,
             definition_switch_check,
+            definition_hosts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");

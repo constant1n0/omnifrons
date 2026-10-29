@@ -81,6 +81,7 @@ import {
 } from './ipc/harness'
 import { DefinitionSection } from './DefinitionSection'
 import { PlainTextLine } from './PlainTextLine'
+import { SwitchCheckLine } from './SwitchCheckLine'
 
 /**
  * The same four `LaunchGate` denial codes {@link HarnessPanel} renders with
@@ -4707,6 +4708,7 @@ export function AgentPanel() {
             </option>
           ))}
         </select>
+        <SwitchCheckLine adapterId={adapterId} disabled={runActive} />
         {selectedAdapter && (
           <p>
             <PlainTextLine text={selectedAdapter.notes} />

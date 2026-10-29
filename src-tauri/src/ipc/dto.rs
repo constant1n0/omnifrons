@@ -2911,6 +2911,41 @@ impl DefinitionFieldDto {
     }
 }
 
+/// One row of the loader table, as the switch check's host picker lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionHostDto {
+    pub name: String,
+    pub files: Vec<String>,
+    pub fallback_files: Vec<String>,
+    /// The date the row was last checked against the host's documentation.
+    pub accessed: String,
+    pub status: String,
+    pub source: String,
+}
+
+impl DefinitionHostDto {
+    /// Every host of the loader table, in table order.
+    #[must_use]
+    pub fn catalogue() -> Vec<Self> {
+        omnifrons_domain::hosts::HOSTS
+            .iter()
+            .map(|host| Self {
+                name: host.name.to_string(),
+                files: host.files.iter().map(ToString::to_string).collect(),
+                fallback_files: host
+                    .fallback_files
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                accessed: host.accessed.to_string(),
+                status: host.status.to_string(),
+                source: host.source.to_string(),
+            })
+            .collect()
+    }
+}
+
 /// What a create preview concluded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
@@ -5776,6 +5811,23 @@ mod tests {
                 "required": true,
                 "list": true,
                 "prompt": "What are the main deliverables the agent produces?",
+            })
+        );
+    }
+
+    #[test]
+    fn definition_host_dto_lists_the_nine_table_rows_in_order() {
+        let hosts = super::DefinitionHostDto::catalogue();
+        assert_eq!(hosts.len(), 9);
+        assert_eq!(
+            json(&hosts[0]),
+            serde_json::json!({
+                "name": "Claude Code",
+                "files": ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"],
+                "fallbackFiles": ["AGENTS.md", ".claude/AGENTS.md"],
+                "accessed": "2026-09-25",
+                "status": "Verified",
+                "source": "https://code.claude.com/docs/en/memory",
             })
         );
     }

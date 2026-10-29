@@ -47,8 +47,8 @@ use crate::executable_state::SystemClock;
 use crate::ipc::commands::active_workspace;
 use crate::ipc::dto::{
     DefinitionApplyDto, DefinitionCreateApplyDto, DefinitionCreatePreviewDto, DefinitionFieldDto,
-    DefinitionPreviewDto, DefinitionStatusDto, DefinitionSwitchCheckDto, DefinitionVerifyDto,
-    ShellError, ShellErrorCode, ShellErrorDetail,
+    DefinitionHostDto, DefinitionPreviewDto, DefinitionStatusDto, DefinitionSwitchCheckDto,
+    DefinitionVerifyDto, ShellError, ShellErrorCode, ShellErrorDetail,
 };
 use crate::ipc::publication::{RunActivity, run_active};
 use crate::publication_state::PublicationState;
@@ -437,6 +437,14 @@ fn raw_answers(value: &serde_json::Value) -> RawValue {
 #[must_use]
 pub fn definition_create_fields() -> Vec<DefinitionFieldDto> {
     DefinitionFieldDto::catalogue()
+}
+
+/// The loader table's hosts, in table order, so the switch check's host
+/// picker does not hardcode them.
+#[tauri::command]
+#[must_use]
+pub fn definition_hosts() -> Vec<DefinitionHostDto> {
+    DefinitionHostDto::catalogue()
 }
 
 /// The proposal for a new definition (`definition_create_preview`): the

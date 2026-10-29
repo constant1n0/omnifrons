@@ -18,6 +18,7 @@ import {
   definitionCreateApply,
   definitionCreateFields,
   definitionCreatePreview,
+  definitionHosts,
   definitionPreview,
   definitionStatus,
   definitionSwitchCheck,
@@ -3955,5 +3956,30 @@ describe('definitionSwitchCheck (ADR-0005 sub-slice 4b)', () => {
     mockCommand('definition_switch_check', () => Promise.reject(error))
 
     await expect(definitionSwitchCheck('nope')).rejects.toMatchObject(error)
+  })
+})
+
+describe('definitionHosts (ADR-0005 sub-slice 4c)', () => {
+  it('invokes definition_hosts with no arguments and returns the table verbatim', async () => {
+    const hosts = [
+      {
+        name: 'Claude Code',
+        files: ['CLAUDE.md'],
+        fallbackFiles: ['AGENTS.md'],
+        accessed: '2026-09-25',
+        status: 'Verified',
+        source: 'https://example.invalid/docs',
+      },
+    ]
+    let invoked = 0
+    mockIPC((cmd, args) => {
+      if (cmd !== 'definition_hosts') throw new Error(`unexpected command: ${cmd}`)
+      invoked += 1
+      expect(args ?? {}).toEqual({})
+      return hosts
+    })
+
+    expect(await definitionHosts()).toEqual(hosts)
+    expect(invoked).toBe(1)
   })
 })
