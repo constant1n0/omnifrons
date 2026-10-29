@@ -116,8 +116,9 @@ A model change is a checkpoint-and-restart handoff, not a transparent transfer o
 
 1. If work is active, the outgoing adapter requests a bounded summary and Omnifrons adds deterministic evidence: current goal, active project, changed files, task state, validations, unresolved risks, and artifact references.
 2. The adapter performs its harness-specific graceful-stop operation. `/exit` is only one possible implementation and is never hard-coded as a universal protocol.
-3. Omnifrons starts the selected, user-installed harness in the same `ActiveProjectRoot` after device-local approval and capability probing.
-4. The new harness receives the checkpoint as startup context and independently validates the referenced workspace state.
+3. Before the restart, the switch preview states whether the selected harness's host reaches the canonical agent definition from the `ActiveProjectRoot`, from the loader table's row for that host (ADR-0005, decision 4): `reaches` through a named file, `unreached` naming the missing or shadowing file, or `uncertain` for a host without a row or an adapter without a chosen host. The verdict carries the row's source, access date and status; it is a claim about the host, never a guarantee.
+4. Omnifrons starts the selected, user-installed harness in the same `ActiveProjectRoot` after device-local approval and capability probing.
+5. The new harness receives the checkpoint as startup context, which references the agent definition by path and digest, and independently validates the referenced workspace state.
 
 If quiescence, shutdown, checkpoint integrity, or workspace consistency cannot be proven, the switch is `uncertain` and requires human review.
 

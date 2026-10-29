@@ -2010,3 +2010,27 @@ Four findings stayed open as INFO rather than blocking: a stable 256-entry inspe
 ### Debt and open questions
 
 The six excluded `.part` producers, their non-PID grammars, generic staging hygiene, and registered-artifact deletion (reserved to a future tombstone kind under HAP-001-R39) remain unresolved later boundaries — named, not silently carried. The authority boundary rests on the already-documented TM-001 A6 same-user residual; changing that threat model would block activation and needs its own, separately approved ownership mechanism. Archived locally 2026-09-14; `local-staging-cleanup` became a new main spec (4 requirements) rather than a modification of an existing one.
+
+## ADR-0005 slice 4 — the loader table in model switching
+
+Domain, application, shell and renderer: `crates/omnifrons-domain/src/switch_check.rs`, `crates/omnifrons-app/src/switch_check.rs`, `src-tauri/src/ipc/definition.rs` (`definition_switch_check`, `definition_hosts`) and `renderer/src/SwitchCheckLine.tsx` under the adapter picker. No restart flow: switching remains the runtime's (ADR-0005, decision 7).
+
+### Scope
+
+In scope: the pre-restart check (whether the target host reaches the canonical definition from the active project root, by the loader table's row for that host) and the definition's reference by path and digest for a startup brief. Out of scope: the checkpoint-and-restart flow itself, the startup brief's assembly, and a switch for a nested root.
+
+### Design decisions (spike defaults, each disclosed)
+
+- **D1 — the loader table is the only source.** The row's files and fallback files drive the verdict; Claude Code's fallback applies only when no Claude file sits at the root or in any ancestor, and the verdict names the fallback actually selected and the exact ancestor file that shadows it.
+- **D2 — binding.** `claude-code` maps to the Claude Code row; `stream-json-cli` and `pty-cli` take a host the user chooses or stay `uncertain`. The closed `AdapterId` set does not grow.
+- **D3 — claims, not guarantees.** Every verdict carries the row's source, access date and status. Detecting a row older than the host version in use waits for a known host version.
+- **D4 — one-line verdict text.** The shell refuses a chosen host holding a control character, and the domain escapes any control character left in the line's dynamic values, so the DTO's `line` stays one physical line.
+- **D5 — the reference by construction.** `DefinitionReference` is built only from a single-line path and a 64-hex digest; the application fills it from the scan's regular `AGENTS.md` and never from a linked file.
+
+### Delivery and verification
+
+Three stacked-to-main pull requests (#169 the domain verdict, #170 the application service and IPC, then the renderer line with the hosts catalogue), each reviewed under receipt-driven development with its findings fixed in a follow-up commit; the external review's findings were fixed on the branch or carried with a reply to the next pull request.
+
+### Debt and open questions
+
+Stale rows against a host version; the startup brief's assembly and the VP scenario's "same definition digest" (slice 5); a switch check for a nested root rather than the workspace root.
