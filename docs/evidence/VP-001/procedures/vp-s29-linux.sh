@@ -11,7 +11,7 @@
 #        vp-s29-linux.sh fixture
 #        vp-s29-linux.sh digests <label>   (before; after-<adapter>-<1|2> per invocation)
 #        vp-s29-linux.sh compare <digests-a> <digests-b>
-#        vp-s29-linux.sh observe <adapter> <transcript> <version-file>
+#        vp-s29-linux.sh observe <adapter> <harness-log>... <version-file>
 #        vp-s29-linux.sh record --run-date <YYYY-MM-DD> [--record-id <id>]
 #          [--baseline-id <id>] [--build-channel <channel, default packaged-ci>]
 #          [--build-channel-digest <sha256> --exercised-artifact-digest <sha256>]
@@ -138,19 +138,25 @@ mode_compare() {
 }
 
 mode_observe() {
-  [[ $# -eq 3 ]] || die_usage "observe needs <adapter> <transcript> <version-file>"
-  [[ -f "$2" && -f "$3" ]] || die_usage "transcript or version file not found"
-  local dir manifest=() home=()
+  [[ $# -ge 3 ]] || die_usage "observe needs <adapter> <log-file>... <version-file>"
+  local adapter="$1" version_file="${!#}" dir file
+  local logs=("${@:2:$#-2}")
+  for file in "${logs[@]}" "${version_file}"; do
+    [[ -f "${file}" ]] || die_usage "file not found: ${file}"
+  done
+  local manifest=() home=()
   dir="$(run_dir)"
   mkdir -p "${dir}"
   [[ -f "${dir}/private/fixture.json" ]] && manifest=(--manifest "${dir}/private/fixture.json")
   [[ -n "${VP_S29_HOME:-}" ]] && home=(--home "${VP_S29_HOME}")
-  node "${procedures_dir}/vp-s29-observations.mjs" "$1" "$2" "$3" ${manifest[@]+"${manifest[@]}"} ${home[@]+"${home[@]}"} \
-    --redacted-out "${dir}/transcript-$1.txt" > "${dir}/observation-$1.json" || {
-      rm -f "${dir}/observation-$1.json" "${dir}/transcript-$1.txt"
+  node "${procedures_dir}/vp-s29-observations.mjs" "${adapter}" "${version_file}" "${logs[@]}" \
+    ${manifest[@]+"${manifest[@]}"} ${home[@]+"${home[@]}"} \
+    --redacted-out "${dir}/transcript-${adapter}.txt" --summary-out "${dir}/log-summary-${adapter}.json" \
+    > "${dir}/observation-${adapter}.json" || {
+      rm -f "${dir}/observation-${adapter}.json" "${dir}/transcript-${adapter}.txt" "${dir}/log-summary-${adapter}.json"
       return 1
     }
-  cat "${dir}/observation-$1.json"
+  cat "${dir}/observation-${adapter}.json"
 }
 
 mode_record() {
@@ -227,7 +233,7 @@ mode_record() {
   # The retained, redacted evidence in one file whose digest the record cites.
   local summary="${dir}/evidence-summary.txt" file
   : > "${summary}"
-  for file in "${dir}"/observation-*.json "${dir}/digests-before.txt" "${dir}"/digests-after-*.txt; do
+  for file in "${dir}"/observation-*.json "${dir}"/log-summary-*.json "${dir}/digests-before.txt" "${dir}"/digests-after-*.txt; do
     [[ -f "${file}" ]] || continue
     printf '== %s ==\n' "$(basename "${file}")" >> "${summary}"
     cat "${file}" >> "${summary}"

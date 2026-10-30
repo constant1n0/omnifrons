@@ -15,8 +15,8 @@
 //   stream-json-cli the bridge's `system/init` line plus a line naming AGENTS.md
 //   pty-cli         a normalized line naming GEMINI.md or the definition's name
 //
-// CLI: node vp-s29-observations.mjs <adapter> <transcript> <version-file>
-//        [--manifest <file>] [--name <definition name>] [--skill <name>] [--home <dir>] [--redacted-out <file>]
+// CLI: node vp-s29-observations.mjs <adapter> <version-file> <harness-log>...
+//        [--manifest <file>] [--skill <name>] [--home <dir>] [--redacted-out <file>] [--summary-out <file>]
 //      node vp-s29-observations.mjs record --run-dir <dir> --run-id <id> --run-date <date>
 //        --digests-unchanged <true|false|unknown> [--invocations <label=state,...>] --evidence-path <p> --evidence-digest <sha256>
 //        [--record-id ..] [--baseline-id ..] [--build-channel ..] [--build-channel-digest ..]
@@ -235,6 +235,106 @@ export function observeLeg({
   };
 }
 
+const HARNESS_LOG_SCHEMA = 'omnifrons.harness-log/1';
+
+/**
+ * Parses a harness log (src-tauri/src/harness_log.rs): one JSON object per
+ * line, a header first, text frames, an optional `truncated` marker and a final
+ * `state` line. A `continued` frame is a fragment of a line longer than the
+ * frame cap; the full line is the fragments up to the first frame that is not
+ * `continued`. Throws on a line that is not JSON, on a missing header and on
+ * another schema.
+ */
+export function parseHarnessLog(text) {
+  const records = text.split('\n')
+    .map((raw, index) => ({ raw: raw.trim(), number: index + 1 }))
+    .filter(({ raw }) => raw !== '')
+    .map(({ raw, number }) => {
+      try {
+        const value = JSON.parse(raw);
+        if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+      } catch { /* reported below */ }
+      throw new Error(`harness log line ${number} is not a JSON object`);
+    });
+  const [header] = records;
+  if (!header || header.kind !== 'header') throw new Error('not a harness log: the first line is not a header');
+  if (header.schema !== HARNESS_LOG_SCHEMA) throw new Error(`harness log schema ${header.schema} is not ${HARNESS_LOG_SCHEMA}`);
+  const lines = { stdout: [], stderr: [] };
+  const open = { stdout: '', stderr: '' };
+  const pending = { stdout: false, stderr: false };
+  let droppedBefore = 0;
+  let truncatedFrames = null;
+  let state = null;
+  for (const entry of records.slice(1)) {
+    if (entry.kind === 'stdout' || entry.kind === 'stderr') {
+      open[entry.kind] += String(entry.text ?? '');
+      pending[entry.kind] = true;
+      droppedBefore += Number(entry.droppedBefore) || 0;
+      if (!entry.continued) {
+        lines[entry.kind].push(open[entry.kind]);
+        open[entry.kind] = '';
+        pending[entry.kind] = false;
+      }
+    } else if (entry.kind === 'truncated') {
+      truncatedFrames = (truncatedFrames ?? 0) + (Number(entry.framesDropped) || 0);
+    } else if (entry.kind === 'state') {
+      state = entry;
+    }
+  }
+  for (const kind of ['stdout', 'stderr']) if (pending[kind]) lines[kind].push(open[kind]);
+  return {
+    header: { runId: header.runId, adapter: header.adapter, startedAt: header.startedAt },
+    stdoutLines: lines.stdout,
+    stderrLines: lines.stderr,
+    droppedBefore,
+    truncatedFrames,
+    state,
+  };
+}
+
+/** The retained, text-only metadata of one harness log. */
+function logSummary(parsed) {
+  return {
+    runId: parsed.header.runId,
+    adapter: parsed.header.adapter,
+    startedAt: parsed.header.startedAt,
+    state: parsed.state,
+    truncatedFrames: parsed.truncatedFrames,
+    droppedBefore: parsed.droppedBefore,
+    stdoutLines: parsed.stdoutLines.length,
+    stderrLines: parsed.stderrLines.length,
+  };
+}
+
+/** The reassembled stdout lines of every log, in order, as one transcript. */
+export function transcriptOfLogs(logs) {
+  const parsed = logs.map(parseHarnessLog);
+  return { parsed, transcript: `${parsed.flatMap((entry) => entry.stdoutLines).join('\n')}\n` };
+}
+
+/**
+ * One leg's observation from its harness logs (one per run). The header's
+ * adapter must be the leg's adapter (otherwise `fail`); a truncated log or a
+ * dropped frame makes the leg at most `uncertain`.
+ */
+export function observeHarnessLogs({ adapter, logs, ...rest }) {
+  const { parsed, transcript } = transcriptOfLogs(logs);
+  const observation = observeLeg({ adapter, transcript, ...rest });
+  const mismatched = parsed.filter((entry) => entry.header.adapter !== adapter);
+  const droppedBefore = parsed.reduce((total, entry) => total + entry.droppedBefore, 0);
+  const incomplete = droppedBefore > 0 || parsed.some((entry) => entry.truncatedFrames !== null);
+  if (mismatched.length > 0) {
+    observation.reasons.push(`a log header names the adapter ${mismatched[0].header.adapter}, not ${adapter}`);
+    observation.result = 'fail';
+  }
+  if (incomplete) {
+    observation.reasons.push('incomplete log: frames were dropped or the size cap truncated it');
+    if (observation.result === 'pass') observation.result = 'uncertain';
+  }
+  observation.log = { incomplete, droppedBefore, logs: parsed.map(logSummary) };
+  return observation;
+}
+
 const LEG_ROWS = [
   ['claude-code', 'claude_code_leg'],
   ['stream-json-cli', 'codex_leg'],
@@ -366,32 +466,37 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       process.exit(1);
     }
   } else {
-    const [adapter, transcriptPath, versionPath] = args;
-    if (!adapter || !transcriptPath || !versionPath) {
-      process.stderr.write('usage: vp-s29-observations.mjs <adapter> <transcript> <version-file> [--manifest f] [--name N] [--skill S] [--home H] [--redacted-out f]\n');
+    // <adapter> <version-file> <log-file>... [flags]
+    const flagAt = args.findIndex((arg) => arg.startsWith('--'));
+    const [adapter, versionPath, ...logPaths] = flagAt < 0 ? args : args.slice(0, flagAt);
+    if (!adapter || !versionPath || logPaths.length === 0) {
+      process.stderr.write('usage: vp-s29-observations.mjs <adapter> <version-file> <log-file>... [--manifest f] [--skill S] [--home H] [--redacted-out f] [--summary-out f]\n');
       process.exit(2);
     }
     try {
       const manifestPath = argValue(args, '--manifest');
       const manifest = manifestPath ? JSON.parse(readFileSync(manifestPath, 'utf8')) : {};
-      const transcript = readFileSync(transcriptPath, 'utf8');
       const home = argValue(args, '--home') ?? manifest.local?.home ?? process.env.VP_S29_HOME ?? '';
-      const observation = observeLeg({
+      const logs = logPaths.map((path) => readFileSync(path, 'utf8'));
+      const observation = observeHarnessLogs({
         adapter,
-        transcript,
+        logs,
         versionText: readFileSync(versionPath, 'utf8'),
         skillName: argValue(args, '--skill') ?? manifest.skillName ?? 'release-notes',
         home,
         userSkillMarker: manifest.userSkillMarker,
       });
       const observationText = `${JSON.stringify(observation, null, 2)}\n`;
-      const redactedText = redact(normalizeText(transcript), home);
-      if (findSecrets(redactedText).length > 0 || findSecrets(observationText).length > 0) {
-        process.stderr.write('vp-s29-observations.mjs: a secret-shaped value remains after redaction; review the transcript by hand\n');
+      const summaryText = `${JSON.stringify(observation.log, null, 2)}\n`;
+      const redactedText = redact(normalizeText(transcriptOfLogs(logs).transcript), home);
+      if ([redactedText, observationText, summaryText].some((text) => findSecrets(text).length > 0)) {
+        process.stderr.write('vp-s29-observations.mjs: a secret-shaped value remains after redaction; review the log by hand\n');
         process.exit(1);
       }
       const redactedOut = argValue(args, '--redacted-out');
       if (redactedOut) writeFileSync(redactedOut, redactedText);
+      const summaryOut = argValue(args, '--summary-out');
+      if (summaryOut) writeFileSync(summaryOut, summaryText);
       process.stdout.write(observationText);
     } catch (error) {
       process.stderr.write(`vp-s29-observations.mjs: ${error.message}\n`);

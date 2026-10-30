@@ -1,10 +1,5 @@
 # VP-S29 operator procedure (Linux)
 
-> **NOT RUNNABLE YET.** The Agent panel renders the transcript as text, not as
-> the raw harness stream the helper parses, so the copy-out in step 4 is a
-> placeholder. Until a raw harness log, or a structured event export, exists,
-> this procedure cannot produce a filable run. Do not file a record from it.
-
 Scenario: `docs/desktop-stack-verification-plan.md`, row VP-S29. This is a
 local operator run with user-installed, credentialed CLIs, not a CI job. The
 helper `vp-s29-linux.sh` prepares the fixture, takes digests, derives each
@@ -127,17 +122,22 @@ For each adapter, in this order (`claude-code`, `stream-json-cli`, `pty-cli`):
    `procedures/vp-s29-linux.sh digests after-<adapter>-1`.
 3. Run 2: prompt `Draft release notes for version 1.2.0. Changes: added an export button; fixed a login timeout.`, Start, wait for the run to end, then immediately
    `procedures/vp-s29-linux.sh digests after-<adapter>-2`.
-4. (Placeholder until the capture route exists.) Copy the text of the Agent panel's "Agent transcript" list (the list whose
-   accessible label is "Agent transcript") of both runs, in order, into
-   one file per leg (`claude-transcript.txt`, `codex-transcript.txt`,
-   `gemini-transcript.txt`). The first lines are the startup capture.
+4. The product retains each run's harness output as a log file. The run's first
+   event in the panel announces `harness log: harness-logs/<run-id>.jsonl`:
+   note it. The file lives in the `harness-logs` folder of the app's local data
+   directory (on Linux, the app's folder under the user's local share
+   directory, the same place as the approval store). Copy it into the run
+   folder as `log-<adapter>-<n>.jsonl` (`n` is 1 for the identity prompt, 2 for
+   the task). The log is readable only by you (mode 0600) and holds the
+   harness output unscrubbed, so it may contain secrets until `observe` scrubs
+   it: never commit the raw logs.
 5. If a run hangs or the harness refuses (login, trust prompt, quota), use
-   Stop, keep whatever transcript exists, and continue: the leg records
+   Stop, keep the log the run produced, and continue: the leg records
    `uncertain`. Do not retry until it looks like a pass.
 
-The app does not retain a run's output on disk, so this copy-out is manual.
-Retaining run output on disk is a product change and is recorded as a
-residual of this procedure.
+A log holds frames as the capture side saw them. A truncated log (size cap) or
+a log with dropped frames makes its leg at most `uncertain`, and a log whose
+header names another adapter fails the leg.
 
 ## 5. Derive and record
 
@@ -147,10 +147,11 @@ residual of this procedure.
    `record` does the same comparison for all six and lists each one.
    `.omnifrons/` and the outbox may change; the digests cover only
    `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and every `skills/**/SKILL.md`.
-2. Per leg: `procedures/vp-s29-linux.sh observe <adapter> <transcript> <version-file>`
+2. Per leg: `procedures/vp-s29-linux.sh observe <adapter> <log-1> <log-2> <version-file>`
    with the adapter id (`claude-code`, `stream-json-cli`, `pty-cli`). It writes
-   `observation-<adapter>.json` and a redacted `transcript-<adapter>.txt`
-   (HOME prefixes become `<home>`).
+   `observation-<adapter>.json`, a redacted reassembled `transcript-<adapter>.txt`
+   (HOME prefixes become `<home>`) and `log-summary-<adapter>.json` (each log's
+   header, final state, truncation and dropped-frame counts).
 3. `procedures/vp-s29-linux.sh record --run-date YYYY-MM-DD --baseline-id <id> --build-channel-digest <sha256 of the AppImage> --exercised-artifact-digest <the same sha256>`
    writes `record.md` and `evidence-summary.txt`. `--build-channel` defaults
    to `packaged-ci` and `--evidence-artifact` (a file inside the run folder)
@@ -164,7 +165,7 @@ residual of this procedure.
 4. Append the filled record to the end of `docs/evidence/VP-001/records.md`
    without editing earlier records. The record's `result` is `uncertain`
    (or `fail`); per-leg results stay in the narrative rows.
-5. Commit `observation-*.json`, `transcript-*.txt`, `digests-*.txt`,
+5. Commit `observation-*.json`, `transcript-*.txt`, `log-summary-*.json`, `digests-*.txt`,
    `evidence-summary.txt` and `record.md`. Never commit the `private/` folder,
    credentials or a path under a home directory. `observe` scrubs HOME
    prefixes and secret-shaped values (bearer and authorization values, common

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  EXPECTED_VERSIONS, SWITCH_LEG, findSecrets, formatRecord, observeLeg, overallResult, redact,
+  EXPECTED_VERSIONS, SWITCH_LEG, findSecrets, formatRecord, observeHarnessLogs, observeLeg, overallResult, parseHarnessLog, redact,
 } from './vp-s29-observations.mjs';
 
 const OPTIONS = { definitionName: 'Orbit Scribe', skillName: 'release-notes', home: '/home/op' };
@@ -347,4 +347,100 @@ test('formatRecord lists each invocation digest result next to the overall value
   assert.match(text, /\| `digests_unchanged` \| false \|/);
   assert.match(text, /\| `digests_by_invocation` \| after-a-1 true; after-a-2 false; after-b-1 missing \|/);
   assert.match(text, /\| `result` \| fail \|/);
+});
+
+// Harness logs (src-tauri/src/harness_log.rs): one JSON object per line.
+const record = (value) => JSON.stringify(value);
+const header = (adapter = 'claude-code', runId = 'run-1') => record({
+  kind: 'header', schema: 'omnifrons.harness-log/1', runId, adapter, startedAt: '2026-11-01T10:00:00Z',
+});
+const out = (text, continued = false, droppedBefore = 0) => record({ kind: 'stdout', text, continued, droppedBefore });
+const err = (text) => record({ kind: 'stderr', text, continued: false, droppedBefore: 0 });
+const state = (code = 0) => record({ kind: 'state', state: 'exited', code });
+const log = (...parts) => `${parts.join('\n')}\n`;
+const claudeLog = (...extra) => log(
+  header('claude-code'), out(init), out(tool('Read', { file_path: 'AGENTS.md' })),
+  out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })), ...extra, state(),
+);
+
+test('parseHarnessLog reassembles continued fragments and keeps stderr, state and drops apart', () => {
+  const long = 'x'.repeat(30);
+  const parsed = parseHarnessLog(log(
+    header('claude-code', 'run-9'), out('first'), out(long.slice(0, 10), true), out(long.slice(10, 20), true), out(long.slice(20)),
+    err('warn'), out('after', false, 3), record({ kind: 'truncated', framesDropped: 7 }), state(1),
+  ));
+  assert.deepEqual(parsed.stdoutLines, ['first', long, 'after']);
+  assert.deepEqual(parsed.stderrLines, ['warn']);
+  assert.equal(parsed.header.runId, 'run-9');
+  assert.equal(parsed.header.adapter, 'claude-code');
+  assert.equal(parsed.header.startedAt, '2026-11-01T10:00:00Z');
+  assert.equal(parsed.droppedBefore, 3);
+  assert.equal(parsed.truncatedFrames, 7);
+  assert.deepEqual(parsed.state, { kind: 'state', state: 'exited', code: 1 });
+});
+
+test('parseHarnessLog flushes a fragment left open at the end and rejects bad logs', () => {
+  assert.deepEqual(parseHarnessLog(log(header(), out('part', true))).stdoutLines, ['part']);
+  assert.throws(() => parseHarnessLog(log(out('no header'))), /header/);
+  assert.throws(() => parseHarnessLog(`${header()}\n{not json\n`), /line 2/);
+  assert.throws(() => parseHarnessLog(log(record({ kind: 'header', schema: 'other/9', runId: 'r', adapter: 'a', startedAt: 't' }))), /schema/);
+});
+
+test('observeHarnessLogs passes a complete claude-code log and carries the log summary', () => {
+  const result = observeHarnessLogs({ adapter: 'claude-code', logs: [claudeLog()], versionText: CLAUDE_VERSION, ...OPTIONS });
+  assert.equal(result.result, 'pass');
+  assert.equal(result.log.logs.length, 1);
+  assert.deepEqual(result.log.logs[0].state, { kind: 'state', state: 'exited', code: 0 });
+  assert.equal(result.log.incomplete, false);
+  assert.equal(result.log.logs[0].runId, 'run-1');
+});
+
+test('a log whose header names another adapter fails the leg', () => {
+  const result = observeHarnessLogs({
+    adapter: 'claude-code', logs: [claudeLog().replace('"adapter":"claude-code"', '"adapter":"pty-cli"')], versionText: CLAUDE_VERSION, ...OPTIONS,
+  });
+  assert.equal(result.result, 'fail');
+  assert.ok(result.reasons.some((reason) => /adapter/.test(reason)));
+});
+
+test('a truncated marker or any dropped frame makes the leg at most uncertain', () => {
+  const truncated = observeHarnessLogs({
+    adapter: 'claude-code', logs: [claudeLog(record({ kind: 'truncated', framesDropped: 4 }))], versionText: CLAUDE_VERSION, ...OPTIONS,
+  });
+  assert.equal(truncated.result, 'uncertain');
+  assert.equal(truncated.log.incomplete, true);
+  assert.ok(truncated.reasons.some((reason) => /incomplete log/.test(reason)));
+  const dropped = observeHarnessLogs({
+    adapter: 'claude-code',
+    logs: [log(header(), out(init), out(tool('Read', { file_path: 'AGENTS.md' }), false, 2), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })), state())],
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(dropped.result, 'uncertain');
+  assert.equal(dropped.log.droppedBefore, 2);
+});
+
+test('a user-level skill path still fails even in an incomplete log', () => {
+  const result = observeHarnessLogs({
+    adapter: 'claude-code',
+    logs: [claudeLog(out(tool('Read', { file_path: '/home/op/.claude/skills/release-notes/SKILL.md' })), record({ kind: 'truncated', framesDropped: 1 }))],
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.result, 'fail');
+});
+
+test('the two runs of a leg combine; a pty-cli log uses its text frames', () => {
+  const first = log(header('claude-code', 'run-1'), out(init), out(tool('Read', { file_path: 'AGENTS.md' })), state());
+  const second = log(header('claude-code', 'run-2'), out(init), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })), state());
+  const both = observeHarnessLogs({ adapter: 'claude-code', logs: [first, second], versionText: CLAUDE_VERSION, ...OPTIONS });
+  assert.equal(both.result, 'pass');
+  assert.deepEqual(both.log.logs.map((entry) => entry.runId), ['run-1', 'run-2']);
+  const pty = observeHarnessLogs({
+    adapter: 'pty-cli',
+    logs: [log(header('pty-cli'), out('\u001b[1mLoaded 1 GEMINI.md file\u001b[0m'), out('ReadFile skills/release-notes/SKILL.md'), state())],
+    versionText: GEMINI_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(pty.result, 'pass');
 });

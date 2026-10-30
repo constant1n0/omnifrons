@@ -35,6 +35,14 @@ function sh(args, env = {}) {
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
+const frame = (kind, text) => JSON.stringify({ kind, text, continued: false, droppedBefore: 0 });
+// A harness log (src-tauri/src/harness_log.rs) holding `stdoutLines`, written to `file`.
+function writeLog(file, adapter, stdoutLines, extra = []) {
+  const header = JSON.stringify({ kind: 'header', schema: 'omnifrons.harness-log/1', runId: 'run-1', adapter, startedAt: '2026-11-01T10:00:00Z' });
+  const state = JSON.stringify({ kind: 'state', state: 'exited', code: 0 });
+  writeFileSync(file, `${[header, ...stdoutLines.map((line) => frame('stdout', line)), ...extra, state].join('\n')}\n`);
+}
+
 function prepared(dir) {
   const runDir = join(dir, 'run');
   const root = join(dir, 'definition');
@@ -116,12 +124,14 @@ test('compare and digests refuse bad arguments with exit 2', LINUX_ONLY, () => {
 test('observe writes observation-<adapter>.json and redacts HOME', LINUX_ONLY, () => {
   withDir((dir) => {
     const { runDir, home, env } = prepared(dir);
-    const transcript = join(dir, 'gemini.txt');
+    const transcript = join(dir, 'gemini.jsonl');
     const version = join(dir, 'gemini-version.txt');
-    writeFileSync(transcript, `Loaded GEMINI.md\nReadFile ${home}/.gemini/skills/release-notes/SKILL.md\n`);
+    writeLog(transcript, 'pty-cli', ['Loaded 1 GEMINI.md file', `ReadFile ${home}/.gemini/skills/release-notes/SKILL.md`]);
     writeFileSync(version, '0.41.2\n');
     const result = sh(['observe', 'pty-cli', transcript, version], env);
     assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(readFileSync(join(runDir, 'log-summary-pty-cli.json'), 'utf8'));
+    assert.equal(summary.logs[0].adapter, 'pty-cli');
     const written = readFileSync(join(runDir, 'observation-pty-cli.json'), 'utf8');
     assert.equal(JSON.parse(written).result, 'fail');
     assert.ok(!written.includes(home), 'HOME is redacted from the retained observation');
@@ -135,9 +145,12 @@ const ADAPTERS = ['claude-code', 'stream-json-cli', 'pty-cli'];
 const AFTER_LABELS = ADAPTERS.flatMap((adapter) => [1, 2].map((index) => `after-${adapter}-${index}`));
 
 function observedClaude(dir, env) {
-  const transcript = join(dir, 'claude.txt');
+  const transcript = join(dir, 'claude.jsonl');
   const version = join(dir, 'claude-version.txt');
-  writeFileSync(transcript, '{"type":"system","subtype":"init"}\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}},{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}\n');
+  writeLog(transcript, 'claude-code', [
+    '{"type":"system","subtype":"init"}',
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}},{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}',
+  ]);
   writeFileSync(version, '2.1.307 (Claude Code)\n');
   assert.equal(sh(['observe', 'claude-code', transcript, version], env).status, 0);
 }
@@ -294,14 +307,14 @@ test('record leaves no record.md when it fails, and names a corrupt observation 
 test('observe exits 1 and keeps nothing when the transcript still holds a secret-shaped value', LINUX_ONLY, () => {
   withDir((dir) => {
     const { runDir, env } = prepared(dir);
-    const transcript = join(dir, 'gemini.txt');
+    const transcript = join(dir, 'gemini.jsonl');
     const version = join(dir, 'gemini-version.txt');
     writeFileSync(version, '0.41.2\n');
-    writeFileSync(transcript, `Loaded GEMINI.md\nkey sk-ant-${'a1B2c3D4'.repeat(4)}\n`);
+    writeLog(transcript, 'pty-cli', ['Loaded 1 GEMINI.md file', `key sk-ant-${'a1B2c3D4'.repeat(4)}`]);
     const scrubbed = sh(['observe', 'pty-cli', transcript, version], env);
     assert.equal(scrubbed.status, 0, scrubbed.stderr);
     assert.doesNotMatch(readFileSync(join(runDir, 'transcript-pty-cli.txt'), 'utf8'), /sk-ant-/);
-    writeFileSync(transcript, 'Loaded GEMINI.md\n-----BEGIN PRIVATE KEY-----\nabc\n');
+    writeLog(transcript, 'pty-cli', ['Loaded 1 GEMINI.md file', '-----BEGIN PRIVATE KEY-----', 'abc']);
     const refused = sh(['observe', 'pty-cli', transcript, version], env);
     assert.equal(refused.status, 1);
     assert.match(refused.stderr, /secret-shaped/);
@@ -352,5 +365,27 @@ test('a symlinked SKILL.md records its target and the target content, and a dang
     unlinkSync(link);
     symlinkSync('missing.md', link);
     assert.match(take('four'), /^symlink {2}skills\/linked\/SKILL\.md -> missing\.md {2}dangling$/m);
+  });
+});
+
+test('observe takes the two logs of a leg and a log that is not a harness log is refused', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, env } = prepared(dir);
+    const first = join(dir, 'log-claude-code-1.jsonl');
+    const second = join(dir, 'log-claude-code-2.jsonl');
+    const version = join(dir, 'claude-version.txt');
+    writeFileSync(version, '2.1.307 (Claude Code)\n');
+    writeLog(first, 'claude-code', ['{"type":"system","subtype":"init"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}}]}}']);
+    writeLog(second, 'claude-code', ['{"type":"system","subtype":"init"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}']);
+    const both = sh(['observe', 'claude-code', first, second, version], env);
+    assert.equal(both.status, 0, both.stderr);
+    assert.equal(JSON.parse(readFileSync(join(runDir, 'observation-claude-code.json'), 'utf8')).result, 'pass');
+    assert.equal(JSON.parse(readFileSync(join(runDir, 'log-summary-claude-code.json'), 'utf8')).logs.length, 2);
+    const plain = join(dir, 'plain.txt');
+    writeFileSync(plain, 'just text\n');
+    const refused = sh(['observe', 'claude-code', plain, version], env);
+    assert.equal(refused.status, 1);
+    assert.equal(existsSync(join(runDir, 'observation-claude-code.json')), false);
+    assert.equal(existsSync(join(runDir, 'log-summary-claude-code.json')), false);
   });
 });
