@@ -157,7 +157,11 @@ residual of this procedure.
    key prefixes, long token-like runs) with `<redacted>` and exits 1 if one
    remains, but you still review every retained file by hand before committing:
    tokens, session ids and paths in login or quota errors are not always
-   recognizable.
+   recognizable. The catch-all token scrub keeps a run that is exactly a lowercase
+   sha256 digest and redacts every other long base64-like run, including the
+   `signature` values of a stream-json transcript: that loss is accepted. A
+   symlinked `SKILL.md` is not expected in the fixture; its digest line shows the
+   link's target as given, so check an absolute target for a local path.
 
 ## 6. Clean up
 

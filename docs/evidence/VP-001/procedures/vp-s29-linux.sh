@@ -54,12 +54,15 @@ run_dir() {
 # The host project-skill folders are listed `present`/`absent` too: none may
 # appear in the definition root during a run.
 digest_tree() {
-  local root="$1" name
+  local root="$1" list status=0
+  list="$(mktemp)" || return 1
+  # Every step checks its own status: this runs under `if !`, where errexit is off.
   (
-    cd "${root}"
+    cd "${root}" || exit 1
+    local name target hash
     for name in AGENTS.md CLAUDE.md GEMINI.md; do
       if [[ -f "${name}" ]]; then
-        sha256sum -- "${name}"
+        sha256sum -- "${name}" || exit 1
       else
         printf 'absent  %s\n' "${name}"
       fi
@@ -72,16 +75,28 @@ digest_tree() {
       fi
     done
     if [[ -d skills ]]; then
-      # A symlink is listed, never followed: a dangling one must not fail the run.
+      # The listing goes to a file first so a failing find (an unreadable
+      # subdirectory) fails the mode instead of yielding a partial digest.
+      find skills \( -type f -o -type l \) -name SKILL.md -print0 | LC_ALL=C sort -z > "${list}" || exit 1
       while IFS= read -r -d '' name; do
         if [[ -L "${name}" ]]; then
-          printf 'symlink  %s\n' "${name}"
+          # A symlink is listed with its target and, when it resolves to a
+          # regular file, that file's content digest; the listing never follows it.
+          target="$(readlink -- "${name}")" || exit 1
+          if [[ -f "${name}" ]]; then
+            hash="$(sha256sum -- "${name}" | cut -d' ' -f1)" || exit 1
+          else
+            hash=dangling
+          fi
+          printf 'symlink  %s -> %s  %s\n' "${name}" "${target}" "${hash}"
         else
-          sha256sum -- "${name}"
+          sha256sum -- "${name}" || exit 1
         fi
-      done < <(find skills \( -type f -o -type l \) -name SKILL.md -print0 | LC_ALL=C sort -z)
+      done < "${list}"
     fi
-  )
+  ) || status=$?
+  rm -f "${list}"
+  return "${status}"
 }
 
 mode_fixture() {

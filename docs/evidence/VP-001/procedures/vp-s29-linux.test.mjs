@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -214,7 +214,7 @@ test('digests list a symlinked or dangling SKILL.md as a symlink entry and never
     const result = sh(['digests', 'before'], env);
     assert.equal(result.status, 0, result.stderr);
     const digests = readFileSync(join(runDir, 'digests-before.txt'), 'utf8');
-    assert.match(digests, /^symlink {2}skills\/other\/SKILL\.md$/m);
+    assert.match(digests, /^symlink {2}skills\/other\/SKILL\.md -> .*does-not-exist {2}dangling$/m);
     assert.match(digests, /^[0-9a-f]{64} {2}skills\/release-notes\/SKILL\.md$/m);
   });
 });
@@ -270,5 +270,50 @@ test('observe exits 1 and keeps nothing when the transcript still holds a secret
     assert.match(refused.stderr, /secret-shaped/);
     assert.equal(existsSync(join(runDir, 'transcript-pty-cli.txt')), false);
     assert.equal(existsSync(join(runDir, 'observation-pty-cli.json')), false);
+  });
+});
+
+test('digests fail and leave no file when a skills subdirectory cannot be listed', unreadableTest, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    const hidden = join(root, 'skills', 'hidden');
+    mkdirSync(hidden);
+    chmodSync(hidden, 0o000);
+    try {
+      const result = sh(['digests', 'before'], env);
+      assert.notEqual(result.status, 0);
+      assert.equal(existsSync(join(runDir, 'digests-before.txt')), false);
+    } finally {
+      chmodSync(hidden, 0o755);
+    }
+  });
+});
+
+test('a symlinked SKILL.md records its target and the target content, and a dangling one says so', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    mkdirSync(join(root, 'skills', 'linked'));
+    writeFileSync(join(root, 'skills', 'linked', 'real-a.md'), 'content a\n');
+    writeFileSync(join(root, 'skills', 'linked', 'real-b.md'), 'content a\n');
+    const link = join(root, 'skills', 'linked', 'SKILL.md');
+    const take = (label) => {
+      assert.equal(sh(['digests', label], env).status, 0);
+      return readFileSync(join(runDir, `digests-${label}.txt`), 'utf8');
+    };
+    symlinkSync('real-a.md', link);
+    const first = take('one');
+    assert.match(first, /^symlink {2}skills\/linked\/SKILL\.md -> real-a\.md {2}[0-9a-f]{64}$/m);
+    writeFileSync(join(root, 'skills', 'linked', 'real-a.md'), 'content changed\n');
+    const changed = take('two');
+    assert.notEqual(changed, first, 'rewritten target content shows');
+    unlinkSync(link);
+    symlinkSync('real-b.md', link);
+    writeFileSync(join(root, 'skills', 'linked', 'real-a.md'), 'content a\n');
+    const retargeted = take('three');
+    assert.match(retargeted, /-> real-b\.md/);
+    assert.notEqual(retargeted, first, 'a retargeted link shows even with equal content');
+    unlinkSync(link);
+    symlinkSync('missing.md', link);
+    assert.match(take('four'), /^symlink {2}skills\/linked\/SKILL\.md -> missing\.md {2}dangling$/m);
   });
 });

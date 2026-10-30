@@ -311,3 +311,17 @@ test('redact with an empty or slash-only HOME prefix never splits the text', () 
   assert.equal(redact('abc', ''), 'abc');
   assert.equal(redact('/home/op/x', '/home/op/'), '<home>/x');
 });
+
+test('a sha256 digest survives redaction and the detector, while base64-like runs do not', () => {
+  const digest = 'ab'.repeat(32);
+  const kept = redact(`sha256 ${digest}`, '');
+  assert.equal(kept, `sha256 ${digest}`);
+  assert.deepEqual(findSecrets(kept), []);
+  const signature = 'Zm9vYmFy'.repeat(6);
+  assert.equal(redact(`signature ${signature}`, ''), 'signature <redacted>');
+  assert.ok(findSecrets(`signature ${signature}`).length > 0);
+  assert.ok(findSecrets(`${digest}${'c'.repeat(10)}`).length > 0, 'a longer run is not a digest');
+  assert.ok(findSecrets(`x${digest}`).length > 0, 'neither is a digest with a neighbour');
+  const observation = JSON.stringify({ digest, other: { sha256: 'f'.repeat(64) } }, null, 2);
+  assert.deepEqual(findSecrets(observation), []);
+});

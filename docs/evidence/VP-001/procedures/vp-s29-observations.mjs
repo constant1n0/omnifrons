@@ -56,11 +56,15 @@ export function normalizeText(text) {
 // Secret-shaped values a harness may print (tokens, keys, session ids in login
 // or quota errors). Conservative on purpose: a false positive costs a manual
 // look, a miss leaks a credential into a committed file.
+// A run that is exactly a lowercase sha256 digest is evidence, not a secret.
+const SHA256_DIGEST = /^[0-9a-f]{64}$/;
+const LONG_RUN = /[A-Za-z0-9+=_-]{40,}/g;
+
 const SECRET_REDACTIONS = [
   [/(authorization:\s*)[^\r\n]*/gi, '$1<redacted>'],
   [/(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1<redacted>'],
   [/\b(?:sk-ant-|sk-|ghp_|gho_|xoxb-|AIza)[A-Za-z0-9_-]{8,}/g, '<redacted>'],
-  [/[A-Za-z0-9+=_-]{40,}/g, '<redacted>'],
+  [/[A-Za-z0-9+=_-]{40,}/g, (run) => (SHA256_DIGEST.test(run) ? run : '<redacted>')],
 ];
 
 // What `findSecrets` reports: the redaction patterns again, plus material that
@@ -69,13 +73,14 @@ const SECRET_DETECTORS = [
   /authorization:\s*(?!<redacted>)\S/i,
   /bearer\s+(?!<redacted>)[A-Za-z0-9._~+/=-]+/i,
   /\b(?:sk-ant-|sk-|ghp_|gho_|xoxb-|AIza)[A-Za-z0-9_-]{8,}/,
-  /[A-Za-z0-9+=_-]{40,}/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
 
 /** Descriptions of the secret-shaped values left in `text` (never the values). */
 export function findSecrets(text) {
-  return SECRET_DETECTORS.filter((pattern) => pattern.test(text)).map((pattern) => `matches ${pattern.source}`);
+  const found = SECRET_DETECTORS.filter((pattern) => pattern.test(text)).map((pattern) => `matches ${pattern.source}`);
+  if ((text.match(LONG_RUN) ?? []).some((run) => !SHA256_DIGEST.test(run))) found.push(`matches ${LONG_RUN.source}`);
+  return found;
 }
 
 /** Replaces the HOME prefix, any other home-shaped prefix and secret-shaped
