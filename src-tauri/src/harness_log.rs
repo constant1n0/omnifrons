@@ -24,9 +24,9 @@
 //!
 //! # Limits and privacy
 //!
-//! A log holds at most [`MAX_LOG_BYTES`]; past that, text frames are
-//! counted instead of written, while the truncation marker and the final
-//! state line are always written. Only the newest [`RETAINED_LOGS`] logs
+//! A log file holds at most [`MAX_LOG_BYTES`] in all; text frames that
+//! would not leave room for the truncation marker and the final state line
+//! are counted instead of written, and those two lines are always written. Only the newest [`RETAINED_LOGS`] logs
 //! are kept ([`prune`]). Nothing is redacted: the file is exactly what the
 //! harness printed and is readable only by the user; whoever archives one
 //! as evidence scrubs it first. The renderer never receives a path, only
@@ -39,7 +39,7 @@
 //! most that many frames and the writer does not issue a syscall per line.
 //! The header line is flushed when the log opens.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -51,8 +51,13 @@ use serde::Serialize;
 
 use crate::ipc::dto::ProcessTerminalStateDto;
 
-/// The most bytes of text-frame lines one log holds.
+/// The most bytes one log file holds, header, text frames, truncation
+/// marker and state line included: text frames stop being written once
+/// they would leave less than [`RESERVED_TAIL_BYTES`] of this bound.
 pub const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+/// Room kept free for the lines that are always written: the truncation
+/// marker and the state line, a few dozen bytes each.
+const RESERVED_TAIL_BYTES: u64 = 256;
 /// How many logs are kept; older ones are deleted when a run starts.
 pub const RETAINED_LOGS: usize = 64;
 /// The header line's `schema` value.
@@ -139,35 +144,42 @@ pub struct PruneReport {
     pub failed: usize,
 }
 
-/// Delete the oldest logs beyond `keep`. Names sort chronologically
-/// (`run-<seconds>-<nanoseconds>-<sequence>`), so the order is by name.
-/// Only `run-*.jsonl` entries are considered and at most
-/// [`MAX_SCANNED_ENTRIES`] are read. A delete that fails is counted and
-/// logged by error kind at debug level, never returned as an error.
+/// The numeric order key of a log file name
+/// `run-<seconds>-<nanoseconds>-<sequence>.jsonl`, or `None` when the name
+/// has another shape.
+fn run_order_key(file_name: &str) -> Option<(u64, u64, u64)> {
+    let stem = file_name.strip_suffix(".jsonl")?.strip_prefix("run-")?;
+    let mut parts = stem.splitn(3, '-');
+    let seconds = parts.next()?.parse().ok()?;
+    let nanoseconds = parts.next()?.parse().ok()?;
+    let sequence = parts.next()?.parse().ok()?;
+    Some((seconds, nanoseconds, sequence))
+}
+
+/// Delete the oldest logs beyond `keep`, ordered by the numeric parts of
+/// the run id (`run-<seconds>-<nanoseconds>-<sequence>`), so an unpadded
+/// sequence of 10 sorts after 9. Only entries named like a run log are
+/// considered, at most [`MAX_SCANNED_ENTRIES`] are read, and a `.jsonl`
+/// file whose name does not parse is left alone: it is not one of ours to
+/// age out. A delete that fails is counted and logged by error kind at
+/// debug level, never returned as an error.
 pub fn prune(dir: &HarnessLogDir, keep: usize) -> PruneReport {
     let Ok(entries) = std::fs::read_dir(&dir.path) else {
         return PruneReport::default();
     };
-    let mut names: Vec<std::ffi::OsString> = entries
+    let mut logs: Vec<((u64, u64, u64), std::ffi::OsString)> = entries
         .take(MAX_SCANNED_ENTRIES)
         .filter_map(Result::ok)
         .map(|entry| entry.file_name())
-        .filter(|name| {
-            name.to_str().is_some_and(|name| {
-                name.starts_with("run-")
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext == "jsonl")
-            })
-        })
+        .filter_map(|name| Some((run_order_key(name.to_str()?)?, name)))
         .collect();
-    names.sort();
+    logs.sort();
     let mut report = PruneReport {
-        scanned: names.len(),
+        scanned: logs.len(),
         ..PruneReport::default()
     };
-    let excess = names.len().saturating_sub(keep);
-    for name in names.into_iter().take(excess) {
+    let excess = logs.len().saturating_sub(keep);
+    for (_, name) in logs.into_iter().take(excess) {
         match std::fs::remove_file(dir.path.join(&name)) {
             Ok(()) => report.deleted += 1,
             Err(error) => {
@@ -214,7 +226,7 @@ struct StateLine<'a> {
 
 /// One run's open log.
 pub struct HarnessLog {
-    writer: BufWriter<File>,
+    writer: BufWriter<Box<dyn Write + Send>>,
     written: u64,
     cap: u64,
     frames_dropped: u64,
@@ -249,8 +261,20 @@ impl HarnessLog {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let file = options.open(dir.file_for(run_id))?;
+        Self::from_writer(Box::new(file), run_id, adapter, now, cap)
+    }
+
+    /// Start a log over any writer and write the header: the seam the
+    /// tests use to make a write fail.
+    pub(crate) fn from_writer(
+        sink: Box<dyn Write + Send>,
+        run_id: &RunId,
+        adapter: &AdapterId,
+        now: SystemTime,
+        cap: u64,
+    ) -> Result<Self, HarnessLogError> {
         let mut log = Self {
-            writer: BufWriter::with_capacity(BUFFER_BYTES, file),
+            writer: BufWriter::with_capacity(BUFFER_BYTES, sink),
             written: 0,
             cap,
             frames_dropped: 0,
@@ -298,7 +322,9 @@ impl HarnessLog {
         let mut bytes =
             serde_json::to_vec(&line).map_err(|_| HarnessLogError(io::ErrorKind::InvalidData))?;
         bytes.push(b'\n');
-        if self.frames_dropped > 0 || self.written + bytes.len() as u64 > self.cap {
+        if self.frames_dropped > 0
+            || self.written + bytes.len() as u64 + RESERVED_TAIL_BYTES > self.cap
+        {
             self.frames_dropped += 1;
             return Ok(());
         }
@@ -515,7 +541,7 @@ mod tests {
             &run("run-3-000000000-0"),
             &AdapterId::claude_code(),
             at(0),
-            400,
+            700,
         )
         .expect("open");
         for seq in 0..10 {
@@ -535,6 +561,10 @@ mod tests {
             serde_json::json!({"kind":"truncated","framesDropped": 10 - kept})
         );
         assert_eq!(lines[n - 1]["kind"], "state");
+        let size = std::fs::metadata(dir.path.join("run-3-000000000-0.jsonl"))
+            .expect("meta")
+            .len();
+        assert!(size <= 700, "the cap bounds the whole file, got {size}");
     }
 
     #[test]
@@ -606,6 +636,59 @@ mod tests {
         assert!(
             dir.path.join("notes.txt").exists(),
             "foreign files are never touched"
+        );
+    }
+
+    #[test]
+    fn prune_orders_by_the_numeric_parts_of_the_run_id_and_spares_unparseable_names() {
+        let temp = Temp::new("pruneorder");
+        let dir = HarnessLogDir::open(&temp.0).expect("dir");
+        for name in ["run-1-5-9", "run-1-5-10", "run-1-5-2", "run-foo"] {
+            std::fs::write(dir.path.join(format!("{name}.jsonl")), b"{}\n").expect("seed");
+        }
+        let report = prune(&dir, 1);
+        assert_eq!(report.deleted, 2);
+        assert!(dir.path.join("run-1-5-10.jsonl").exists(), "newest kept");
+        assert!(!dir.path.join("run-1-5-9.jsonl").exists());
+        assert!(!dir.path.join("run-1-5-2.jsonl").exists());
+        assert!(
+            dir.path.join("run-foo.jsonl").exists(),
+            "unparseable is never deleted"
+        );
+    }
+
+    #[test]
+    fn a_failing_writer_surfaces_as_an_error_from_the_flush() {
+        struct FailsAfter(usize);
+        impl Write for FailsAfter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if buf.len() > self.0 {
+                    return Err(io::Error::from(io::ErrorKind::StorageFull));
+                }
+                self.0 -= buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut log = HarnessLog::from_writer(
+            Box::new(FailsAfter(300)),
+            &run("run-9-000000000-0"),
+            &AdapterId::claude_code(),
+            at(0),
+            MAX_LOG_BYTES,
+        )
+        .expect("the header fits");
+        let mut failed = None;
+        for seq in 0..256 {
+            if let Err(error) = log.write_frame(&text(seq, OutputStream::Stdout, "a", false, 0)) {
+                failed = Some(error);
+            }
+        }
+        assert!(
+            failed.is_some(),
+            "the flush at frame 256 must report the write error"
         );
     }
 

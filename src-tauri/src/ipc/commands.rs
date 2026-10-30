@@ -419,33 +419,83 @@ fn forward_adapter_output(
         // frame of the run (`crate::harness_log`).
         let (mut run_log, opening) =
             open_run_log(&app.state::<HarnessLogs>().0, &run_id, &adapter_id);
-        if on_frame.send(sequencer.shell_event(opening)).is_err() {
-            return;
-        }
+        let mut send = |frame: HarnessFrame| on_frame.send(frame).is_ok();
         match forwarder_for(adapter.describe().transport_class) {
             ForwarderKind::Line => {
                 let mut assembler = LineAssembler::new();
-                relay_wire_frames(id_dto, receiver, &on_frame, |frame| {
-                    let mut frames = log_frame(&mut run_log, &mut sequencer, &frame);
-                    frames.extend(adapter_wire_frames(
-                        adapter,
-                        &mut assembler,
-                        &mut sequencer,
-                        frame,
-                    ));
-                    frames
-                });
+                relay_logged_run(
+                    id_dto,
+                    receiver,
+                    &mut send,
+                    &mut run_log,
+                    &mut sequencer,
+                    opening,
+                    &mut |sequencer, frame| {
+                        adapter_wire_frames(adapter, &mut assembler, sequencer, frame)
+                    },
+                );
             }
             ForwarderKind::Pty => {
                 let mut forwarder = PtyForwarder::new();
-                relay_wire_frames(id_dto, receiver, &on_frame, |frame| {
-                    let mut frames = log_frame(&mut run_log, &mut sequencer, &frame);
-                    frames.extend(pty_wire_frames(&mut forwarder, &mut sequencer, frame));
-                    frames
-                });
+                relay_logged_run(
+                    id_dto,
+                    receiver,
+                    &mut send,
+                    &mut run_log,
+                    &mut sequencer,
+                    opening,
+                    &mut |sequencer, frame| pty_wire_frames(&mut forwarder, sequencer, frame),
+                );
             }
         }
     });
+}
+
+/// Relay one adapter run: send the `opening` event, then for every raw
+/// frame of `receiver`, in order, log it ([`log_frame`]), map it with
+/// `map`, and send the result through `send` (`false` means the renderer
+/// channel is closed).
+///
+/// A closed channel never stops the loop: the frames after it are still
+/// logged and mapped but no longer sent, so the receiver is drained to the
+/// terminal frame, the log ends with its state line, and the run-end
+/// tracker inside `sequencer` sees the terminal frame. The loop ends when
+/// the receiver closes (the process is confirmed terminal and drained).
+fn relay_logged_run(
+    id_dto: ProcessIdDto,
+    receiver: Receiver<OutputFrame>,
+    send: &mut dyn FnMut(HarnessFrame) -> bool,
+    run_log: &mut RunLog,
+    sequencer: &mut AdapterWireSequencer,
+    opening: AdapterEventDto,
+    map: &mut dyn FnMut(&mut AdapterWireSequencer, OutputFrame) -> Vec<HarnessFrame>,
+) {
+    let mut send_failures = 0u32;
+    let mut open = send(sequencer.shell_event(opening));
+    if !open {
+        send_failures += 1;
+    }
+    for frame in receiver {
+        let mut frames = log_frame(run_log, sequencer, &frame);
+        frames.extend(map(sequencer, frame));
+        if !open {
+            continue;
+        }
+        for wire_frame in frames {
+            if !send(wire_frame) {
+                send_failures += 1;
+                open = false;
+                break;
+            }
+        }
+    }
+    if send_failures > 0 {
+        tracing::warn!(
+            pid = id_dto.0,
+            send_failures,
+            "adapter output forwarder lost its channel; the run was still drained and logged"
+        );
+    }
 }
 
 /// One run's harness log as the forwarder holds it: the open log, or
@@ -553,34 +603,6 @@ const fn forwarder_for(transport: TransportClass) -> ForwarderKind {
     match transport {
         TransportClass::StructuredStreamingCli => ForwarderKind::Line,
         TransportClass::Pty => ForwarderKind::Pty,
-    }
-}
-
-/// Relay every raw frame of `receiver` through `map` onto `on_frame`, in
-/// order, until the receiver closes (the process is confirmed terminal and
-/// fully drained) or a send fails (the frontend navigated away or dropped
-/// the channel).
-fn relay_wire_frames(
-    id_dto: ProcessIdDto,
-    receiver: Receiver<OutputFrame>,
-    on_frame: &Channel<HarnessFrame>,
-    mut map: impl FnMut(OutputFrame) -> Vec<HarnessFrame>,
-) {
-    let mut send_failures = 0u32;
-    'frames: for frame in receiver {
-        for wire_frame in map(frame) {
-            if on_frame.send(wire_frame).is_err() {
-                send_failures += 1;
-                break 'frames;
-            }
-        }
-    }
-    if send_failures > 0 {
-        tracing::warn!(
-            pid = id_dto.0,
-            send_failures,
-            "adapter output forwarder stopped after a channel send failure"
-        );
     }
 }
 
@@ -4510,5 +4532,115 @@ mod tests {
             lines[2],
             serde_json::json!({"kind":"state","state":"exited","code":0})
         );
+    }
+
+    /// A renderer channel that is already closed at the announcement must
+    /// not stop the forwarder: the receiver is still drained to the state
+    /// frame and the log still ends with the state line.
+    #[test]
+    fn a_closed_renderer_channel_still_drains_the_run_into_the_log() {
+        let temp = TempProject::new("log-closed");
+        let logs = crate::harness_log::HarnessLogDir::open(&temp.0);
+        let run_id = omnifrons_domain::outbox::RunId::new("run-9-000000000-3").expect("valid");
+        let (mut run_log, opening) = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(a_text_frame(0, "first")).expect("queue");
+        tx.send(a_text_frame(1, "second")).expect("queue");
+        tx.send(omnifrons_app::OutputFrame::new(
+            2,
+            omnifrons_app::FramePayload::State(omnifrons_app::ProcessTerminalState::Exited {
+                code: Some(0),
+            }),
+        ))
+        .expect("queue");
+        drop(tx);
+        let mut sequencer = super::AdapterWireSequencer::new(ProcessIdDto(7));
+
+        super::relay_logged_run(
+            ProcessIdDto(7),
+            rx,
+            &mut |_frame| false,
+            &mut run_log,
+            &mut sequencer,
+            opening,
+            &mut |_sequencer, _frame| Vec::new(),
+        );
+
+        let lines = log_lines(&temp.0, "run-9-000000000-3");
+        assert_eq!(lines.len(), 4, "header, two text frames, state: {lines:?}");
+        assert_eq!(lines[3]["kind"], "state");
+    }
+
+    /// A write that fails raises one diagnostic, later frames are not
+    /// logged and raise nothing more, and the relay goes on.
+    #[test]
+    fn a_failing_log_write_emits_one_diagnostic_and_the_relay_continues() {
+        struct FailsAfter(usize);
+        impl std::io::Write for FailsAfter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.len() > self.0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+                }
+                self.0 -= buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = crate::harness_log::HarnessLog::from_writer(
+            Box::new(FailsAfter(300)),
+            &omnifrons_domain::outbox::RunId::new("run-9-000000000-4").expect("valid"),
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+            std::time::SystemTime::UNIX_EPOCH,
+            crate::harness_log::MAX_LOG_BYTES,
+        )
+        .expect("the header fits");
+        let mut run_log = super::RunLog { log: Some(log) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        for seq in 0..300 {
+            tx.send(a_text_frame(seq, "a")).expect("queue");
+        }
+        drop(tx);
+        let mut sequencer = super::AdapterWireSequencer::new(ProcessIdDto(7));
+        let mut sent: Vec<HarnessFrame> = Vec::new();
+
+        super::relay_logged_run(
+            ProcessIdDto(7),
+            rx,
+            &mut |frame| {
+                sent.push(frame);
+                true
+            },
+            &mut run_log,
+            &mut sequencer,
+            crate::ipc::dto::AdapterEventDto::HarnessLog {
+                run_id: "run-9-000000000-4".to_string(),
+                name: "harness-logs/run-9-000000000-4.jsonl".to_string(),
+            },
+            &mut |sequencer, _frame| {
+                vec![
+                    sequencer.shell_event(crate::ipc::dto::AdapterEventDto::Message {
+                        text: "m".to_string(),
+                    }),
+                ]
+            },
+        );
+
+        let diagnostics = sent
+            .iter()
+            .filter(|frame| summarize(frame).2 == "diagnostic")
+            .count();
+        let messages = sent
+            .iter()
+            .filter(|frame| summarize(frame).2 == "message")
+            .count();
+        assert_eq!(diagnostics, 1, "exactly one diagnostic");
+        assert_eq!(messages, 300, "every frame is still relayed");
+        assert!(run_log.log.is_none(), "the failed log is dropped");
     }
 }
