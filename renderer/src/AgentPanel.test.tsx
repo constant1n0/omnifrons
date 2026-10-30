@@ -8987,6 +8987,38 @@ describe('AgentPanel run-end misplaced frame (slice 5d)', () => {
     expect(transcriptRows()[1]).not.toContain('scan: 0 scanned')
     await endRun(channel)
   })
+
+  it('shows the run\'s harness log as one plain line, the fixed relative name and never a path', async () => {
+    let channel: LiveChannel | undefined
+    mountWrongRoots({ rows: [] }, (cmd, args) => {
+      if (cmd === 'harness_spawn') {
+        channel = (args as { onFrame: LiveChannel }).onFrame
+        return 7
+      }
+      return undefined
+    })
+    await startRunOverWorkspace()
+    if (!channel) throw new Error('harness_spawn was not called')
+
+    act(() => {
+      channel!.onmessage({
+        stream: 'event',
+        body: {
+          id: 7,
+          seq: 0,
+          droppedBefore: 0,
+          kind: 'harness-log',
+          payload: {
+            runId: 'run-1-000000000-0',
+            name: 'harness-logs/run-1-000000000-0.jsonl',
+          },
+        },
+      })
+    })
+
+    expect(transcriptRows()[1]).toBe('harness log: harness-logs/run-1-000000000-0.jsonl')
+    await endRun(channel)
+  })
 })
 
 describe('AgentPanel wrong roots and the workspace (slice 5d; slice 5c review, R1-001)', () => {

@@ -840,6 +840,9 @@ function DroppedFramesMarker({ droppedBefore }: { droppedBefore: number }) {
  * sentence when the walk stopped early. A scan that could not run emits no
  * `misplaced` frame at all: the shell sends its fixed `diagnostic` text in
  * its place, which renders as the diagnostic it is.
+ *
+ * `harness-log` (task 5d) renders as the one line `harness log: <name>`, the
+ * fixed relative name of the run's retained log and never a path.
  */
 function TranscriptEntryView({ item }: { item: TranscriptItem }) {
   if (item.type === 'prompt') {
@@ -915,6 +918,9 @@ function TranscriptEntryView({ item }: { item: TranscriptItem }) {
         <PlainTextLine text={formatCandidatesSummary(event.payload)} />
       )}
       {event.kind === 'misplaced' && <PlainTextLine text={formatScanSummary(event.payload)} />}
+      {event.kind === 'harness-log' && (
+        <PlainTextLine text={`harness log: ${event.payload.name}`} />
+      )}
       {event.kind === 'artifact-publish' && (
         <div data-testid="publish-proposal">
           <p>{PUBLISH_PROPOSAL_LABEL}</p>

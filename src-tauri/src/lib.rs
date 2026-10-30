@@ -7,6 +7,7 @@
 
 mod adapter_state;
 mod executable_state;
+mod harness_log;
 mod health;
 mod ipc;
 mod outbox_state;
@@ -97,6 +98,12 @@ pub fn run() {
             // (HAP-001 D1, D8; `docs/spike-log.md` § Slice 5b) and are
             // re-checked at every use, never opened here.
             app.manage(PublicationState::under(&store_dir));
+            // The per-run harness logs sit under the same directory
+            // (`crate::harness_log`); a failure to create it is reported per
+            // run, never fatal.
+            app.manage(harness_log::HarnessLogs(harness_log::HarnessLogDir::open(
+                &store_dir,
+            )));
             app.manage(ExecutableState::open(store_dir)?);
 
             // The closed, built-in adapter catalog and the single active-

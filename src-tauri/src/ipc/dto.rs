@@ -332,14 +332,16 @@ pub struct ProposedEntryDto {
 /// literal `kind`/`payload` field names [`HarnessFrame::Event`] flattens
 /// this into come from here.
 ///
-/// Three kinds are the shell's own rather than an adapter's:
+/// Four kinds are the shell's own rather than an adapter's:
 /// `artifact-publish` is the typed proposal a line agent recognized
 /// (spike slice 5); `candidates` is emitted once per adapter launch at run
 /// end, before the terminal `state` frame, summarizing the run
 /// subdirectory's inventory by state and attribution; and `misplaced`
 /// (spike slice 5d) follows it with the wrong-root scan's own counts --
 /// HAP-001 D16's post-run scan. Both carry counts only, never a name and
-/// never a path (`docs/spike-log.md` § Slice 5, § Slice 5d).
+/// never a path (`docs/spike-log.md` § Slice 5, § Slice 5d). `harness-log`
+/// names the run's retained harness log once, right after it opens
+/// (`crate::harness_log`).
 ///
 /// `Unknown::raw` is rendered as a plain (lossily decoded) string, never
 /// base64 or a byte array: every `raw` this slice's own adapters ever
@@ -418,6 +420,13 @@ pub enum AdapterEventDto {
         excluded: u32,
         unreadable: u32,
         truncated: bool,
+    },
+    /// Emitted once, right after the run's harness log opens (before any
+    /// `stdout` or `event` frame of the run): the run id and the fixed
+    /// relative name `harness-logs/<run id>.jsonl`, never a path.
+    HarnessLog {
+        run_id: String,
+        name: String,
     },
 }
 
@@ -4182,6 +4191,35 @@ mod tests {
                         "runId": "run-1", "total": 5, "candidate": 3, "outboxEscape": 1,
                         "outboxLinked": 1, "attributed": 2, "unattributed": 3,
                         "unreadable": 0, "unmatchedProposals": 1
+                    }
+                }
+            })
+        );
+    }
+
+    /// The `harness-log` event the shell emits once, right after a run's
+    /// log opens: the run id and the fixed relative name, never a path.
+    #[test]
+    fn harness_frame_event_harness_log_json_shape() {
+        let frame = HarnessFrame::event_dto(
+            ProcessIdDto(42),
+            0,
+            0,
+            super::AdapterEventDto::HarnessLog {
+                run_id: "run-1-000000000-0".to_string(),
+                name: "harness-logs/run-1-000000000-0.jsonl".to_string(),
+            },
+        );
+        assert_eq!(
+            json(&frame),
+            serde_json::json!({
+                "stream": "event",
+                "body": {
+                    "id": 42, "seq": 0, "droppedBefore": 0,
+                    "kind": "harness-log",
+                    "payload": {
+                        "runId": "run-1-000000000-0",
+                        "name": "harness-logs/run-1-000000000-0.jsonl"
                     }
                 }
             })

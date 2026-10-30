@@ -209,6 +209,13 @@ export interface CandidatesSummary {
  * rides it. A scan that could not run emits the fixed `diagnostic` text
  * `the project could not be scanned for output written outside the outbox`
  * in its place, never a `misplaced` frame claiming nothing was found.
+ *
+ * One kind (task 5d) names the run's retained harness log: `harness-log`
+ * is the shell's own announcement, emitted once per adapter launch right
+ * after the log opens and before any other frame of the run. It carries the
+ * run id and the fixed relative name `harness-logs/<run id>.jsonl` to show,
+ * never a path: the log lives in the app's local data directory and the
+ * renderer never learns where.
  */
 export type AgentEvent =
   | {
@@ -225,6 +232,7 @@ export type AgentEvent =
   | { kind: 'artifact-publish'; payload: { entries: ProposedEntry[] } }
   | { kind: 'candidates'; payload: CandidatesSummary }
   | { kind: 'misplaced'; payload: ScanSummary }
+  | { kind: 'harness-log'; payload: { runId: string; name: string } }
 
 interface HarnessEventFrameBody {
   id: ProcessId

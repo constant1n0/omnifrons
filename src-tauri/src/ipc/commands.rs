@@ -34,10 +34,10 @@ use omnifrons_app::run_outbox::{
     validate_outbox_declaration,
 };
 use omnifrons_app::{
-    ApprovalStore, ApprovalStoreError, EnvPlan, ExecutableProber, GateDecision, HarnessKind,
-    HarnessRequest, InvalidRequest, LaunchPlan, LaunchPlanError, LaunchRequest, LineAssembler,
-    OutputFrame, ProcessId, ProcessOutput, ProcessSupervisor, ProcessTerminalState, StdinPlan,
-    SupervisorError, TerminalChunk, TerminalNormalizer, WorkspaceRoot,
+    ApprovalStore, ApprovalStoreError, EnvPlan, ExecutableProber, FramePayload, GateDecision,
+    HarnessKind, HarnessRequest, InvalidRequest, LaunchPlan, LaunchPlanError, LaunchRequest,
+    LineAssembler, OutputFrame, ProcessId, ProcessOutput, ProcessSupervisor, ProcessTerminalState,
+    StdinPlan, SupervisorError, TerminalChunk, TerminalNormalizer, WorkspaceRoot,
 };
 use omnifrons_domain::adapter::{
     AdapterEvent, AdapterId, AgentPrompt, PromptError, TransportClass,
@@ -52,6 +52,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::adapter_state::AdapterState;
 use crate::executable_state::{CandidateId, CandidateTable, ExecutableState, ShellLaunchGate};
+use crate::harness_log::{self, HarnessLog, HarnessLogDir, HarnessLogError, HarnessLogs};
 use crate::ipc::dto::{
     AdapterDescriptorDto, AdapterEventDto, ApprovalDto, CandidateDto, CandidateIdDto, EvidenceDto,
     HarnessFrame, HarnessKindDto, OutboxReasonTag, OutboxStateTag, OutboxStatusDto, ProbeResultDto,
@@ -371,6 +372,7 @@ fn forward_output(id: ProcessId, receiver: Receiver<OutputFrame>, on_frame: Chan
 fn forward_adapter_output(
     id: ProcessId,
     adapter_id: AdapterId,
+    run_id: RunId,
     receiver: Receiver<OutputFrame>,
     on_frame: Channel<HarnessFrame>,
     app: AppHandle,
@@ -411,21 +413,128 @@ fn forward_adapter_output(
             None => RunEndTracker::new(Arc::clone(&outbox_state.runs), id, outbox_state.inventory),
         };
         let mut sequencer = AdapterWireSequencer::with_outbox(id_dto, tracker);
+
+        // The run's harness log opens here, on the forwarder thread, before
+        // the first frame is relayed, so its announcement is the first
+        // frame of the run (`crate::harness_log`).
+        let (mut run_log, opening) =
+            open_run_log(&app.state::<HarnessLogs>().0, &run_id, &adapter_id);
+        if on_frame.send(sequencer.shell_event(opening)).is_err() {
+            return;
+        }
         match forwarder_for(adapter.describe().transport_class) {
             ForwarderKind::Line => {
                 let mut assembler = LineAssembler::new();
                 relay_wire_frames(id_dto, receiver, &on_frame, |frame| {
-                    adapter_wire_frames(adapter, &mut assembler, &mut sequencer, frame)
+                    let mut frames = log_frame(&mut run_log, &mut sequencer, &frame);
+                    frames.extend(adapter_wire_frames(
+                        adapter,
+                        &mut assembler,
+                        &mut sequencer,
+                        frame,
+                    ));
+                    frames
                 });
             }
             ForwarderKind::Pty => {
                 let mut forwarder = PtyForwarder::new();
                 relay_wire_frames(id_dto, receiver, &on_frame, |frame| {
-                    pty_wire_frames(&mut forwarder, &mut sequencer, frame)
+                    let mut frames = log_frame(&mut run_log, &mut sequencer, &frame);
+                    frames.extend(pty_wire_frames(&mut forwarder, &mut sequencer, frame));
+                    frames
                 });
             }
         }
     });
+}
+
+/// One run's harness log as the forwarder holds it: the open log, or
+/// `None` when it could not be opened or a write failed (the run goes on
+/// without it).
+struct RunLog {
+    log: Option<HarnessLog>,
+}
+
+impl RunLog {
+    /// Write `frame` to the log. Returns the diagnostic text, once, when
+    /// the write fails; the log is then dropped and later calls are
+    /// no-ops.
+    fn record(&mut self, frame: &OutputFrame) -> Option<String> {
+        let log = self.log.as_mut()?;
+        let written = match &frame.payload {
+            FramePayload::Text { .. } => log.write_frame(frame),
+            FramePayload::State(state) => log.write_state(&ProcessTerminalStateDto::from(*state)),
+        };
+        match written {
+            Ok(()) => None,
+            Err(error) => {
+                self.log = None;
+                Some(log_unavailable_text(error))
+            }
+        }
+    }
+}
+
+/// The diagnostic text for a log that is not available: the I/O error kind
+/// only, never a path.
+fn log_unavailable_text(error: HarnessLogError) -> String {
+    format!("harness log unavailable: {error}")
+}
+
+/// Prune old logs, then open the log for `run_id`. Returns the run's log
+/// and the first event of the run: `harness-log` when the log opened, or
+/// one `Diagnostic` (and a log that records nothing) when it could not --
+/// a missing log never fails the run.
+fn open_run_log(
+    dir: &Result<HarnessLogDir, HarnessLogError>,
+    run_id: &RunId,
+    adapter_id: &AdapterId,
+) -> (RunLog, AdapterEventDto) {
+    let opened = match dir {
+        Ok(dir) => {
+            // One slot is left for the log about to be created.
+            let report = harness_log::prune(dir, harness_log::RETAINED_LOGS - 1);
+            if report.failed > 0 {
+                tracing::debug!(
+                    failed = report.failed,
+                    "old harness logs could not be deleted"
+                );
+            }
+            HarnessLog::open(dir, run_id, adapter_id)
+        }
+        Err(error) => Err(*error),
+    };
+    match opened {
+        Ok(log) => (
+            RunLog { log: Some(log) },
+            AdapterEventDto::HarnessLog {
+                run_id: run_id.as_str().to_string(),
+                name: HarnessLogDir::relative_name(run_id),
+            },
+        ),
+        Err(error) => (
+            RunLog { log: None },
+            AdapterEventDto::Diagnostic {
+                text: log_unavailable_text(error),
+            },
+        ),
+    }
+}
+
+/// Log `frame` before it is relayed; the frames to send ahead of its own
+/// mapping: none, or the single diagnostic of a failed write. Runs on the
+/// forwarder thread, synchronously, so the log order is the receive order;
+/// a slow disk slows the relay, bounded by the log's byte cap.
+fn log_frame(
+    run_log: &mut RunLog,
+    sequencer: &mut AdapterWireSequencer,
+    frame: &OutputFrame,
+) -> Vec<HarnessFrame> {
+    run_log
+        .record(frame)
+        .map(|text| sequencer.shell_event(AdapterEventDto::Diagnostic { text }))
+        .into_iter()
+        .collect()
 }
 
 /// The two ways [`forward_adapter_output`] can map a launch's raw frames.
@@ -882,6 +991,13 @@ impl AdapterWireSequencer {
         seq
     }
 
+    /// An event the shell itself raises (the `harness-log` announcement, a
+    /// log diagnostic): next sequence number, no drops.
+    fn shell_event(&mut self, event: AdapterEventDto) -> HarnessFrame {
+        let seq = self.next_seq();
+        HarnessFrame::event_dto(self.id, seq, 0, event)
+    }
+
     fn event(&mut self, dropped_before: u64, event: AdapterEvent) -> HarnessFrame {
         if let (Some(tracker), AdapterEvent::ArtifactPublish(proposal)) = (&self.tracker, &event) {
             tracker.record_proposal(proposal.clone());
@@ -1242,6 +1358,7 @@ async fn spawn_adapter_harness(
             crate::outbox_state::mint_next_run_id(),
         )
     };
+    let minted_run_id = run_id.clone();
     let display_path = executable.identity.canonical_path.clone();
     let (launched, receiver) = with_supervisor(app.clone(), move |supervisor| {
         let launched =
@@ -1271,7 +1388,7 @@ async fn spawn_adapter_harness(
             ),
         );
 
-    forward_adapter_output(id, adapter_id, receiver, on_frame, app);
+    forward_adapter_output(id, adapter_id, minted_run_id, receiver, on_frame, app);
     Ok(ProcessIdDto::from(id))
 }
 
@@ -2290,6 +2407,7 @@ mod tests {
                     AdapterEventDto::ArtifactPublish { .. } => "artifact-publish",
                     AdapterEventDto::Candidates { .. } => "candidates",
                     AdapterEventDto::Misplaced { .. } => "misplaced",
+                    AdapterEventDto::HarnessLog { .. } => "harness-log",
                 };
                 (*seq, *dropped_before, kind)
             }
@@ -4230,6 +4348,167 @@ mod tests {
             runs.lock().expect("table").held_handles(),
             0,
             "nothing of the evicted run is held"
+        );
+    }
+
+    // ---- harness log wiring (spike slice 5, task 5d) ----
+
+    fn a_text_frame(seq: u64, text: &str) -> omnifrons_app::OutputFrame {
+        omnifrons_app::OutputFrame::new(
+            seq,
+            omnifrons_app::FramePayload::Text {
+                stream: omnifrons_app::OutputStream::Stdout,
+                text: text.to_string(),
+                continued: false,
+            },
+        )
+    }
+
+    fn log_lines(dir: &std::path::Path, run: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("harness-logs").join(format!("{run}.jsonl")))
+            .expect("the log exists")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON line"))
+            .collect()
+    }
+
+    /// The opening of a run's log announces it with the `harness-log`
+    /// event: run id and the fixed relative name, nothing else.
+    #[test]
+    fn opening_a_run_log_announces_it_with_a_pathless_event() {
+        let temp = TempProject::new("log-open");
+        let logs = crate::harness_log::HarnessLogDir::open(&temp.0);
+        let run_id = omnifrons_domain::outbox::RunId::new("run-9-000000000-0").expect("valid");
+
+        let (_run_log, event) = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+
+        assert_eq!(
+            event,
+            crate::ipc::dto::AdapterEventDto::HarnessLog {
+                run_id: "run-9-000000000-0".to_string(),
+                name: "harness-logs/run-9-000000000-0.jsonl".to_string(),
+            }
+        );
+        assert_eq!(log_lines(&temp.0, "run-9-000000000-0")[0]["kind"], "header");
+    }
+
+    /// A directory that cannot be used never fails the run: one
+    /// diagnostic, no path in it, and the run's frames are not logged.
+    #[test]
+    fn an_unusable_log_directory_yields_one_diagnostic_without_a_path() {
+        let temp = TempProject::new("log-unusable");
+        let blocker = temp.0.join("blocker");
+        std::fs::write(&blocker, b"a file, not a directory").expect("fixture");
+        let logs = crate::harness_log::HarnessLogDir::open(&blocker);
+        let run_id = omnifrons_domain::outbox::RunId::new("run-9-000000000-1").expect("valid");
+
+        let (mut run_log, event) = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+
+        let crate::ipc::dto::AdapterEventDto::Diagnostic { text } = event else {
+            panic!("expected a diagnostic, got {event:?}");
+        };
+        assert!(text.starts_with("harness log unavailable: "), "{text}");
+        assert!(
+            !text.contains(temp.0.to_str().expect("utf-8 temp path")),
+            "the diagnostic must not carry a path: {text}"
+        );
+        assert_eq!(run_log.record(&a_text_frame(0, "x")), None);
+    }
+
+    /// Starting a run keeps at most 64 logs, the new one included.
+    #[test]
+    fn opening_a_run_log_prunes_to_the_retention_bound() {
+        let temp = TempProject::new("log-prune");
+        let logs = crate::harness_log::HarnessLogDir::open(&temp.0);
+        for n in 0..70 {
+            let name = format!("run-{:010}-000000000-0.jsonl", 1_000 + n);
+            std::fs::write(temp.0.join("harness-logs").join(name), b"{}\n").expect("seed");
+        }
+        let run_id =
+            omnifrons_domain::outbox::RunId::new("run-9999999999-000000000-0").expect("valid");
+
+        let _opened = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+
+        let remaining = std::fs::read_dir(temp.0.join("harness-logs"))
+            .expect("dir")
+            .count();
+        assert_eq!(remaining, 64);
+        assert!(
+            temp.0
+                .join("harness-logs/run-9999999999-000000000-0.jsonl")
+                .exists()
+        );
+        assert!(
+            !temp
+                .0
+                .join("harness-logs/run-0000001000-000000000-0.jsonl")
+                .exists()
+        );
+    }
+
+    /// Every received frame reaches the log, the terminal state last, and
+    /// the announcement takes the first sequence number so it precedes
+    /// every frame the adapter produced.
+    #[test]
+    fn received_frames_and_the_state_are_logged_and_the_announcement_comes_first() {
+        let temp = TempProject::new("log-frames");
+        let logs = crate::harness_log::HarnessLogDir::open(&temp.0);
+        let run_id = omnifrons_domain::outbox::RunId::new("run-9-000000000-2").expect("valid");
+        let (mut run_log, event) = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+        let mut sequencer = super::AdapterWireSequencer::new(ProcessIdDto(7));
+
+        let announcement = sequencer.shell_event(event);
+        assert_eq!(summarize(&announcement), (0, 0, "harness-log"));
+        let first = sequencer.event(
+            0,
+            omnifrons_domain::adapter::AdapterEvent::Message {
+                text: "hi".to_string(),
+            },
+        );
+        assert_eq!(
+            summarize(&first).0,
+            1,
+            "adapter frames follow the announcement"
+        );
+
+        assert!(
+            super::log_frame(
+                &mut run_log,
+                &mut sequencer,
+                &a_text_frame(0, "{\"type\":\"system\"}")
+            )
+            .is_empty()
+        );
+        let state = omnifrons_app::OutputFrame::new(
+            1,
+            omnifrons_app::FramePayload::State(omnifrons_app::ProcessTerminalState::Exited {
+                code: Some(0),
+            }),
+        );
+        assert!(super::log_frame(&mut run_log, &mut sequencer, &state).is_empty());
+
+        let lines = log_lines(&temp.0, "run-9-000000000-2");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1]["text"], "{\"type\":\"system\"}");
+        assert_eq!(
+            lines[2],
+            serde_json::json!({"kind":"state","state":"exited","code":0})
         );
     }
 }

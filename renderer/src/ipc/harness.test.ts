@@ -731,7 +731,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
     ])
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the eleven kinds to itself', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over AgentEvent kinds with a never default compiles, and at runtime maps each of the twelve kinds to itself', () => {
     function kindLabel(kind: AgentEvent['kind']): string {
       switch (kind) {
         case 'state':
@@ -745,6 +745,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
         case 'artifact-publish':
         case 'candidates':
         case 'misplaced':
+        case 'harness-log':
           return kind
         default: {
           const unreachable: never = kind
@@ -765,6 +766,7 @@ describe('HarnessFrame terminal event kinds (slice 4, pty-cli)', () => {
       'artifact-publish',
       'candidates',
       'misplaced',
+      'harness-log',
     ]
     expect(kinds.map(kindLabel)).toEqual(kinds)
   })
@@ -2551,6 +2553,36 @@ describe('misplacedRemedy (slice 5d)', () => {
       expect((rejected as ShellError).detail).toBeUndefined()
       clearMocks()
     }
+  })
+})
+
+describe('HarnessFrame harness-log event kind (task 5d)', () => {
+  it('delivers the harness-log event with exactly runId and name verbatim -- the fixed relative name, no path', async () => {
+    const { channel, received } = await spawnAdapterAndCapture('claude-code')
+
+    const frame: HarnessFrame = {
+      stream: 'event',
+      body: {
+        id: 42,
+        seq: 0,
+        droppedBefore: 0,
+        kind: 'harness-log',
+        payload: {
+          runId: 'run-1-000000000-0',
+          name: 'harness-logs/run-1-000000000-0.jsonl',
+        },
+      },
+    }
+    channel.onmessage(frame)
+
+    expect(received).toEqual([frame])
+    const delivered = received[0]
+    if (delivered?.stream !== 'event' || delivered.body.kind !== 'harness-log') {
+      throw new Error('expected a harness-log event frame')
+    }
+    expect(Object.keys(delivered.body.payload).sort()).toEqual(['name', 'runId'])
+    expectNoPathShapedKey(delivered.body.payload)
+    expect(delivered.body.payload.name).toBe(`harness-logs/${delivered.body.payload.runId}.jsonl`)
   })
 })
 

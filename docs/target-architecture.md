@@ -110,6 +110,8 @@ The planned adapter/event contract must define capabilities, epochs, sequence ow
 
 PTY bytes and escape/OSC sequences are untrusted active content. AEC-001 must normalize only allowlisted terminal controls into typed actions, render unsupported sequences inert or drop them with diagnostics, and never treat raw terminal bytes as authorization. Clipboard, hyperlink/navigation, title, notification, and file-transfer actions require the RCS-001 policy described below.
 
+Each adapter run also keeps a harness log: the frames the shell received from the harness, written as one JSON object per line (a header, the stdout and stderr text frames with their `continued` and `droppedBefore` fields, and the final state), so a reviewer can read the exact lines the product parsed. It is stored in the app's local data directory as `harness-logs/<run id>.jsonl`, never under the project, readable only by the user (mode 0700 for the directory and 0600 for each file on Unix; the default ACLs of the user's data directory on Windows). A log holds at most 8 MiB of text frames, after which frames are counted and a truncation marker precedes the final state line; the newest 64 logs are kept and older ones are deleted when a run starts. The log is not redacted, because it is exactly what the harness printed: whoever archives one as evidence removes secrets first. The renderer receives the run id and the fixed relative name to display and never the path. A log that cannot be created or written raises one diagnostic and the run continues without it.
+
 ## Model and harness switching
 
 A model change is a checkpoint-and-restart handoff, not a transparent transfer of a vendor session.
