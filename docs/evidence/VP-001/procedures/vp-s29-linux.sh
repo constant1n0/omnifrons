@@ -6,6 +6,7 @@
 # record. It never launches a harness or the app: the operator does that
 # (vp-s29-operator.md).
 #
+# usage-begin
 # Usage: vp-s29-linux.sh --help
 #        vp-s29-linux.sh fixture
 #        vp-s29-linux.sh digests <label>
@@ -16,11 +17,12 @@
 #          [--build-channel-digest <sha256> --exercised-artifact-digest <sha256>]
 #          [--evidence-artifact <file under the run folder, default evidence-summary.txt>]
 #          [--observed-state <token, default uncertain>] [--operator-role <role>]
-# Env: VP029_RUN_ID   run identifier (required for `record`; names the artifact folder)
-#      VP029_RUN_DIR  artifact folder (default: docs/evidence/VP-001/artifacts/vp-s29/<run id>)
-#      VP029_ROOT     the definition root (fixture, digests)
-#      VP029_HOME     the HOME holding the user-level skill (fixture; redacted from retained text)
+# Env: VP_S29_RUN_ID   run identifier (required for `record`; names the artifact folder)
+#      VP_S29_RUN_DIR  artifact folder (default: docs/evidence/VP-001/artifacts/vp-s29/<run id>)
+#      VP_S29_ROOT     the definition root (fixture, digests)
+#      VP_S29_HOME     the HOME holding the user-level skill (fixture; redacted from retained text)
 # Exit: 0 ok; 1 a failed check (digests differ, a helper failed); 2 a usage error.
+# usage-end
 
 set -euo pipefail
 
@@ -28,7 +30,7 @@ procedures_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${procedures_dir}/../../../.." && pwd)"
 
 usage() {
-  sed -n '3,/^# Exit:/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '/^# usage-begin$/,/^# usage-end$/p' "${BASH_SOURCE[0]}" | sed '1d;$d' | sed 's/^# \{0,1\}//'
 }
 
 die_usage() {
@@ -37,12 +39,12 @@ die_usage() {
 }
 
 run_dir() {
-  if [[ -n "${VP029_RUN_DIR:-}" ]]; then
-    printf '%s\n' "${VP029_RUN_DIR}"
-  elif [[ -n "${VP029_RUN_ID:-}" ]]; then
-    printf '%s\n' "${repo_root}/docs/evidence/VP-001/artifacts/vp-s29/${VP029_RUN_ID}"
+  if [[ -n "${VP_S29_RUN_DIR:-}" ]]; then
+    printf '%s\n' "${VP_S29_RUN_DIR}"
+  elif [[ -n "${VP_S29_RUN_ID:-}" ]]; then
+    printf '%s\n' "${repo_root}/docs/evidence/VP-001/artifacts/vp-s29/${VP_S29_RUN_ID}"
   else
-    die_usage "set VP029_RUN_ID or VP029_RUN_DIR"
+    die_usage "set VP_S29_RUN_ID or VP_S29_RUN_DIR"
   fi
 }
 
@@ -70,40 +72,54 @@ digest_tree() {
       fi
     done
     if [[ -d skills ]]; then
-      find skills \( -type f -o -type l \) -name SKILL.md -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum --
+      # A symlink is listed, never followed: a dangling one must not fail the run.
+      while IFS= read -r -d '' name; do
+        if [[ -L "${name}" ]]; then
+          printf 'symlink  %s\n' "${name}"
+        else
+          sha256sum -- "${name}"
+        fi
+      done < <(find skills \( -type f -o -type l \) -name SKILL.md -print0 | LC_ALL=C sort -z)
     fi
   )
 }
 
 mode_fixture() {
-  [[ -n "${VP029_ROOT:-}" && -n "${VP029_HOME:-}" ]] || die_usage "fixture needs VP029_ROOT and VP029_HOME"
+  [[ -n "${VP_S29_ROOT:-}" && -n "${VP_S29_HOME:-}" ]] || die_usage "fixture needs VP_S29_ROOT and VP_S29_HOME"
   local dir
   dir="$(run_dir)"
   mkdir -p "${dir}"
-  node "${procedures_dir}/vp-s29-fixture.mjs" --root "${VP029_ROOT}" --home "${VP029_HOME}" --manifest "${dir}/private/fixture.json"
+  node "${procedures_dir}/vp-s29-fixture.mjs" --root "${VP_S29_ROOT}" --home "${VP_S29_HOME}" --manifest "${dir}/private/fixture.json"
   echo "fixture prepared; manifest: private/fixture.json (local paths, ignored by git)"
 }
 
 mode_digests() {
   [[ $# -eq 1 ]] || die_usage "digests needs a label"
   [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die_usage "the label is a plain word: '$1'"
-  [[ -n "${VP029_ROOT:-}" && -d "${VP029_ROOT}" ]] || die_usage "digests needs VP029_ROOT to name an existing directory"
+  [[ -n "${VP_S29_ROOT:-}" && -d "${VP_S29_ROOT}" ]] || die_usage "digests needs VP_S29_ROOT to name an existing directory"
   local dir
   dir="$(run_dir)"
   mkdir -p "${dir}"
-  digest_tree "${VP029_ROOT}" > "${dir}/digests-$1.txt"
+  # Written to a temporary file and moved into place only when complete.
+  if ! digest_tree "${VP_S29_ROOT}" > "${dir}/.digests-$1.tmp"; then
+    rm -f "${dir}/.digests-$1.tmp"
+    echo "vp-s29-linux.sh: digests failed" >&2
+    return 1
+  fi
+  mv "${dir}/.digests-$1.tmp" "${dir}/digests-$1.txt"
   echo "wrote digests-$1.txt"
 }
 
 mode_compare() {
   [[ $# -eq 2 ]] || die_usage "compare needs two digest files"
   [[ -f "$1" && -f "$2" ]] || die_usage "digest file not found"
-  if diff -u --label "$(basename "$1")" --label "$(basename "$2")" "$1" "$2"; then
-    echo "digests unchanged"
-  else
-    echo "digests CHANGED" >&2
-    return 1
-  fi
+  local status=0
+  diff -u --label "$(basename "$1")" --label "$(basename "$2")" "$1" "$2" || status=$?
+  case "${status}" in
+    0) echo "digests unchanged" ;;
+    1) echo "digests CHANGED" >&2; return 1 ;;
+    *) echo "vp-s29-linux.sh: diff failed (status ${status})" >&2; return 2 ;;
+  esac
 }
 
 mode_observe() {
@@ -113,10 +129,10 @@ mode_observe() {
   dir="$(run_dir)"
   mkdir -p "${dir}"
   [[ -f "${dir}/private/fixture.json" ]] && manifest=(--manifest "${dir}/private/fixture.json")
-  [[ -n "${VP029_HOME:-}" ]] && home=(--home "${VP029_HOME}")
+  [[ -n "${VP_S29_HOME:-}" ]] && home=(--home "${VP_S29_HOME}")
   node "${procedures_dir}/vp-s29-observations.mjs" "$1" "$2" "$3" ${manifest[@]+"${manifest[@]}"} ${home[@]+"${home[@]}"} \
     --redacted-out "${dir}/transcript-$1.txt" > "${dir}/observation-$1.json" || {
-      rm -f "${dir}/observation-$1.json"
+      rm -f "${dir}/observation-$1.json" "${dir}/transcript-$1.txt"
       return 1
     }
   cat "${dir}/observation-$1.json"
@@ -144,7 +160,7 @@ mode_record() {
   local dir
   dir="$(run_dir)"
   [[ -d "${dir}" ]] || die_usage "run directory not found"
-  [[ -n "${VP029_RUN_ID:-}" ]] || die_usage "record needs VP029_RUN_ID"
+  [[ -n "${VP_S29_RUN_ID:-}" ]] || die_usage "record needs VP_S29_RUN_ID"
   [[ "${run_date}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die_usage "record needs --run-date YYYY-MM-DD"
 
   if [[ -n "${channel_digest}${artifact_digest}" ]]; then
@@ -186,10 +202,14 @@ mode_record() {
   [[ -n "${channel_digest}" ]] && optional+=(--build-channel-digest "${channel_digest}" --exercised-artifact-digest "${artifact_digest}")
   [[ -n "${observed_state}" ]] && optional+=(--observed-state "${observed_state}")
   [[ -n "${operator_role}" ]] && optional+=(--operator-role "${operator_role}")
-  node "${procedures_dir}/vp-s29-observations.mjs" record --run-dir "${dir}" --run-id "${VP029_RUN_ID}" \
+  node "${procedures_dir}/vp-s29-observations.mjs" record --run-dir "${dir}" --run-id "${VP_S29_RUN_ID}" \
     --run-date "${run_date}" --digests-unchanged "${unchanged}" \
-    --evidence-path "docs/evidence/VP-001/artifacts/vp-s29/${VP029_RUN_ID}/${evidence_artifact}" \
-    --evidence-digest "${digest}" ${optional[@]+"${optional[@]}"} > "${dir}/record.md"
+    --evidence-path "docs/evidence/VP-001/artifacts/vp-s29/${VP_S29_RUN_ID}/${evidence_artifact}" \
+    --evidence-digest "${digest}" ${optional[@]+"${optional[@]}"} > "${dir}/.record.md.tmp" || {
+      rm -f "${dir}/.record.md.tmp"
+      return 1
+    }
+  mv "${dir}/.record.md.tmp" "${dir}/record.md"
   echo "wrote record.md and evidence-summary.txt; fill every <operator: ...> placeholder before appending to records.md"
 }
 

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  EXPECTED_VERSIONS, SWITCH_LEG, formatRecord, observeLeg, overallResult,
+  EXPECTED_VERSIONS, SWITCH_LEG, findSecrets, formatRecord, observeLeg, overallResult, redact,
 } from './vp-s29-observations.mjs';
 
 const OPTIONS = { definitionName: 'Orbit Scribe', skillName: 'release-notes', home: '/home/op' };
@@ -245,4 +245,69 @@ test('formatRecord omits both digest rows when none is given and cites the named
   });
   assert.doesNotMatch(text, /build_channel_digest|exercised_artifact_digest/);
   assert.match(text, /retained redacted file docs\/evidence\/VP-001\/artifacts\/vp-s29\/run-2\/bundle\.txt/);
+});
+
+test('an assistant text mention of AGENTS.md is not loaded-file evidence; a tool_use read is', () => {
+  const textOnly = observeLeg({
+    adapter: 'claude-code',
+    transcript: lines(init, say('I read AGENTS.md at startup.'), tool('Read', { file_path: 'skills/release-notes/SKILL.md' })),
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(textOnly.result, 'uncertain');
+  assert.equal(textOnly.loadedFileEvidence.found, false);
+  const read = observeLeg({
+    adapter: 'claude-code',
+    transcript: lines(init, tool('Read', { file_path: 'AGENTS.md' }), tool('Read', { file_path: 'skills/release-notes/SKILL.md' })),
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(read.result, 'pass');
+});
+
+test('the same rule holds for the bridge, and for the indexed skill path named only in prose', () => {
+  const textOnly = observeLeg({
+    adapter: 'stream-json-cli',
+    transcript: lines(init, bridge, say('AGENTS.md says so.'), tool('command_execution', { command: 'cat skills/release-notes/SKILL.md' })),
+    versionText: CODEX_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(textOnly.result, 'uncertain');
+  const proseSkill = observeLeg({
+    adapter: 'claude-code',
+    transcript: lines(init, tool('Read', { file_path: 'AGENTS.md' }), say('I used skills/release-notes/SKILL.md')),
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(proseSkill.skillPaths.indexed, false);
+  assert.equal(proseSkill.result, 'uncertain');
+  const proseUser = observeLeg({
+    adapter: 'claude-code',
+    transcript: lines(init, tool('Read', { file_path: 'AGENTS.md' }), say('I used .claude/skills/release-notes/SKILL.md')),
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(proseUser.result, 'fail');
+});
+
+test('redact scrubs secret-shaped values and findSecrets reports what is left', () => {
+  const key = `sk-ant-${'Ab3dEf6h'.repeat(4)}`;
+  const text = [
+    `Authorization: Bearer abc.def-ghi`, `token ${key}`, `gh ghp_${'a'.repeat(30)}`, `slack xoxb-123-456-${'z'.repeat(12)}`,
+    `google AIza${'B'.repeat(35)}`, `hex ${'0123456789abcdef'.repeat(3)}`, 'path /work/definition/skills/release-notes/SKILL.md',
+  ].join('\n');
+  const out = redact(text, '');
+  assert.doesNotMatch(out, /abc\.def|sk-ant|ghp_|xoxb|AIza|0123456789abcdef/);
+  assert.match(out, /<redacted>/);
+  assert.match(out, /\/work\/definition\/skills\/release-notes\/SKILL\.md/, 'ordinary paths survive');
+  assert.deepEqual(findSecrets(out), []);
+  assert.ok(findSecrets('-----BEGIN RSA PRIVATE KEY-----').length > 0);
+  assert.ok(findSecrets(`raw ${key}`).length > 0);
+});
+
+test('redact with an empty or slash-only HOME prefix never splits the text', () => {
+  assert.equal(redact('abc', '/'), 'abc');
+  assert.equal(redact('abc', '//'), 'abc');
+  assert.equal(redact('abc', ''), 'abc');
+  assert.equal(redact('/home/op/x', '/home/op/'), '<home>/x');
 });

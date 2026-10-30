@@ -10,7 +10,11 @@ Outcome rules: the switch leg is always `uncertain` (no checkpoint-and-restart
 flow exists), so the run's overall `result` is `uncertain` and never discharges
 the ADR-0005 gate. A load leg is `pass` only with loaded-file evidence from the
 harness itself plus the indexed skill path; anything unclear is `uncertain`,
-never `pass`. A user-level skill path in a transcript, or a changed digest, is
+never `pass`. For `claude-code` and the bridge, loaded-file evidence is
+non-assistant material only: a `system` line naming `CLAUDE.md`/`AGENTS.md`, or
+a `tool_use` block whose input names the file (a read). An assistant text block
+that merely mentions the file never counts, and the indexed skill path counts
+only when it appears in such material. A user-level skill path in a transcript, or a changed digest, is
 `fail`.
 
 ## 0. Bindings
@@ -63,8 +67,8 @@ never `pass`. A user-level skill path in a transcript, or a changed digest, is
      `HOME` so the adapters' environment allowlist forwards it. Delete the
      directory afterwards; it holds credentials.
 4. Pick a run id and export the helper's variables (all paths absolute):
-   `VP029_RUN_ID` (for example `local-YYYYMMDD-1`), `VP029_ROOT` (a new
-   directory that does not exist yet: the definition root), `VP029_HOME`.
+   `VP_S29_RUN_ID` (for example `local-YYYYMMDD-1`), `VP_S29_ROOT` (a new
+   directory that does not exist yet: the definition root), `VP_S29_HOME`.
    Artifacts go to `docs/evidence/VP-001/artifacts/vp-s29/<run id>/`.
 5. `procedures/vp-s29-linux.sh fixture`. The root now holds only
    `skills/release-notes/SKILL.md`, so the Definition section offers
@@ -74,7 +78,7 @@ never `pass`. A user-level skill path in a transcript, or a changed digest, is
 
 ## 2. Create the definition through the app
 
-1. Start the app, choose "Pick workspace" and pick `VP029_ROOT`. Every harness
+1. Start the app, choose "Pick workspace" and pick `VP_S29_ROOT`. Every harness
    then starts in the definition root.
 2. In the Definition section tick "Also write GEMINI.md", then use "Create .".
 3. Type these answers, one per question (the form asks them in this order;
@@ -148,8 +152,12 @@ residual of this procedure.
    (or `fail`); per-leg results stay in the narrative rows.
 5. Commit `observation-*.json`, `transcript-*.txt`, `digests-*.txt`,
    `evidence-summary.txt` and `record.md`. Never commit the `private/` folder,
-   credentials or a path under a home directory. Check
-   the files for a home path before committing.
+   credentials or a path under a home directory. `observe` scrubs HOME
+   prefixes and secret-shaped values (bearer and authorization values, common
+   key prefixes, long token-like runs) with `<redacted>` and exits 1 if one
+   remains, but you still review every retained file by hand before committing:
+   tokens, session ids and paths in login or quota errors are not always
+   recognizable.
 
 ## 6. Clean up
 

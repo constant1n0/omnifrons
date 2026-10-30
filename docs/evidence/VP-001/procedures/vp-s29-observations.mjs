@@ -53,11 +53,40 @@ export function normalizeText(text) {
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
 }
 
-/** Replaces the HOME prefix, and any other home-shaped prefix, with a placeholder. */
+// Secret-shaped values a harness may print (tokens, keys, session ids in login
+// or quota errors). Conservative on purpose: a false positive costs a manual
+// look, a miss leaks a credential into a committed file.
+const SECRET_REDACTIONS = [
+  [/(authorization:\s*)[^\r\n]*/gi, '$1<redacted>'],
+  [/(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1<redacted>'],
+  [/\b(?:sk-ant-|sk-|ghp_|gho_|xoxb-|AIza)[A-Za-z0-9_-]{8,}/g, '<redacted>'],
+  [/[A-Za-z0-9+=_-]{40,}/g, '<redacted>'],
+];
+
+// What `findSecrets` reports: the redaction patterns again, plus material that
+// is never scrubbed automatically (a private key block) and so needs a person.
+const SECRET_DETECTORS = [
+  /authorization:\s*(?!<redacted>)\S/i,
+  /bearer\s+(?!<redacted>)[A-Za-z0-9._~+/=-]+/i,
+  /\b(?:sk-ant-|sk-|ghp_|gho_|xoxb-|AIza)[A-Za-z0-9_-]{8,}/,
+  /[A-Za-z0-9+=_-]{40,}/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+
+/** Descriptions of the secret-shaped values left in `text` (never the values). */
+export function findSecrets(text) {
+  return SECRET_DETECTORS.filter((pattern) => pattern.test(text)).map((pattern) => `matches ${pattern.source}`);
+}
+
+/** Replaces the HOME prefix, any other home-shaped prefix and secret-shaped
+ * values with placeholders. */
 export function redact(text, home) {
   let out = text;
-  if (home) out = out.split(home.replace(/\/+$/, '')).join('<home>');
-  return out.replace(/\/(?:home|Users)\/[^/\s"'\\]+/g, '<home>');
+  const prefix = home ? home.replace(/\/+$/, '') : '';
+  if (prefix) out = out.split(prefix).join('<home>');
+  out = out.replace(/\/(?:home|Users)\/[^/\s"'\\]+/g, '<home>');
+  for (const [pattern, replacement] of SECRET_REDACTIONS) out = out.replace(pattern, replacement);
+  return out;
 }
 
 const excerptOf = (line, home) => {
@@ -76,6 +105,23 @@ function parseJsonLine(line) {
 }
 
 const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** The `system` lines and `tool_use` blocks of a stream-json transcript, as
+ * strings; every other line (assistant text, results, plain text) is left out. */
+function harnessMaterial(lines, parsed) {
+  const out = [];
+  parsed.forEach((value, index) => {
+    if (!value) return;
+    if (value.type === 'system') out.push(lines[index]);
+    const content = value.message?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block && block.type === 'tool_use') out.push(JSON.stringify(block));
+      }
+    }
+  });
+  return out;
+}
 
 function findLines(lines, pattern) {
   return lines.filter((line) => pattern.test(line));
@@ -120,17 +166,23 @@ export function observeLeg({
     }
   }
 
+  // Material that comes from the harness, not the model's prose: `system`
+  // lines and `tool_use` blocks (a read names its file in its input). An
+  // assistant `text` block never counts. A PTY capture has no such structure.
+  const jsonAdapter = adapter !== 'pty-cli';
+  const material = jsonAdapter ? harnessMaterial(lines, parsed) : lines;
+
   // Loaded-file evidence.
   let evidenceLines = [];
   if (adapter === 'claude-code') {
-    evidenceLines = findLines(lines, /(?:CLAUDE|AGENTS)\.md/);
+    evidenceLines = findLines(material, /(?:CLAUDE|AGENTS)\.md/);
     if (!hasSystem('init')) evidenceLines = [];
   } else if (adapter === 'stream-json-cli') {
-    evidenceLines = findLines(lines, /AGENTS\.md/);
+    evidenceLines = findLines(material, /AGENTS\.md/);
     if (!hasSystem('init')) evidenceLines = [];
   } else {
-    const name = definitionName ? new RegExp(escapeRegex(definitionName), 'i') : null;
-    evidenceLines = lines.filter((line) => /GEMINI\.md/.test(line) || (name !== null && name.test(line)));
+    const definitionPattern = definitionName ? new RegExp(escapeRegex(definitionName), 'i') : null;
+    evidenceLines = lines.filter((line) => /GEMINI\.md/.test(line) || (definitionPattern !== null && definitionPattern.test(line)));
   }
   const loadedFound = evidenceLines.length > 0;
   if (!loadedFound && lines.length > 0) {
@@ -142,11 +194,11 @@ export function observeLeg({
   }
 
   // Skill paths.
-  const name = escapeRegex(skillName);
-  const userPath = new RegExp(`\\.(?:claude|agents|gemini|codex)/skills/${name}/SKILL\\.md`);
-  const indexedPath = new RegExp(`(?<!\\.(?:claude|agents|gemini|codex)/)skills/${name}/SKILL\\.md`);
+  const skillPattern = escapeRegex(skillName);
+  const userPath = new RegExp(`\\.(?:claude|agents|gemini|codex)/skills/${skillPattern}/SKILL\\.md`);
+  const indexedPath = new RegExp(`(?<!\\.(?:claude|agents|gemini|codex)/)skills/${skillPattern}/SKILL\\.md`);
   const userLines = lines.filter((line) => userPath.test(line) || line.includes(userSkillMarker));
-  const indexedLines = findLines(lines, indexedPath);
+  const indexedLines = findLines(material, indexedPath);
   const userLevel = userLines.length > 0;
   const indexed = indexedLines.length > 0;
   if (userLevel) reasons.push('the transcript names the user-level skill (path or marker)');
@@ -157,7 +209,6 @@ export function observeLeg({
   else if (!loadedFound || !indexed || !versionMatchesBinding || (adapter === 'stream-json-cli' && bridge === null)) {
     result = 'uncertain';
   }
-  if (lines.length === 0 && result === 'pass') result = 'uncertain';
 
   return {
     adapter,
@@ -266,7 +317,8 @@ function recordMain(args) {
   for (const [adapter] of LEG_ROWS) {
     try {
       legs[adapter] = JSON.parse(readFileSync(`${runDir}/observation-${adapter}.json`, 'utf8'));
-    } catch {
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw new Error(`observation-${adapter}.json: ${error.message}`);
       legs[adapter] = null;
     }
   }
@@ -307,21 +359,25 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       const manifestPath = argValue(args, '--manifest');
       const manifest = manifestPath ? JSON.parse(readFileSync(manifestPath, 'utf8')) : {};
       const transcript = readFileSync(transcriptPath, 'utf8');
+      const home = argValue(args, '--home') ?? manifest.local?.home ?? process.env.VP_S29_HOME ?? '';
       const observation = observeLeg({
         adapter,
         transcript,
         versionText: readFileSync(versionPath, 'utf8'),
         definitionName: argValue(args, '--name') ?? manifest.definitionName ?? '',
         skillName: argValue(args, '--skill') ?? manifest.skillName ?? 'release-notes',
-        home: argValue(args, '--home') ?? manifest.local?.home ?? process.env.VP029_HOME ?? '',
+        home,
         userSkillMarker: manifest.userSkillMarker,
       });
-      const redactedOut = argValue(args, '--redacted-out');
-      if (redactedOut) {
-        const home = argValue(args, '--home') ?? manifest.local?.home ?? process.env.VP029_HOME ?? '';
-        writeFileSync(redactedOut, redact(normalizeText(transcript), home));
+      const observationText = `${JSON.stringify(observation, null, 2)}\n`;
+      const redactedText = redact(normalizeText(transcript), home);
+      if (findSecrets(redactedText).length > 0 || findSecrets(observationText).length > 0) {
+        process.stderr.write('vp-s29-observations.mjs: a secret-shaped value remains after redaction; review the transcript by hand\n');
+        process.exit(1);
       }
-      process.stdout.write(`${JSON.stringify(observation, null, 2)}\n`);
+      const redactedOut = argValue(args, '--redacted-out');
+      if (redactedOut) writeFileSync(redactedOut, redactedText);
+      process.stdout.write(observationText);
     } catch (error) {
       process.stderr.write(`vp-s29-observations.mjs: ${error.message}\n`);
       process.exit(1);

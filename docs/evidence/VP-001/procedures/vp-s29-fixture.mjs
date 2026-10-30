@@ -25,7 +25,7 @@
 //
 // CLI: node vp-s29-fixture.mjs --root <dir> --home <dir> --manifest <file>
 
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -68,10 +68,9 @@ function assertAbsolute(label, path) {
 
 /** Prepares the fixture and returns its manifest. Every refusal happens
  * before the first write. */
-export function prepareFixture({ root, home, skillName = SKILL_NAME }) {
+export function prepareFixture({ root, home }) {
   assertAbsolute('root', root);
   assertAbsolute('home', home);
-  if (skillName !== SKILL_NAME) throw new Error(`only the skill ${SKILL_NAME} is defined`);
   const fromRoot = relative(root, home);
   if (fromRoot === '' || (!fromRoot.startsWith('..') && !isAbsolute(fromRoot))) {
     throw new Error('home is inside the root: the user-level skill would join the definition');
@@ -85,12 +84,28 @@ export function prepareFixture({ root, home, skillName = SKILL_NAME }) {
     if (existsSync(file)) throw new Error(`a user-level skill already exists at ${file}`);
   }
 
-  const indexed = join(root, 'skills', SKILL_NAME, 'SKILL.md');
-  mkdirSync(dirname(indexed), { recursive: true });
-  writeFileSync(indexed, skillText('Drafts release notes from a list of changes.', LOCAL_SKILL_MARKER));
-  for (const file of userFiles) {
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, skillText('Drafts release notes in the user-level style.', USER_SKILL_MARKER));
+  // Everything this call creates is tracked so a failure part-way removes
+  // exactly that and nothing that existed before.
+  const created = [];
+  const makeDir = (dir) => {
+    const first = mkdirSync(dir, { recursive: true });
+    if (first) created.push(first);
+  };
+  const write = (file, text) => {
+    created.push(file);
+    writeFileSync(file, text);
+  };
+  try {
+    const indexed = join(root, 'skills', SKILL_NAME, 'SKILL.md');
+    makeDir(dirname(indexed));
+    write(indexed, skillText('Drafts release notes from a list of changes.', LOCAL_SKILL_MARKER));
+    for (const file of userFiles) {
+      makeDir(dirname(file));
+      write(file, skillText('Drafts release notes in the user-level style.', USER_SKILL_MARKER));
+    }
+  } catch (error) {
+    for (const path of created.reverse()) rmSync(path, { recursive: true, force: true });
+    throw error;
   }
   return {
     scenario: 'VP-S29',

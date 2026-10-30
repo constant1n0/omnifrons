@@ -4,7 +4,9 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -12,7 +14,10 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, 'vp-s29-linux.sh');
+const IS_ROOT = process.getuid?.() === 0;
 const LINUX_ONLY = process.platform === 'linux' ? {} : { skip: 'vp-s29-linux.sh needs GNU sha256sum (Linux only)' };
+
+const unreadableTest = process.platform !== 'linux' ? LINUX_ONLY : { skip: IS_ROOT ? 'root reads everything' : false };
 
 function withDir(run) {
   const dir = mkdtempSync(join(tmpdir(), 'vp-s29-linux-'));
@@ -34,7 +39,7 @@ function prepared(dir) {
   const runDir = join(dir, 'run');
   const root = join(dir, 'definition');
   const home = join(dir, 'home');
-  const env = { VP029_RUN_ID: 'test-run', VP029_RUN_DIR: runDir, VP029_ROOT: root, VP029_HOME: home };
+  const env = { VP_S29_RUN_ID: 'test-run', VP_S29_RUN_DIR: runDir, VP_S29_ROOT: root, VP_S29_HOME: home };
   const result = sh(['fixture'], env);
   assert.equal(result.status, 0, result.stderr);
   return { runDir, root, home, env };
@@ -44,6 +49,9 @@ test('--help prints the modes and exits 0; no mode and an unknown mode exit 2', 
   const help = sh(['--help']);
   assert.equal(help.status, 0);
   for (const mode of ['fixture', 'digests', 'compare', 'observe', 'record']) assert.match(help.stdout, new RegExp(mode));
+  const helpLines = help.stdout.trimEnd().split('\n');
+  assert.equal(helpLines[0], 'Usage: vp-s29-linux.sh --help');
+  assert.match(helpLines.at(-1), /^Exit: 0 ok;/);
   assert.equal(sh([]).status, 2);
   assert.equal(sh(['launch']).status, 2);
 });
@@ -99,9 +107,9 @@ test('digests then compare: unchanged exits 0; an edited SKILL.md, a new GEMINI.
 test('compare and digests refuse bad arguments with exit 2', LINUX_ONLY, () => {
   withDir((dir) => {
     assert.equal(sh(['compare', join(dir, 'nope-a'), join(dir, 'nope-b')]).status, 2);
-    assert.equal(sh(['digests'], { VP029_RUN_DIR: dir, VP029_ROOT: dir }).status, 2);
-    assert.equal(sh(['digests', 'a/b'], { VP029_RUN_DIR: dir, VP029_ROOT: dir }).status, 2, 'label is a plain word');
-    assert.equal(sh(['digests', 'x'], { VP029_RUN_DIR: dir }).status, 2, 'root is required');
+    assert.equal(sh(['digests'], { VP_S29_RUN_DIR: dir, VP_S29_ROOT: dir }).status, 2);
+    assert.equal(sh(['digests', 'a/b'], { VP_S29_RUN_DIR: dir, VP_S29_ROOT: dir }).status, 2, 'label is a plain word');
+    assert.equal(sh(['digests', 'x'], { VP_S29_RUN_DIR: dir }).status, 2, 'root is required');
   });
 });
 
@@ -118,8 +126,8 @@ test('observe writes observation-<adapter>.json and redacts HOME', LINUX_ONLY, (
     assert.equal(JSON.parse(written).result, 'fail');
     assert.ok(!written.includes(home), 'HOME is redacted from the retained observation');
     assert.ok(!readFileSync(join(runDir, 'transcript-pty-cli.txt'), 'utf8').includes(home), 'and from the retained transcript');
-    assert.equal(existsSync(join(runDir, 'observation-bogus.json')), false);
     assert.equal(sh(['observe', 'bogus', transcript, version], env).status, 1);
+    assert.equal(existsSync(join(runDir, 'observation-bogus.json')), false);
   });
 });
 
@@ -156,7 +164,14 @@ test('record assembles record.md and evidence-summary.txt; a changed digest make
 
 test('record without --run-date or with a missing run directory exits 2', LINUX_ONLY, () => {
   withDir((dir) => {
-    assert.equal(sh(['record'], { VP029_RUN_ID: 'x', VP029_RUN_DIR: join(dir, 'missing') }).status, 2);
+    assert.equal(sh(['record'], { VP_S29_RUN_ID: 'x', VP_S29_RUN_DIR: join(dir, 'missing') }).status, 2);
+    const existing = join(dir, 'existing');
+    mkdirSync(existing);
+    const env = { VP_S29_RUN_ID: 'x', VP_S29_RUN_DIR: existing };
+    const noDate = sh(['record'], env);
+    assert.equal(noDate.status, 2);
+    assert.match(noDate.stderr, /--run-date/);
+    assert.equal(sh(['record', '--run-date', '1 Nov 2026'], env).status, 2);
   });
 });
 
@@ -188,5 +203,72 @@ test('record takes the channel, the two digests and a named evidence file', LINU
     assert.equal(sh([...base, '--build-channel-digest', 'xyz', '--exercised-artifact-digest', 'xyz'], env).status, 2);
     assert.equal(sh([...base, '--evidence-artifact', '../escape.txt'], env).status, 2);
     assert.equal(sh([...base, '--evidence-artifact', 'missing.txt'], env).status, 2);
+  });
+});
+
+test('digests list a symlinked or dangling SKILL.md as a symlink entry and never fail on it', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    mkdirSync(join(root, 'skills', 'other'));
+    symlinkSync(join(dir, 'does-not-exist'), join(root, 'skills', 'other', 'SKILL.md'));
+    const result = sh(['digests', 'before'], env);
+    assert.equal(result.status, 0, result.stderr);
+    const digests = readFileSync(join(runDir, 'digests-before.txt'), 'utf8');
+    assert.match(digests, /^symlink {2}skills\/other\/SKILL\.md$/m);
+    assert.match(digests, /^[0-9a-f]{64} {2}skills\/release-notes\/SKILL\.md$/m);
+  });
+});
+
+test('a failing digests run leaves no partial digest file', unreadableTest, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    chmodSync(join(root, 'skills', 'release-notes', 'SKILL.md'), 0o000);
+    const result = sh(['digests', 'before'], env);
+    assert.notEqual(result.status, 0);
+    assert.equal(existsSync(join(runDir, 'digests-before.txt')), false);
+  });
+});
+
+test('compare separates a diff tool error (2) from a difference (1)', unreadableTest, () => {
+  withDir((dir) => {
+    const a = join(dir, 'a.txt');
+    const b = join(dir, 'b.txt');
+    writeFileSync(a, 'one\n');
+    writeFileSync(b, 'one\n');
+    chmodSync(b, 0o000);
+    const result = sh(['compare', a, b]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /diff failed/);
+  });
+});
+
+test('record leaves no record.md when it fails, and names a corrupt observation file', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, env } = prepared(dir);
+    writeFileSync(join(runDir, 'observation-claude-code.json'), '{not json');
+    const result = sh(['record', '--run-date', '2026-11-01'], env);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /observation-claude-code\.json/);
+    assert.equal(existsSync(join(runDir, 'record.md')), false);
+    assert.deepEqual(readdirSync(runDir).filter((name) => name.includes('record')), []);
+  });
+});
+
+test('observe exits 1 and keeps nothing when the transcript still holds a secret-shaped value', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, env } = prepared(dir);
+    const transcript = join(dir, 'gemini.txt');
+    const version = join(dir, 'gemini-version.txt');
+    writeFileSync(version, '0.41.2\n');
+    writeFileSync(transcript, `Loaded GEMINI.md\nkey sk-ant-${'a1B2c3D4'.repeat(4)}\n`);
+    const scrubbed = sh(['observe', 'pty-cli', transcript, version], env);
+    assert.equal(scrubbed.status, 0, scrubbed.stderr);
+    assert.doesNotMatch(readFileSync(join(runDir, 'transcript-pty-cli.txt'), 'utf8'), /sk-ant-/);
+    writeFileSync(transcript, 'Loaded GEMINI.md\n-----BEGIN PRIVATE KEY-----\nabc\n');
+    const refused = sh(['observe', 'pty-cli', transcript, version], env);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /secret-shaped/);
+    assert.equal(existsSync(join(runDir, 'transcript-pty-cli.txt')), false);
+    assert.equal(existsSync(join(runDir, 'observation-pty-cli.json')), false);
   });
 });

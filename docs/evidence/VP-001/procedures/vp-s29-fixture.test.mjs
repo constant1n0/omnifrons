@@ -107,3 +107,19 @@ test('the CLI writes the manifest and a catch-all .gitignore beside it', () => {
     assert.equal(readFileSync(join(dir, 'run', 'private', '.gitignore'), 'utf8'), '*\n!.gitignore\n');
   });
 });
+
+test('a failure after the first write removes what this call created and nothing else', () => {
+  scratch((dir) => {
+    const root = join(dir, 'definition');
+    const home = join(dir, 'home');
+    mkdirSync(home);
+    writeFileSync(join(home, '.gemini'), 'a file where the skills folder parent should be');
+    assert.throws(() => prepareFixture({ root, home }));
+    assert.equal(existsSync(root), false, 'the root this call created is gone');
+    assert.equal(existsSync(join(home, '.claude')), false);
+    assert.equal(existsSync(join(home, '.agents')), false);
+    assert.equal(readFileSync(join(home, '.gemini'), 'utf8'), 'a file where the skills folder parent should be');
+    rmSync(join(home, '.gemini'));
+    assert.doesNotThrow(() => prepareFixture({ root, home }), 'a re-run no longer refuses');
+  });
+});
