@@ -79,38 +79,18 @@ through the pick, probe and approve flow for a `stream-json-cli` harness.
 Approvals are device-local and are never committed. `codex` itself must be on
 `PATH` for the app's environment and already signed in.
 
-## Codex event schema
+## Codex event schema provenance
 
 From `codex exec --help` (0.163.0): `--json` prints events to stdout as JSONL;
 `--skip-git-repo-check` exists; the prompt is read from stdin when no argument
 is given or when `-` is used.
 
-The event vocabulary below is taken from `codex-rs/exec/src/exec_events.rs` at
-tag `rust-v0.163.0` (snake_case type names).
-
-Top-level events:
-
-| Event | Translation |
-| --- | --- |
-| `thread.started` (`thread_id`) | `init` with that session id, then the version line |
-| `turn.started`, `item.started`, `item.updated` | nothing |
-| `turn.completed` | `result/success`, exit 0 |
-| `turn.failed` | stderr diagnostic, `result/error`, exit 1 |
-| `error` (`message`; "fatal error emitted by the stream") | stderr diagnostic, `result/error`, exit 1 |
-| `item.completed` | by item type, below |
-
-Item types (`item.type` in `item.completed`):
-
-| Item type | Translation |
-| --- | --- |
-| `agent_message` (`text`) | `text` block |
-| `reasoning` (`text`) | skipped unless `CODEX_STREAM_BRIDGE_REASONING=1` |
-| `command_execution`, `file_change`, `mcp_tool_call`, `collab_tool_call`, `web_search`, `todo_list` | `tool_use` block, `name` = item type, `input` = the item |
-| `error` (`message`; "a non-fatal error surfaced as an item") | stderr diagnostic, run continues |
-
-Unknown event or item types, and malformed lines, are reported on stderr and
-never abort the run. Not taken from the schema file: a `model` field on any
-event is used when present, otherwise `model` is `codex`.
+The event and item vocabulary in the behaviour table above is taken from
+`codex-rs/exec/src/exec_events.rs` at tag `rust-v0.163.0` (snake_case type
+names). In that file the top-level `error` event is a fatal error emitted by
+the stream, and a non-fatal error is an `item.completed` whose item type is
+`error`. The `model` field is not in that schema: it is used when an event
+carries one, otherwise `model` is `codex`.
 
 The schema source is not a recording. A recorded real Codex stream is still
 the evidence the scenario files; until then this translation is validated by

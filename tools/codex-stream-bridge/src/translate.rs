@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(outs.last(), Some(&Out::Finish { exit: 1 }));
         assert!(
             outs.iter()
-                .any(|o| matches!(o, Out::Stderr(s) if s.contains("boom")))
+                .any(|o| matches!(o, Out::Stderr(s) if s.starts_with("codex-stream-bridge: codex reported turn.failed: ") && s.contains("boom")))
         );
     }
 
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(outs.last(), Some(&Out::Finish { exit: 1 }));
         assert!(
             outs.iter()
-                .any(|o| matches!(o, Out::Stderr(s) if s.contains("fatal")))
+                .any(|o| matches!(o, Out::Stderr(s) if s.starts_with("codex-stream-bridge: codex reported error: ") && s.contains("fatal")))
         );
     }
 
