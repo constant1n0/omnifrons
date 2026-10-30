@@ -78,15 +78,21 @@ pub fn translate(line: &str, state: &mut State) -> Vec<Out> {
             outs.push(stdout(&json!({"type": "result", "subtype": "success"})));
             outs.push(Out::Finish { exit: 0 });
         }
-        "turn.failed" | "error" => {
+        "turn.failed" => {
             ensure_init(state, None, &mut outs);
             outs.push(diag(&format!(
-                "codex reported {kind}: {}",
-                error_message(&value)
+                "codex reported turn.failed: {}",
+                clip(&error_message(&value))
             )));
             outs.push(stdout(&json!({"type": "result", "subtype": "error"})));
             outs.push(Out::Finish { exit: 1 });
         }
+        // Codex also uses `error` for non-fatal, retried stream errors, so it
+        // is a diagnostic only; the turn ends at `turn.failed` or end of input.
+        "error" => outs.push(diag(&format!(
+            "codex reported error: {}",
+            clip(&error_message(&value))
+        ))),
         other => outs.push(diag(&format!("unknown event type {other}: {}", clip(line)))),
     }
     outs
@@ -94,9 +100,20 @@ pub fn translate(line: &str, state: &mut State) -> Vec<Out> {
 
 /// Called when Codex's stdout ends without a terminal event.
 pub fn end_of_input(state: &mut State) -> Vec<Out> {
+    let mut outs = vec![diag("codex ended without a terminal event")];
+    outs.extend(unknown_result(state));
+    outs
+}
+
+/// Called when Codex could not be started: `init` (generated session id),
+/// then `result/unknown`. The caller reports the spawn error itself.
+pub fn spawn_failed(state: &mut State) -> Vec<Out> {
+    unknown_result(state)
+}
+
+fn unknown_result(state: &mut State) -> Vec<Out> {
     let mut outs = Vec::new();
     ensure_init(state, None, &mut outs);
-    outs.push(diag("codex ended without a terminal event"));
     outs.push(stdout(&json!({"type": "result", "subtype": "unknown"})));
     outs.push(Out::Finish { exit: 1 });
     outs
@@ -238,10 +255,7 @@ mod tests {
             json!({"type":"system","subtype":"bridge","codex_version":"codex-cli 0.163.0","bridge_version":env!("CARGO_PKG_VERSION")})
         );
         assert_eq!(v.len(), 2);
-        assert!(
-            translate(THREAD, &mut st).is_empty()
-                || stdout_values(&translate(THREAD, &mut st)).is_empty()
-        );
+        assert!(stdout_values(&translate(THREAD, &mut st)).is_empty());
     }
 
     #[test]
@@ -324,23 +338,50 @@ mod tests {
     }
 
     #[test]
-    fn turn_failed_and_error_finish_with_error() {
-        for line in [
+    fn turn_failed_finishes_with_error() {
+        let mut st = state();
+        translate(THREAD, &mut st);
+        let outs = translate(
             r#"{"type":"turn.failed","error":{"message":"boom"}}"#,
-            r#"{"type":"error","message":"boom"}"#,
+            &mut st,
+        );
+        assert_eq!(
+            stdout_values(&outs),
+            vec![json!({"type":"result","subtype":"error"})]
+        );
+        assert_eq!(outs.last(), Some(&Out::Finish { exit: 1 }));
+        assert!(
+            outs.iter()
+                .any(|o| matches!(o, Out::Stderr(s) if s.contains("boom")))
+        );
+    }
+
+    #[test]
+    fn error_event_is_a_diagnostic_and_the_run_continues() {
+        let mut st = state();
+        translate(THREAD, &mut st);
+        let outs = translate(r#"{"type":"error","message":"retrying"}"#, &mut st);
+        assert_eq!(outs.len(), 1);
+        assert!(matches!(&outs[0], Out::Stderr(s) if s.contains("retrying")));
+        let next =
+            r#"{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"x"}}"#;
+        assert_eq!(stdout_values(&translate(next, &mut st)).len(), 1);
+    }
+
+    #[test]
+    fn error_messages_are_clipped_to_one_line() {
+        for line in [
+            json!({"type":"turn.failed","error":{"message":"a\nb"}}).to_string(),
+            json!({"type":"error","message":"a\nb"}).to_string(),
         ] {
             let mut st = state();
             translate(THREAD, &mut st);
-            let outs = translate(line, &mut st);
-            assert_eq!(
-                stdout_values(&outs),
-                vec![json!({"type":"result","subtype":"error"})]
-            );
-            assert_eq!(outs.last(), Some(&Out::Finish { exit: 1 }));
-            assert!(
-                outs.iter()
-                    .any(|o| matches!(o, Out::Stderr(s) if s.contains("boom")))
-            );
+            for o in translate(&line, &mut st) {
+                if let Out::Stderr(s) = o {
+                    assert!(!s.contains('\n'));
+                    assert!(s.contains("a\\nb"));
+                }
+            }
         }
     }
 

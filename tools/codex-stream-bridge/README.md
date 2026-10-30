@@ -27,16 +27,29 @@ Bridge behaviour:
 | `item.completed`, `command_execution` / `mcp_tool_call` / `file_change` / `web_search` | `assistant` message with one `tool_use` block, `name` = item type, `input` = the item object | |
 | `item.completed`, `reasoning` | skipped; a `text` block when `CODEX_STREAM_BRIDGE_REASONING=1` | |
 | `turn.completed` | `{"type":"result","subtype":"success"}` | 0 |
-| `turn.failed`, `error` | stderr diagnostic, then `{"type":"result","subtype":"error"}` | 1 |
+| `turn.failed` | stderr diagnostic, then `{"type":"result","subtype":"error"}` | 1 |
+| `error` | one stderr diagnostic; the run continues (see below) | |
 | stdout ends with no terminal event | `{"type":"result","subtype":"unknown"}` | 1 |
 | `turn.started`, `item.started`, `item.updated` | nothing | |
 | anything else, malformed JSON | one stderr diagnostic line, no stdout | |
 
-Every emitted line is a single physical line of compact JSON (keys are
-sorted by `serde_json`; the parser does not depend on key order). `model` is
+Every emitted line is a single physical line of compact JSON (the consumer
+does not depend on key order). `model` is
 `codex` unless an event carries a `model` field. If an item arrives before any
 `thread.started`, `init` is emitted first with a generated session id
 (`codex-bridge-<pid>-<nanos>`) and a stderr note says so.
+
+`error` is not terminal: Codex also uses it for non-fatal, retried stream
+errors, so the bridge only logs it. This follows the documented semantics; a
+recorded real stream will confirm it. The turn ends at `turn.completed`,
+`turn.failed` or the end of Codex's output. If Codex cannot be started, the
+bridge reports the error on stderr, emits `init` with a generated session id
+and `result/unknown`, and exits 1.
+
+Process hygiene: `codex --version` is bounded to 5 seconds (the version line
+is omitted on timeout); after the output ends, Codex gets 10 seconds to exit
+before it is killed. Every run writes one stderr line with Codex's exit status
+(code or signal).
 
 Version record: right after `init` the bridge emits
 `{"type":"system","subtype":"bridge","codex_version":..,"bridge_version":..}`.
