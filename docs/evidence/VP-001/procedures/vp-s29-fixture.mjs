@@ -12,7 +12,16 @@
 //   .agents/skills  Codex CLI (and a Gemini CLI alias)
 //   .gemini/skills  Gemini CLI
 // The skill is written to all three so every harness can see a same-named
-// user-level skill wherever it looks.
+// user-level skill wherever it looks. Sources: the Codex CLI docs ("Build
+// skills": user skills in $HOME/.agents/skills; .agents/skills scanned from the
+// working directory up to the repository root), the Gemini CLI docs ("Skills":
+// ~/.gemini/skills or the ~/.agents/skills alias; workspace .gemini/skills or
+// .agents/skills, the .agents alias first within a tier) and Claude Code's
+// personal skills folder, ~/.claude/skills.
+//
+// The definition root must hold neither .agents/skills nor .gemini/skills: a
+// host would then load the project skill through its own loader instead of the
+// indexed path (PROJECT_SKILL_DIRS).
 //
 // CLI: node vp-s29-fixture.mjs --root <dir> --home <dir> --manifest <file>
 
@@ -24,6 +33,7 @@ export const SKILL_NAME = 'release-notes';
 export const LOCAL_SKILL_MARKER = 'LOCAL-SKILL-MARKER';
 export const USER_SKILL_MARKER = 'USER-LEVEL-SKILL-MARKER';
 export const USER_SKILL_DIRS = ['.claude/skills', '.agents/skills', '.gemini/skills'];
+export const PROJECT_SKILL_DIRS = ['.agents/skills', '.gemini/skills'];
 
 /** Fixed, neutral answers for the Definition section's create form, in the
  * form's own order (the keys are the answers document's field keys). */
@@ -65,6 +75,9 @@ export function prepareFixture({ root, home, skillName = SKILL_NAME }) {
   const fromRoot = relative(root, home);
   if (fromRoot === '' || (!fromRoot.startsWith('..') && !isAbsolute(fromRoot))) {
     throw new Error('home is inside the root: the user-level skill would join the definition');
+  }
+  for (const dir of PROJECT_SKILL_DIRS) {
+    if (existsSync(join(root, ...dir.split('/')))) throw new Error(`root holds ${dir}: a host would load it through its own loader`);
   }
   if (existsSync(root) && readdirSync(root).length > 0) throw new Error('root is not empty');
   const userFiles = USER_SKILL_DIRS.map((dir) => join(home, ...dir.split('/'), SKILL_NAME, 'SKILL.md'));
@@ -109,6 +122,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const manifest = prepareFixture({ root, home });
     mkdirSync(dirname(manifestPath), { recursive: true });
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    // The manifest holds local paths: keep its folder out of any commit.
+    writeFileSync(join(dirname(manifestPath), '.gitignore'), '*\n!.gitignore\n');
   } catch (error) {
     process.stderr.write(`vp-s29-fixture.mjs: ${error.message}\n`);
     process.exit(1);

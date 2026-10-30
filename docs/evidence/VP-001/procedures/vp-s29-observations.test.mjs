@@ -204,6 +204,8 @@ test('formatRecord renders one two-column table with every leg, the switch leg a
     recordId: null,
     baselineId: 'VP-001-BASE-01',
     buildChannel: null,
+    buildChannelDigest: 'b'.repeat(64),
+    exercisedArtifactDigest: 'b'.repeat(64),
     observedState: null,
     runDate: '2026-11-01',
     operatorRole: 'maintainer, local operator run',
@@ -221,7 +223,10 @@ test('formatRecord renders one two-column table with every leg, the switch leg a
   assert.match(text, /\| `result` \| uncertain \|/);
   assert.match(text, /\| `baseline_id` \| VP-001-BASE-01 \|/);
   assert.match(text, /\| `record_id` \| <operator: [^>]+> \|/);
-  assert.match(text, /\| `build_channel` \| <operator: [^>]+> \|/);
+  assert.match(text, /\| `build_channel` \| packaged-ci \|/);
+  assert.match(text, /\| `observed_state` \| uncertain \|/);
+  assert.match(text, new RegExp(`\\| \`build_channel_digest\` \\| ${'b'.repeat(64)} \\|`));
+  assert.match(text, new RegExp(`\\| \`exercised_artifact_digest\` \\| ${'b'.repeat(64)} \\|`));
   assert.match(text, /\| `claude_code_leg` \| pass --/);
   assert.match(text, /\| `codex_leg` \| uncertain -- .*names no skill path \/ x/);
   assert.match(text, /\| `gemini_leg` \| uncertain -- the leg was not run or has no observation/);
@@ -230,4 +235,14 @@ test('formatRecord renders one two-column table with every leg, the switch leg a
   assert.match(text, new RegExp(`\\| \`evidence_artifact\` \\| ${'a'.repeat(64)} -- `));
   const rows = text.split('\n').filter((line) => line.startsWith('| `'));
   assert.ok(rows.every((row) => row.split(' | ').length === 2), 'every row has exactly two cells');
+});
+
+test('formatRecord omits both digest rows when none is given and cites the named evidence file', () => {
+  const text = formatRecord({
+    runId: 'run-2', recordId: 'R', baselineId: 'B', buildChannel: 'packaged-ci', observedState: 'uncertain',
+    runDate: '2026-11-01', operatorRole: 'r', legs: {}, digestsUnchanged: null,
+    evidencePath: 'docs/evidence/VP-001/artifacts/vp-s29/run-2/bundle.txt', evidenceDigest: 'c'.repeat(64),
+  });
+  assert.doesNotMatch(text, /build_channel_digest|exercised_artifact_digest/);
+  assert.match(text, /retained redacted file docs\/evidence\/VP-001\/artifacts\/vp-s29\/run-2\/bundle\.txt/);
 });

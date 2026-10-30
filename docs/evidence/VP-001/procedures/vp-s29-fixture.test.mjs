@@ -2,9 +2,11 @@
 // temp directory, no network and no harness.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import {
@@ -81,5 +83,27 @@ test('refuses to overwrite an existing user-level skill', () => {
     assert.throws(() => prepareFixture({ root: join(dir, 'definition'), home }), /already exists/);
     assert.equal(readFileSync(join(existing, 'SKILL.md'), 'utf8'), 'someone else');
     assert.equal(existsSync(join(dir, 'definition')), false);
+  });
+});
+
+test('refuses a root holding a host project-skill folder', () => {
+  for (const folder of ['.agents/skills', '.gemini/skills']) {
+    scratch((dir) => {
+      const root = join(dir, 'definition');
+      mkdirSync(join(root, ...folder.split('/')), { recursive: true });
+      assert.throws(() => prepareFixture({ root, home: join(dir, 'home') }), new RegExp(folder.replace('.', '\\.')));
+      assert.equal(existsSync(join(dir, 'home')), false, 'nothing is written on a refusal');
+    });
+  }
+});
+
+test('the CLI writes the manifest and a catch-all .gitignore beside it', () => {
+  scratch((dir) => {
+    const script = join(dirname(fileURLToPath(import.meta.url)), 'vp-s29-fixture.mjs');
+    const manifest = join(dir, 'run', 'private', 'fixture.json');
+    const result = spawnSync('node', [script, '--root', join(dir, 'definition'), '--home', join(dir, 'home'), '--manifest', manifest], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(readFileSync(manifest, 'utf8')).skillName, SKILL_NAME);
+    assert.equal(readFileSync(join(dir, 'run', 'private', '.gitignore'), 'utf8'), '*\n!.gitignore\n');
   });
 });

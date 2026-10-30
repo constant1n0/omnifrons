@@ -24,8 +24,16 @@ never `pass`. A user-level skill path in a transcript, or a changed digest, is
 ## 1. Prepare
 
 1. Build the bridge: `cargo build --release -p codex-stream-bridge` (the
-   binary is `target/release/codex-stream-bridge`). Build or start the app the
-   way you normally do (for example `pnpm exec tauri dev`).
+   binary is `target/release/codex-stream-bridge`).
+   Run the CI-packaged app, not a source build: the evidence validator accepts
+   only the `packaged-ci` build channel, and a row that carries a build digest
+   needs a retained evidence file. Download the AppImage that the
+   `tauri-build.yml` run for the main commit produced (list the run's artifacts
+   with `gh run view <run id>`, then `gh run download <run id> --name <artifact>`),
+   make it executable and note `sha256sum <AppImage>`: that digest is both the
+   `build_channel_digest` and the `exercised_artifact_digest` in step 5. A local
+   source build (for example `pnpm exec tauri dev`) can be used to rehearse the
+   procedure but its run cannot be filed in `records.md`.
 2. Check the three versions and that each CLI is logged in. Save each version
    output; the helper reads these files:
    `claude --version > claude-version.txt`, `codex --version > codex-version.txt`,
@@ -33,6 +41,18 @@ never `pass`. A user-level skill path in a transcript, or a changed digest, is
    `uncertain` for that leg.
 3. Decide which HOME the whole run uses. The user-level skill must sit where
    the harness looks for it, so the choice applies to every step:
+   User-level skill locations, from the vendors' documentation: Codex CLI
+   ("Build skills" page of the OpenAI Codex docs) reads `$HOME/.agents/skills`
+   and also scans `.agents/skills` in every directory from the working
+   directory up to the repository root; Gemini CLI (docs, "Skills") reads
+   `~/.gemini/skills/` or the alias `~/.agents/skills/`, and the `.agents`
+   alias wins within a tier; Claude Code reads its personal skills folder
+   `~/.claude/skills/`. The definition root itself must hold neither
+   `.agents/skills` nor `.gemini/skills`, or a host would load the project
+   skill through its own loader instead of the indexed path: the fixture
+   refuses such a root and the digest files list both folders as `absent`
+   or `present`. Do not place the root inside a Git repository that has an
+   `.agents/skills` folder.
    - **Real HOME.** The CLIs already have their logins. The fixture writes
      `release-notes/SKILL.md` under `.claude/skills`, `.agents/skills` and
      `.gemini/skills` in that HOME and refuses to overwrite an existing one.
@@ -48,8 +68,9 @@ never `pass`. A user-level skill path in a transcript, or a changed digest, is
    Artifacts go to `docs/evidence/VP-001/artifacts/vp-s29/<run id>/`.
 5. `procedures/vp-s29-linux.sh fixture`. The root now holds only
    `skills/release-notes/SKILL.md`, so the Definition section offers
-   "Create .". `fixture.json` in the artifact folder holds local paths:
-   never commit it.
+   "Create .". The manifest `private/fixture.json` in the artifact folder holds
+   local paths; the `private/` folder carries a `.gitignore` that excludes
+   everything in it, so it is never committed.
 
 ## 2. Create the definition through the app
 
@@ -90,12 +111,17 @@ For each adapter, in this order (`claude-code`, `stream-json-cli`, `pty-cli`):
 1. In the Agent panel pick the adapter and its approval.
 2. Run 1: prompt `Who are you?`, Start, wait for the run to end.
 3. Run 2: prompt `Draft release notes for version 1.2.0. Changes: added an export button; fixed a login timeout.`, Start, wait for the run to end.
-4. Copy the text of the "Agent transcript" region of both runs, in order, into
+4. Copy the text of the Agent panel's "Agent transcript" list (the list whose
+   accessible label is "Agent transcript") of both runs, in order, into
    one file per leg (`claude-transcript.txt`, `codex-transcript.txt`,
    `gemini-transcript.txt`). The first lines are the startup capture.
 5. If a run hangs or the harness refuses (login, trust prompt, quota), use
    Stop, keep whatever transcript exists, and continue: the leg records
    `uncertain`. Do not retry until it looks like a pass.
+
+The app does not retain a run's output on disk, so this copy-out is manual.
+Retaining run output on disk is a product change and is recorded as a
+residual of this procedure.
 
 ## 5. Derive and record
 
@@ -107,15 +133,21 @@ For each adapter, in this order (`claude-code`, `stream-json-cli`, `pty-cli`):
    with the adapter id (`claude-code`, `stream-json-cli`, `pty-cli`). It writes
    `observation-<adapter>.json` and a redacted `transcript-<adapter>.txt`
    (HOME prefixes become `<home>`).
-3. `procedures/vp-s29-linux.sh record --run-date YYYY-MM-DD --baseline-id <id> ...`
-   writes `record.md` and `evidence-summary.txt`. Fill every
-   `<operator: ...>` placeholder (record id, build channel, observed state,
-   operator role) and check the legs' text against the transcripts.
+3. `procedures/vp-s29-linux.sh record --run-date YYYY-MM-DD --baseline-id <id> --build-channel-digest <sha256 of the AppImage> --exercised-artifact-digest <the same sha256>`
+   writes `record.md` and `evidence-summary.txt`. `--build-channel` defaults
+   to `packaged-ci` and `--evidence-artifact` (a file inside the run folder)
+   to `evidence-summary.txt`; the record's `evidence_artifact` is that file's
+   digest. `--observed-state` defaults to `uncertain`: the validator accepts
+   any token there, and `uncertain` is the public synchronization state of the
+   switch outcome this partial run observes. Fill the remaining
+   `<operator: ...>` placeholders (record id, operator role) and check the
+   legs' text against the transcripts. A run of a local source build has no
+   packaged digest and cannot be filed.
 4. Append the filled record to the end of `docs/evidence/VP-001/records.md`
    without editing earlier records. The record's `result` is `uncertain`
    (or `fail`); per-leg results stay in the narrative rows.
 5. Commit `observation-*.json`, `transcript-*.txt`, `digests-*.txt`,
-   `evidence-summary.txt` and `record.md`. Never commit `fixture.json`,
+   `evidence-summary.txt` and `record.md`. Never commit the `private/` folder,
    credentials or a path under a home directory. Check
    the files for a home path before committing.
 

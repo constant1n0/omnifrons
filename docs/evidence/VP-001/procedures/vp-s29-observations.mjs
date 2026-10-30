@@ -19,7 +19,8 @@
 //        [--manifest <file>] [--name <definition name>] [--skill <name>] [--home <dir>] [--redacted-out <file>]
 //      node vp-s29-observations.mjs record --run-dir <dir> --run-id <id> --run-date <date>
 //        --digests-unchanged <true|false> --evidence-path <p> --evidence-digest <sha256>
-//        [--record-id ..] [--baseline-id ..] [--build-channel ..] [--observed-state ..] [--operator-role ..]
+//        [--record-id ..] [--baseline-id ..] [--build-channel ..] [--build-channel-digest ..]
+//        [--exercised-artifact-digest ..] [--observed-state ..] [--operator-role ..]
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -207,8 +208,8 @@ function legCell(observation) {
  * operator to review and append to records.md. A value the script cannot
  * know is left as an `<operator: ...>` placeholder, never invented. */
 export function formatRecord({
-  runId, recordId, baselineId, buildChannel, observedState, runDate, operatorRole,
-  legs, digestsUnchanged, evidencePath, evidenceDigest,
+  runId, recordId, baselineId, buildChannel, buildChannelDigest, exercisedArtifactDigest, observedState,
+  runDate, operatorRole, legs, digestsUnchanged, evidencePath, evidenceDigest,
 }) {
   const placeholder = (what) => `<operator: ${what}>`;
   const versions = LEG_ROWS.map(([adapter]) => {
@@ -225,8 +226,11 @@ export function formatRecord({
     ['scenario_id', 'VP-S29'],
     ['baseline_id', baselineId ?? placeholder('pinned baseline id')],
     ['result', overallResult(legs, digestsUnchanged)],
-    ['observed_state', observedState ?? placeholder('observed_state token')],
-    ['build_channel', buildChannel ?? placeholder('build channel of the exercised app')],
+    ['observed_state', observedState ?? 'uncertain'],
+    ['build_channel', buildChannel ?? 'packaged-ci'],
+    ...(buildChannelDigest && exercisedArtifactDigest
+      ? [['build_channel_digest', buildChannelDigest], ['exercised_artifact_digest', exercisedArtifactDigest]]
+      : []),
     ['variant_scan', 'absent'],
     ['procedure_ref', 'docs/evidence/VP-001/procedures/vp-s29-linux.sh'],
     ...LEG_ROWS.map(([adapter, key]) => [key, legCell(legs[adapter])]),
@@ -272,6 +276,8 @@ function recordMain(args) {
     recordId: get('--record-id'),
     baselineId: get('--baseline-id'),
     buildChannel: get('--build-channel'),
+    buildChannelDigest: get('--build-channel-digest'),
+    exercisedArtifactDigest: get('--exercised-artifact-digest'),
     observedState: get('--observed-state'),
     runDate: get('--run-date'),
     operatorRole: get('--operator-role'),

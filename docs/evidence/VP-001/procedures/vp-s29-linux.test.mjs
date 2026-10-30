@@ -53,8 +53,10 @@ test('fixture writes the definition root, the user-level skills under HOME and f
     const { runDir, root, home } = prepared(dir);
     assert.ok(existsSync(join(root, 'skills', 'release-notes', 'SKILL.md')));
     assert.ok(existsSync(join(home, '.claude', 'skills', 'release-notes', 'SKILL.md')));
-    const manifest = JSON.parse(readFileSync(join(runDir, 'fixture.json'), 'utf8'));
+    const manifest = JSON.parse(readFileSync(join(runDir, 'private', 'fixture.json'), 'utf8'));
     assert.equal(manifest.skillName, 'release-notes');
+    assert.equal(readFileSync(join(runDir, 'private', '.gitignore'), 'utf8'), '*\n!.gitignore\n');
+    assert.equal(existsSync(join(runDir, 'fixture.json')), false);
   });
 });
 
@@ -67,6 +69,8 @@ test('digests then compare: unchanged exits 0; an edited SKILL.md, a new GEMINI.
     assert.match(before, /^[0-9a-f]{64} {2}AGENTS\.md$/m);
     assert.match(before, /^[0-9a-f]{64} {2}skills\/release-notes\/SKILL\.md$/m);
     assert.match(before, /^absent {2}GEMINI\.md$/m);
+    assert.match(before, /^absent {2}\.agents\/skills$/m);
+    assert.match(before, /^absent {2}\.gemini\/skills$/m);
     assert.doesNotMatch(before, new RegExp(dir), 'no absolute path in a digest file');
 
     mkdirSync(join(root, '.omnifrons'));
@@ -153,5 +157,36 @@ test('record assembles record.md and evidence-summary.txt; a changed digest make
 test('record without --run-date or with a missing run directory exits 2', LINUX_ONLY, () => {
   withDir((dir) => {
     assert.equal(sh(['record'], { VP029_RUN_ID: 'x', VP029_RUN_DIR: join(dir, 'missing') }).status, 2);
+  });
+});
+
+test('digests show a host project-skill folder that appears during a run', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    sh(['digests', 'before'], env);
+    mkdirSync(join(root, '.agents', 'skills'), { recursive: true });
+    sh(['digests', 'after'], env);
+    assert.match(readFileSync(join(runDir, 'digests-after.txt'), 'utf8'), /^present {2}\.agents\/skills$/m);
+    assert.equal(sh(['compare', join(runDir, 'digests-before.txt'), join(runDir, 'digests-after.txt')]).status, 1);
+  });
+});
+
+test('record takes the channel, the two digests and a named evidence file', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, env } = prepared(dir);
+    writeFileSync(join(runDir, 'bundle.txt'), 'evidence\n');
+    const base = ['record', '--run-date', '2026-11-01'];
+    const digest = 'd'.repeat(64);
+    const ok = sh([...base, '--build-channel-digest', digest, '--exercised-artifact-digest', digest, '--evidence-artifact', 'bundle.txt'], env);
+    assert.equal(ok.status, 0, ok.stderr);
+    const record = readFileSync(join(runDir, 'record.md'), 'utf8');
+    assert.match(record, /\| `build_channel` \| packaged-ci \|/);
+    assert.match(record, /\| `observed_state` \| uncertain \|/);
+    assert.match(record, new RegExp(`\\| \`build_channel_digest\` \\| ${digest} \\|`));
+    assert.match(record, /retained redacted file docs\/evidence\/VP-001\/artifacts\/vp-s29\/test-run\/bundle\.txt/);
+    assert.equal(sh([...base, '--build-channel-digest', digest], env).status, 2, 'both digests or neither');
+    assert.equal(sh([...base, '--build-channel-digest', 'xyz', '--exercised-artifact-digest', 'xyz'], env).status, 2);
+    assert.equal(sh([...base, '--evidence-artifact', '../escape.txt'], env).status, 2);
+    assert.equal(sh([...base, '--evidence-artifact', 'missing.txt'], env).status, 2);
   });
 });

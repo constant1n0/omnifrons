@@ -12,8 +12,10 @@
 #        vp-s29-linux.sh compare <digests-a> <digests-b>
 #        vp-s29-linux.sh observe <adapter> <transcript> <version-file>
 #        vp-s29-linux.sh record --run-date <YYYY-MM-DD> [--record-id <id>]
-#          [--baseline-id <id>] [--build-channel <channel>]
-#          [--observed-state <token>] [--operator-role <role>]
+#          [--baseline-id <id>] [--build-channel <channel, default packaged-ci>]
+#          [--build-channel-digest <sha256> --exercised-artifact-digest <sha256>]
+#          [--evidence-artifact <file under the run folder, default evidence-summary.txt>]
+#          [--observed-state <token, default uncertain>] [--operator-role <role>]
 # Env: VP029_RUN_ID   run identifier (required for `record`; names the artifact folder)
 #      VP029_RUN_DIR  artifact folder (default: docs/evidence/VP-001/artifacts/vp-s29/<run id>)
 #      VP029_ROOT     the definition root (fixture, digests)
@@ -47,6 +49,8 @@ run_dir() {
 # The three identity files (named whether or not they exist) and every
 # skills/**/SKILL.md, as `<sha256>  <relative path>` lines; a missing identity
 # file is `absent  <path>`, so an added or removed file shows in a comparison.
+# The host project-skill folders are listed `present`/`absent` too: none may
+# appear in the definition root during a run.
 digest_tree() {
   local root="$1" name
   (
@@ -54,6 +58,13 @@ digest_tree() {
     for name in AGENTS.md CLAUDE.md GEMINI.md; do
       if [[ -f "${name}" ]]; then
         sha256sum -- "${name}"
+      else
+        printf 'absent  %s\n' "${name}"
+      fi
+    done
+    for name in .agents/skills .gemini/skills; do
+      if [[ -e "${name}" ]]; then
+        printf 'present  %s\n' "${name}"
       else
         printf 'absent  %s\n' "${name}"
       fi
@@ -69,8 +80,8 @@ mode_fixture() {
   local dir
   dir="$(run_dir)"
   mkdir -p "${dir}"
-  node "${procedures_dir}/vp-s29-fixture.mjs" --root "${VP029_ROOT}" --home "${VP029_HOME}" --manifest "${dir}/fixture.json"
-  echo "fixture prepared; manifest: fixture.json"
+  node "${procedures_dir}/vp-s29-fixture.mjs" --root "${VP029_ROOT}" --home "${VP029_HOME}" --manifest "${dir}/private/fixture.json"
+  echo "fixture prepared; manifest: private/fixture.json (local paths, ignored by git)"
 }
 
 mode_digests() {
@@ -101,7 +112,7 @@ mode_observe() {
   local dir manifest=() home=()
   dir="$(run_dir)"
   mkdir -p "${dir}"
-  [[ -f "${dir}/fixture.json" ]] && manifest=(--manifest "${dir}/fixture.json")
+  [[ -f "${dir}/private/fixture.json" ]] && manifest=(--manifest "${dir}/private/fixture.json")
   [[ -n "${VP029_HOME:-}" ]] && home=(--home "${VP029_HOME}")
   node "${procedures_dir}/vp-s29-observations.mjs" "$1" "$2" "$3" ${manifest[@]+"${manifest[@]}"} ${home[@]+"${home[@]}"} \
     --redacted-out "${dir}/transcript-$1.txt" > "${dir}/observation-$1.json" || {
@@ -113,6 +124,7 @@ mode_observe() {
 
 mode_record() {
   local record_id="" baseline_id="" build_channel="" observed_state="" operator_role="" run_date=""
+  local channel_digest="" artifact_digest="" evidence_artifact="evidence-summary.txt"
   while [[ $# -gt 0 ]]; do
     [[ $# -ge 2 ]] || die_usage "$1 needs a value"
     case "$1" in
@@ -122,6 +134,9 @@ mode_record() {
       --observed-state) observed_state="$2" ;;
       --operator-role) operator_role="$2" ;;
       --run-date) run_date="$2" ;;
+      --build-channel-digest) channel_digest="$2" ;;
+      --exercised-artifact-digest) artifact_digest="$2" ;;
+      --evidence-artifact) evidence_artifact="$2" ;;
       *) die_usage "unknown option: $1" ;;
     esac
     shift 2
@@ -131,6 +146,18 @@ mode_record() {
   [[ -d "${dir}" ]] || die_usage "run directory not found"
   [[ -n "${VP029_RUN_ID:-}" ]] || die_usage "record needs VP029_RUN_ID"
   [[ "${run_date}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die_usage "record needs --run-date YYYY-MM-DD"
+
+  if [[ -n "${channel_digest}${artifact_digest}" ]]; then
+    [[ "${channel_digest}" =~ ^[0-9a-f]{64}$ && "${artifact_digest}" =~ ^[0-9a-f]{64}$ ]] \
+      || die_usage "give both --build-channel-digest and --exercised-artifact-digest, each 64 hex digits"
+  fi
+  if [[ "${evidence_artifact}" == /* || "${evidence_artifact}" == ".." || "${evidence_artifact}" == ../* \
+    || "${evidence_artifact}" == */../* || "${evidence_artifact}" == */.. ]]; then
+    die_usage "--evidence-artifact is a relative path inside the run folder"
+  fi
+  if [[ "${evidence_artifact}" != evidence-summary.txt && ! -f "${dir}/${evidence_artifact}" ]]; then
+    die_usage "evidence artifact not found in the run folder: ${evidence_artifact}"
+  fi
 
   local unchanged=unknown
   if [[ -f "${dir}/digests-before.txt" && -f "${dir}/digests-after.txt" ]]; then
@@ -150,17 +177,18 @@ mode_record() {
     printf '== sha256 of %s ==\n%s\n' "$(basename "${file}")" "$(sha256sum < "${file}" | cut -d' ' -f1)" >> "${summary}"
   done
   local digest
-  digest="$(sha256sum < "${summary}" | cut -d' ' -f1)"
+  digest="$(sha256sum < "${dir}/${evidence_artifact}" | cut -d' ' -f1)"
 
   local optional=()
   [[ -n "${record_id}" ]] && optional+=(--record-id "${record_id}")
   [[ -n "${baseline_id}" ]] && optional+=(--baseline-id "${baseline_id}")
   [[ -n "${build_channel}" ]] && optional+=(--build-channel "${build_channel}")
+  [[ -n "${channel_digest}" ]] && optional+=(--build-channel-digest "${channel_digest}" --exercised-artifact-digest "${artifact_digest}")
   [[ -n "${observed_state}" ]] && optional+=(--observed-state "${observed_state}")
   [[ -n "${operator_role}" ]] && optional+=(--operator-role "${operator_role}")
   node "${procedures_dir}/vp-s29-observations.mjs" record --run-dir "${dir}" --run-id "${VP029_RUN_ID}" \
     --run-date "${run_date}" --digests-unchanged "${unchanged}" \
-    --evidence-path "docs/evidence/VP-001/artifacts/vp-s29/${VP029_RUN_ID}/evidence-summary.txt" \
+    --evidence-path "docs/evidence/VP-001/artifacts/vp-s29/${VP029_RUN_ID}/${evidence_artifact}" \
     --evidence-digest "${digest}" ${optional[@]+"${optional[@]}"} > "${dir}/record.md"
   echo "wrote record.md and evidence-summary.txt; fill every <operator: ...> placeholder before appending to records.md"
 }
