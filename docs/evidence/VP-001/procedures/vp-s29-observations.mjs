@@ -18,7 +18,7 @@
 // CLI: node vp-s29-observations.mjs <adapter> <transcript> <version-file>
 //        [--manifest <file>] [--name <definition name>] [--skill <name>] [--home <dir>] [--redacted-out <file>]
 //      node vp-s29-observations.mjs record --run-dir <dir> --run-id <id> --run-date <date>
-//        --digests-unchanged <true|false> --evidence-path <p> --evidence-digest <sha256>
+//        --digests-unchanged <true|false|unknown> [--invocations <label=state,...>] --evidence-path <p> --evidence-digest <sha256>
 //        [--record-id ..] [--baseline-id ..] [--build-channel ..] [--build-channel-digest ..]
 //        [--exercised-artifact-digest ..] [--observed-state ..] [--operator-role ..]
 
@@ -39,6 +39,8 @@ const HARNESS_NAMES = {
 
 export const SWITCH_LEG = { result: 'uncertain', reason: 'no checkpoint-and-restart flow exists' };
 
+// A number followed, within a few words, by `file` or `files`.
+const GEMINI_NOTICE_COUNT = /\b\d+\b[^\n]{0,40}\bfiles?\b/i;
 const SEMVER = /\d+\.\d+\.\d+/;
 const EXCERPT_LIMIT = 200;
 
@@ -139,7 +141,7 @@ function findLines(lines, pattern) {
  *   userSkillMarker?: string}} input
  */
 export function observeLeg({
-  adapter, transcript, versionText, definitionName, skillName, home = '', userSkillMarker = 'USER-LEVEL-SKILL-MARKER',
+  adapter, transcript, versionText, skillName, home = '', userSkillMarker = 'USER-LEVEL-SKILL-MARKER',
 }) {
   if (!Object.hasOwn(EXPECTED_VERSIONS, adapter)) throw new Error(`unknown adapter: ${adapter}`);
   const reasons = [];
@@ -186,15 +188,17 @@ export function observeLeg({
     evidenceLines = findLines(material, /AGENTS\.md/);
     if (!hasSystem('init')) evidenceLines = [];
   } else {
-    const definitionPattern = definitionName ? new RegExp(escapeRegex(definitionName), 'i') : null;
-    evidenceLines = lines.filter((line) => /GEMINI\.md/.test(line) || (definitionPattern !== null && definitionPattern.test(line)));
+    // Only Gemini CLI's own context-file notice counts: a line naming GEMINI.md
+    // together with a count of files ("Loaded 1 GEMINI.md file", "1 context file
+    // (GEMINI.md)"). The model saying who it is, or merely mentioning the file, is prose.
+    evidenceLines = lines.filter((line) => /GEMINI\.md/.test(line) && GEMINI_NOTICE_COUNT.test(line));
   }
   const loadedFound = evidenceLines.length > 0;
   if (!loadedFound && lines.length > 0) {
     reasons.push({
       'claude-code': 'no system/init line together with a line naming CLAUDE.md or AGENTS.md',
       'stream-json-cli': 'no system/init line together with a line naming AGENTS.md',
-      'pty-cli': 'no normalized line names GEMINI.md or the definition',
+      'pty-cli': 'no normalized line is the CLI notice counting GEMINI.md files',
     }[adapter]);
   }
 
@@ -265,7 +269,7 @@ function legCell(observation) {
  * know is left as an `<operator: ...>` placeholder, never invented. */
 export function formatRecord({
   runId, recordId, baselineId, buildChannel, buildChannelDigest, exercisedArtifactDigest, observedState,
-  runDate, operatorRole, legs, digestsUnchanged, evidencePath, evidenceDigest,
+  runDate, operatorRole, legs, digestsUnchanged, invocationDigests = [], evidencePath, evidenceDigest,
 }) {
   const placeholder = (what) => `<operator: ${what}>`;
   const versions = LEG_ROWS.map(([adapter]) => {
@@ -292,6 +296,9 @@ export function formatRecord({
     ...LEG_ROWS.map(([adapter, key]) => [key, legCell(legs[adapter])]),
     ['switch_leg', `${SWITCH_LEG.result} -- ${SWITCH_LEG.reason}`],
     ['digests_unchanged', unchanged],
+    ...(invocationDigests.length > 0
+      ? [['digests_by_invocation', invocationDigests.map(({ label, state }) => `${label} ${state}`).join('; ')]]
+      : []),
     ['harness_versions', versions],
     ['run_date', runDate],
     ['operator_role', operatorRole ?? placeholder('role of the person who ran it')],
@@ -340,6 +347,10 @@ function recordMain(args) {
     operatorRole: get('--operator-role'),
     legs,
     digestsUnchanged: unchanged === 'true' ? true : unchanged === 'false' ? false : null,
+    invocationDigests: (get('--invocations') ?? '').split(',').filter((pair) => pair !== '').map((pair) => {
+      const at = pair.lastIndexOf('=');
+      return { label: pair.slice(0, at), state: pair.slice(at + 1) };
+    }),
     evidencePath: get('--evidence-path'),
     evidenceDigest: get('--evidence-digest'),
   }));
@@ -369,7 +380,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         adapter,
         transcript,
         versionText: readFileSync(versionPath, 'utf8'),
-        definitionName: argValue(args, '--name') ?? manifest.definitionName ?? '',
         skillName: argValue(args, '--skill') ?? manifest.skillName ?? 'release-notes',
         home,
         userSkillMarker: manifest.userSkillMarker,

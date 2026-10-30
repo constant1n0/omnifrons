@@ -131,17 +131,24 @@ test('observe writes observation-<adapter>.json and redacts HOME', LINUX_ONLY, (
   });
 });
 
-test('record assembles record.md and evidence-summary.txt; a changed digest makes it fail', LINUX_ONLY, () => {
+const ADAPTERS = ['claude-code', 'stream-json-cli', 'pty-cli'];
+const AFTER_LABELS = ADAPTERS.flatMap((adapter) => [1, 2].map((index) => `after-${adapter}-${index}`));
+
+function observedClaude(dir, env) {
+  const transcript = join(dir, 'claude.txt');
+  const version = join(dir, 'claude-version.txt');
+  writeFileSync(transcript, '{"type":"system","subtype":"init"}\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}},{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}\n');
+  writeFileSync(version, '2.1.307 (Claude Code)\n');
+  assert.equal(sh(['observe', 'claude-code', transcript, version], env).status, 0);
+}
+
+test('record assembles record.md and evidence-summary.txt from six per-invocation digests', LINUX_ONLY, () => {
   withDir((dir) => {
     const { runDir, root, env } = prepared(dir);
     writeFileSync(join(root, 'AGENTS.md'), 'canonical\n');
     sh(['digests', 'before'], env);
-    sh(['digests', 'after'], env);
-    const transcript = join(dir, 'claude.txt');
-    const version = join(dir, 'claude-version.txt');
-    writeFileSync(transcript, '{"type":"system","subtype":"init"}\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}},{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}\n');
-    writeFileSync(version, '2.1.307 (Claude Code)\n');
-    assert.equal(sh(['observe', 'claude-code', transcript, version], env).status, 0);
+    for (const label of AFTER_LABELS) assert.equal(sh(['digests', label], env).status, 0);
+    observedClaude(dir, env);
 
     const args = ['record', '--baseline-id', 'VP-001-BASE-01', '--run-date', '2026-11-01'];
     const ok = sh(args, env);
@@ -150,15 +157,45 @@ test('record assembles record.md and evidence-summary.txt; a changed digest make
     assert.match(record, /\| `result` \| uncertain \|/);
     assert.match(record, /\| `claude_code_leg` \| pass --/);
     assert.match(record, /\| `digests_unchanged` \| true \|/);
+    for (const label of AFTER_LABELS) assert.match(record, new RegExp(`${label} true`));
     assert.match(record, /\| `baseline_id` \| VP-001-BASE-01 \|/);
     assert.match(record, /\| `evidence_artifact` \| [0-9a-f]{64} -- /);
     assert.ok(existsSync(join(runDir, 'evidence-summary.txt')));
     assert.ok(!record.includes(dir), 'no local path in the record');
+  });
+});
 
-    writeFileSync(join(root, 'AGENTS.md'), 'changed\n');
-    sh(['digests', 'after'], env);
-    assert.equal(sh(args, env).status, 0);
-    assert.match(readFileSync(join(runDir, 'record.md'), 'utf8'), /\| `result` \| fail \|/);
+test('a changed intermediate digest makes the record fail even when the last one is unchanged', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    writeFileSync(join(root, 'AGENTS.md'), 'canonical\n');
+    sh(['digests', 'before'], env);
+    for (const label of AFTER_LABELS) {
+      if (label === 'after-stream-json-cli-1') writeFileSync(join(root, 'AGENTS.md'), 'changed\n');
+      if (label === 'after-stream-json-cli-2') writeFileSync(join(root, 'AGENTS.md'), 'canonical\n');
+      sh(['digests', label], env);
+    }
+    observedClaude(dir, env);
+    assert.equal(sh(['record', '--run-date', '2026-11-01'], env).status, 0);
+    const record = readFileSync(join(runDir, 'record.md'), 'utf8');
+    assert.match(record, /\| `result` \| fail \|/);
+    assert.match(record, /\| `digests_unchanged` \| false \|/);
+    assert.match(record, /after-stream-json-cli-1 false/);
+    assert.match(record, /after-stream-json-cli-2 true/);
+  });
+});
+
+test('a missing per-invocation digest leaves the overall value unknown, never true', LINUX_ONLY, () => {
+  withDir((dir) => {
+    const { runDir, root, env } = prepared(dir);
+    writeFileSync(join(root, 'AGENTS.md'), 'canonical\n');
+    sh(['digests', 'before'], env);
+    sh(['digests', AFTER_LABELS[0]], env);
+    assert.equal(sh(['record', '--run-date', '2026-11-01'], env).status, 0);
+    const record = readFileSync(join(runDir, 'record.md'), 'utf8');
+    assert.match(record, /\| `digests_unchanged` \| unknown/);
+    assert.match(record, /after-pty-cli-2 missing/);
+    assert.match(record, /\| `result` \| uncertain \|/);
   });
 });
 

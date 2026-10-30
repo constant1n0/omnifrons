@@ -146,7 +146,7 @@ test('the bridge without its retained version line is uncertain', () => {
 test('pty-cli passes on a normalized line naming GEMINI.md and the indexed path', () => {
   const result = observeLeg({
     adapter: 'pty-cli',
-    transcript: '\u001b[2J\u001b[1;32mLoaded GEMINI.md\u001b[0m\r\nReadFile skills/release-notes/SKILL.md\r\n',
+    transcript: '\u001b[2J\u001b[1;32mUsing: 1 GEMINI.md file\u001b[0m\r\nReadFile skills/release-notes/SKILL.md\r\n',
     versionText: GEMINI_VERSION,
     ...OPTIONS,
   });
@@ -155,14 +155,26 @@ test('pty-cli passes on a normalized line naming GEMINI.md and the indexed path'
   assert.equal(result.harness.version, '0.41.2');
 });
 
-test('pty-cli accepts the definition name as loaded-file evidence', () => {
+test('pty-cli does not accept the model saying who it is as loaded-file evidence', () => {
   const result = observeLeg({
     adapter: 'pty-cli',
     transcript: 'I am Orbit Scribe.\nReadFile skills/release-notes/SKILL.md\n',
     versionText: GEMINI_VERSION,
     ...OPTIONS,
   });
-  assert.equal(result.result, 'pass');
+  assert.equal(result.result, 'uncertain');
+  assert.equal(result.loadedFileEvidence.found, false);
+  assert.equal(result.skillPaths.indexed, true);
+});
+
+test('pty-cli needs the CLI notice that counts GEMINI.md files, not any mention', () => {
+  const notice = (line) => observeLeg({
+    adapter: 'pty-cli', transcript: `${line}\nReadFile skills/release-notes/SKILL.md\n`, versionText: GEMINI_VERSION, ...OPTIONS,
+  });
+  assert.equal(notice('Loaded 1 GEMINI.md file').result, 'pass');
+  assert.equal(notice('1 context file (GEMINI.md)').result, 'pass');
+  assert.equal(notice('I read GEMINI.md earlier').result, 'uncertain');
+  assert.equal(notice('Loaded GEMINI.md').result, 'uncertain');
 });
 
 test('pty-cli with neither evidence nor a skill path is uncertain; an empty transcript too', () => {
@@ -324,4 +336,15 @@ test('a sha256 digest survives redaction and the detector, while base64-like run
   assert.ok(findSecrets(`x${digest}`).length > 0, 'neither is a digest with a neighbour');
   const observation = JSON.stringify({ digest, other: { sha256: 'f'.repeat(64) } }, null, 2);
   assert.deepEqual(findSecrets(observation), []);
+});
+
+test('formatRecord lists each invocation digest result next to the overall value', () => {
+  const text = formatRecord({
+    runId: 'run-3', recordId: 'R', baselineId: 'B', runDate: '2026-11-01', operatorRole: 'r', legs: {},
+    digestsUnchanged: false, evidencePath: 'p', evidenceDigest: 'e'.repeat(64),
+    invocationDigests: [{ label: 'after-a-1', state: 'true' }, { label: 'after-a-2', state: 'false' }, { label: 'after-b-1', state: 'missing' }],
+  });
+  assert.match(text, /\| `digests_unchanged` \| false \|/);
+  assert.match(text, /\| `digests_by_invocation` \| after-a-1 true; after-a-2 false; after-b-1 missing \|/);
+  assert.match(text, /\| `result` \| fail \|/);
 });

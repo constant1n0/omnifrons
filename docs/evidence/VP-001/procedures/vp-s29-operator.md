@@ -1,5 +1,10 @@
 # VP-S29 operator procedure (Linux)
 
+> **NOT RUNNABLE YET.** The Agent panel renders the transcript as text, not as
+> the raw harness stream the helper parses, so the copy-out in step 4 is a
+> placeholder. Until a raw harness log, or a structured event export, exists,
+> this procedure cannot produce a filable run. Do not file a record from it.
+
 Scenario: `docs/desktop-stack-verification-plan.md`, row VP-S29. This is a
 local operator run with user-installed, credentialed CLIs, not a CI job. The
 helper `vp-s29-linux.sh` prepares the fixture, takes digests, derives each
@@ -10,7 +15,12 @@ Outcome rules: the switch leg is always `uncertain` (no checkpoint-and-restart
 flow exists), so the run's overall `result` is `uncertain` and never discharges
 the ADR-0005 gate. A load leg is `pass` only with loaded-file evidence from the
 harness itself plus the indexed skill path; anything unclear is `uncertain`,
-never `pass`. For `claude-code` and the bridge, loaded-file evidence is
+never `pass`. For `pty-cli`, loaded-file evidence is Gemini CLI's own context-file notice
+only: a line naming `GEMINI.md` together with a count of files (for example
+"Loaded 1 GEMINI.md file" or "1 context file (GEMINI.md)"). The model saying
+who it is, or mentioning the file, never counts; without the notice the leg is
+`uncertain` even when the indexed skill path appears. For `claude-code` and the
+bridge, loaded-file evidence is
 non-assistant material only: a `system` line naming `CLAUDE.md`/`AGENTS.md`, or
 a `tool_use` block whose input names the file (a read). An assistant text block
 that merely mentions the file never counts, and the indexed skill path counts
@@ -113,9 +123,11 @@ never committed. The `codex` CLI itself is not approved: the bridge runs it.
 For each adapter, in this order (`claude-code`, `stream-json-cli`, `pty-cli`):
 
 1. In the Agent panel pick the adapter and its approval.
-2. Run 1: prompt `Who are you?`, Start, wait for the run to end.
-3. Run 2: prompt `Draft release notes for version 1.2.0. Changes: added an export button; fixed a login timeout.`, Start, wait for the run to end.
-4. Copy the text of the Agent panel's "Agent transcript" list (the list whose
+2. Run 1: prompt `Who are you?`, Start, wait for the run to end, then immediately
+   `procedures/vp-s29-linux.sh digests after-<adapter>-1`.
+3. Run 2: prompt `Draft release notes for version 1.2.0. Changes: added an export button; fixed a login timeout.`, Start, wait for the run to end, then immediately
+   `procedures/vp-s29-linux.sh digests after-<adapter>-2`.
+4. (Placeholder until the capture route exists.) Copy the text of the Agent panel's "Agent transcript" list (the list whose
    accessible label is "Agent transcript") of both runs, in order, into
    one file per leg (`claude-transcript.txt`, `codex-transcript.txt`,
    `gemini-transcript.txt`). The first lines are the startup capture.
@@ -129,8 +141,10 @@ residual of this procedure.
 
 ## 5. Derive and record
 
-1. `procedures/vp-s29-linux.sh digests after`, then
-   `procedures/vp-s29-linux.sh compare <run dir>/digests-before.txt <run dir>/digests-after.txt`.
+1. One digest was taken after each of the six invocations (step 4), so a run
+   that changed a file and a later one that restored it cannot hide. Compare
+   each one: `procedures/vp-s29-linux.sh compare <run dir>/digests-before.txt <run dir>/digests-after-<adapter>-<n>.txt`.
+   `record` does the same comparison for all six and lists each one.
    `.omnifrons/` and the outbox may change; the digests cover only
    `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and every `skills/**/SKILL.md`.
 2. Per leg: `procedures/vp-s29-linux.sh observe <adapter> <transcript> <version-file>`

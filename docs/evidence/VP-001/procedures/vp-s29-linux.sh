@@ -9,7 +9,7 @@
 # usage-begin
 # Usage: vp-s29-linux.sh --help
 #        vp-s29-linux.sh fixture
-#        vp-s29-linux.sh digests <label>
+#        vp-s29-linux.sh digests <label>   (before; after-<adapter>-<1|2> per invocation)
 #        vp-s29-linux.sh compare <digests-a> <digests-b>
 #        vp-s29-linux.sh observe <adapter> <transcript> <version-file>
 #        vp-s29-linux.sh record --run-date <YYYY-MM-DD> [--record-id <id>]
@@ -190,15 +190,44 @@ mode_record() {
     die_usage "evidence artifact not found in the run folder: ${evidence_artifact}"
   fi
 
-  local unchanged=unknown
-  if [[ -f "${dir}/digests-before.txt" && -f "${dir}/digests-after.txt" ]]; then
-    if cmp -s "${dir}/digests-before.txt" "${dir}/digests-after.txt"; then unchanged=true; else unchanged=false; fi
-  fi
+  # One digest file per harness invocation (digests after-<adapter>-<1|2>),
+  # each compared with `before`. Changed anywhere means changed overall; a
+  # missing invocation keeps the overall value `unknown`, never `true`.
+  local unchanged=true adapter index label expected=" " invocations=""
+  if [[ ! -f "${dir}/digests-before.txt" ]]; then unchanged=unknown; fi
+  record_invocation() {
+    local state
+    if [[ ! -f "${dir}/digests-$1.txt" ]]; then
+      state=missing
+      [[ "${unchanged}" == true ]] && unchanged=unknown
+    elif [[ ! -f "${dir}/digests-before.txt" ]]; then
+      state=unknown
+    elif cmp -s "${dir}/digests-before.txt" "${dir}/digests-$1.txt"; then
+      state=true
+    else
+      state=false
+      unchanged=false
+    fi
+    invocations+="${invocations:+,}$1=${state}"
+  }
+  for adapter in claude-code stream-json-cli pty-cli; do
+    for index in 1 2; do
+      label="after-${adapter}-${index}"
+      expected+="${label} "
+      record_invocation "${label}"
+    done
+  done
+  for file in "${dir}"/digests-after-*.txt; do
+    [[ -f "${file}" ]] || continue
+    label="$(basename "${file}" .txt)"
+    label="${label#digests-}"
+    [[ "${expected}" == *" ${label} "* ]] || record_invocation "${label}"
+  done
 
   # The retained, redacted evidence in one file whose digest the record cites.
   local summary="${dir}/evidence-summary.txt" file
   : > "${summary}"
-  for file in "${dir}"/observation-*.json "${dir}/digests-before.txt" "${dir}/digests-after.txt"; do
+  for file in "${dir}"/observation-*.json "${dir}/digests-before.txt" "${dir}"/digests-after-*.txt; do
     [[ -f "${file}" ]] || continue
     printf '== %s ==\n' "$(basename "${file}")" >> "${summary}"
     cat "${file}" >> "${summary}"
@@ -218,7 +247,7 @@ mode_record() {
   [[ -n "${observed_state}" ]] && optional+=(--observed-state "${observed_state}")
   [[ -n "${operator_role}" ]] && optional+=(--operator-role "${operator_role}")
   node "${procedures_dir}/vp-s29-observations.mjs" record --run-dir "${dir}" --run-id "${VP_S29_RUN_ID}" \
-    --run-date "${run_date}" --digests-unchanged "${unchanged}" \
+    --run-date "${run_date}" --digests-unchanged "${unchanged}" --invocations "${invocations}" \
     --evidence-path "docs/evidence/VP-001/artifacts/vp-s29/${VP_S29_RUN_ID}/${evidence_artifact}" \
     --evidence-digest "${digest}" ${optional[@]+"${optional[@]}"} > "${dir}/.record.md.tmp" || {
       rm -f "${dir}/.record.md.tmp"
