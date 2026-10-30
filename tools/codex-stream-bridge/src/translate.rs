@@ -43,6 +43,8 @@ const TOOL_ITEMS: &[&str] = &[
     "mcp_tool_call",
     "file_change",
     "web_search",
+    "collab_tool_call",
+    "todo_list",
 ];
 
 /// Translate one Codex JSONL line into the actions the bridge must take.
@@ -78,21 +80,17 @@ pub fn translate(line: &str, state: &mut State) -> Vec<Out> {
             outs.push(stdout(&json!({"type": "result", "subtype": "success"})));
             outs.push(Out::Finish { exit: 0 });
         }
-        "turn.failed" => {
+        // `turn.failed` and the top-level `error` are both fatal in Codex's
+        // event schema; a non-fatal error arrives as an `error` item instead.
+        "turn.failed" | "error" => {
             ensure_init(state, None, &mut outs);
             outs.push(diag(&format!(
-                "codex reported turn.failed: {}",
+                "codex reported {kind}: {}",
                 clip(&error_message(&value))
             )));
             outs.push(stdout(&json!({"type": "result", "subtype": "error"})));
             outs.push(Out::Finish { exit: 1 });
         }
-        // Codex also uses `error` for non-fatal, retried stream errors, so it
-        // is a diagnostic only; the turn ends at `turn.failed` or end of input.
-        "error" => outs.push(diag(&format!(
-            "codex reported error: {}",
-            clip(&error_message(&value))
-        ))),
         other => outs.push(diag(&format!("unknown event type {other}: {}", clip(line)))),
     }
     outs
@@ -133,6 +131,10 @@ fn translate_item(item: &Value, state: &mut State, outs: &mut Vec<Out>) {
                 outs.push(assistant(&json!({"type": "text", "text": text})));
             }
         }
+        ("error", _) => outs.push(diag(&format!(
+            "codex non-fatal error item: {}",
+            clip(&error_message(item))
+        ))),
         (ty, _) if TOOL_ITEMS.contains(&ty) => {
             ensure_init(state, None, outs);
             outs.push(assistant(
@@ -275,6 +277,8 @@ mod tests {
     #[test]
     fn tool_like_items_become_tool_use_with_item_as_input() {
         for ty in [
+            "collab_tool_call",
+            "todo_list",
             "command_execution",
             "mcp_tool_call",
             "file_change",
@@ -357,12 +361,30 @@ mod tests {
     }
 
     #[test]
-    fn error_event_is_a_diagnostic_and_the_run_continues() {
+    fn a_fatal_error_event_ends_the_run_with_an_error_result() {
         let mut st = state();
         translate(THREAD, &mut st);
-        let outs = translate(r#"{"type":"error","message":"retrying"}"#, &mut st);
+        let outs = translate(r#"{"type":"error","message":"fatal"}"#, &mut st);
+        assert_eq!(
+            stdout_values(&outs),
+            vec![json!({"type":"result","subtype":"error"})]
+        );
+        assert_eq!(outs.last(), Some(&Out::Finish { exit: 1 }));
+        assert!(
+            outs.iter()
+                .any(|o| matches!(o, Out::Stderr(s) if s.contains("fatal")))
+        );
+    }
+
+    #[test]
+    fn an_error_item_is_a_diagnostic_and_the_run_continues() {
+        let mut st = state();
+        translate(THREAD, &mut st);
+        let line =
+            r#"{"type":"item.completed","item":{"id":"i","type":"error","message":"soft\nfail"}}"#;
+        let outs = translate(line, &mut st);
         assert_eq!(outs.len(), 1);
-        assert!(matches!(&outs[0], Out::Stderr(s) if s.contains("retrying")));
+        assert!(matches!(&outs[0], Out::Stderr(s) if s.contains("soft") && !s.contains('\n')));
         let next =
             r#"{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"x"}}"#;
         assert_eq!(stdout_values(&translate(next, &mut st)).len(), 1);
@@ -391,7 +413,7 @@ mod tests {
         translate(THREAD, &mut st);
         for line in [
             r#"{"type":"something.new","x":1}"#,
-            r#"{"type":"item.completed","item":{"id":"i","type":"todo_list"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i","type":"brand_new_item"}}"#,
             r#"{"no_type":true}"#,
             "not json at all",
             "",
