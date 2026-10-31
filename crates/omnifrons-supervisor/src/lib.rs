@@ -464,9 +464,6 @@ impl SelfExitReaper {
     /// The caller holds this id's [`SettlingGuard`] across the call, so
     /// until the verdict is recorded `observe` does not report (or finalize
     /// with) the reap-derived state and `stop` waits for it.
-    // On Windows the body has no `.await`: the census is a stub and the state
-    // is recorded inline, so clippy's `unused_async` would fire there alone.
-    #[cfg_attr(not(unix), allow(clippy::unused_async))]
     async fn settle_and_record(&self, census: Census, reaped: ProcessTerminalState) {
         #[cfg(unix)]
         {
@@ -484,7 +481,12 @@ impl SelfExitReaper {
         }
         #[cfg(not(unix))]
         {
+            // No sweep exists here; the yield keeps this an honest `async fn`
+            // on every platform (clippy's `unused_async` otherwise fires on
+            // Windows alone) and lets the runtime schedule between reap and
+            // record exactly as the unix branch's blocking task does.
             let _ = census;
+            tokio::task::yield_now().await;
             output_capture::record_confirmed_state(&self.outputs, self.id, reaped);
         }
     }
@@ -592,7 +594,10 @@ impl Census {
     // Takes `&self` it does not read, so this stub keeps the exact shape
     // the Linux census has and `stop` stays one platform-independent call
     // site (`clippy::unused_self` would have it an associated function).
+    // Called only from the unix paths (`stop` and the self-exit settle), so
+    // on Windows the stub is compiled but never used.
     #[allow(clippy::unused_self)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn settle<P>(&self, _pgid: P, reaped: ProcessTerminalState) -> ProcessTerminalState {
         reaped
     }
