@@ -286,6 +286,10 @@ struct ReapPacing {
     census_refresh: Duration,
     /// How often it is retaken in the idle phase.
     census_idle_refresh: Duration,
+    /// How long `observe` keeps deferring to a claimed reaper that has not
+    /// polled: longer than the slowest poll (2 s idle), so a healthy reaper
+    /// is never mistaken for a stalled one.
+    stall_grace: Duration,
 }
 
 impl ReapPacing {
@@ -297,6 +301,7 @@ impl ReapPacing {
         idle_poll: Duration::from_secs(2),
         census_refresh: Duration::from_millis(250),
         census_idle_refresh: CENSUS_IDLE_REFRESH,
+        stall_grace: Duration::from_secs(3),
     };
 
     fn interval(&self, elapsed: Duration) -> Duration {
@@ -379,12 +384,6 @@ impl Drop for SettlingGuard {
 /// backstop against a stuck blocking pool.
 const SETTLE_WAIT: Duration = Duration::from_secs(5);
 const SETTLE_POLL: Duration = Duration::from_millis(5);
-
-/// How long `observe` defers to a self-exit reaper that holds a child. It
-/// equals the reaper's fast window: the reaper's designed job is the
-/// EOF-to-exit window plus the settle, which take milliseconds, so a claim
-/// older than this is a stalled reaper, not a busy one.
-const OBSERVE_DEFERRAL: Duration = Duration::from_secs(3);
 
 impl Drop for StoppingGuard<'_> {
     fn drop(&mut self) {
@@ -492,7 +491,13 @@ impl SelfExitReaper {
                     "descendant settle took longer than the settle wait"
                 );
             }
-            unix::record_settled_state(&self.children, &self.outputs, self.id, settled);
+            unix::record_reaper_settled_state(
+                &self.children,
+                &self.settling,
+                &self.outputs,
+                self.id,
+                settled,
+            );
         }
         #[cfg(not(unix))]
         {
@@ -609,7 +614,7 @@ impl Census {
     // Takes `&self` it does not read, so this stub keeps the exact shape
     // the Linux census has and `stop` stays one platform-independent call
     // site (`clippy::unused_self` would have it an associated function).
-    // Called only from the unix paths (`stop` and the self-exit settle), so
+    // The call sites are unix-only: `windows::stop` never settles, so
     // on Windows the stub is compiled but never used.
     #[allow(clippy::unused_self)]
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -1471,12 +1476,17 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         // holds this child it alone confirms the reap, so that its
         // descendant sweep decides the terminal state; `observe` reports
         // `Running` meanwhile (at most the reaper's next poll plus the
-        // sweep). The deferral is bounded by `OBSERVE_DEFERRAL`: past it the
-        // reaper is stalled, and `observe` confirms the reap itself, as it
-        // did before the reaper existed.
+        // sweep). The deferral lasts while the reaper keeps polling: it ends
+        // once its last poll (its claim, before the first) is older than
+        // `stall_grace`, and `observe` then confirms the reap itself.
         let claim = output_capture::reaper_claim(&self.inner.outputs, id);
         let reaper_active = match &claim {
-            Some(claim) if claim.claimed_at.elapsed() < OBSERVE_DEFERRAL => true,
+            Some(claim)
+                if claim.last_poll_at.unwrap_or(claim.claimed_at).elapsed()
+                    < self.inner.reap_pacing.stall_grace =>
+            {
+                true
+            }
             Some(claim) => {
                 if output_capture::note_deferral_expired(&self.inner.outputs, id) {
                     tracing::warn!(
@@ -1484,8 +1494,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                         claimed_ago = ?claim.claimed_at.elapsed(),
                         polls = claim.polls,
                         last_poll_ago = ?claim.last_poll_at.map(|at| at.elapsed()),
-                        "self-exit reaper held the child past the observe deferral; \
-                         observing it directly"
+                        "self-exit reaper stopped polling; observing the child directly"
                     );
                 }
                 false
@@ -1504,20 +1513,31 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             // The self-exit reaper reaped it but has not recorded its
             // settled verdict: report the child as still running and
             // finalize nothing with the reap-derived state.
-            // Bounded by `SETTLE_WAIT`, like `stop`'s wait: past it the
-            // terminal state is reported as recorded.
-            Tracked::Terminal(_)
-                if self
+            // Past `SETTLE_WAIT` `observe` takes the settle over: it drops the
+            // id from `settling` inside this `children` critical section, so
+            // the reaper's late verdict is discarded and one child never shows
+            // two terminal states. `children` may nest `settling`, not back.
+            Tracked::Terminal(state) => {
+                let mut settling = self
                     .inner
                     .settling
                     .lock()
-                    .expect("settling mutex poisoned by a prior panic")
-                    .get(&id)
-                    .is_some_and(|since| since.elapsed() < SETTLE_WAIT) =>
-            {
-                Some(ProcessStatus::Running)
+                    .expect("settling mutex poisoned by a prior panic");
+                match settling.get(&id).map(std::time::Instant::elapsed) {
+                    Some(waited) if waited < SETTLE_WAIT => Some(ProcessStatus::Running),
+                    Some(waited) => {
+                        settling.remove(&id);
+                        tracing::warn!(
+                            pid = id.0,
+                            waited = ?waited,
+                            "settle verdict not recorded within the settle wait; \
+                             reporting the reap-derived state"
+                        );
+                        Some(ProcessStatus::Terminal(*state))
+                    }
+                    None => Some(ProcessStatus::Terminal(*state)),
+                }
             }
-            Tracked::Terminal(state) => Some(ProcessStatus::Terminal(*state)),
             Tracked::Running(_) if reaper_active => Some(ProcessStatus::Running),
             Tracked::Running(child) => match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1908,6 +1928,45 @@ mod unix {
         output_capture::record_confirmed_state(outputs, id, state);
     }
 
+    /// [`record_settled_state`] for the self-exit reaper: writes only while
+    /// `id` is still in `settling`. Once `observe` took the settle over it
+    /// has reported the reap-derived state, so a late verdict is discarded.
+    /// Locks `children`, then `settling`; `outputs` is locked alone after.
+    pub(crate) fn record_reaper_settled_state(
+        children: &Mutex<HashMap<ProcessId, Tracked>>,
+        settling: &Mutex<HashMap<ProcessId, std::time::Instant>>,
+        outputs: &OutputTable,
+        id: ProcessId,
+        settled: ProcessTerminalState,
+    ) {
+        {
+            let mut guard = children
+                .lock()
+                .expect("children mutex poisoned by a prior panic");
+            let settling = settling
+                .lock()
+                .expect("settling mutex poisoned by a prior panic");
+            if !settling.contains_key(&id) {
+                if let Some(Tracked::Terminal(recorded)) = guard.get(&id)
+                    && *recorded != settled
+                {
+                    tracing::warn!(
+                        pid = id.0,
+                        settled = ?settled,
+                        reported = ?recorded,
+                        "late settle verdict discarded; observe already reported \
+                         the reap-derived state"
+                    );
+                }
+                return;
+            }
+            if let Some(tracked) = guard.get_mut(&id) {
+                *tracked = Tracked::Terminal(settled);
+            }
+        }
+        output_capture::record_confirmed_state(outputs, id, settled);
+    }
+
     /// Poll `try_wait` until the child is reaped or `budget` elapses.
     ///
     /// On reap, evicts the entry to `Tracked::Terminal` (dropping the
@@ -2164,6 +2223,7 @@ mod self_exit_tests {
         idle_poll: Duration::from_millis(20),
         census_refresh: Duration::from_secs(1),
         census_idle_refresh: Duration::from_secs(10),
+        stall_grace: Duration::from_secs(3),
     };
 
     #[test]
@@ -2199,6 +2259,7 @@ mod self_exit_tests {
         idle_poll: Duration::from_secs(3600),
         census_refresh: Duration::from_secs(3600),
         census_idle_refresh: Duration::from_secs(3600),
+        stall_grace: Duration::from_millis(300),
     };
 
     #[test]
@@ -2207,7 +2268,7 @@ mod self_exit_tests {
         // Output closes at once and the reaper's first attempt finds the
         // child alive; the child exits by itself a moment later, after which
         // the stalled reaper never looks again.
-        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 0.3"]);
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 2"]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
         let _frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
@@ -2220,7 +2281,7 @@ mod self_exit_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let end = std::time::Instant::now() + super::OBSERVE_DEFERRAL + Duration::from_secs(2);
+        let end = std::time::Instant::now() + NEVER_POLLS.stall_grace + Duration::from_secs(2);
         let status = loop {
             match supervisor.observe(id) {
                 Some(ProcessStatus::Running) if std::time::Instant::now() < end => {
@@ -2257,5 +2318,38 @@ mod self_exit_tests {
             takes <= 2,
             "census taken {takes} times for one long-lived child"
         );
+    }
+
+    #[test]
+    fn observe_keeps_deferring_to_a_healthy_slow_reaper() {
+        // A reaper polling every 200 ms outlives `stall_grace` (500 ms).
+        let pacing = ReapPacing {
+            idle_poll: Duration::from_millis(200),
+            stall_grace: Duration::from_millis(500),
+            ..SHORT
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 1.5"]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let _frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        let outputs = supervisor.inner.outputs.clone();
+        while super::output_capture::reaper_claim(&outputs, id).is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (watch, end) = (Duration::from_millis(1200), Duration::from_secs(4));
+        let began = std::time::Instant::now();
+        let status = loop {
+            let status = supervisor.observe(id);
+            if status != Some(ProcessStatus::Running) || began.elapsed() > end {
+                break status;
+            }
+            if began.elapsed() < watch {
+                assert!(super::output_capture::reaper_claim(&outputs, id).is_some());
+                assert!(!super::output_capture::deferral_expired(&outputs, id));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let exited = ProcessTerminalState::Exited { code: Some(0) };
+        assert_eq!(status, Some(ProcessStatus::Terminal(exited)));
     }
 }

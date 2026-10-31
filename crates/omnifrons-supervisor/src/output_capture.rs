@@ -605,6 +605,13 @@ pub(crate) fn note_deferral_expired(outputs: &OutputTable, id: ProcessId) -> boo
     }
 }
 
+/// Whether [`note_deferral_expired`] fired for `id` (test read accessor).
+#[cfg(test)]
+pub(crate) fn deferral_expired(outputs: &OutputTable, id: ProcessId) -> bool {
+    let guard = outputs.lock().expect("outputs mutex poisoned");
+    guard.get(&id).is_some_and(|e| e.deferral_expired_logged)
+}
+
 /// Give up a claim taken by [`claim_reap`], for a reaper that ends without
 /// having reaped the child, so `observe` confirms the reap again.
 pub(crate) fn release_reap(outputs: &OutputTable, id: ProcessId) {
