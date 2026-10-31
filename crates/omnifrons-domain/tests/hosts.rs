@@ -1,10 +1,11 @@
 //! Host loader table contracts (ADR-0005 sub-slice 1d): the nine hosts
 //! the prototype's `HOSTS.md` documented, transcribed as data for
-//! warnings.
+//! warnings, plus the Hermes Agent row added from its own documentation
+//! on 2026-10-31.
 
 use omnifrons_domain::hosts;
 
-const HOST_ORDER: [&str; 9] = [
+const HOST_ORDER: [&str; 10] = [
     "Claude Code",
     "Codex",
     "Gemini CLI",
@@ -14,13 +15,14 @@ const HOST_ORDER: [&str; 9] = [
     "Kimi",
     "Cursor",
     "Copilot",
+    "Hermes Agent",
 ];
 
 /// The prototype sorts warning hosts by `HOST_ORDER.index`; `HOSTS` and
 /// `order_index` must agree with that same order, and an unknown name
 /// resolves to `None` on both lookups.
 #[test]
-fn host_order_matches_the_nine_documented_hosts() {
+fn host_order_matches_the_nine_documented_hosts_plus_hermes_agent() {
     assert_eq!(hosts::HOSTS.len(), HOST_ORDER.len());
     for (index, name) in HOST_ORDER.iter().copied().enumerate() {
         assert_eq!(
@@ -65,21 +67,26 @@ fn import_blind_readers_matches_the_prototypes_order() {
         "Kimi",
         "Cursor",
         "Copilot",
+        "Hermes Agent",
     ];
     let actual: Vec<&str> = hosts::import_blind_readers().collect();
     assert_eq!(actual, expected);
 }
 
-/// `CODEX_MAX_BYTES` (32 KiB) and `ANTIGRAVITY_MAX_BYTES` (24,000 bytes)
-/// are the only two documented size caps; every other host is uncapped.
+/// `CODEX_MAX_BYTES` (32 KiB), `ANTIGRAVITY_MAX_BYTES` (24,000 bytes) and
+/// `HERMES_CONTEXT_MIN_CHARS` (the 20,000-character floor of Hermes Agent's
+/// context-file cap) are the only documented size caps; every other host is
+/// uncapped.
 #[test]
-fn size_caps_are_set_only_for_codex_and_antigravity() {
+fn size_caps_are_set_only_for_codex_antigravity_and_hermes_agent() {
     assert_eq!(hosts::CODEX_MAX_BYTES, 32_768);
     assert_eq!(hosts::ANTIGRAVITY_MAX_BYTES, 24_000);
+    assert_eq!(hosts::HERMES_CONTEXT_MIN_CHARS, 20_000);
     for host in &hosts::HOSTS {
         let expected = match host.name {
             "Codex" => Some(hosts::CODEX_MAX_BYTES),
             "Antigravity" => Some(hosts::ANTIGRAVITY_MAX_BYTES),
+            "Hermes Agent" => Some(hosts::HERMES_CONTEXT_MIN_CHARS),
             _ => None,
         };
         assert_eq!(host.size_cap, expected, "{} size_cap", host.name);
@@ -101,10 +108,12 @@ fn extra_readers_maps_each_extra_file_to_its_prototype_host_tuple() {
         (".agents/AGENTS.md", &["Antigravity"]),
         (".agents/rules", &["Antigravity"]),
         (".claude/rules", &["Claude Code"]),
-        (".cursor/rules", &["Cursor"]),
-        (".cursorrules", &["Cursor"]),
+        (".cursor/rules", &["Cursor", "Hermes Agent"]),
+        (".cursorrules", &["Cursor", "Hermes Agent"]),
         (".github/copilot-instructions.md", &["Copilot"]),
         (".claude/AGENTS.md", &["Claude Code"]),
+        (".hermes.md", &["Hermes Agent"]),
+        ("HERMES.md", &["Hermes Agent"]),
     ];
     assert_eq!(hosts::EXTRA_READERS, expected);
 }
@@ -151,6 +160,43 @@ fn host_files_match_the_documented_table() {
     );
     assert_eq!(hosts::host("Cursor").unwrap().files, ["AGENTS.md"]);
     assert_eq!(hosts::host("Copilot").unwrap().files, ["AGENTS.md"]);
+    assert_eq!(
+        hosts::host("Hermes Agent").unwrap().files,
+        [
+            ".hermes.md",
+            "HERMES.md",
+            "AGENTS.override.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".cursorrules",
+        ]
+    );
+}
+
+/// Hermes Agent is the one row that does not come from the prototype: its
+/// documentation ("Context Files", read 2026-10-31) loads one project file
+/// type per session, first match wins in the order above, gathers
+/// `AGENTS.md` from the git root down to the working directory and never
+/// consults parents outside a repository, documents no `@` import, and caps
+/// each startup file at a character budget whose floor is 20,000.
+#[test]
+fn hermes_agent_row_follows_its_own_documentation() {
+    let hermes = hosts::host("Hermes Agent").unwrap();
+    assert_eq!(hermes.walk, hosts::Walk::GitRootToCwd);
+    assert_eq!(hermes.imports, hosts::ImportSupport::None);
+    assert!(hermes.import_blind);
+    assert!(hermes.upward_kinds.is_empty());
+    assert_eq!(hermes.size_cap, Some(hosts::HERMES_CONTEXT_MIN_CHARS));
+    assert_eq!(
+        hermes.source,
+        "https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files"
+    );
+    assert_eq!(hermes.accessed, "2026-10-31");
+    assert_eq!(hermes.status, "Verified (docs page)");
+    assert!(hermes.reads("AGENTS.md"));
+    assert!(hermes.reads(".hermes.md"));
+    assert!(!hermes.reads("GEMINI.md"));
+    assert_eq!(hosts::order_index("Hermes Agent"), Some(9));
 }
 
 /// Each host's `fallback_files`: the files a host reads only when none
@@ -205,7 +251,10 @@ fn skip_dirs_host_config_dirs_and_generated_state_dirs_match_the_prototype() {
             ".portable-agent"
         ]
     );
-    assert_eq!(hosts::HOST_CONFIG_DIRS, [".claude", ".kimi", ".agents"]);
+    assert_eq!(
+        hosts::HOST_CONFIG_DIRS,
+        [".claude", ".kimi", ".agents", ".hermes"]
+    );
     assert_eq!(hosts::GENERATED_STATE_DIRS, [".atl"]);
 }
 

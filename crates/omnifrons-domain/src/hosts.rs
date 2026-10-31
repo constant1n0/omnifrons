@@ -5,7 +5,10 @@
 //! [`HostLoader::reads`] provide. The table
 //! starts from the nine hosts the `base_omnifrons` prototype's
 //! `HOSTS.md` documented (accessed 2026-09-25), and carries each row's
-//! source URL, access date, and verification status unchanged. The
+//! source URL, access date, and verification status unchanged; a tenth
+//! row, Hermes Agent, was added on 2026-10-31 from that host's own
+//! documentation, so the prototype-derived constants below name it only
+//! where its documentation supports the same claim. The
 //! prototype's own constants -- `HOST_ORDER`, `EXTRA_READERS`,
 //! `SKIP_DIRS`, `HOST_CONFIG_DIRS`, `GENERATED_STATE_DIRS`,
 //! `CODEX_MAX_BYTES`, `ANTIGRAVITY_MAX_BYTES`, `UPWARD_LOADERS`, and
@@ -15,7 +18,7 @@
 //! ADR-0005 (`docs/adr/0005-agent-identity-and-portable-definition.md`)
 //! uses this table for warnings only: it flags when an agent root's
 //! canonical files could be shadowed, truncated, or misread by one of
-//! these nine hosts, and reports a host-specific extra file without ever
+//! these hosts, and reports a host-specific extra file without ever
 //! touching it. A row is a claim about a host, never a guarantee --
 //! Omnifrons guarantees behaviour only through its own built-in adapters,
 //! and this table never extends the closed `AdapterId` set.
@@ -27,6 +30,14 @@ pub const CODEX_MAX_BYTES: usize = 32 * 1024;
 /// The byte size above which Antigravity truncates a single rule file
 /// after expanding includes (the prototype's `ANTIGRAVITY_MAX_BYTES`).
 pub const ANTIGRAVITY_MAX_BYTES: usize = 24_000;
+
+/// The floor of Hermes Agent's per-file context budget: its documentation
+/// ("Context Files", read 2026-10-31) caps each startup file at
+/// `context_file_max_chars` when set, otherwise at a budget that scales
+/// with the model's context window between 20,000 and 500,000 characters,
+/// truncating an oversized file to 70% head and 20% tail. The floor is the
+/// only bound that holds for every configuration, so the row carries it.
+pub const HERMES_CONTEXT_MIN_CHARS: usize = 20_000;
 
 /// The directory walk a host's Notes column documents, or the lack of
 /// one. Variants group hosts whose wording describes the same walk
@@ -143,9 +154,11 @@ impl HostLoader {
     }
 }
 
-/// The nine hosts the `base_omnifrons` prototype's `HOSTS.md` documented
+/// The nine hosts the `base_omnifrons` prototype's `HOSTS.md` documented,
+/// plus Hermes Agent (2026-10-31, from its own documentation): the nine
+/// prototype hosts
 /// (accessed 2026-09-25), in the prototype's `HOST_ORDER`.
-pub const HOSTS: [HostLoader; 9] = [
+pub const HOSTS: [HostLoader; 10] = [
     HostLoader {
         name: "Claude Code",
         files: &["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"],
@@ -266,6 +279,34 @@ pub const HOSTS: [HostLoader; 9] = [
         accessed: "2026-09-25",
         status: "Verified",
     },
+    // Not from the prototype: Hermes Agent's own documentation ("Context
+    // Files", read 2026-10-31). One project file type loads per session,
+    // first match wins in this order; `AGENTS.md` files are gathered from
+    // the git root down to the working directory and combined, and
+    // parents are never consulted outside a repository. No `@` import is
+    // documented, so the row reads as import-blind. The identity file
+    // `SOUL.md` lives under the host's own home and is never probed in
+    // the working directory, so it is not a project file here.
+    HostLoader {
+        name: "Hermes Agent",
+        files: &[
+            ".hermes.md",
+            "HERMES.md",
+            "AGENTS.override.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".cursorrules",
+        ],
+        fallback_files: &[],
+        walk: Walk::GitRootToCwd,
+        imports: ImportSupport::None,
+        upward_kinds: &[],
+        import_blind: true,
+        size_cap: Some(HERMES_CONTEXT_MIN_CHARS),
+        source: "https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files",
+        accessed: "2026-10-31",
+        status: "Verified (docs page)",
+    },
 ];
 
 /// The host named `name`, or `None` if it is not one of the documented
@@ -298,6 +339,9 @@ pub fn order_index(name: &str) -> Option<usize> {
 /// reader. Modelling it as a host extra instead lets a port report it
 /// exactly like any other host-specific file this table already names:
 /// surfaced, and never touched.
+/// Hermes Agent (2026-10-31) adds two entries of its own, `.hermes.md` and
+/// `HERMES.md`, and joins Cursor as a reader of `.cursorrules` and
+/// `.cursor/rules`, per its "Context Files" documentation.
 #[rustfmt::skip]
 pub const EXTRA_READERS: &[(&str, &[&str])] = &[
     ("CLAUDE.local.md", &["Claude Code"]),
@@ -305,10 +349,12 @@ pub const EXTRA_READERS: &[(&str, &[&str])] = &[
     (".agents/AGENTS.md", &["Antigravity"]),
     (".agents/rules", &["Antigravity"]),
     (".claude/rules", &["Claude Code"]),
-    (".cursor/rules", &["Cursor"]),
-    (".cursorrules", &["Cursor"]),
+    (".cursor/rules", &["Cursor", "Hermes Agent"]),
+    (".cursorrules", &["Cursor", "Hermes Agent"]),
     (".github/copilot-instructions.md", &["Copilot"]),
     (".claude/AGENTS.md", &["Claude Code"]),
+    (".hermes.md", &["Hermes Agent"]),
+    ("HERMES.md", &["Hermes Agent"]),
 ];
 
 /// Directories the prototype's walk never descends into, verbatim from
@@ -324,7 +370,7 @@ pub const SKIP_DIRS: &[&str] = &[
 
 /// Host configuration folders whose identity-named files belong to the
 /// parent root, verbatim from `HOST_CONFIG_DIRS`.
-pub const HOST_CONFIG_DIRS: &[&str] = &[".claude", ".kimi", ".agents"];
+pub const HOST_CONFIG_DIRS: &[&str] = &[".claude", ".kimi", ".agents", ".hermes"];
 
 /// Folders that hold generated tool state, never agent instructions,
 /// verbatim from `GENERATED_STATE_DIRS`.
