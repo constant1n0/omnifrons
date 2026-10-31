@@ -1173,26 +1173,57 @@ pub async fn harness_spawn(
     on_frame: Channel<HarnessFrame>,
 ) -> Result<ProcessIdDto, ShellError> {
     let progress = LaunchProgress::new();
+    let stop_app = app.clone();
     run_launch_watchdog(
         LAUNCH_BUDGET,
         progress.clone(),
         launch_harness(app, kind, on_frame, progress),
         |outcome| match outcome {
             // The caller was told the launch timed out, so the panel holds
-            // no id for this process: report it loudly rather than leak it
-            // silently.
+            // no id for this process; the watchdog stops it right after
+            // this callback, so only record that it existed.
             Ok(id) => tracing::error!(
                 process_id = ?id,
-                "a harness launch finished after its caller was told it timed out; \
-                 the process is running with no panel attached"
+                "a harness launch finished after its caller was told it timed out"
             ),
             Err(error) => tracing::warn!(
                 code = ?error.code,
                 "a harness launch failed after its caller was told it timed out"
             ),
         },
+        move |id| stop_orphaned_launch(&stop_app, id),
     )
     .await
+}
+
+/// How long the supervisor gets to stop a child a launch left behind
+/// before it is killed, in the same bounds `harness_stop` accepts.
+const ORPHAN_STOP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Stops the child of a launch whose caller was already answered (or whose
+/// task died) and logs the result with the process id: a failed stop is the
+/// one case that leaves a process running with no panel attached.
+fn stop_orphaned_launch(app: &AppHandle, id: ProcessId) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = with_supervisor(app, move |supervisor| {
+            supervisor.stop(id, ORPHAN_STOP_DEADLINE)
+        })
+        .await;
+        match outcome {
+            Ok(state) => tracing::warn!(
+                process_id = ?id,
+                state = ?state,
+                "stopped a harness process whose launch had already been answered"
+            ),
+            Err(error) => tracing::error!(
+                process_id = ?id,
+                error = ?error,
+                "could not stop a harness process whose launch had already been answered; \
+                 it may still be running with no panel attached"
+            ),
+        }
+    });
 }
 
 /// The body of [`harness_spawn`], dispatching on the requested kind.
@@ -1204,7 +1235,15 @@ async fn launch_harness(
 ) -> Result<ProcessIdDto, ShellError> {
     match kind {
         HarnessKindDto::DemoLines { rate_hz, lines } => {
-            spawn_demo_harness(app, HarnessKind::DemoLines, rate_hz, lines, on_frame).await
+            spawn_demo_harness(
+                app,
+                HarnessKind::DemoLines,
+                rate_hz,
+                lines,
+                on_frame,
+                &progress,
+            )
+            .await
         }
         HarnessKindDto::DemoIgnoresSigterm { rate_hz, lines } => {
             spawn_demo_harness(
@@ -1213,11 +1252,12 @@ async fn launch_harness(
                 rate_hz,
                 lines,
                 on_frame,
+                &progress,
             )
             .await
         }
         HarnessKindDto::Approved { approval_id } => {
-            spawn_approved_harness(app, approval_id.into(), on_frame).await
+            spawn_approved_harness(app, approval_id.into(), on_frame, &progress).await
         }
         HarnessKindDto::Adapter {
             adapter_id,
@@ -1245,16 +1285,22 @@ async fn spawn_demo_harness(
     rate_hz: u16,
     lines: u32,
     on_frame: Channel<HarnessFrame>,
+    progress: &LaunchProgress,
 ) -> Result<ProcessIdDto, ShellError> {
     let request = HarnessRequest::new(kind, rate_hz, lines)?;
 
+    progress.reach("spawn");
+    let launch_progress = progress.clone();
     let (id, receiver) = with_supervisor(app, move |supervisor| {
         let id = supervisor.spawn_harness(&request)?;
+        launch_progress.spawned(id);
+        launch_progress.reach("subscribe");
         let receiver = supervisor.subscribe(id)?;
         Ok::<_, SupervisorError>((id, receiver))
     })
     .await?;
 
+    progress.reach("forwarder");
     forward_output(id, receiver, on_frame);
     Ok(ProcessIdDto::from(id))
 }
@@ -1281,22 +1327,30 @@ async fn spawn_approved_harness(
     app: AppHandle,
     approval_id: ApprovalId,
     on_frame: Channel<HarnessFrame>,
+    progress: &LaunchProgress,
 ) -> Result<ProcessIdDto, ShellError> {
+    progress.reach("gate");
     let decision = with_gate(app.clone(), move |gate| gate.decide(approval_id)).await;
     let executable = match decision {
         GateDecision::Allowed { executable, .. } => executable,
         GateDecision::Denied(reason) => return Err(ShellError::from(reason)),
     };
 
+    progress.reach("launch-plan");
     let display_path = executable.identity.canonical_path.clone();
     let plan = default_approved_plan()?;
+    progress.reach("spawn");
+    let launch_progress = progress.clone();
     let (id, receiver) = with_supervisor(app, move |supervisor| {
         let id = supervisor.spawn_approved(executable.handle, display_path, &plan)?;
+        launch_progress.spawned(id);
+        launch_progress.reach("subscribe");
         let receiver = supervisor.subscribe(id)?;
         Ok::<_, SupervisorError>((id, receiver))
     })
     .await?;
 
+    progress.reach("forwarder");
     forward_output(id, receiver, on_frame);
     Ok(ProcessIdDto::from(id))
 }
@@ -1440,7 +1494,9 @@ async fn spawn_adapter_harness(
         let launched =
             launch_with_run_subdirectory(&store, &preparer, &workspace, &run_id, plan, |plan| {
                 launch_progress.reach("spawn");
-                supervisor.spawn_approved(executable.handle, display_path, plan)
+                let id = supervisor.spawn_approved(executable.handle, display_path, plan)?;
+                launch_progress.spawned(id);
+                Ok::<_, SupervisorError>(id)
             })?;
         launch_progress.reach("subscribe");
         let receiver = supervisor.subscribe(launched.id)?;
@@ -2170,25 +2226,51 @@ pub async fn harness_observe(
 /// short enough that a stalled launch surfaces as a banner (#185).
 const LAUNCH_BUDGET: Duration = Duration::from_secs(30);
 
-/// The step a launch has reached, updated between steps so a panic or a
-/// timeout can name where the launch stopped. Cloning shares the marker.
+/// What a launch has reached: the step it is at and, once the supervisor
+/// has forked the child, that child's id.
+#[derive(Debug)]
+struct LaunchMarker {
+    step: &'static str,
+    process: Option<ProcessId>,
+}
+
+/// The step a launch has reached and the process it has forked, updated
+/// between steps so a panic or a timeout can name where the launch
+/// stopped and stop a child nobody holds. Cloning shares the marker.
 #[derive(Clone, Debug)]
-struct LaunchProgress(Arc<Mutex<&'static str>>);
+struct LaunchProgress(Arc<Mutex<LaunchMarker>>);
 
 impl LaunchProgress {
     /// A marker at `request`: nothing past argument handling has run.
     fn new() -> Self {
-        Self(Arc::new(Mutex::new("request")))
+        Self(Arc::new(Mutex::new(LaunchMarker {
+            step: "request",
+            process: None,
+        })))
+    }
+
+    fn marker(&self) -> std::sync::MutexGuard<'_, LaunchMarker> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Record that the launch is now at `step`.
     fn reach(&self, step: &'static str) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = step;
+        self.marker().step = step;
+    }
+
+    /// Record the child the supervisor just forked.
+    fn spawned(&self, id: ProcessId) {
+        self.marker().process = Some(id);
     }
 
     /// The last step recorded.
     fn last(&self) -> &'static str {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.marker().step
+    }
+
+    /// Hands out the recorded child once, so it is stopped exactly once.
+    fn take_process(&self) -> Option<ProcessId> {
+        self.marker().process.take()
     }
 }
 
@@ -2201,27 +2283,40 @@ impl LaunchProgress {
 /// last step `progress` recorded; every other result passes through
 /// unchanged. The task is not aborted on timeout -- it may already hold a
 /// forked process -- so a launch that completes after its caller was
-/// answered hands its outcome to `on_late`, which must stop or log the
-/// process it may carry.
-async fn run_launch_watchdog<T, Fut, L>(
+/// answered hands its outcome to `on_late`. Whenever the caller is answered
+/// with an error, or the late outcome arrives, the child `progress`
+/// recorded (if any) is handed once to `stop`, so no forked process is
+/// left running unattached.
+async fn run_launch_watchdog<T, Fut, L, S>(
     budget: Duration,
     progress: LaunchProgress,
     launch: Fut,
     on_late: L,
+    stop: S,
 ) -> Result<T, ShellError>
 where
     Fut: std::future::Future<Output = Result<T, ShellError>> + Send + 'static,
     T: Send + 'static,
     L: FnOnce(Result<T, ShellError>) + Send + 'static,
+    S: Fn(ProcessId) + Send + Sync + 'static,
 {
+    let stop = Arc::new(stop);
     let (sender, mut receiver) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        // A failed send means the caller already gave up: the receiver was
-        // closed after the budget elapsed, so the outcome is late.
-        if let Err(outcome) = sender.send(launch.await) {
-            on_late(outcome);
-        }
-    });
+    let task = {
+        let stop = Arc::clone(&stop);
+        let progress = progress.clone();
+        tokio::spawn(async move {
+            // A failed send means the caller already gave up: the receiver
+            // was closed after the budget elapsed, so the outcome is late
+            // and the child it forked belongs to nobody.
+            if let Err(outcome) = sender.send(launch.await) {
+                on_late(outcome);
+                if let Some(id) = progress.take_process() {
+                    stop(id);
+                }
+            }
+        })
+    };
     match tokio::time::timeout(budget, &mut receiver).await {
         Ok(Ok(outcome)) => outcome,
         // The sender dropped without sending: the task panicked or was
@@ -2231,6 +2326,11 @@ where
                 Err(error) if error.is_panic() => "panicked",
                 _ => "was cancelled",
             };
+            // The task is over: a child it forked before dying has no
+            // owner left.
+            if let Some(id) = progress.take_process() {
+                stop(id);
+            }
             Err(ShellError::new(
                 ShellErrorCode::LaunchPanicked,
                 &format!(
@@ -2244,16 +2344,21 @@ where
             // instant before the close is still delivered, and any later
             // one reaches `on_late`.
             receiver.close();
-            match receiver.try_recv() {
-                Ok(outcome) => outcome,
-                Err(_) => Err(ShellError::new(
+            if let Ok(outcome) = receiver.try_recv() {
+                outcome
+            } else {
+                // A child forked so far is stopped now; one forked by the
+                // still-running task later is stopped when it ends.
+                if let Some(id) = progress.take_process() {
+                    stop(id);
+                }
+                Err(ShellError::new(
                     ShellErrorCode::LaunchTimedOut,
                     &format!(
-                        "the launch did not finish within {} seconds; last step reached: `{}`",
-                        budget.as_secs().max(1),
+                        "the launch did not finish within {budget:?}; last step reached: `{}`",
                         progress.last()
                     ),
-                )),
+                ))
             }
         }
     }
@@ -2269,7 +2374,7 @@ mod tests {
     use crate::ipc::dto::{
         CandidateIdDto, HarnessFrame, ProcessIdDto, ShellErrorCode, ShellErrorDetail,
     };
-    use omnifrons_app::{EnvPlan, LineAssembler, StdinPlan, SupervisorError};
+    use omnifrons_app::{EnvPlan, LineAssembler, ProcessId, StdinPlan, SupervisorError};
 
     /// Drives `run_launch_watchdog` on the shell's async runtime.
     fn watchdog<T, Fut>(
@@ -2277,14 +2382,33 @@ mod tests {
         progress: super::LaunchProgress,
         launch: Fut,
         on_late: impl FnOnce(Result<T, ShellError>) + Send + 'static,
+        stop: impl Fn(ProcessId) + Send + Sync + 'static,
     ) -> Result<T, ShellError>
     where
         Fut: std::future::Future<Output = Result<T, ShellError>> + Send + 'static,
         T: Send + 'static,
     {
         tauri::async_runtime::block_on(super::run_launch_watchdog(
-            budget, progress, launch, on_late,
+            budget, progress, launch, on_late, stop,
         ))
+    }
+
+    /// A stop callback that records the ids it receives.
+    fn recording_stop() -> (
+        impl Fn(ProcessId) + Send + Sync + 'static,
+        std::sync::mpsc::Receiver<ProcessId>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        (
+            move |id| {
+                tx.lock()
+                    .expect("sender lock")
+                    .send(id)
+                    .expect("receiver alive");
+            },
+            rx,
+        )
     }
 
     /// A launch that finishes inside the budget passes its result, success
@@ -2296,6 +2420,7 @@ mod tests {
             super::LaunchProgress::new(),
             async { Ok(7_u32) },
             |_| panic!("not late"),
+            |_| panic!("no process"),
         );
         assert_eq!(ok.expect("completes"), 7);
 
@@ -2309,6 +2434,7 @@ mod tests {
                 ))
             },
             |_| panic!("not late"),
+            |_| panic!("no process"),
         )
         .expect_err("the error passes through");
         assert_eq!(err.code, ShellErrorCode::UnknownAdapter);
@@ -2334,6 +2460,7 @@ mod tests {
                 Ok(explode("boom"))
             },
             |_| panic!("not late"),
+            |_| panic!("no process"),
         )
         .expect_err("a panic is an error");
         assert_eq!(err.code, ShellErrorCode::LaunchPanicked);
@@ -2354,6 +2481,7 @@ mod tests {
                 std::future::pending::<Result<u32, ShellError>>().await
             },
             |_| panic!("never completes"),
+            |_| panic!("no process"),
         )
         .expect_err("a stall is an error");
         assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
@@ -2361,21 +2489,27 @@ mod tests {
     }
 
     /// A launch that finishes after the budget has already been answered
-    /// is handed to `on_late`, so its process cannot leak unseen.
+    /// is handed to `on_late`, and the child it forked after the answer is
+    /// stopped, so its process cannot run unattached.
     #[test]
-    fn watchdog_hands_a_late_completion_to_on_late() {
+    fn watchdog_hands_a_late_completion_to_on_late_and_stops_its_process() {
         let (tx, rx) = std::sync::mpsc::channel();
+        let (stop, stopped) = recording_stop();
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
         let err = watchdog(
             std::time::Duration::from_millis(30),
-            super::LaunchProgress::new(),
-            async {
+            progress,
+            async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                marker.spawned(ProcessId(9));
                 Ok(9_u32)
             },
             move |outcome| {
                 tx.send(outcome.expect("late success"))
                     .expect("receiver alive");
             },
+            stop,
         )
         .expect_err("the budget elapsed first");
         assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
@@ -2383,6 +2517,64 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the late outcome is reported");
         assert_eq!(late, 9);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ProcessId(9))
+        );
+    }
+
+    /// A panic after the child was forked stops that child.
+    #[test]
+    fn watchdog_stops_the_process_forked_before_a_panic() {
+        let (stop, stopped) = recording_stop();
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_secs(5),
+            progress,
+            async move {
+                marker.reach("spawn");
+                marker.spawned(ProcessId(5));
+                marker.reach("subscribe");
+                Ok(explode("boom"))
+            },
+            |_| panic!("not late"),
+            stop,
+        )
+        .expect_err("a panic is an error");
+        assert_eq!(err.code, ShellErrorCode::LaunchPanicked);
+        assert!(err.message.contains("subscribe"), "{}", err.message);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ProcessId(5))
+        );
+    }
+
+    /// A stall after the child was forked stops that child at the timeout
+    /// and names the budget in its own unit.
+    #[test]
+    fn watchdog_stops_the_process_of_a_stalled_launch() {
+        let (stop, stopped) = recording_stop();
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_millis(50),
+            progress,
+            async move {
+                marker.spawned(ProcessId(7));
+                marker.reach("subscribe");
+                std::future::pending::<Result<u32, ShellError>>().await
+            },
+            |_| panic!("never completes"),
+            stop,
+        )
+        .expect_err("a stall is an error");
+        assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
+        assert!(err.message.contains("50ms"), "{}", err.message);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ProcessId(7))
+        );
     }
 
     /// R1-001: a `kind: "approved"` launch must never inherit this shell's

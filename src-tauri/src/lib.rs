@@ -176,21 +176,84 @@ pub fn run() {
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let thread = std::thread::current();
-        let message = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-string panic payload");
-        tracing::error!(
-            thread = thread.name().unwrap_or("unnamed"),
-            location = %info
-                .location()
-                .map_or_else(|| "unknown".to_string(), ToString::to_string),
-            message,
-            "panic"
+        guarded_panic_report(
+            || {
+                let thread = std::thread::current();
+                let panic_message = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("non-string panic payload");
+                tracing::error!(
+                    thread = thread.name().unwrap_or("unnamed"),
+                    location = %info
+                        .location()
+                        .map_or_else(|| "unknown".to_string(), ToString::to_string),
+                    panic_message,
+                    "panic"
+                );
+            },
+            || previous(info),
         );
-        previous(info);
     }));
+}
+
+thread_local! {
+    /// Set while this thread is inside the panic hook's logging.
+    static IN_PANIC_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `log` and then `previous`, so a failing logger never replaces the
+/// panic being reported: a panic inside `log` (a subscriber that panics) is
+/// caught, and a panic raised while this thread is already inside the hook
+/// skips `log` instead of recursing. A panic escaping a hook aborts the
+/// process, which would turn one task's panic into a crash.
+fn guarded_panic_report(log: impl FnOnce(), previous: impl FnOnce()) {
+    let nested = IN_PANIC_HOOK.with(|flag| flag.replace(true));
+    if !nested {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(log));
+        IN_PANIC_HOOK.with(|flag| flag.set(false));
+    }
+    previous();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guarded_panic_report;
+    use std::cell::Cell;
+
+    /// A logger that panics must not stop the previous hook or unwind out.
+    #[test]
+    fn a_panicking_logger_still_runs_the_previous_hook() {
+        let previous_ran = Cell::new(false);
+        let logger_panic: fn() = || std::panic::resume_unwind(Box::new("subscriber failed"));
+        guarded_panic_report(logger_panic, || previous_ran.set(true));
+        assert!(previous_ran.get());
+    }
+
+    /// A panic raised inside the logging skips the nested log and still
+    /// reaches the previous hook, without recursing.
+    #[test]
+    fn a_nested_report_skips_the_log_and_runs_the_previous_hook() {
+        let nested_logged = Cell::new(false);
+        let nested_previous = Cell::new(false);
+        guarded_panic_report(
+            || {
+                guarded_panic_report(|| nested_logged.set(true), || nested_previous.set(true));
+            },
+            || {},
+        );
+        assert!(!nested_logged.get());
+        assert!(nested_previous.get());
+    }
+
+    /// The flag is cleared afterwards: a later report logs again.
+    #[test]
+    fn the_guard_is_released_after_each_report() {
+        let logged = Cell::new(0);
+        guarded_panic_report(|| logged.set(logged.get() + 1), || {});
+        guarded_panic_report(|| logged.set(logged.get() + 1), || {});
+        assert_eq!(logged.get(), 2);
+    }
 }

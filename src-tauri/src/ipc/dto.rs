@@ -1794,13 +1794,16 @@ pub enum ShellErrorCode {
     /// is written; the caller previews again (ADR-0005 decision 3).
     /// Carries [`ShellErrorDetail::DefinitionReason`].
     PlanStale,
-    /// `harness_spawn`'s launch task panicked before it answered; the
-    /// message names the last step it reached. Nothing is known to have
-    /// been spawned (run-lifecycle fixes, #185).
+    /// `harness_spawn`'s launch task panicked (or was cancelled) before it
+    /// answered; the message names the last step it reached. A process
+    /// forked before the panic (the `spawn`, `subscribe` and `forwarder`
+    /// steps) is stopped through the supervisor, and the stop's result is
+    /// logged with its id, at error level when the stop fails (#185).
     LaunchPanicked,
     /// `harness_spawn`'s launch did not finish within its budget; the
-    /// message names the last step it reached. A launch that completes
-    /// afterwards is logged at error level with its process id (#185).
+    /// message names the budget and the last step it reached. A process
+    /// forked by then, or by the launch finishing later, is stopped through
+    /// the supervisor and the result logged with its id (#185).
     LaunchTimedOut,
 }
 
