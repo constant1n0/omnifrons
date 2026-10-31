@@ -1,0 +1,66 @@
+{
+  "adapter": "stream-json-cli",
+  "harness": {
+    "name": "Codex CLI through codex-stream-bridge",
+    "version": "0.163.0",
+    "expectedVersion": "0.163.0",
+    "versionMatchesBinding": true,
+    "bridge": {
+      "codexVersion": "0.163.0",
+      "bridgeVersion": "0.1.0"
+    }
+  },
+  "loadedFileEvidence": {
+    "found": false,
+    "excerpts": []
+  },
+  "skillPaths": {
+    "indexed": true,
+    "userLevel": false,
+    "excerpts": [
+      "{\"input\":{\"aggregated_output\":\"bwrap: execvp <home>/.npm-global/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex: No such file or director..."
+    ]
+  },
+  "result": "uncertain",
+  "reasons": [
+    "no system/init line together with a line naming AGENTS.md"
+  ],
+  "log": {
+    "incomplete": false,
+    "droppedBefore": 0,
+    "logs": [
+      {
+        "runId": "run-1793444188-487541638-2",
+        "adapter": "stream-json-cli",
+        "startedAt": "2026-10-31T10:56:28Z",
+        "state": {
+          "kind": "state",
+          "droppedBefore": 0,
+          "state": "exited",
+          "code": 0
+        },
+        "truncatedFrames": null,
+        "droppedBefore": 0,
+        "endsMidLine": false,
+        "stdoutLines": 7,
+        "stderrLines": 1
+      },
+      {
+        "runId": "run-1793444371-074032028-3",
+        "adapter": "stream-json-cli",
+        "startedAt": "2026-10-31T10:59:31Z",
+        "state": {
+          "kind": "state",
+          "droppedBefore": 0,
+          "state": "exited",
+          "code": 0
+        },
+        "truncatedFrames": null,
+        "droppedBefore": 0,
+        "endsMidLine": false,
+        "stdoutLines": 6,
+        "stderrLines": 1
+      }
+    ]
+  }
+}

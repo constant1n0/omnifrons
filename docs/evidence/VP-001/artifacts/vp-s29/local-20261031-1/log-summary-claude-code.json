@@ -1,0 +1,38 @@
+{
+  "incomplete": false,
+  "droppedBefore": 0,
+  "logs": [
+    {
+      "runId": "run-1793442806-136669331-0",
+      "adapter": "claude-code",
+      "startedAt": "2026-10-31T10:33:26Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 21,
+      "stderrLines": 0
+    },
+    {
+      "runId": "run-1793443717-849762875-1",
+      "adapter": "claude-code",
+      "startedAt": "2026-10-31T10:48:37Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 23,
+      "stderrLines": 0
+    }
+  ]
+}

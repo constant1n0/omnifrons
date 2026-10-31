@@ -1,0 +1,248 @@
+== observation-claude-code.json ==
+{
+  "adapter": "claude-code",
+  "harness": {
+    "name": "Claude Code",
+    "version": "2.1.316",
+    "expectedVersion": "2.1.316",
+    "versionMatchesBinding": true,
+    "bridge": null
+  },
+  "loadedFileEvidence": {
+    "found": false,
+    "excerpts": []
+  },
+  "skillPaths": {
+    "indexed": true,
+    "userLevel": false,
+    "excerpts": [
+      "{\"type\":\"tool_use\",\"id\":\"toolu_018VvmScS2eD8sVHJZmWxTyD\",\"name\":\"Read\",\"input\":{\"file_path\":\"<home>/vp-s29/root/skills/release-notes/SKILL.md\"},\"caller\":{\"type\":\"direct\"}}"
+    ]
+  },
+  "result": "uncertain",
+  "reasons": [
+    "no system/init line together with a line naming CLAUDE.md or AGENTS.md"
+  ],
+  "log": {
+    "incomplete": false,
+    "droppedBefore": 0,
+    "logs": [
+      {
+        "runId": "run-1793442806-136669331-0",
+        "adapter": "claude-code",
+        "startedAt": "2026-10-31T10:33:26Z",
+        "state": {
+          "kind": "state",
+          "droppedBefore": 0,
+          "state": "exited",
+          "code": 0
+        },
+        "truncatedFrames": null,
+        "droppedBefore": 0,
+        "endsMidLine": false,
+        "stdoutLines": 21,
+        "stderrLines": 0
+      },
+      {
+        "runId": "run-1793443717-849762875-1",
+        "adapter": "claude-code",
+        "startedAt": "2026-10-31T10:48:37Z",
+        "state": {
+          "kind": "state",
+          "droppedBefore": 0,
+          "state": "exited",
+          "code": 0
+        },
+        "truncatedFrames": null,
+        "droppedBefore": 0,
+        "endsMidLine": false,
+        "stdoutLines": 23,
+        "stderrLines": 0
+      }
+    ]
+  }
+}
+== observation-stream-json-cli.json ==
+{
+  "adapter": "stream-json-cli",
+  "harness": {
+    "name": "Codex CLI through codex-stream-bridge",
+    "version": "0.163.0",
+    "expectedVersion": "0.163.0",
+    "versionMatchesBinding": true,
+    "bridge": {
+      "codexVersion": "0.163.0",
+      "bridgeVersion": "0.1.0"
+    }
+  },
+  "loadedFileEvidence": {
+    "found": false,
+    "excerpts": []
+  },
+  "skillPaths": {
+    "indexed": true,
+    "userLevel": false,
+    "excerpts": [
+      "{\"input\":{\"aggregated_output\":\"bwrap: execvp <home>/.npm-global/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex: No such file or director..."
+    ]
+  },
+  "result": "uncertain",
+  "reasons": [
+    "no system/init line together with a line naming AGENTS.md"
+  ],
+  "log": {
+    "incomplete": false,
+    "droppedBefore": 0,
+    "logs": [
+      {
+        "runId": "run-1793444188-487541638-2",
+        "adapter": "stream-json-cli",
+        "startedAt": "2026-10-31T10:56:28Z",
+        "state": {
+          "kind": "state",
+          "droppedBefore": 0,
+          "state": "exited",
+          "code": 0
+        },
+        "truncatedFrames": null,
+        "droppedBefore": 0,
+        "endsMidLine": false,
+        "stdoutLines": 7,
+        "stderrLines": 1
+      },
+      {
+        "runId": "run-1793444371-074032028-3",
+        "adapter": "stream-json-cli",
+        "startedAt": "2026-10-31T10:59:31Z",
+        "state": {
+          "kind": "state",
+          "droppedBefore": 0,
+          "state": "exited",
+          "code": 0
+        },
+        "truncatedFrames": null,
+        "droppedBefore": 0,
+        "endsMidLine": false,
+        "stdoutLines": 6,
+        "stderrLines": 1
+      }
+    ]
+  }
+}
+== log-summary-claude-code.json ==
+{
+  "incomplete": false,
+  "droppedBefore": 0,
+  "logs": [
+    {
+      "runId": "run-1793442806-136669331-0",
+      "adapter": "claude-code",
+      "startedAt": "2026-10-31T10:33:26Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 21,
+      "stderrLines": 0
+    },
+    {
+      "runId": "run-1793443717-849762875-1",
+      "adapter": "claude-code",
+      "startedAt": "2026-10-31T10:48:37Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 23,
+      "stderrLines": 0
+    }
+  ]
+}
+== log-summary-stream-json-cli.json ==
+{
+  "incomplete": false,
+  "droppedBefore": 0,
+  "logs": [
+    {
+      "runId": "run-1793444188-487541638-2",
+      "adapter": "stream-json-cli",
+      "startedAt": "2026-10-31T10:56:28Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 7,
+      "stderrLines": 1
+    },
+    {
+      "runId": "run-1793444371-074032028-3",
+      "adapter": "stream-json-cli",
+      "startedAt": "2026-10-31T10:59:31Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 6,
+      "stderrLines": 1
+    }
+  ]
+}
+== digests-before.txt ==
+2009a44cad8d64cad78bcc30f3d9de260c4f6996d1e15dd9d9348793a41d854d  AGENTS.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  CLAUDE.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  GEMINI.md
+absent  .agents/skills
+absent  .gemini/skills
+04145b27c7f920e434c93c0a52dbd67b6f3f0b8f8f23c169bb8d12672fe06688  skills/release-notes/SKILL.md
+== digests-after-claude-code-1.txt ==
+2009a44cad8d64cad78bcc30f3d9de260c4f6996d1e15dd9d9348793a41d854d  AGENTS.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  CLAUDE.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  GEMINI.md
+absent  .agents/skills
+absent  .gemini/skills
+04145b27c7f920e434c93c0a52dbd67b6f3f0b8f8f23c169bb8d12672fe06688  skills/release-notes/SKILL.md
+== digests-after-claude-code-2.txt ==
+2009a44cad8d64cad78bcc30f3d9de260c4f6996d1e15dd9d9348793a41d854d  AGENTS.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  CLAUDE.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  GEMINI.md
+absent  .agents/skills
+absent  .gemini/skills
+04145b27c7f920e434c93c0a52dbd67b6f3f0b8f8f23c169bb8d12672fe06688  skills/release-notes/SKILL.md
+== digests-after-stream-json-cli-1.txt ==
+2009a44cad8d64cad78bcc30f3d9de260c4f6996d1e15dd9d9348793a41d854d  AGENTS.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  CLAUDE.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  GEMINI.md
+absent  .agents/skills
+absent  .gemini/skills
+04145b27c7f920e434c93c0a52dbd67b6f3f0b8f8f23c169bb8d12672fe06688  skills/release-notes/SKILL.md
+== digests-after-stream-json-cli-2.txt ==
+2009a44cad8d64cad78bcc30f3d9de260c4f6996d1e15dd9d9348793a41d854d  AGENTS.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  CLAUDE.md
+336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49  GEMINI.md
+absent  .agents/skills
+absent  .gemini/skills
+04145b27c7f920e434c93c0a52dbd67b6f3f0b8f8f23c169bb8d12672fe06688  skills/release-notes/SKILL.md
+== sha256 of transcript-claude-code.txt ==
+0b036484ebcfb5a428adcc7ecefd48ed5037c0fc5bb7feef83ed3fa2f1203667
+== sha256 of transcript-stream-json-cli.txt ==
+b36f37c0a6cf26cdaa4031569159d49c4b16acefbb8ba26d05403de9c60dd683
