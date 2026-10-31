@@ -13,7 +13,7 @@
 // Loaded-file evidence per adapter:
 //   claude-code     the `system/init` line plus a line naming CLAUDE.md or AGENTS.md
 //   stream-json-cli the bridge's `system/init` line plus a line naming AGENTS.md
-//   pty-cli         a normalized line naming GEMINI.md or the definition's name
+//   pty-cli         the CLI's own notice counting context files, naming GEMINI.md or AGENTS.md
 //
 // CLI: node vp-s29-observations.mjs <adapter> <version-file> <harness-log>...
 //        [--manifest <file>] [--skill <name>] [--home <dir>] [--redacted-out <file>] [--summary-out <file>]
@@ -28,19 +28,19 @@ import { fileURLToPath } from 'node:url';
 export const EXPECTED_VERSIONS = {
   'claude-code': '2.1.316',
   'stream-json-cli': '0.163.0',
-  'pty-cli': '0.41.2',
+  'pty-cli': '1.2.5',
 };
 
 const HARNESS_NAMES = {
   'claude-code': 'Claude Code',
   'stream-json-cli': 'Codex CLI through codex-stream-bridge',
-  'pty-cli': 'Gemini CLI',
+  'pty-cli': 'Antigravity CLI',
 };
 
 export const SWITCH_LEG = { result: 'uncertain', reason: 'no checkpoint-and-restart flow exists' };
 
 // A number followed, within a few words, by `file` or `files`.
-const GEMINI_NOTICE_COUNT = /\b\d+\b[^\n]{0,40}\bfiles?\b/i;
+const NOTICE_COUNT = /\b\d+\b[^\n]{0,40}\bfiles?\b/i;
 const SEMVER = /\d+\.\d+\.\d+/;
 const EXCERPT_LIMIT = 200;
 
@@ -205,17 +205,19 @@ export function observeLeg({
     evidenceLines = findLines(material, /AGENTS\.md/);
     if (!hasSystem('init')) evidenceLines = [];
   } else {
-    // Only Gemini CLI's own context-file notice counts: a line naming GEMINI.md
-    // together with a count of files ("Loaded 1 GEMINI.md file", "1 context file
-    // (GEMINI.md)"). The model saying who it is, or merely mentioning the file, is prose.
-    evidenceLines = lines.filter((line) => /GEMINI\.md/.test(line) && GEMINI_NOTICE_COUNT.test(line));
+    // Only the CLI's own context-file notice counts: a line naming GEMINI.md or
+    // AGENTS.md together with a count of files ("Loaded 1 GEMINI.md file", "1 context
+    // file (AGENTS.md)"). Antigravity CLI documents no such notice, so this leg is
+    // expected to stay `uncertain` until one is observed. The model saying who it
+    // is, or merely mentioning the file, is prose.
+    evidenceLines = lines.filter((line) => /(?:GEMINI|AGENTS)\.md/.test(line) && NOTICE_COUNT.test(line));
   }
   const loadedFound = evidenceLines.length > 0;
   if (!loadedFound && lines.length > 0) {
     reasons.push({
       'claude-code': 'no system/init line together with a line naming CLAUDE.md or AGENTS.md',
       'stream-json-cli': 'no system/init line together with a line naming AGENTS.md',
-      'pty-cli': 'no normalized line is the CLI notice counting GEMINI.md files',
+      'pty-cli': 'no normalized line is the CLI notice counting GEMINI.md or AGENTS.md files',
     }[adapter]);
   }
 
@@ -371,7 +373,7 @@ export function observeHarnessLogs({ adapter, logs, ...rest }) {
 const LEG_ROWS = [
   ['claude-code', 'claude_code_leg'],
   ['stream-json-cli', 'codex_leg'],
-  ['pty-cli', 'gemini_leg'],
+  ['pty-cli', 'pty_cli_leg'],
 ];
 
 const cell = (text) => String(text).replace(/\|/g, '/').replace(/\s+/g, ' ').trim();

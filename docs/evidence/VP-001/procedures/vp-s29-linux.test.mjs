@@ -124,10 +124,10 @@ test('compare and digests refuse bad arguments with exit 2', LINUX_ONLY, () => {
 test('observe writes observation-<adapter>.json and redacts HOME', LINUX_ONLY, () => {
   withDir((dir) => {
     const { runDir, home, env } = prepared(dir);
-    const transcript = join(dir, 'gemini.jsonl');
-    const version = join(dir, 'gemini-version.txt');
+    const transcript = join(dir, 'agy.jsonl');
+    const version = join(dir, 'agy-version.txt');
     writeLog(transcript, 'pty-cli', ['Loaded 1 GEMINI.md file', `ReadFile ${home}/.gemini/skills/release-notes/SKILL.md`]);
-    writeFileSync(version, '0.41.2\n');
+    writeFileSync(version, '1.2.5\n');
     const result = sh(['observe', 'pty-cli', transcript, version], env);
     assert.equal(result.status, 0, result.stderr);
     const summary = JSON.parse(readFileSync(join(runDir, 'log-summary-pty-cli.json'), 'utf8'));
@@ -307,9 +307,9 @@ test('record leaves no record.md when it fails, and names a corrupt observation 
 test('observe exits 1 and keeps nothing when the transcript still holds a secret-shaped value', LINUX_ONLY, () => {
   withDir((dir) => {
     const { runDir, env } = prepared(dir);
-    const transcript = join(dir, 'gemini.jsonl');
-    const version = join(dir, 'gemini-version.txt');
-    writeFileSync(version, '0.41.2\n');
+    const transcript = join(dir, 'agy.jsonl');
+    const version = join(dir, 'agy-version.txt');
+    writeFileSync(version, '1.2.5\n');
     writeLog(transcript, 'pty-cli', ['Loaded 1 GEMINI.md file', `key sk-ant-${'a1B2c3D4'.repeat(4)}`]);
     const scrubbed = sh(['observe', 'pty-cli', transcript, version], env);
     assert.equal(scrubbed.status, 0, scrubbed.stderr);

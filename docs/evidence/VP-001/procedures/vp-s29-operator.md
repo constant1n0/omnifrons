@@ -10,9 +10,10 @@ Outcome rules: the switch leg is always `uncertain` (no checkpoint-and-restart
 flow exists), so the run's overall `result` is `uncertain` and never discharges
 the ADR-0005 gate. A load leg is `pass` only with loaded-file evidence from the
 harness itself plus the indexed skill path; anything unclear is `uncertain`,
-never `pass`. For `pty-cli`, loaded-file evidence is Gemini CLI's own context-file notice
-only: a line naming `GEMINI.md` together with a count of files (for example
-"Loaded 1 GEMINI.md file" or "1 context file (GEMINI.md)"). The model saying
+never `pass`. For `pty-cli`, loaded-file evidence is the CLI's own context-file notice
+only: a line naming `AGENTS.md` or `GEMINI.md` together with a count of files
+(for example "1 context file (AGENTS.md)"); Antigravity CLI documents no such
+notice, so expect `uncertain` until one is observed. The model saying
 who it is, or mentioning the file, never counts; without the notice the leg is
 `uncertain` even when the indexed skill path appears. For `claude-code` and the
 bridge, loaded-file evidence is
@@ -28,7 +29,12 @@ only when it appears in such material. A user-level skill path in a transcript, 
 | --- | --- | --- | --- |
 | `claude-code` | Claude Code (`claude`) | 2.1.316 | `CLAUDE.md`, falling back to `AGENTS.md` |
 | `stream-json-cli` | Codex CLI (`codex`) through `tools/codex-stream-bridge` | 0.163.0 | `AGENTS.md` |
-| `pty-cli` | Gemini CLI (`gemini`) | 0.41.2 | `GEMINI.md` (the wrapper) |
+| `pty-cli` | Antigravity CLI (`agy`) | 1.2.5 | `AGENTS.md` directly (and the `GEMINI.md` wrapper) |
+
+The `pty-cli` leg was bound to Gemini CLI 0.41.2 until 2026-10-31: Google
+retired that CLI for individual accounts after 2026-06-18, and its Node
+launcher cannot run from the app's sealed memfd, so the binding moved to
+Antigravity CLI, which still reads `AGENTS.md` and `GEMINI.md`.
 
 ## 1. Prepare
 
@@ -46,16 +52,17 @@ only when it appears in such material. A user-level skill path in a transcript, 
 2. Check the three versions and that each CLI is logged in. Save each version
    output; the helper reads these files:
    `claude --version > claude-version.txt`, `codex --version > codex-version.txt`,
-   `gemini --version > gemini-version.txt`. A different version is recorded as
+   `agy --version > agy-version.txt`. A different version is recorded as
    `uncertain` for that leg.
 3. Decide which HOME the whole run uses. The user-level skill must sit where
    the harness looks for it, so the choice applies to every step:
    User-level skill locations, from the vendors' documentation: Codex CLI
    ("Build skills" page of the OpenAI Codex docs) reads `$HOME/.agents/skills`
    and also scans `.agents/skills` in every directory from the working
-   directory up to the repository root; Gemini CLI (docs, "Skills") reads
-   `~/.gemini/skills/` or the alias `~/.agents/skills/`, and the `.agents`
-   alias wins within a tier; Claude Code reads its personal skills folder
+   directory up to the repository root; Antigravity CLI (docs, "Migrating from Gemini CLI") reads global skills
+   from `~/.gemini/skills/` or `~/.gemini/antigravity-cli/skills/` and
+   workspace skills from `.agents/skills/` (Gemini CLI, the previous binding,
+   read `~/.gemini/skills/` or the alias `~/.agents/skills/`); Claude Code reads its personal skills folder
    `~/.claude/skills/`. The definition root itself must hold neither
    `.agents/skills` nor `.gemini/skills`, or a host would load the project
    skill through its own loader instead of the indexed path: the fixture
@@ -85,7 +92,9 @@ only when it appears in such material. A user-level skill path in a transcript, 
 
 1. Start the app, choose "Pick workspace" and pick `VP_S29_ROOT`. Every harness
    then starts in the definition root.
-2. In the Definition section tick "Also write GEMINI.md", then use "Create .".
+2. In the Definition section tick "Also write GEMINI.md" (Antigravity CLI reads `AGENTS.md`
+   directly; the wrapper keeps the root loadable by Gemini-family hosts), then
+   use "Create .".
 3. Type these answers, one per question (the form asks them in this order;
    the same text is in `fixture.json` under `createAnswers`). Leave the other
    questions with their proposals or blank where optional:
@@ -108,10 +117,16 @@ only when it appears in such material. A user-level skill path in a transcript, 
 
 ## 3. Approve the three executables
 
-For each of `claude`, `target/release/codex-stream-bridge` and `gemini`: in
+For each of `claude`, `target/release/codex-stream-bridge` and `agy`: in
 "Executable approval" use "Pick executable", read the candidate evidence, type
 the candidate's short digest and "Approve". Approvals are device-local and
 never committed. The `codex` CLI itself is not approved: the bridge runs it.
+
+Before the `pty-cli` leg, trust the definition root in Antigravity CLI once
+from a terminal: `cd <root> && agy`, answer "Yes, I trust this folder" and
+quit. The PTY adapter types the prompt as soon as the child starts, so a trust
+or sign-in dialog in the TUI swallows it; a leg that stops at such a dialog
+records `uncertain`.
 
 ## 4. Run each leg
 

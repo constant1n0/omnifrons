@@ -19,7 +19,7 @@ const say = (text) => json({ type: 'assistant', message: { content: [{ type: 'te
 const tool = (name, input) => json({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
 const CLAUDE_VERSION = '2.1.316 (Claude Code)\n';
 const CODEX_VERSION = 'codex-cli 0.163.0\n';
-const GEMINI_VERSION = '0.41.2\n';
+const AGY_VERSION = '1.2.5\n';
 
 const claudeBase = (extra) => lines(
   init,
@@ -147,19 +147,19 @@ test('pty-cli passes on a normalized line naming GEMINI.md and the indexed path'
   const result = observeLeg({
     adapter: 'pty-cli',
     transcript: '\u001b[2J\u001b[1;32mUsing: 1 GEMINI.md file\u001b[0m\r\nReadFile skills/release-notes/SKILL.md\r\n',
-    versionText: GEMINI_VERSION,
+    versionText: AGY_VERSION,
     ...OPTIONS,
   });
   assert.equal(result.result, 'pass');
-  assert.equal(result.harness.name, 'Gemini CLI');
-  assert.equal(result.harness.version, '0.41.2');
+  assert.equal(result.harness.name, 'Antigravity CLI');
+  assert.equal(result.harness.version, '1.2.5');
 });
 
 test('pty-cli does not accept the model saying who it is as loaded-file evidence', () => {
   const result = observeLeg({
     adapter: 'pty-cli',
     transcript: 'I am Orbit Scribe.\nReadFile skills/release-notes/SKILL.md\n',
-    versionText: GEMINI_VERSION,
+    versionText: AGY_VERSION,
     ...OPTIONS,
   });
   assert.equal(result.result, 'uncertain');
@@ -169,7 +169,7 @@ test('pty-cli does not accept the model saying who it is as loaded-file evidence
 
 test('pty-cli needs the CLI notice that counts GEMINI.md files, not any mention', () => {
   const notice = (line) => observeLeg({
-    adapter: 'pty-cli', transcript: `${line}\nReadFile skills/release-notes/SKILL.md\n`, versionText: GEMINI_VERSION, ...OPTIONS,
+    adapter: 'pty-cli', transcript: `${line}\nReadFile skills/release-notes/SKILL.md\n`, versionText: AGY_VERSION, ...OPTIONS,
   });
   assert.equal(notice('Loaded 1 GEMINI.md file').result, 'pass');
   assert.equal(notice('1 context file (GEMINI.md)').result, 'pass');
@@ -178,9 +178,9 @@ test('pty-cli needs the CLI notice that counts GEMINI.md files, not any mention'
 });
 
 test('pty-cli with neither evidence nor a skill path is uncertain; an empty transcript too', () => {
-  const none = observeLeg({ adapter: 'pty-cli', transcript: 'hello\n', versionText: GEMINI_VERSION, ...OPTIONS });
+  const none = observeLeg({ adapter: 'pty-cli', transcript: 'hello\n', versionText: AGY_VERSION, ...OPTIONS });
   assert.equal(none.result, 'uncertain');
-  const empty = observeLeg({ adapter: 'pty-cli', transcript: '', versionText: GEMINI_VERSION, ...OPTIONS });
+  const empty = observeLeg({ adapter: 'pty-cli', transcript: '', versionText: AGY_VERSION, ...OPTIONS });
   assert.equal(empty.result, 'uncertain');
   assert.ok(empty.reasons.some((reason) => /empty/.test(reason)));
 });
@@ -241,7 +241,7 @@ test('formatRecord renders one two-column table with every leg, the switch leg a
   assert.match(text, new RegExp(`\\| \`exercised_artifact_digest\` \\| ${'b'.repeat(64)} \\|`));
   assert.match(text, /\| `claude_code_leg` \| pass --/);
   assert.match(text, /\| `codex_leg` \| uncertain -- .*names no skill path \/ x/);
-  assert.match(text, /\| `gemini_leg` \| uncertain -- the leg was not run or has no observation/);
+  assert.match(text, /\| `pty_cli_leg` \| uncertain -- the leg was not run or has no observation/);
   assert.match(text, /\| `switch_leg` \| uncertain -- no checkpoint-and-restart flow exists \|/);
   assert.match(text, /\| `digests_unchanged` \| true/);
   assert.match(text, new RegExp(`\\| \`evidence_artifact\` \\| ${'a'.repeat(64)} -- `));
@@ -439,7 +439,7 @@ test('the two runs of a leg combine; a pty-cli log uses its text frames', () => 
   const pty = observeHarnessLogs({
     adapter: 'pty-cli',
     logs: [log(header('pty-cli'), out('\u001b[1mLoaded 1 GEMINI.md file\u001b[0m'), out('ReadFile skills/release-notes/SKILL.md'), state())],
-    versionText: GEMINI_VERSION,
+    versionText: AGY_VERSION,
     ...OPTIONS,
   });
   assert.equal(pty.result, 'pass');
@@ -502,4 +502,29 @@ test('a completed command execution naming the indexed skill path still counts a
   });
   assert.equal(result.skillPaths.indexed, true);
   assert.ok(!result.reasons.some((reason) => /access to the indexed skill path failed/.test(reason)));
+});
+
+test('pty-cli passes on the CLI notice counting AGENTS.md files, as Antigravity CLI would name it', () => {
+  const result = observeLeg({
+    adapter: 'pty-cli',
+    transcript: lines('1 context file (AGENTS.md)', 'ReadFile skills/release-notes/SKILL.md', 'I am Orbit Scribe.'),
+    versionText: AGY_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.harness.name, 'Antigravity CLI');
+  assert.equal(result.harness.expectedVersion, '1.2.5');
+  assert.equal(result.loadedFileEvidence.found, true);
+  assert.equal(result.result, 'pass');
+});
+
+test('pty-cli without a counting notice is uncertain even when AGENTS.md is mentioned in prose', () => {
+  const result = observeLeg({
+    adapter: 'pty-cli',
+    transcript: lines('Reading AGENTS.md now.', 'ReadFile skills/release-notes/SKILL.md', 'I am Orbit Scribe.'),
+    versionText: AGY_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.loadedFileEvidence.found, false);
+  assert.equal(result.result, 'uncertain');
+  assert.ok(result.reasons.some((reason) => /counting GEMINI\.md or AGENTS\.md files/.test(reason)));
 });

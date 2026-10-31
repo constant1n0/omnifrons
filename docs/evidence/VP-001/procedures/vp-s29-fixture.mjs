@@ -9,15 +9,17 @@
 // not where its user-level skills live). Each directory is the documented
 // user skill location of at least one of the three bound harnesses:
 //   .claude/skills  Claude Code
-//   .agents/skills  Codex CLI (and a Gemini CLI alias)
-//   .gemini/skills  Gemini CLI
+//   .agents/skills  Codex CLI, Antigravity CLI workspace skills (and a Gemini CLI alias)
+//   .gemini/skills  Antigravity CLI global skills (and Gemini CLI, the previous binding)
 // The skill is written to all three so every harness can see a same-named
 // user-level skill wherever it looks. Sources: the Codex CLI docs ("Build
 // skills": user skills in $HOME/.agents/skills; .agents/skills scanned from the
-// working directory up to the repository root), the Gemini CLI docs ("Skills":
-// ~/.gemini/skills or the ~/.agents/skills alias; workspace .gemini/skills or
-// .agents/skills, the .agents alias first within a tier) and Claude Code's
-// personal skills folder, ~/.claude/skills.
+// working directory up to the repository root), the Antigravity CLI docs
+// ("Migrating from Gemini CLI": global skills in ~/.gemini/skills or
+// ~/.gemini/antigravity-cli/skills; workspace skills in .agents/skills), the
+// Gemini CLI docs ("Skills": ~/.gemini/skills or the ~/.agents/skills alias;
+// workspace .gemini/skills or .agents/skills, the .agents alias first within a
+// tier) and Claude Code's personal skills folder, ~/.claude/skills.
 //
 // The definition root must hold neither .agents/skills nor .gemini/skills: a
 // host would then load the project skill through its own loader instead of the
