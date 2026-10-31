@@ -13,7 +13,9 @@
 // Loaded-file evidence per adapter:
 //   claude-code     the `system/init` line plus a line naming CLAUDE.md or AGENTS.md
 //   stream-json-cli the bridge's `system/init` line plus a line naming AGENTS.md
-//   pty-cli         the CLI's own notice counting context files, naming GEMINI.md or AGENTS.md
+//   pty-cli         none: a PTY transcript cannot tell the CLI's output from the model's
+//                   prose and the bound CLI documents no loaded-context notice, so the
+//                   leg stays `uncertain` on that count
 //
 // CLI: node vp-s29-observations.mjs <adapter> <version-file> <harness-log>...
 //        [--manifest <file>] [--skill <name>] [--home <dir>] [--redacted-out <file>] [--summary-out <file>]
@@ -39,8 +41,6 @@ const HARNESS_NAMES = {
 
 export const SWITCH_LEG = { result: 'uncertain', reason: 'no checkpoint-and-restart flow exists' };
 
-// A number followed, within a few words, by `file` or `files`.
-const NOTICE_COUNT = /\b\d+\b[^\n]{0,40}\bfiles?\b/i;
 const SEMVER = /\d+\.\d+\.\d+/;
 const EXCERPT_LIMIT = 200;
 
@@ -205,26 +205,29 @@ export function observeLeg({
     evidenceLines = findLines(material, /AGENTS\.md/);
     if (!hasSystem('init')) evidenceLines = [];
   } else {
-    // Only the CLI's own context-file notice counts: a line naming GEMINI.md or
-    // AGENTS.md together with a count of files ("Loaded 1 GEMINI.md file", "1 context
-    // file (AGENTS.md)"). Antigravity CLI documents no such notice, so this leg is
-    // expected to stay `uncertain` until one is observed. The model saying who it
-    // is, or merely mentioning the file, is prose.
-    evidenceLines = lines.filter((line) => /(?:GEMINI|AGENTS)\.md/.test(line) && NOTICE_COUNT.test(line));
+    // A PTY transcript cannot distinguish the CLI's own output from the model's
+    // prose, and Antigravity CLI documents no loaded-context notice, so no line
+    // counts: the leg stays `uncertain` on loaded-file evidence until the host
+    // prints a notice that can be authenticated as its own (review finding on
+    // the binding change, 2026-10-31).
+    evidenceLines = [];
   }
   const loadedFound = evidenceLines.length > 0;
   if (!loadedFound && lines.length > 0) {
     reasons.push({
       'claude-code': 'no system/init line together with a line naming CLAUDE.md or AGENTS.md',
       'stream-json-cli': 'no system/init line together with a line naming AGENTS.md',
-      'pty-cli': 'no normalized line is the CLI notice counting GEMINI.md or AGENTS.md files',
+      'pty-cli': 'the bound CLI documents no loaded-context notice and PTY text cannot be authenticated as CLI output',
     }[adapter]);
   }
 
   // Skill paths.
   const skillPattern = escapeRegex(skillName);
-  const userPath = new RegExp(`\\.(?:claude|agents|gemini|codex)/skills/${skillPattern}/SKILL\\.md`);
-  const indexedPath = new RegExp(`(?<!\\.(?:claude|agents|gemini|codex)/)skills/${skillPattern}/SKILL\\.md`);
+  // Antigravity CLI's dedicated global folder, `.gemini/antigravity-cli/skills`,
+  // is user-level too; its `skills/<name>/SKILL.md` tail must never read as the
+  // indexed path.
+  const userPath = new RegExp(`\\.(?:claude|agents|gemini|codex)/(?:antigravity-cli/)?skills/${skillPattern}/SKILL\\.md`);
+  const indexedPath = new RegExp(`(?<!\\.(?:claude|agents|gemini|codex)/)(?<!antigravity-cli/)skills/${skillPattern}/SKILL\\.md`);
   const userLines = lines.filter((line) => userPath.test(line) || line.includes(userSkillMarker));
   const indexedNamed = findLines(material, indexedPath);
   // A read that failed (a command execution with a failed status or a non-zero
