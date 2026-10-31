@@ -536,6 +536,29 @@ pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
     true
 }
 
+/// Whether a self-exit reaper holds the claim on `id` and the final frame is
+/// still owed: from then on the reaper is the one that confirms the reap,
+/// so `observe` leaves the child to it ([`release_reap`] hands it back).
+pub(crate) fn reaper_active(outputs: &OutputTable, id: ProcessId) -> bool {
+    let guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    guard
+        .get(&id)
+        .is_some_and(|entry| entry.reaper_claimed && entry.sender.is_some())
+}
+
+/// Give up a claim taken by [`claim_reap`], for a reaper that ends without
+/// having reaped the child, so `observe` confirms the reap again.
+pub(crate) fn release_reap(outputs: &OutputTable, id: ProcessId) {
+    let mut guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    if let Some(entry) = guard.get_mut(&id) {
+        entry.reaper_claimed = false;
+    }
+}
+
 /// Whether `id`'s final `State` frame is still owed (the entry exists and
 /// was not finalized): the reaper's signal to keep polling or to stop.
 pub(crate) fn final_frame_owed(outputs: &OutputTable, id: ProcessId) -> bool {

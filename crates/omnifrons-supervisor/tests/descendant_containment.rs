@@ -326,9 +326,16 @@ fn wait_until_exited(pid: u32, deadline: Instant) {
     loop {
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            // Only a missing entry means reaped; any other error is a
-            // failure to look, not evidence.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            // Only a missing entry means reaped -- `NotFound` when it was
+            // gone before the open, `ESRCH` when it was reaped between the
+            // open and the read. Any other error is a failure to look, not
+            // evidence.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(3) =>
+            {
+                return;
+            }
             Err(error) => panic!("reading /proc/{pid}/stat failed: {error}"),
         };
         let after_comm = &stat[stat.rfind(')').expect("stat carries a comm field") + 1..];
