@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a defect observed in the app, the supervisor, an adapter, the renderer or the evidence tooling.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe what you observed, what you expected, and how to see it again. Keep local paths, usernames and credentials out of the report.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: The part of the project the defect lives in.
+      options:
+        - Shell (Tauri)
+        - Supervisor
+        - Adapters
+        - Renderer
+        - Evidence tooling
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Version or build
+      description: The commit, release or build channel you observed it on.
+      placeholder: "main f8468c6, packaged-ci AppImage"
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened
+      description: The observed behaviour, with the exact messages where there are any.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the defect.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Code references, record ids, log excerpts or a map of the cause, when you have them.
+    validations:
+      required: false
