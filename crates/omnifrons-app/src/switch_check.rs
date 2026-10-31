@@ -81,7 +81,10 @@ pub fn switch_check(
 /// The file names of `agent`'s regular identity files, plus the host
 /// extras present at that root: a host that lists one of its own files
 /// ahead of the definition (Hermes Agent's `.hermes.md`) must see it, or
-/// the verdict would say it reaches a file it never loads.
+/// the verdict would say it reaches a file it never loads. The extras reach
+/// every host's verdict: Claude Code's `CLAUDE.local.md` now displaces its
+/// `AGENTS.md` fallback, as its row documents, where the earlier verdict
+/// reached through the fallback anyway (pinned by the switch-check tests).
 fn root_file_names(agent: &AgentReport) -> Vec<String> {
     agent
         .identity_files

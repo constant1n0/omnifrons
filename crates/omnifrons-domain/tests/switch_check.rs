@@ -463,3 +463,31 @@ fn an_identity_kind_listed_first_still_reaches() {
     let verdict = switch_check("Hermes Agent", &root(&["AGENTS.md", "AGENTS.override.md"]));
     assert_eq!(reached_file(&verdict), Some("AGENTS.override.md"));
 }
+
+/// A consequence the root extras bring to Claude Code, pinned on purpose:
+/// its row lists `CLAUDE.local.md` among the files it loads, and its
+/// documented `AGENTS.md` fallback applies only when none of `CLAUDE.md`,
+/// `.claude/CLAUDE.md` or `CLAUDE.local.md` exists. A root with `AGENTS.md`
+/// and `CLAUDE.local.md` but no `CLAUDE.md` therefore never reaches the
+/// definition through the fallback; the previous verdict, which could not
+/// see the extra, reached through it anyway.
+#[test]
+fn claude_local_md_at_the_root_displaces_the_agents_md_fallback() {
+    let verdict = switch_check("Claude Code", &root(&["AGENTS.md", "CLAUDE.local.md"]));
+    assert!(
+        matches!(&verdict, SwitchVerdict::Unreached { shadowed_by: Some(shadow), fallback: None, .. } if shadow.path == "." && shadow.file == "CLAUDE.local.md"),
+        "{verdict:?}"
+    );
+    assert!(
+        verdict
+            .to_string()
+            .contains("AGENTS.md is displaced by CLAUDE.local.md at the root"),
+        "{verdict}"
+    );
+    // The wrapper still wins when present: `CLAUDE.md` is first in the row.
+    let with_wrapper = switch_check(
+        "Claude Code",
+        &root(&["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"]),
+    );
+    assert_eq!(reached_file(&with_wrapper), Some("CLAUDE.md"));
+}

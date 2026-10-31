@@ -305,3 +305,33 @@ fn a_generic_adapter_with_hermes_agent_reaches_a_root_with_only_agents_md() {
         check.verdict
     );
 }
+
+/// The root extras reach every host's verdict, not only Hermes Agent's:
+/// `claude-code` with `AGENTS.md` and a `CLAUDE.local.md` extra, no
+/// `CLAUDE.md`, is unreached, displaced at the root, because Claude Code's
+/// `AGENTS.md` fallback applies only when no `CLAUDE.local.md` exists.
+#[test]
+fn claude_code_is_unreached_when_a_claude_local_md_sits_beside_agents_md() {
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![file(IdentityKind::Agents, AGENTS_BYTES)],
+            vec!["CLAUDE.local.md".to_string()],
+            Vec::new(),
+        )
+        .build();
+    let check = check(snapshot, &AdapterId::claude_code(), None);
+    match check.verdict {
+        SwitchVerdict::Unreached {
+            shadowed_by,
+            fallback,
+            ..
+        } => {
+            let shadow = shadowed_by.expect("displaced at the root");
+            assert_eq!(shadow.path, ".");
+            assert_eq!(shadow.file, "CLAUDE.local.md");
+            assert_eq!(fallback, None);
+        }
+        other => panic!("expected unreached, got {other:?}"),
+    }
+}
