@@ -151,7 +151,7 @@ function observedClaude(dir, env) {
     '{"type":"system","subtype":"init"}',
     '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}},{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}',
   ]);
-  writeFileSync(version, '2.1.307 (Claude Code)\n');
+  writeFileSync(version, '2.1.316 (Claude Code)\n');
   assert.equal(sh(['observe', 'claude-code', transcript, version], env).status, 0);
 }
 
@@ -374,7 +374,7 @@ test('observe takes the two logs of a leg and a log that is not a harness log is
     const first = join(dir, 'log-claude-code-1.jsonl');
     const second = join(dir, 'log-claude-code-2.jsonl');
     const version = join(dir, 'claude-version.txt');
-    writeFileSync(version, '2.1.307 (Claude Code)\n');
+    writeFileSync(version, '2.1.316 (Claude Code)\n');
     writeLog(first, 'claude-code', ['{"type":"system","subtype":"init"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}}]}}']);
     writeLog(second, 'claude-code', ['{"type":"system","subtype":"init"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}']);
     const both = sh(['observe', 'claude-code', first, second, version], env);

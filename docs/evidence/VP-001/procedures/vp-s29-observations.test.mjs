@@ -17,7 +17,7 @@ const init = json({ type: 'system', subtype: 'init', cwd: '/work/definition', mo
 const bridge = json({ type: 'system', subtype: 'bridge', codex_version: 'codex-cli 0.163.0', bridge_version: '0.1.0' });
 const say = (text) => json({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
 const tool = (name, input) => json({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
-const CLAUDE_VERSION = '2.1.307 (Claude Code)\n';
+const CLAUDE_VERSION = '2.1.316 (Claude Code)\n';
 const CODEX_VERSION = 'codex-cli 0.163.0\n';
 const GEMINI_VERSION = '0.41.2\n';
 
@@ -37,7 +37,7 @@ test('claude-code passes with loaded-file evidence and only the indexed skill pa
   });
   assert.equal(result.result, 'pass');
   assert.equal(result.harness.name, 'Claude Code');
-  assert.equal(result.harness.version, '2.1.307');
+  assert.equal(result.harness.version, '2.1.316');
   assert.equal(result.harness.versionMatchesBinding, true);
   assert.equal(result.loadedFileEvidence.found, true);
   assert.equal(result.skillPaths.indexed, true);

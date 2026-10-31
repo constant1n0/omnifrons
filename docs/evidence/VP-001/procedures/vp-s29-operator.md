@@ -26,7 +26,7 @@ only when it appears in such material. A user-level skill path in a transcript, 
 
 | Adapter | Harness | Version | Reads |
 | --- | --- | --- | --- |
-| `claude-code` | Claude Code (`claude`) | 2.1.307 | `CLAUDE.md`, falling back to `AGENTS.md` |
+| `claude-code` | Claude Code (`claude`) | 2.1.316 | `CLAUDE.md`, falling back to `AGENTS.md` |
 | `stream-json-cli` | Codex CLI (`codex`) through `tools/codex-stream-bridge` | 0.163.0 | `AGENTS.md` |
 | `pty-cli` | Gemini CLI (`gemini`) | 0.41.2 | `GEMINI.md` (the wrapper) |
 

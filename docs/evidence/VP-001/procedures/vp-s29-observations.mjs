@@ -26,7 +26,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const EXPECTED_VERSIONS = {
-  'claude-code': '2.1.307',
+  'claude-code': '2.1.316',
   'stream-json-cli': '0.163.0',
   'pty-cli': '0.41.2',
 };
