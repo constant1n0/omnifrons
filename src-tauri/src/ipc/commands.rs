@@ -513,7 +513,9 @@ impl RunLog {
         let log = self.log.as_mut()?;
         let written = match &frame.payload {
             FramePayload::Text { .. } => log.write_frame(frame),
-            FramePayload::State(state) => log.write_state(&ProcessTerminalStateDto::from(*state)),
+            FramePayload::State(state) => {
+                log.write_state(&ProcessTerminalStateDto::from(*state), frame.dropped_before)
+            }
         };
         match written {
             Ok(()) => None,
@@ -4530,7 +4532,7 @@ mod tests {
         assert_eq!(lines[1]["text"], "{\"type\":\"system\"}");
         assert_eq!(
             lines[2],
-            serde_json::json!({"kind":"state","state":"exited","code":0})
+            serde_json::json!({"kind":"state","droppedBefore":0,"state":"exited","code":0})
         );
     }
 
@@ -4698,5 +4700,36 @@ mod tests {
         let lines = log_lines(&temp.0, "run-9-000000000-5");
         assert_eq!(lines.len(), 8, "header, six text frames, state: {lines:?}");
         assert_eq!(lines[7]["kind"], "state");
+    }
+
+    /// Frames still pending when the process ends ride the guaranteed
+    /// terminal frame as its `dropped_before`; the log's state line must
+    /// report them rather than claim no loss.
+    #[test]
+    fn the_logged_state_line_carries_the_terminal_frames_drops() {
+        let temp = TempProject::new("log-terminal-drops");
+        let logs = crate::harness_log::HarnessLogDir::open(&temp.0);
+        let run_id = omnifrons_domain::outbox::RunId::new("run-9-000000000-6").expect("valid");
+        let (mut run_log, _opening) = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+        let mut sequencer = super::AdapterWireSequencer::new(ProcessIdDto(7));
+        let terminal = omnifrons_app::OutputFrame::with_dropped_before(
+            5,
+            4,
+            omnifrons_app::FramePayload::State(omnifrons_app::ProcessTerminalState::Exited {
+                code: Some(1),
+            }),
+        );
+
+        assert!(super::log_frame(&mut run_log, &mut sequencer, &terminal).is_empty());
+
+        let lines = log_lines(&temp.0, "run-9-000000000-6");
+        assert_eq!(
+            lines[1],
+            serde_json::json!({"kind":"state","droppedBefore":4,"state":"exited","code":1})
+        );
     }
 }

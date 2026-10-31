@@ -20,7 +20,9 @@
 //!   "droppedBefore":0}`, the capture side's own fields, unmodified
 //! - `{"kind":"truncated","framesDropped":<n>}`, only when the cap dropped
 //!   text frames, immediately before the state line
-//! - state, last: `{"kind":"state","state":"exited","code":0}`
+//! - state, last: `{"kind":"state","droppedBefore":0,"state":"exited",
+//!   "code":0}`, where `droppedBefore` is the terminal frame's own count of
+//!   frames the capture side dropped (backpressure) before it
 //!
 //! # Limits and privacy
 //!
@@ -218,8 +220,10 @@ struct TruncatedLine {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StateLine<'a> {
     kind: &'static str,
+    dropped_before: u64,
     #[serde(flatten)]
     terminal: &'a ProcessTerminalStateDto,
 }
@@ -340,12 +344,20 @@ impl HarnessLog {
 
     /// Write the final state line, preceded by the truncation marker when
     /// the cap dropped frames, and flush. Neither line counts against the
-    /// cap: they are always written.
+    /// cap: they are always written. `dropped_before` is the terminal
+    /// frame's own drop count: the supervisor puts every drop still pending
+    /// at the end of the run on that guaranteed frame, so it is the loss
+    /// the capture side reports for the tail of the run (the marker counts
+    /// a different thing, frames this log's cap did not write).
     ///
     /// # Errors
     ///
     /// Returns [`HarnessLogError`] if the write or the flush fails.
-    pub fn write_state(&mut self, state: &ProcessTerminalStateDto) -> Result<(), HarnessLogError> {
+    pub fn write_state(
+        &mut self,
+        state: &ProcessTerminalStateDto,
+        dropped_before: u64,
+    ) -> Result<(), HarnessLogError> {
         if self.frames_dropped > 0 {
             let marker = TruncatedLine {
                 kind: "truncated",
@@ -355,6 +367,7 @@ impl HarnessLog {
         }
         self.write_line(&StateLine {
             kind: "state",
+            dropped_before,
             terminal: state,
         })?;
         self.writer.flush()?;
@@ -485,7 +498,7 @@ mod tests {
             MAX_LOG_BYTES,
         )
         .expect("open");
-        log.write_state(&exited()).expect("state");
+        log.write_state(&exited(), 0).expect("state");
         let lines = lines_of(&dir, "run-1-000000000-0");
         assert_eq!(
             lines[0],
@@ -515,7 +528,7 @@ mod tests {
         .expect("stdout");
         log.write_frame(&text(1, OutputStream::Stderr, "warn \"x\"\u{1b}", true, 3))
             .expect("stderr");
-        log.write_state(&exited()).expect("state");
+        log.write_state(&exited(), 0).expect("state");
         let lines = lines_of(&dir, "run-2-000000000-0");
         assert_eq!(lines.len(), 4);
         assert_eq!(
@@ -528,7 +541,7 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            serde_json::json!({"kind":"state","state":"exited","code":0})
+            serde_json::json!({"kind":"state","droppedBefore":0,"state":"exited","code":0})
         );
     }
 
@@ -548,7 +561,7 @@ mod tests {
             log.write_frame(&text(seq, OutputStream::Stdout, &"y".repeat(60), false, 0))
                 .expect("frame");
         }
-        log.write_state(&exited()).expect("state");
+        log.write_state(&exited(), 0).expect("state");
         let lines = lines_of(&dir, "run-3-000000000-0");
         let kept = lines.iter().filter(|line| line["kind"] == "stdout").count();
         assert!(
@@ -568,12 +581,26 @@ mod tests {
     }
 
     #[test]
+    fn the_state_line_reports_the_frames_dropped_before_the_terminal_frame() {
+        let temp = Temp::new("statedrops");
+        let dir = HarnessLogDir::open(&temp.0).expect("dir");
+        let mut log = HarnessLog::open(&dir, &run("run-12-000000000-0"), &AdapterId::claude_code())
+            .expect("open");
+        log.write_state(&exited(), 3).expect("state");
+        let lines = lines_of(&dir, "run-12-000000000-0");
+        assert_eq!(
+            lines[1],
+            serde_json::json!({"kind":"state","droppedBefore":3,"state":"exited","code":0})
+        );
+    }
+
+    #[test]
     fn no_marker_is_written_when_nothing_was_dropped() {
         let temp = Temp::new("nomarker");
         let dir = HarnessLogDir::open(&temp.0).expect("dir");
         let mut log = HarnessLog::open(&dir, &run("run-4-000000000-0"), &AdapterId::claude_code())
             .expect("open");
-        log.write_state(&exited()).expect("state");
+        log.write_state(&exited(), 0).expect("state");
         let lines = lines_of(&dir, "run-4-000000000-0");
         assert!(lines.iter().all(|line| line["kind"] != "truncated"));
     }
@@ -775,10 +802,13 @@ mod tests {
             log.write_frame(&frame(seq)).expect("frame");
         }
         // The longest state token, so the tail is as long as it gets.
-        log.write_state(&ProcessTerminalStateDto {
-            state: ProcessTerminalStateTag::OrphanRiskUncertain,
-            code: None,
-        })
+        log.write_state(
+            &ProcessTerminalStateDto {
+                state: ProcessTerminalStateTag::OrphanRiskUncertain,
+                code: None,
+            },
+            u64::MAX,
+        )
         .expect("state");
 
         let lines = lines_of(&dir, "run-11-000000000-0");
