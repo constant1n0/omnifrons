@@ -605,8 +605,9 @@ pub(crate) fn note_deferral_expired(outputs: &OutputTable, id: ProcessId) -> boo
     }
 }
 
-/// Whether [`note_deferral_expired`] fired for `id` (test read accessor).
-#[cfg(test)]
+/// Whether [`note_deferral_expired`] fired for `id` (test read accessor; its
+/// only reader is the unix-only self-exit test module).
+#[cfg(all(test, unix))]
 pub(crate) fn deferral_expired(outputs: &OutputTable, id: ProcessId) -> bool {
     let guard = outputs.lock().expect("outputs mutex poisoned");
     guard.get(&id).is_some_and(|e| e.deferral_expired_logged)
