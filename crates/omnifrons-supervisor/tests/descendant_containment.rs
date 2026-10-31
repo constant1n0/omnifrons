@@ -302,7 +302,7 @@ fn a_child_with_no_descendants_still_reports_its_own_exit_code() {
         r#"{"type":"result","subtype":"success"}"#,
         Instant::now() + FRAME_DEADLINE,
     );
-    wait_until_zombie(id.0, Instant::now() + FRAME_DEADLINE);
+    wait_until_exited(id.0, Instant::now() + FRAME_DEADLINE);
 
     let terminal = supervisor
         .stop(id, STOP_DEADLINE)
@@ -315,21 +315,25 @@ fn a_child_with_no_descendants_still_reports_its_own_exit_code() {
     );
 }
 
-/// Block until `pid` is an unreaped zombie (`/proc/<pid>/stat` state `Z`),
-/// so the test knows the child has really exited before it calls `stop` --
-/// rather than sleeping a hopeful interval and racing `stop`'s own
-/// `SIGTERM`, which would replace the exit code with a signal death.
-fn wait_until_zombie(pid: u32, deadline: Instant) {
+/// Block until `pid` has exited: an unreaped zombie (`/proc/<pid>/stat`
+/// state `Z`) or already reaped (no `/proc` entry), so the test knows the
+/// child has really exited before it calls `stop` -- rather than sleeping a
+/// hopeful interval and racing `stop`'s own `SIGTERM`, which would replace
+/// the exit code with a signal death. The supervisor now reaps a child that
+/// exited on its own once its output has closed, so the zombie window is
+/// short and may be missed entirely.
+fn wait_until_exited(pid: u32, deadline: Instant) {
     loop {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .expect("the child's /proc entry must exist until it is reaped");
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return;
+        };
         let after_comm = &stat[stat.rfind(')').expect("stat carries a comm field") + 1..];
         if after_comm.split_whitespace().next() == Some("Z") {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "the child never became a zombie within the deadline"
+            "the child never exited within the deadline"
         );
         std::thread::sleep(Duration::from_millis(20));
     }

@@ -12,7 +12,7 @@
 //! "cleanly stopped" (docs/target-architecture.md § Required failure
 //! states).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -260,6 +260,143 @@ fn record_terminal_order(
     }
 }
 
+/// How often the self-exit reaper asks `try_wait` during the first
+/// [`SELF_EXIT_FAST_WINDOW`] after a child's last reader finished: a child
+/// that closes its output is normally about to exit, so the run ends
+/// promptly.
+const SELF_EXIT_FAST_POLL: Duration = Duration::from_millis(10);
+/// How long the fast cadence lasts.
+const SELF_EXIT_FAST_WINDOW: Duration = Duration::from_secs(3);
+/// The cadence after the fast window, for a child that closed its output
+/// and keeps running.
+const SELF_EXIT_SLOW_POLL: Duration = Duration::from_millis(250);
+/// How long the reaper keeps asking before it logs once and leaves the
+/// child to `observe`/`stop` (the shell's next spawn confirms it through
+/// `running_ids`), as before the reaper existed.
+const SELF_EXIT_REAP_CAP: Duration = Duration::from_secs(60);
+
+/// Ends a run whose child exited on its own, with no operator action.
+///
+/// `output_capture::try_finalize` sends the final `State` frame only once
+/// the reap is confirmed, and only `observe`/`stop` confirmed it. After a
+/// child's last reader finishes (pipe EOF on both streams, or the PTY
+/// master's EOF/EIO), [`Self::confirm_reap_after_readers`] polls `try_wait`
+/// through the same children table, evicts the entry exactly as `observe`
+/// does, and hands the state to output capture. It holds the tables, never
+/// `Inner`, and never holds a lock across an await.
+struct SelfExitReaper {
+    children: Arc<Mutex<HashMap<ProcessId, Tracked>>>,
+    terminal_order: Arc<Mutex<VecDeque<ProcessId>>>,
+    stopping: Arc<Mutex<HashSet<ProcessId>>>,
+    outputs: OutputTable,
+    id: ProcessId,
+}
+
+/// Marks `id` as being stopped for as long as it lives (see
+/// [`Inner::stopping`]).
+struct StoppingGuard<'a> {
+    stopping: &'a Mutex<HashSet<ProcessId>>,
+    id: ProcessId,
+}
+
+impl<'a> StoppingGuard<'a> {
+    fn new(stopping: &'a Mutex<HashSet<ProcessId>>, id: ProcessId) -> Self {
+        stopping
+            .lock()
+            .expect("stopping mutex poisoned by a prior panic")
+            .insert(id);
+        Self { stopping, id }
+    }
+}
+
+impl Drop for StoppingGuard<'_> {
+    fn drop(&mut self) {
+        // Poison-tolerant: this runs during unwinding as readily as not.
+        let mut set = match self.stopping.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        set.remove(&self.id);
+    }
+}
+
+impl SelfExitReaper {
+    /// Runs after one reader task ended; a no-op unless it was the last
+    /// reader and the final frame is still owed.
+    async fn confirm_reap_after_readers(self) {
+        if !output_capture::awaiting_reap(&self.outputs, self.id) {
+            return;
+        }
+        let began = std::time::Instant::now();
+        loop {
+            if self.try_reap() {
+                return;
+            }
+            let elapsed = began.elapsed();
+            if elapsed >= SELF_EXIT_REAP_CAP {
+                tracing::warn!(
+                    pid = self.id.0,
+                    cap = ?SELF_EXIT_REAP_CAP,
+                    "child closed its output but is still running; \
+                     leaving the reap to observe/stop"
+                );
+                return;
+            }
+            let poll = if elapsed < SELF_EXIT_FAST_WINDOW {
+                SELF_EXIT_FAST_POLL
+            } else {
+                SELF_EXIT_SLOW_POLL
+            };
+            tokio::time::sleep(poll).await;
+        }
+    }
+
+    /// One non-blocking reap attempt. `true` when nothing is left to poll
+    /// for: this call reaped the child, someone else already did (then
+    /// `observe`/`stop` own the state), or the entry is gone or unanswerable.
+    fn try_reap(&self) -> bool {
+        let state = {
+            let mut children = self
+                .children
+                .lock()
+                .expect("children mutex poisoned by a prior panic");
+            let Some(tracked) = children.get_mut(&self.id) else {
+                return true;
+            };
+            let Tracked::Running(child) = tracked else {
+                return true;
+            };
+            // Checked with `children` held (the only nesting of the two
+            // locks): a `stop` that registered before this point owns the
+            // state it is about to prove.
+            if self
+                .stopping
+                .lock()
+                .expect("stopping mutex poisoned by a prior panic")
+                .contains(&self.id)
+            {
+                return false;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let state = ProcessTerminalState::Exited {
+                        code: status.code(),
+                    };
+                    *tracked = Tracked::Terminal(state);
+                    state
+                }
+                Ok(None) => return false,
+                // Not a confirmed reap; retrying an error learns nothing.
+                Err(_) => return true,
+            }
+        };
+        // With `children` unlocked, as `observe` does.
+        record_terminal_order(&self.children, &self.terminal_order, self.id);
+        output_capture::record_confirmed_state(&self.outputs, self.id, state);
+        true
+    }
+}
+
 /// The bookkeeping this supervisor holds for one spawned process.
 ///
 /// A child is evicted to `Terminal` the moment it is confirmed reaped (in
@@ -335,13 +472,22 @@ pub struct TokioProcessSupervisor {
 /// construct runtime-dependent resources on that thread.
 struct Inner {
     runtime: Arc<Runtime>,
-    children: Mutex<HashMap<ProcessId, Tracked>>,
+    /// `Arc`-shared so the self-exit reaper task ([`confirm_reap_after_readers`])
+    /// can hold the table without holding `Inner` itself: `Inner`'s `Drop`
+    /// joins the driver thread, which a task running on that thread must
+    /// never be the one to trigger.
+    children: Arc<Mutex<HashMap<ProcessId, Tracked>>>,
     /// The order, oldest first, in which entries in `children` transitioned
     /// to `Tracked::Terminal`. Every id pushed here exactly once, at the
     /// moment of that transition (`record_terminal_order`); consulted only
     /// to decide which entry to evict once [`MAX_RETAINED_TERMINAL_CHILDREN`]
     /// is exceeded.
-    terminal_order: Mutex<VecDeque<ProcessId>>,
+    terminal_order: Arc<Mutex<VecDeque<ProcessId>>>,
+    /// Ids a `stop` call is working on right now. The self-exit reaper
+    /// leaves these alone, so the state `stop` proves (`Killed`, or the
+    /// settled descendant verdict) is never pre-empted by a bare reap of the
+    /// child that `stop` itself just signalled.
+    stopping: Arc<Mutex<HashSet<ProcessId>>>,
     /// Per-child output-capture bookkeeping (`output_capture` module),
     /// deliberately a separate table from `children`: it must outlive a
     /// `Tracked` entry's own Running/Terminal transition (`observe`/`stop`
@@ -430,8 +576,9 @@ impl TokioProcessSupervisor {
         Self {
             inner: Arc::new(Inner {
                 runtime,
-                children: Mutex::new(HashMap::new()),
-                terminal_order: Mutex::new(VecDeque::new()),
+                children: Arc::new(Mutex::new(HashMap::new())),
+                terminal_order: Arc::new(Mutex::new(VecDeque::new())),
+                stopping: Arc::new(Mutex::new(HashSet::new())),
                 outputs: Arc::new(Mutex::new(HashMap::new())),
                 demo_launcher,
                 driver_shutdown: Some(driver_shutdown),
@@ -682,6 +829,18 @@ impl TokioProcessSupervisor {
         Ok(id)
     }
 
+    /// The handles the self-exit reaper needs for `id`, cloned out of
+    /// `Inner` so the reaper task never keeps `Inner` itself alive.
+    fn reaper(&self, id: ProcessId) -> SelfExitReaper {
+        SelfExitReaper {
+            children: Arc::clone(&self.inner.children),
+            terminal_order: Arc::clone(&self.inner.terminal_order),
+            stopping: Arc::clone(&self.inner.stopping),
+            outputs: Arc::clone(&self.inner.outputs),
+            id,
+        }
+    }
+
     /// Attach the reader task(s) and, when `prompt` is `Some`, the prompt
     /// writer for a freshly spawned `child`, per its [`Wiring`]: two
     /// drains (stdout, stderr) plus a stdin writer under `Pipes`; one drain
@@ -713,20 +872,30 @@ impl TokioProcessSupervisor {
                     .take()
                     .expect("stderr was configured as piped by configure_stdio");
                 let stderr_handles = handles.clone();
-                self.spawn_on_runtime(output_capture::drain_stream(
+                let stdout_drain = output_capture::drain_stream(
                     stdout,
                     omnifrons_app::OutputStream::Stdout,
                     handles,
                     Arc::clone(&self.inner.outputs),
                     id,
-                ));
-                self.spawn_on_runtime(output_capture::drain_stream(
+                );
+                let stderr_drain = output_capture::drain_stream(
                     stderr,
                     omnifrons_app::OutputStream::Stderr,
                     stderr_handles,
                     Arc::clone(&self.inner.outputs),
                     id,
-                ));
+                );
+                let stdout_reaper = self.reaper(id);
+                let stderr_reaper = self.reaper(id);
+                self.spawn_on_runtime(async move {
+                    stdout_drain.await;
+                    stdout_reaper.confirm_reap_after_readers().await;
+                });
+                self.spawn_on_runtime(async move {
+                    stderr_drain.await;
+                    stderr_reaper.confirm_reap_after_readers().await;
+                });
 
                 if let Some(prompt_bytes) = prompt {
                     let mut stdin_handle = child
@@ -750,13 +919,18 @@ impl TokioProcessSupervisor {
                 // pseudo-terminal has no separate stderr, and the frames
                 // keep slice 1's framing (cap, `continued`, CRLF handling)
                 // by reusing the same drain.
-                self.spawn_on_runtime(output_capture::drain_stream(
+                let drain = output_capture::drain_stream(
                     pty::MasterReader::new(Arc::clone(&master)),
                     omnifrons_app::OutputStream::Stdout,
                     handles,
                     Arc::clone(&self.inner.outputs),
                     id,
-                ));
+                );
+                let reaper = self.reaper(id);
+                self.spawn_on_runtime(async move {
+                    drain.await;
+                    reaper.confirm_reap_after_readers().await;
+                });
                 if let Some(prompt_bytes) = prompt {
                     self.spawn_on_runtime(pty::type_prompt(
                         master,
@@ -937,6 +1111,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         deadline: Duration,
     ) -> Result<ProcessTerminalState, SupervisorError> {
         let _guard = self.inner.runtime.enter();
+        let _stopping = StoppingGuard::new(&self.inner.stopping, id);
 
         #[cfg(unix)]
         {
@@ -1417,7 +1592,13 @@ mod unix {
                     .expect("children mutex poisoned by a prior panic");
                 let tracked = guard.get_mut(&id).expect("checked present by the caller");
                 let Tracked::Running(child) = tracked else {
-                    unreachable!("this entry is only ever reached while still Running")
+                    // Reaped and recorded by the self-exit reaper (or an
+                    // `observe`) after this call's own `Running` check:
+                    // report that same recorded state.
+                    let Tracked::Terminal(state) = tracked else {
+                        unreachable!("the entry is not Running, so it is Terminal")
+                    };
+                    return Some(*state);
                 };
                 if let Ok(Some(status)) = child.try_wait() {
                     let state = match on_reap {

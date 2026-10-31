@@ -506,6 +506,21 @@ pub(crate) fn record_confirmed_state(
     try_finalize(outputs, id);
 }
 
+/// Whether `id`'s final `State` frame is owed and only the reap is missing:
+/// not finalized yet, every reader task finished, and no terminal state
+/// confirmed. This is exactly the situation [`try_finalize`] returns from
+/// with "reap not confirmed yet".
+pub(crate) fn awaiting_reap(outputs: &OutputTable, id: ProcessId) -> bool {
+    let guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    guard.get(&id).is_some_and(|entry| {
+        entry.sender.is_some()
+            && entry.active_readers.load(Ordering::Acquire) == 0
+            && entry.confirmed_state.is_none()
+    })
+}
+
 /// Send the final `State` frame and drop this channel's sender, but only
 /// once the process's terminal state is confirmed *and* both reader tasks
 /// have finished -- whichever of the two happens second performs the send.
