@@ -11,6 +11,7 @@
 //   .claude/skills  Claude Code
 //   .agents/skills  Codex CLI, Antigravity CLI workspace skills (and a Gemini CLI alias)
 //   .gemini/skills  Antigravity CLI global skills (and Gemini CLI, the previous binding)
+//   .gemini/antigravity-cli/skills  Antigravity CLI's dedicated global folder
 // The skill is written to all three so every harness can see a same-named
 // user-level skill wherever it looks. Sources: the Codex CLI docs ("Build
 // skills": user skills in $HOME/.agents/skills; .agents/skills scanned from the
@@ -34,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 export const SKILL_NAME = 'release-notes';
 export const LOCAL_SKILL_MARKER = 'LOCAL-SKILL-MARKER';
 export const USER_SKILL_MARKER = 'USER-LEVEL-SKILL-MARKER';
-export const USER_SKILL_DIRS = ['.claude/skills', '.agents/skills', '.gemini/skills'];
+export const USER_SKILL_DIRS = ['.claude/skills', '.agents/skills', '.gemini/skills', '.gemini/antigravity-cli/skills'];
 export const PROJECT_SKILL_DIRS = ['.agents/skills', '.gemini/skills'];
 
 /** Fixed, neutral answers for the Definition section's create form, in the

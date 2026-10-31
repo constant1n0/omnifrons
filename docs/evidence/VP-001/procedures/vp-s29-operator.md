@@ -10,10 +10,10 @@ Outcome rules: the switch leg is always `uncertain` (no checkpoint-and-restart
 flow exists), so the run's overall `result` is `uncertain` and never discharges
 the ADR-0005 gate. A load leg is `pass` only with loaded-file evidence from the
 harness itself plus the indexed skill path; anything unclear is `uncertain`,
-never `pass`. For `pty-cli`, loaded-file evidence is the CLI's own context-file notice
-only: a line naming `AGENTS.md` or `GEMINI.md` together with a count of files
-(for example "1 context file (AGENTS.md)"); Antigravity CLI documents no such
-notice, so expect `uncertain` until one is observed. The model saying
+never `pass`. For `pty-cli`, no transcript text counts as loaded-file evidence: a PTY
+transcript cannot distinguish the CLI's own output from the model's prose, and
+Antigravity CLI documents no loaded-context notice, so the leg records
+`uncertain` on that count. The model saying
 who it is, or mentioning the file, never counts; without the notice the leg is
 `uncertain` even when the indexed skill path appears. For `claude-code` and the
 bridge, loaded-file evidence is
@@ -71,8 +71,9 @@ Antigravity CLI, which still reads `AGENTS.md` and `GEMINI.md`.
    `.agents/skills` folder.
    - **Real HOME.** The CLIs already have their logins. The fixture writes
      `release-notes/SKILL.md` under `.claude/skills`, `.agents/skills` and
-     `.gemini/skills` in that HOME and refuses to overwrite an existing one.
-     Afterwards remove exactly those three `release-notes` directories.
+     `.gemini/skills` and `.gemini/antigravity-cli/skills` in that HOME and
+     refuses to overwrite an existing one. Afterwards remove exactly those
+     four `release-notes` directories.
    - **Dedicated HOME** (a new empty directory). Nothing else in your real
      HOME can leak into the run, but each CLI must be logged in again with
      `HOME=<dedicated> <cli> ...`, and the app must be started with that

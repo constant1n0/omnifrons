@@ -143,14 +143,14 @@ test('the bridge without its retained version line is uncertain', () => {
   assert.ok(result.reasons.some((reason) => /bridge/.test(reason)));
 });
 
-test('pty-cli passes on a normalized line naming GEMINI.md and the indexed path', () => {
+test('pty-cli stays uncertain on a line naming GEMINI.md with a count: PTY text is never loaded-file evidence', () => {
   const result = observeLeg({
     adapter: 'pty-cli',
     transcript: '\u001b[2J\u001b[1;32mUsing: 1 GEMINI.md file\u001b[0m\r\nReadFile skills/release-notes/SKILL.md\r\n',
     versionText: AGY_VERSION,
     ...OPTIONS,
   });
-  assert.equal(result.result, 'pass');
+  assert.equal(result.result, 'uncertain');
   assert.equal(result.harness.name, 'Antigravity CLI');
   assert.equal(result.harness.version, '1.2.5');
 });
@@ -167,12 +167,12 @@ test('pty-cli does not accept the model saying who it is as loaded-file evidence
   assert.equal(result.skillPaths.indexed, true);
 });
 
-test('pty-cli needs the CLI notice that counts GEMINI.md files, not any mention', () => {
+test('pty-cli takes no transcript line as loaded-file evidence, notice-shaped or not', () => {
   const notice = (line) => observeLeg({
     adapter: 'pty-cli', transcript: `${line}\nReadFile skills/release-notes/SKILL.md\n`, versionText: AGY_VERSION, ...OPTIONS,
   });
-  assert.equal(notice('Loaded 1 GEMINI.md file').result, 'pass');
-  assert.equal(notice('1 context file (GEMINI.md)').result, 'pass');
+  assert.equal(notice('Loaded 1 GEMINI.md file').result, 'uncertain');
+  assert.equal(notice('1 context file (GEMINI.md)').result, 'uncertain');
   assert.equal(notice('I read GEMINI.md earlier').result, 'uncertain');
   assert.equal(notice('Loaded GEMINI.md').result, 'uncertain');
 });
@@ -442,7 +442,8 @@ test('the two runs of a leg combine; a pty-cli log uses its text frames', () => 
     versionText: AGY_VERSION,
     ...OPTIONS,
   });
-  assert.equal(pty.result, 'pass');
+  assert.equal(pty.result, 'uncertain');
+  assert.equal(pty.loadedFileEvidence.found, false);
 });
 
 test('a log with no final state line is incomplete, and says so', () => {
@@ -504,7 +505,7 @@ test('a completed command execution naming the indexed skill path still counts a
   assert.ok(!result.reasons.some((reason) => /access to the indexed skill path failed/.test(reason)));
 });
 
-test('pty-cli passes on the CLI notice counting AGENTS.md files, as Antigravity CLI would name it', () => {
+test('pty-cli never takes transcript text as loaded-file evidence: a counting notice naming AGENTS.md stays uncertain', () => {
   const result = observeLeg({
     adapter: 'pty-cli',
     transcript: lines('1 context file (AGENTS.md)', 'ReadFile skills/release-notes/SKILL.md', 'I am Orbit Scribe.'),
@@ -513,11 +514,25 @@ test('pty-cli passes on the CLI notice counting AGENTS.md files, as Antigravity 
   });
   assert.equal(result.harness.name, 'Antigravity CLI');
   assert.equal(result.harness.expectedVersion, '1.2.5');
-  assert.equal(result.loadedFileEvidence.found, true);
-  assert.equal(result.result, 'pass');
+  assert.equal(result.loadedFileEvidence.found, false);
+  assert.equal(result.loadedFileEvidence.excerpts.length, 0);
+  assert.equal(result.result, 'uncertain');
+  assert.ok(result.reasons.some((reason) => /documents no loaded-context notice/.test(reason)));
 });
 
-test('pty-cli without a counting notice is uncertain even when AGENTS.md is mentioned in prose', () => {
+test('pty-cli classifies a read under the dedicated Antigravity skill folder as user-level, never indexed', () => {
+  const result = observeLeg({
+    adapter: 'pty-cli',
+    transcript: lines('ReadFile /home/op/.gemini/antigravity-cli/skills/release-notes/SKILL.md', 'I am Orbit Scribe.'),
+    versionText: AGY_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.skillPaths.userLevel, true);
+  assert.equal(result.skillPaths.indexed, false);
+  assert.equal(result.result, 'fail');
+});
+
+test('pty-cli without any notice is uncertain when AGENTS.md is mentioned in prose', () => {
   const result = observeLeg({
     adapter: 'pty-cli',
     transcript: lines('Reading AGENTS.md now.', 'ReadFile skills/release-notes/SKILL.md', 'I am Orbit Scribe.'),
@@ -526,5 +541,5 @@ test('pty-cli without a counting notice is uncertain even when AGENTS.md is ment
   });
   assert.equal(result.loadedFileEvidence.found, false);
   assert.equal(result.result, 'uncertain');
-  assert.ok(result.reasons.some((reason) => /counting GEMINI\.md or AGENTS\.md files/.test(reason)));
+  assert.ok(result.reasons.some((reason) => /documents no loaded-context notice/.test(reason)));
 });

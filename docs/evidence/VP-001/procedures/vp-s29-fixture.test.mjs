@@ -123,3 +123,7 @@ test('a failure after the first write removes what this call created and nothing
     assert.doesNotThrow(() => prepareFixture({ root, home }), 'a re-run no longer refuses');
   });
 });
+
+test('the user-level skill is written to every documented user skill folder, including the dedicated Antigravity one', () => {
+  assert.deepEqual(USER_SKILL_DIRS, ['.claude/skills', '.agents/skills', '.gemini/skills', '.gemini/antigravity-cli/skills']);
+});
