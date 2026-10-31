@@ -54,7 +54,7 @@ pub fn switch_check(
     let report = scan(ports, workspace)?;
     let root = report.agents.iter().find(|agent| agent.path == ROOT_PATH);
     let site = SwitchSite {
-        root_files: root.map(regular_file_names).unwrap_or_default(),
+        root_files: root.map(root_file_names).unwrap_or_default(),
         ancestors: report
             .ancestors
             .iter()
@@ -78,13 +78,17 @@ pub fn switch_check(
     })
 }
 
-/// The file names of `agent`'s regular identity files.
-fn regular_file_names(agent: &AgentReport) -> Vec<String> {
+/// The file names of `agent`'s regular identity files, plus the host
+/// extras present at that root: a host that lists one of its own files
+/// ahead of the definition (Hermes Agent's `.hermes.md`) must see it, or
+/// the verdict would say it reaches a file it never loads.
+fn root_file_names(agent: &AgentReport) -> Vec<String> {
     agent
         .identity_files
         .iter()
         .filter(|file| matches!(file.shape, FileShape::Regular))
         .map(|file| file.kind.file_name().to_string())
+        .chain(agent.host_extras.iter().cloned())
         .collect()
 }
 

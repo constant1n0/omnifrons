@@ -51,6 +51,7 @@ fn upward_loaders_matches_the_prototypes_tuple() {
     let expected: Vec<(&str, &[&str])> = vec![
         ("Claude Code", &["CLAUDE.md", ".claude/CLAUDE.md"]),
         ("Qwen Code", &["QWEN.md", "AGENTS.md"]),
+        ("Hermes Agent", &["AGENTS.md"]),
     ];
     let actual: Vec<(&str, &[&str])> = hosts::upward_loaders().collect();
     assert_eq!(actual, expected);
@@ -185,7 +186,7 @@ fn hermes_agent_row_follows_its_own_documentation() {
     assert_eq!(hermes.walk, hosts::Walk::GitRootToCwd);
     assert_eq!(hermes.imports, hosts::ImportSupport::None);
     assert!(hermes.import_blind);
-    assert!(hermes.upward_kinds.is_empty());
+    assert_eq!(hermes.upward_kinds, ["AGENTS.md"]);
     assert_eq!(hermes.size_cap, Some(hosts::HERMES_CONTEXT_MIN_CHARS));
     assert_eq!(
         hermes.source,

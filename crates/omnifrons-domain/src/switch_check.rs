@@ -24,7 +24,12 @@
 use std::fmt::{self, Write as _};
 
 use crate::adapter::AdapterId;
+use crate::definition::IdentityKind;
 use crate::hosts::{self, HostLoader};
+
+/// The scan's name for the project root itself, used as a [`Shadow::path`]
+/// when a host's own file displaces the definition at the root.
+pub const ROOT_PATH: &str = ".";
 
 /// How many leading characters of a digest [`DefinitionReference`]'s
 /// `Display` shows.
@@ -76,10 +81,14 @@ impl Claim {
     }
 }
 
-/// The ancestor file that blocks Claude Code's `AGENTS.md` fallback.
+/// The file that blocks the canonical definition: an ancestor's file that
+/// shadows Claude Code's `AGENTS.md` fallback, or a host-specific file at
+/// the root itself ([`ROOT_PATH`]) that the host loads ahead of the
+/// definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shadow {
-    /// The nearest ancestor folder holding one of the host's files.
+    /// The nearest ancestor folder holding one of the host's files, or
+    /// [`ROOT_PATH`] when the file sits at the root.
     pub path: String,
     /// The file found there: the first present in the row's `files`
     /// order.
@@ -194,6 +203,18 @@ impl fmt::Display for SwitchVerdict {
                 shadowed_by: Some(shadow),
                 fallback,
                 claim,
+            } if !expected.is_empty() && shadow.path == ROOT_PATH => write!(
+                f,
+                "{} does not reach the definition: {} is displaced by {} at the root",
+                claim.host,
+                fallback.unwrap_or("AGENTS.md"),
+                shadow.file
+            ),
+            Self::Unreached {
+                expected,
+                shadowed_by: Some(shadow),
+                fallback,
+                claim,
             } if !expected.is_empty() => write!(
                 f,
                 "{} does not reach the definition: {} is shadowed by {} in {}",
@@ -255,10 +276,25 @@ pub fn switch_check(host: &str, site: &SwitchSite) -> SwitchVerdict {
     };
     let claim = Claim::of(row);
     if let Some(file) = first_present(row.files, &site.root_files) {
-        return SwitchVerdict::Reaches {
-            file: file.to_string(),
+        if IdentityKind::from_file_name(file).is_some() {
+            return SwitchVerdict::Reaches {
+                file: file.to_string(),
+                claim,
+            };
+        }
+        // A host-specific file outside the identity kinds (`.hermes.md`,
+        // `HERMES.md`, `.cursorrules`) is not the definition: the host loads
+        // it ahead of the canonical file, so the definition is displaced at
+        // the root itself.
+        return unreached(
+            row,
+            Some(Shadow {
+                path: ROOT_PATH.to_string(),
+                file,
+            }),
+            None,
             claim,
-        };
+        );
     }
     let Some(fallback) = first_present(row.fallback_files, &site.root_files) else {
         return unreached(row, None, None, claim);

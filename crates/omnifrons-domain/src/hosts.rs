@@ -286,7 +286,11 @@ pub const HOSTS: [HostLoader; 10] = [
     // parents are never consulted outside a repository. No `@` import is
     // documented, so the row reads as import-blind. The identity file
     // `SOUL.md` lives under the host's own home and is never probed in
-    // the working directory, so it is not a project file here.
+    // the working directory, so it is not a project file here. The
+    // `AGENTS.md` chain is modelled as an upward loader so the ancestor
+    // warnings include this host; Hermes stops at the git root, which the
+    // warnings do not model, so a warning for an ancestor above it errs
+    // on the side of warning.
     HostLoader {
         name: "Hermes Agent",
         files: &[
@@ -300,7 +304,7 @@ pub const HOSTS: [HostLoader; 10] = [
         fallback_files: &[],
         walk: Walk::GitRootToCwd,
         imports: ImportSupport::None,
-        upward_kinds: &[],
+        upward_kinds: &["AGENTS.md"],
         import_blind: true,
         size_cap: Some(HERMES_CONTEXT_MIN_CHARS),
         source: "https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files",

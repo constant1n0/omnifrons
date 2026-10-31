@@ -59,7 +59,10 @@ fn ancestor_shadows_kinds_the_child_lacks_and_exposes_the_one_it_has() {
 
     let shadowing = with_code(&warnings, WarningCode::AncestorShadowing);
     assert_eq!(shadowing.len(), 1, "{warnings:?}");
-    assert_eq!(shadowing[0].hosts, vec!["Qwen Code", "OpenCode"]);
+    assert_eq!(
+        shadowing[0].hosts,
+        vec!["Qwen Code", "OpenCode", "Hermes Agent"]
+    );
     assert!(shadowing[0].detail.contains("atlas"), "{:?}", shadowing[0]);
 
     let exposure = with_code(&warnings, WarningCode::AncestorExposure);
@@ -92,7 +95,10 @@ fn ancestor_exposure_grows_once_the_child_gains_the_missing_kinds() {
     );
     let exposure = with_code(&warnings, WarningCode::AncestorExposure);
     assert_eq!(exposure.len(), 1, "{warnings:?}");
-    assert_eq!(exposure[0].hosts, vec!["Claude Code", "Qwen Code"]);
+    assert_eq!(
+        exposure[0].hosts,
+        vec!["Claude Code", "Qwen Code", "Hermes Agent"]
+    );
 }
 
 #[test]
@@ -155,11 +161,16 @@ fn opencode_shadowing_fires_once_for_the_nearest_ancestor_only() {
         ..blank_input()
     });
 
+    // OpenCode shadows from the nearest ancestor only; Hermes Agent, which
+    // gathers `AGENTS.md` from every ancestor of the chain, shadows from
+    // both, so the far ancestor carries a Hermes-only warning.
     let shadowing = with_code(&warnings, WarningCode::AncestorShadowing);
-    assert_eq!(shadowing.len(), 1, "{warnings:?}");
-    assert_eq!(shadowing[0].hosts, vec!["OpenCode"]);
+    assert_eq!(shadowing.len(), 2, "{warnings:?}");
+    assert_eq!(shadowing[0].hosts, vec!["OpenCode", "Hermes Agent"]);
     assert!(shadowing[0].detail.contains("near"));
     assert!(!shadowing[0].detail.contains("far"));
+    assert_eq!(shadowing[1].hosts, vec!["Hermes Agent"]);
+    assert!(shadowing[1].detail.contains("far"));
 }
 
 // ---------------------------------------------------------------------
@@ -983,7 +994,7 @@ fn extra_host_files_and_a_generated_state_dir_are_each_reported() {
     assert!(
         extras
             .iter()
-            .any(|w| w.detail.contains(".cursorrules") && w.hosts == vec!["Cursor"])
+            .any(|w| w.detail.contains(".cursorrules") && w.hosts == vec!["Cursor", "Hermes Agent"])
     );
     assert!(extras.iter().any(|w| {
         w.detail.contains(".github/copilot-instructions.md") && w.hosts == vec!["Copilot"]

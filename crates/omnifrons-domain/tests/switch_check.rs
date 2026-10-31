@@ -3,6 +3,7 @@
 //! table.
 
 use omnifrons_domain::adapter::AdapterId;
+use omnifrons_domain::definition::IdentityKind;
 use omnifrons_domain::hosts;
 use omnifrons_domain::switch_check::{
     AncestorSite, DefinitionReference, ReferenceError, Shadow, SwitchSite, SwitchVerdict,
@@ -38,13 +39,20 @@ fn reached_file(verdict: &SwitchVerdict) -> Option<&str> {
 
 #[test]
 fn every_host_reaches_a_root_holding_its_first_file() {
-    for row in hosts::HOSTS {
-        let Some(first) = row.files.first().copied() else {
-            panic!("{} declares no primary file", row.name);
-        };
-        let site = root(&[first]);
-        let verdict = switch_check(row.name, &site);
-        assert_eq!(reached_file(&verdict), Some(first), "{}", row.name);
+    for host in &hosts::HOSTS {
+        let first = host.files[0];
+        let verdict = switch_check(host.name, &root(&[first]));
+        if IdentityKind::from_file_name(first).is_some() {
+            assert_eq!(reached_file(&verdict), Some(first), "{}", host.name);
+        } else {
+            // A host whose first file is its own extra (Hermes Agent's
+            // `.hermes.md`) loads that file instead of the definition.
+            assert!(
+                matches!(&verdict, SwitchVerdict::Unreached { shadowed_by: Some(shadow), .. } if shadow.path == "." && shadow.file == first),
+                "{}: {verdict:?}",
+                host.name
+            );
+        }
     }
 }
 
@@ -411,4 +419,47 @@ fn a_shadow_path_with_a_carriage_return_is_escaped_on_one_line() {
         "Claude Code does not reach the definition: AGENTS.md is shadowed by CLAUDE.md in ../par\\rent\\n"
     );
     assert!(!line.contains(['\n', '\r']));
+}
+
+/// A host-specific file outside the six identity kinds is not the
+/// definition: Hermes Agent loads `.hermes.md` ahead of `AGENTS.md`, so a
+/// root holding both displaces the canonical file at the root itself.
+#[test]
+fn a_host_file_outside_the_identity_kinds_displaces_the_definition_at_the_root() {
+    let verdict = switch_check("Hermes Agent", &root(&["AGENTS.md", ".hermes.md"]));
+    assert_eq!(
+        verdict,
+        SwitchVerdict::Unreached {
+            expected: hosts::host("Hermes Agent").unwrap().files.to_vec(),
+            shadowed_by: Some(Shadow {
+                path: ".".to_string(),
+                file: ".hermes.md",
+            }),
+            fallback: None,
+            claim: match switch_check("Hermes Agent", &root(&["AGENTS.md"])) {
+                SwitchVerdict::Reaches { claim, .. } => claim,
+                other => panic!("expected a claim, got {other:?}"),
+            },
+        }
+    );
+    assert!(
+        verdict
+            .to_string()
+            .contains("AGENTS.md is displaced by .hermes.md at the root"),
+        "{verdict}"
+    );
+}
+
+#[test]
+fn hermes_agent_reaches_a_root_holding_only_agents_md() {
+    let verdict = switch_check("Hermes Agent", &root(&["AGENTS.md"]));
+    assert_eq!(reached_file(&verdict), Some("AGENTS.md"));
+}
+
+/// `AGENTS.override.md` is an identity kind (secondary), so a host that
+/// lists it first still reaches the definition through it, as before.
+#[test]
+fn an_identity_kind_listed_first_still_reaches() {
+    let verdict = switch_check("Hermes Agent", &root(&["AGENTS.md", "AGENTS.override.md"]));
+    assert_eq!(reached_file(&verdict), Some("AGENTS.override.md"));
 }

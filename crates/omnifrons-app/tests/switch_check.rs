@@ -264,3 +264,44 @@ fn an_unrecognized_ancestor_entry_is_dropped_and_shadows_nothing() {
         result.verdict
     );
 }
+
+/// A root host extra that the chosen host lists ahead of `AGENTS.md`
+/// reaches the verdict: Hermes Agent with `.hermes.md` beside `AGENTS.md`
+/// is unreached, displaced at the root itself.
+#[test]
+fn a_generic_adapter_with_hermes_agent_is_unreached_when_the_root_holds_its_own_file() {
+    let snapshot = TreeSnapshotBuilder::new()
+        .directory(
+            ".",
+            vec![file(IdentityKind::Agents, AGENTS_BYTES)],
+            vec![".hermes.md".to_string()],
+            Vec::new(),
+        )
+        .build();
+    let adapter = AdapterId::parse("pty-cli").expect("built-in adapter");
+    let check = check(snapshot, &adapter, Some("Hermes Agent"));
+    match check.verdict {
+        SwitchVerdict::Unreached { shadowed_by, .. } => {
+            let shadow = shadowed_by.expect("displaced at the root");
+            assert_eq!(shadow.path, ".");
+            assert_eq!(shadow.file, ".hermes.md");
+        }
+        other => panic!("expected unreached, got {other:?}"),
+    }
+    assert!(
+        check.reference.is_some(),
+        "the canonical AGENTS.md is still referenced"
+    );
+}
+
+#[test]
+fn a_generic_adapter_with_hermes_agent_reaches_a_root_with_only_agents_md() {
+    let snapshot = root(vec![file(IdentityKind::Agents, AGENTS_BYTES)]).build();
+    let adapter = AdapterId::parse("pty-cli").expect("built-in adapter");
+    let check = check(snapshot, &adapter, Some("Hermes Agent"));
+    assert!(
+        matches!(check.verdict, SwitchVerdict::Reaches { ref file, .. } if file == "AGENTS.md"),
+        "{:?}",
+        check.verdict
+    );
+}

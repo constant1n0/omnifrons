@@ -5332,6 +5332,7 @@ mod tests {
                 precedence: false,
             },
             warnings: vec![],
+            host_extras: vec![],
         };
         let dto: super::AgentDto = (&report).into();
         let value = json(&dto);
@@ -5854,9 +5855,13 @@ mod tests {
     }
 
     #[test]
-    fn definition_host_dto_lists_the_nine_table_rows_in_order() {
+    fn definition_host_dto_lists_the_ten_table_rows_in_order() {
         let hosts = super::DefinitionHostDto::catalogue();
-        assert_eq!(hosts.len(), 9);
+        assert_eq!(hosts.len(), 10);
+        assert_eq!(
+            hosts.last().map(|host| host.name.as_str()),
+            Some("Hermes Agent")
+        );
         assert_eq!(
             json(&hosts[0]),
             serde_json::json!({

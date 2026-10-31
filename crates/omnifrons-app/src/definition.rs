@@ -253,6 +253,10 @@ pub struct AgentReport {
     pub skills: SkillsReport,
     /// This root's warnings, in `WARNING_ORDER`.
     pub warnings: Vec<Warning>,
+    /// The host-specific extra files present at this root that the loader
+    /// table names (`hosts::EXTRA_READERS`), by file name; surfaced for
+    /// the switch check, never read.
+    pub host_extras: Vec<String>,
 }
 
 /// A full scan (the prototype's `ScanResult.to_json`, minus the `root`
@@ -695,6 +699,12 @@ fn build_agent_report(
         consent_required: relation.consent_required(),
         skills,
         warnings,
+        host_extras: directory
+            .host_extras
+            .iter()
+            .filter(|name| hosts::EXTRA_READERS.iter().any(|(key, _)| key == name))
+            .cloned()
+            .collect(),
     }
 }
 
