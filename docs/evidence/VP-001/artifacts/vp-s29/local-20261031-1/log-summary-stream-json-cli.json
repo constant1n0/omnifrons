@@ -1,0 +1,38 @@
+{
+  "incomplete": false,
+  "droppedBefore": 0,
+  "logs": [
+    {
+      "runId": "run-1793444188-487541638-2",
+      "adapter": "stream-json-cli",
+      "startedAt": "2026-10-31T10:56:28Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 7,
+      "stderrLines": 1
+    },
+    {
+      "runId": "run-1793444371-074032028-3",
+      "adapter": "stream-json-cli",
+      "startedAt": "2026-10-31T10:59:31Z",
+      "state": {
+        "kind": "state",
+        "droppedBefore": 0,
+        "state": "exited",
+        "code": 0
+      },
+      "truncatedFrames": null,
+      "droppedBefore": 0,
+      "endsMidLine": false,
+      "stdoutLines": 6,
+      "stderrLines": 1
+    }
+  ]
+}
