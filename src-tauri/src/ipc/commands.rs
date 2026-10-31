@@ -4643,4 +4643,60 @@ mod tests {
         assert_eq!(messages, 300, "every frame is still relayed");
         assert!(run_log.log.is_none(), "the failed log is dropped");
     }
+
+    /// The channel closes after some frames were relayed: the rest of the
+    /// run is still logged to the state line and the receiver drained, and
+    /// nothing is sent after the first failed send.
+    #[test]
+    fn a_channel_closing_mid_run_keeps_logging_to_the_state_line_and_stops_sending() {
+        let temp = TempProject::new("log-mid-close");
+        let logs = crate::harness_log::HarnessLogDir::open(&temp.0);
+        let run_id = omnifrons_domain::outbox::RunId::new("run-9-000000000-5").expect("valid");
+        let (mut run_log, opening) = super::open_run_log(
+            &logs,
+            &run_id,
+            &omnifrons_domain::adapter::AdapterId::claude_code(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        for seq in 0..6 {
+            tx.send(a_text_frame(seq, "x")).expect("queue");
+        }
+        tx.send(omnifrons_app::OutputFrame::new(
+            6,
+            omnifrons_app::FramePayload::State(omnifrons_app::ProcessTerminalState::Exited {
+                code: Some(0),
+            }),
+        ))
+        .expect("queue");
+        drop(tx);
+        let mut sequencer = super::AdapterWireSequencer::new(ProcessIdDto(7));
+        let mut attempts = 0u32;
+
+        super::relay_logged_run(
+            ProcessIdDto(7),
+            rx,
+            &mut |_frame| {
+                attempts += 1;
+                attempts <= 3
+            },
+            &mut run_log,
+            &mut sequencer,
+            opening,
+            &mut |sequencer, _frame| {
+                vec![
+                    sequencer.shell_event(crate::ipc::dto::AdapterEventDto::Message {
+                        text: "m".to_string(),
+                    }),
+                ]
+            },
+        );
+
+        assert_eq!(
+            attempts, 4,
+            "three sends succeed, the fourth fails, none after"
+        );
+        let lines = log_lines(&temp.0, "run-9-000000000-5");
+        assert_eq!(lines.len(), 8, "header, six text frames, state: {lines:?}");
+        assert_eq!(lines[7]["kind"], "state");
+    }
 }

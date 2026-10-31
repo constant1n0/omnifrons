@@ -741,4 +741,55 @@ mod tests {
         assert_eq!(mode(&dir.path), 0o700);
         assert_eq!(mode(&dir.path.join("run-8-000000000-0.jsonl")), 0o600);
     }
+
+    #[test]
+    fn the_header_counts_against_the_cap() {
+        let temp = Temp::new("headercap");
+        let dir = HarnessLogDir::open(&temp.0).expect("dir");
+        let adapter = AdapterId::claude_code();
+        let frame = |seq| text(seq, OutputStream::Stdout, "twenty chars of text", false, 0);
+        // Measure the header and one frame line on a scratch log.
+        let probe_id = run("run-10-000000000-0");
+        let mut probe =
+            HarnessLog::open_with(&dir, &probe_id, &adapter, at(0), MAX_LOG_BYTES).expect("open");
+        let header_len = probe.written;
+        assert_eq!(
+            std::fs::metadata(dir.path.join("run-10-000000000-0.jsonl"))
+                .expect("meta")
+                .len(),
+            header_len,
+            "the bytes counted right after open are the header line"
+        );
+        probe.write_frame(&frame(0)).expect("frame");
+        let frame_len = probe.written - header_len;
+        assert!(
+            frame_len < header_len,
+            "the fixture needs a short frame line"
+        );
+
+        // Room for the header, exactly one frame and the reserved tail.
+        let cap = header_len + frame_len + RESERVED_TAIL_BYTES;
+        let mut log = HarnessLog::open_with(&dir, &run("run-11-000000000-0"), &adapter, at(0), cap)
+            .expect("open");
+        for seq in 0..3 {
+            log.write_frame(&frame(seq)).expect("frame");
+        }
+        // The longest state token, so the tail is as long as it gets.
+        log.write_state(&ProcessTerminalStateDto {
+            state: ProcessTerminalStateTag::OrphanRiskUncertain,
+            code: None,
+        })
+        .expect("state");
+
+        let lines = lines_of(&dir, "run-11-000000000-0");
+        let kept = lines.iter().filter(|line| line["kind"] == "stdout").count();
+        assert_eq!(kept, 1, "header-uncounted accounting would keep two");
+        let size = std::fs::metadata(dir.path.join("run-11-000000000-0.jsonl"))
+            .expect("meta")
+            .len();
+        assert!(
+            size <= cap,
+            "the whole file stays within the cap: {size} > {cap}"
+        );
+    }
 }
