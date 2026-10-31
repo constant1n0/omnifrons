@@ -1088,7 +1088,7 @@ describe('ShellErrorCode launch watchdog codes (#185)', () => {
     ['launch-panicked', 'the launch panicked after reaching step `launch-plan`'],
     [
       'launch-timed-out',
-      'the launch did not finish within 30s; last step reached: `spawn`',
+      'the launch did not finish within 30 seconds; last step reached: `spawn`',
     ],
   ] as const)(
     'harnessSpawn rejects with the typed %s ShellError naming the last step reached, carrying no detail',

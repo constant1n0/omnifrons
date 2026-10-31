@@ -3868,7 +3868,7 @@ describe('AgentPanel launch watchdog error codes (#185)', () => {
     ['launch-panicked', 'the launch panicked after reaching step `gate`'],
     [
       'launch-timed-out',
-      'the launch did not finish within 30s; last step reached: `run-preparation`',
+      'the launch did not finish within 30 seconds; last step reached: `run-preparation`',
     ],
   ])(
     'renders %s from harness_spawn as a plain catalogue code naming the last step reached, no "untrusted"; the echoed prompt is withdrawn and Start re-enabled',

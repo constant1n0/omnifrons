@@ -1200,23 +1200,36 @@ pub async fn harness_spawn(
 /// before it is killed, in the same bounds `harness_stop` accepts.
 const ORPHAN_STOP_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long `stop_orphaned_launch` waits for the supervisor before it gives
+/// up and logs: longer than the stop deadline, because the scenario it
+/// serves may have the supervisor stuck.
+const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Stops the child of a launch whose caller was already answered (or whose
 /// task died) and logs the result with the process id: a failed stop is the
 /// one case that leaves a process running with no panel attached.
 fn stop_orphaned_launch(app: &AppHandle, id: ProcessId) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let outcome = with_supervisor(app, move |supervisor| {
-            supervisor.stop(id, ORPHAN_STOP_DEADLINE)
-        })
+        let outcome = tokio::time::timeout(
+            ORPHAN_STOP_TIMEOUT,
+            with_supervisor(app, move |supervisor| {
+                supervisor.stop(id, ORPHAN_STOP_DEADLINE)
+            }),
+        )
         .await;
         match outcome {
-            Ok(state) => tracing::warn!(
+            Err(_elapsed) => tracing::error!(
+                process_id = ?id,
+                "the supervisor did not answer a stop for a harness process whose launch had \
+                 already been answered; it may still be running with no panel attached"
+            ),
+            Ok(Ok(state)) => tracing::warn!(
                 process_id = ?id,
                 state = ?state,
                 "stopped a harness process whose launch had already been answered"
             ),
-            Err(error) => tracing::error!(
+            Ok(Err(error)) => tracing::error!(
                 process_id = ?id,
                 error = ?error,
                 "could not stop a harness process whose launch had already been answered; \
@@ -2232,6 +2245,9 @@ const LAUNCH_BUDGET: Duration = Duration::from_secs(30);
 struct LaunchMarker {
     step: &'static str,
     process: Option<ProcessId>,
+    /// Set once the caller was answered with a timeout: from then on the
+    /// launch task stops whatever child it holds when it ends.
+    abandoned: bool,
 }
 
 /// The step a launch has reached and the process it has forked, updated
@@ -2246,6 +2262,7 @@ impl LaunchProgress {
         Self(Arc::new(Mutex::new(LaunchMarker {
             step: "request",
             process: None,
+            abandoned: false,
         })))
     }
 
@@ -2272,6 +2289,48 @@ impl LaunchProgress {
     fn take_process(&self) -> Option<ProcessId> {
         self.marker().process.take()
     }
+
+    /// Marks the launch as given up on by its caller.
+    fn abandon(&self) {
+        self.marker().abandoned = true;
+    }
+
+    /// Hands out the recorded child once, only if the caller gave up.
+    fn take_process_if_abandoned(&self) -> Option<ProcessId> {
+        let mut marker = self.marker();
+        if marker.abandoned {
+            marker.process.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// The budget as the message shows it: whole seconds when it is a whole
+/// number of seconds, milliseconds otherwise.
+fn budget_phrase(budget: Duration) -> String {
+    if budget.subsec_nanos() == 0 {
+        let seconds = budget.as_secs();
+        format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+    } else {
+        format!("{} ms", budget.as_millis())
+    }
+}
+
+/// Stops the child a launch task still holds when the task ends, whatever
+/// the way out (return, panic, cancellation), provided the caller already
+/// gave up on it.
+struct TaskExitGuard<S: Fn(ProcessId)> {
+    progress: LaunchProgress,
+    stop: Arc<S>,
+}
+
+impl<S: Fn(ProcessId)> Drop for TaskExitGuard<S> {
+    fn drop(&mut self) {
+        if let Some(id) = self.progress.take_process_if_abandoned() {
+            (self.stop)(id);
+        }
+    }
 }
 
 /// Runs `launch` as its own task under `budget` so `harness_spawn` always
@@ -2283,10 +2342,16 @@ impl LaunchProgress {
 /// last step `progress` recorded; every other result passes through
 /// unchanged. The task is not aborted on timeout -- it may already hold a
 /// forked process -- so a launch that completes after its caller was
-/// answered hands its outcome to `on_late`. Whenever the caller is answered
-/// with an error, or the late outcome arrives, the child `progress`
-/// recorded (if any) is handed once to `stop`, so no forked process is
-/// left running unattached.
+/// answered hands its outcome to `on_late`.
+///
+/// What is guaranteed about the child `progress` records, each stopped at
+/// most once through `stop`: when the caller is answered with any error
+/// (panic, cancellation, timeout, or an in-budget `Err`), the child
+/// recorded so far is stopped; when the caller gave up on a timeout, the
+/// task stops whatever child it holds as it ends, however it ends; and
+/// one sweep, one `budget` after the timeout, stops a child recorded
+/// meanwhile by a task that is still running. A child forked later than
+/// that by a task that never ends is not covered.
 async fn run_launch_watchdog<T, Fut, L, S>(
     budget: Duration,
     progress: LaunchProgress,
@@ -2306,19 +2371,29 @@ where
         let stop = Arc::clone(&stop);
         let progress = progress.clone();
         tokio::spawn(async move {
+            let _exit = TaskExitGuard {
+                progress: progress.clone(),
+                stop: Arc::clone(&stop),
+            };
             // A failed send means the caller already gave up: the receiver
             // was closed after the budget elapsed, so the outcome is late
             // and the child it forked belongs to nobody.
             if let Err(outcome) = sender.send(launch.await) {
                 on_late(outcome);
-                if let Some(id) = progress.take_process() {
-                    stop(id);
-                }
             }
         })
     };
     match tokio::time::timeout(budget, &mut receiver).await {
-        Ok(Ok(outcome)) => outcome,
+        Ok(Ok(outcome)) => {
+            // An error answered to the caller leaves nobody holding a
+            // child the launch forked before failing.
+            if outcome.is_err()
+                && let Some(id) = progress.take_process()
+            {
+                stop(id);
+            }
+            outcome
+        }
         // The sender dropped without sending: the task panicked or was
         // cancelled before it finished.
         Ok(Err(_)) => {
@@ -2347,15 +2422,25 @@ where
             if let Ok(outcome) = receiver.try_recv() {
                 outcome
             } else {
-                // A child forked so far is stopped now; one forked by the
-                // still-running task later is stopped when it ends.
+                // From here the task stops its own child as it ends; the
+                // child forked so far is stopped now, and a sweep catches
+                // one recorded by a task that keeps running.
+                progress.abandon();
                 if let Some(id) = progress.take_process() {
                     stop(id);
                 }
+                let sweep_progress = progress.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(budget).await;
+                    if let Some(id) = sweep_progress.take_process() {
+                        stop(id);
+                    }
+                });
                 Err(ShellError::new(
                     ShellErrorCode::LaunchTimedOut,
                     &format!(
-                        "the launch did not finish within {budget:?}; last step reached: `{}`",
+                        "the launch did not finish within {}; last step reached: `{}`",
+                        budget_phrase(budget),
                         progress.last()
                     ),
                 ))
@@ -2570,10 +2655,101 @@ mod tests {
         )
         .expect_err("a stall is an error");
         assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
-        assert!(err.message.contains("50ms"), "{}", err.message);
+        assert!(err.message.contains("50 ms"), "{}", err.message);
         assert_eq!(
             stopped.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(ProcessId(7))
+        );
+    }
+
+    /// The budget reads as whole seconds when it is a whole number of
+    /// seconds and as milliseconds otherwise.
+    #[test]
+    fn budget_phrase_uses_whole_seconds_or_milliseconds() {
+        use std::time::Duration;
+        assert_eq!(super::budget_phrase(Duration::from_secs(30)), "30 seconds");
+        assert_eq!(super::budget_phrase(Duration::from_secs(1)), "1 second");
+        assert_eq!(super::budget_phrase(Duration::from_millis(50)), "50 ms");
+        assert_eq!(super::budget_phrase(Duration::from_millis(1500)), "1500 ms");
+    }
+
+    /// An in-budget launch that fails after forking answers its error and
+    /// stops the child it forked.
+    #[test]
+    fn watchdog_stops_the_process_of_an_in_budget_error() {
+        let (stop, stopped) = recording_stop();
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_secs(5),
+            progress,
+            async move {
+                marker.spawned(ProcessId(3));
+                Err::<u32, _>(ShellError::new(
+                    ShellErrorCode::SpawnFailed,
+                    "subscribe failed",
+                ))
+            },
+            |_| panic!("not late"),
+            stop,
+        )
+        .expect_err("the error passes through");
+        assert_eq!(err.code, ShellErrorCode::SpawnFailed);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ProcessId(3))
+        );
+    }
+
+    /// A launch that forks after the caller was told it timed out and then
+    /// panics still has its child stopped, on the way out of the task.
+    #[test]
+    fn watchdog_stops_a_child_forked_after_the_timeout_by_a_task_that_panics() {
+        let (stop, stopped) = recording_stop();
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_millis(30),
+            progress,
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                marker.spawned(ProcessId(4));
+                Ok(explode("boom"))
+            },
+            |_| panic!("never completes"),
+            stop,
+        )
+        .expect_err("the budget elapsed first");
+        assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ProcessId(4))
+        );
+    }
+
+    /// A launch that forks after the timeout and then stalls forever has
+    /// its child stopped by the delayed sweep.
+    #[test]
+    fn watchdog_sweeps_a_child_forked_after_the_timeout_by_a_stalled_task() {
+        let (stop, stopped) = recording_stop();
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_millis(30),
+            progress,
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+                marker.spawned(ProcessId(8));
+                std::future::pending::<Result<u32, ShellError>>().await
+            },
+            |_| panic!("never completes"),
+            stop,
+        )
+        .expect_err("the budget elapsed first");
+        assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ProcessId(8))
         );
     }
 
