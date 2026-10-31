@@ -464,6 +464,9 @@ impl SelfExitReaper {
     /// The caller holds this id's [`SettlingGuard`] across the call, so
     /// until the verdict is recorded `observe` does not report (or finalize
     /// with) the reap-derived state and `stop` waits for it.
+    // On Windows the body has no `.await`: the census is a stub and the state
+    // is recorded inline, so clippy's `unused_async` would fire there alone.
+    #[cfg_attr(not(unix), allow(clippy::unused_async))]
     async fn settle_and_record(&self, census: Census, reaped: ProcessTerminalState) {
         #[cfg(unix)]
         {
