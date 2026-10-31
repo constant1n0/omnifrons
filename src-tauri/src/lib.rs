@@ -68,6 +68,7 @@ fn shell_health() -> ShellHealth {
 /// approval store under it could not be opened.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -165,4 +166,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Omnifrons Tauri application");
+}
+
+/// Installs a process-wide panic hook that logs every panic through
+/// `tracing` (thread, location, message) and then calls the previous hook,
+/// so the default stderr report stays. Tauri never settles the promise of
+/// an async command whose future panics, so without this a panic inside a
+/// command left no trace at all (#185).
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        tracing::error!(
+            thread = thread.name().unwrap_or("unnamed"),
+            location = %info
+                .location()
+                .map_or_else(|| "unknown".to_string(), ToString::to_string),
+            message,
+            "panic"
+        );
+        previous(info);
+    }));
 }

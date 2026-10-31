@@ -460,6 +460,16 @@ export type ShellErrorCode =
    * Carries the reason token in {@link DefinitionReasonDetail}.
    */
   | 'plan-stale'
+  /**
+   * `harness_spawn`'s launch panicked before it answered. The message names
+   * the last launch step reached; nothing is known to have been spawned.
+   */
+  | 'launch-panicked'
+  /**
+   * `harness_spawn`'s launch did not finish within the shell's budget. The
+   * message names the last launch step reached.
+   */
+  | 'launch-timed-out'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {

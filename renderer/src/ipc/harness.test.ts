@@ -1083,6 +1083,32 @@ describe('HarnessFrame outbox event kinds (slice 5)', () => {
   })
 })
 
+describe('ShellErrorCode launch watchdog codes (#185)', () => {
+  it.each([
+    ['launch-panicked', 'the launch panicked after reaching step `launch-plan`'],
+    [
+      'launch-timed-out',
+      'the launch did not finish within 30 seconds; last step reached: `spawn`',
+    ],
+  ] as const)(
+    'harnessSpawn rejects with the typed %s ShellError naming the last step reached, carrying no detail',
+    async (code, message) => {
+      const error: ShellError = { code, message }
+      mockIPC((cmd) => {
+        if (cmd === 'harness_spawn') return Promise.reject(error)
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      await expect(
+        harnessSpawn(
+          { type: 'adapter', adapterId: 'pty-cli', approvalId: '1', prompt: 'hi' },
+          () => {},
+        ),
+      ).rejects.toEqual(error)
+    },
+  )
+})
+
 describe('ShellErrorCode outbox codes (slice 5)', () => {
   it('harnessSpawn rejects with the typed outbox-unavailable ShellError for an adapter launch whose run subdirectory could not be prepared, nothing spawned', async () => {
     const error: ShellError = {
@@ -1606,6 +1632,8 @@ describe('slice 5b closed sets', () => {
         case 'recovery-unknown':
         case 'definition-invalid':
         case 'plan-stale':
+        case 'launch-panicked':
+        case 'launch-timed-out':
           return code
         default: {
           const unreachable: never = code
@@ -1662,8 +1690,10 @@ describe('slice 5b closed sets', () => {
       'recovery-unknown',
       'definition-invalid',
       'plan-stale',
+      'launch-panicked',
+      'launch-timed-out',
     ]
-    expect(new Set(codes).size).toBe(47)
+    expect(new Set(codes).size).toBe(49)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
@@ -3652,6 +3682,8 @@ const SHELL_ERROR_CODES = [
   'recovery-unknown',
   'definition-invalid',
   'plan-stale',
+  'launch-panicked',
+  'launch-timed-out',
 ] as const
 /** Every token {@link ApprovalStatus} declares. */
 const APPROVAL_STATUSES = ['active', 'revoked'] as const

@@ -1794,6 +1794,14 @@ pub enum ShellErrorCode {
     /// is written; the caller previews again (ADR-0005 decision 3).
     /// Carries [`ShellErrorDetail::DefinitionReason`].
     PlanStale,
+    /// `harness_spawn`'s launch task panicked before it answered; the
+    /// message names the last step it reached. Nothing is known to have
+    /// been spawned (run-lifecycle fixes, #185).
+    LaunchPanicked,
+    /// `harness_spawn`'s launch did not finish within its budget; the
+    /// message names the last step it reached. A launch that completes
+    /// afterwards is logged at error level with its process id (#185).
+    LaunchTimedOut,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -4237,6 +4245,23 @@ mod tests {
         for (code, token) in cases {
             let error = ShellError::new(code, "message");
             assert_eq!(json(&error)["code"], serde_json::json!(token));
+        }
+    }
+
+    /// The two launch-watchdog codes render as their documented kebab-case
+    /// tokens (#185).
+    #[test]
+    fn launch_watchdog_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::LaunchPanicked, "launch-panicked"),
+            (ShellErrorCode::LaunchTimedOut, "launch-timed-out"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(
+                json(&error),
+                serde_json::json!({"code": token, "message": "message"})
+            );
         }
     }
 

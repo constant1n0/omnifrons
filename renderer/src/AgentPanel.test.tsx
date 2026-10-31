@@ -3863,6 +3863,34 @@ describe('AgentPanel candidates content security (slice 5, RCS-001)', () => {
   })
 })
 
+describe('AgentPanel launch watchdog error codes (#185)', () => {
+  it.each([
+    ['launch-panicked', 'the launch panicked after reaching step `gate`'],
+    [
+      'launch-timed-out',
+      'the launch did not finish within 30 seconds; last step reached: `run-preparation`',
+    ],
+  ])(
+    'renders %s from harness_spawn as a plain catalogue code naming the last step reached, no "untrusted"; the echoed prompt is withdrawn and Start re-enabled',
+    async (code, message) => {
+      await renderReady((cmd) => {
+        if (cmd === 'harness_spawn') return Promise.reject({ code, message })
+        throw new Error(`unexpected command: ${cmd}`)
+      })
+
+      fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(banner.textContent).not.toContain('untrusted')
+      expect((screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(
+        false,
+      )
+      expect(screen.getByLabelText('Agent transcript').querySelectorAll('li').length).toBe(0)
+    },
+  )
+})
+
 describe('AgentPanel outbox error codes (slice 5, R3-013 analogue)', () => {
   it('renders outbox-unavailable from harness_spawn as a plain catalogue code with its fixed message, no "untrusted" and no stray detail; nothing spawned, so the echoed prompt is withdrawn and Start re-enabled', async () => {
     await renderReady((cmd) => {

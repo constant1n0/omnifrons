@@ -20,7 +20,7 @@
 //! which can carry a real filesystem path.
 
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use omnifrons_adapters::{FsOutboxInventory, FsRunOutboxPreparer, JsonOutboxPolicyStore};
@@ -1160,11 +1160,47 @@ fn assembled_wire_frames(
 /// [`ShellErrorCode::PromptTooLarge`]/`invalid-request`,
 /// [`ShellErrorCode::WorkspaceUnavailable`], or the mapped
 /// [`LaunchPlanError`].
+///
+/// The launch runs under a watchdog ([`run_launch_watchdog`]): it never
+/// stays pending. A panicking launch answers
+/// [`ShellErrorCode::LaunchPanicked`] and one that outlasts
+/// [`LAUNCH_BUDGET`] answers [`ShellErrorCode::LaunchTimedOut`], each
+/// naming the last adapter-launch step reached.
 #[tauri::command]
 pub async fn harness_spawn(
     app: AppHandle,
     kind: HarnessKindDto,
     on_frame: Channel<HarnessFrame>,
+) -> Result<ProcessIdDto, ShellError> {
+    let progress = LaunchProgress::new();
+    run_launch_watchdog(
+        LAUNCH_BUDGET,
+        progress.clone(),
+        launch_harness(app, kind, on_frame, progress),
+        |outcome| match outcome {
+            // The caller was told the launch timed out, so the panel holds
+            // no id for this process: report it loudly rather than leak it
+            // silently.
+            Ok(id) => tracing::error!(
+                process_id = ?id,
+                "a harness launch finished after its caller was told it timed out; \
+                 the process is running with no panel attached"
+            ),
+            Err(error) => tracing::warn!(
+                code = ?error.code,
+                "a harness launch failed after its caller was told it timed out"
+            ),
+        },
+    )
+    .await
+}
+
+/// The body of [`harness_spawn`], dispatching on the requested kind.
+async fn launch_harness(
+    app: AppHandle,
+    kind: HarnessKindDto,
+    on_frame: Channel<HarnessFrame>,
+    progress: LaunchProgress,
 ) -> Result<ProcessIdDto, ShellError> {
     match kind {
         HarnessKindDto::DemoLines { rate_hz, lines } => {
@@ -1187,7 +1223,17 @@ pub async fn harness_spawn(
             adapter_id,
             approval_id,
             prompt,
-        } => spawn_adapter_harness(app, adapter_id, approval_id.into(), prompt, on_frame).await,
+        } => {
+            spawn_adapter_harness(
+                app,
+                adapter_id,
+                approval_id.into(),
+                prompt,
+                on_frame,
+                &progress,
+            )
+            .await
+        }
     }
 }
 
@@ -1326,6 +1372,7 @@ async fn spawn_adapter_harness(
     approval_id: ApprovalId,
     prompt: String,
     on_frame: Channel<HarnessFrame>,
+    progress: &LaunchProgress,
 ) -> Result<ProcessIdDto, ShellError> {
     let adapter_id = AdapterId::parse(&adapter_id).ok_or_else(|| {
         ShellError::new(
@@ -1335,6 +1382,7 @@ async fn spawn_adapter_harness(
     })?;
     let prompt = AgentPrompt::new(prompt)?;
 
+    progress.reach("workspace");
     let workspace = {
         let state = app.state::<AdapterState>();
         state
@@ -1350,12 +1398,14 @@ async fn spawn_adapter_harness(
             })?
     };
 
+    progress.reach("gate");
     let decision = with_gate(app.clone(), move |gate| gate.decide(approval_id)).await;
     let executable = match decision {
         GateDecision::Allowed { executable, .. } => executable,
         GateDecision::Denied(reason) => return Err(ShellError::from(reason)),
     };
 
+    progress.reach("launch-plan");
     let plan = {
         let state = app.state::<AdapterState>();
         let adapter = state
@@ -1384,11 +1434,15 @@ async fn spawn_adapter_harness(
     };
     let minted_run_id = run_id.clone();
     let display_path = executable.identity.canonical_path.clone();
+    progress.reach("run-preparation");
+    let launch_progress = progress.clone();
     let (launched, receiver) = with_supervisor(app.clone(), move |supervisor| {
         let launched =
             launch_with_run_subdirectory(&store, &preparer, &workspace, &run_id, plan, |plan| {
+                launch_progress.reach("spawn");
                 supervisor.spawn_approved(executable.handle, display_path, plan)
             })?;
+        launch_progress.reach("subscribe");
         let receiver = supervisor.subscribe(launched.id)?;
         Ok::<_, ShellError>((launched, receiver))
     })
@@ -1412,6 +1466,7 @@ async fn spawn_adapter_harness(
             ),
         );
 
+    progress.reach("forwarder");
     forward_adapter_output(id, adapter_id, minted_run_id, receiver, on_frame, app);
     Ok(ProcessIdDto::from(id))
 }
@@ -2108,6 +2163,102 @@ pub async fn harness_observe(
     .await
 }
 
+/// How long `harness_spawn` may run before it answers with
+/// [`ShellErrorCode::LaunchTimedOut`]. A healthy launch (gate decision,
+/// plan, run-directory preparation, fork) takes well under a second; the
+/// budget only has to be longer than a slow disk or a loaded machine, and
+/// short enough that a stalled launch surfaces as a banner (#185).
+const LAUNCH_BUDGET: Duration = Duration::from_secs(30);
+
+/// The step a launch has reached, updated between steps so a panic or a
+/// timeout can name where the launch stopped. Cloning shares the marker.
+#[derive(Clone, Debug)]
+struct LaunchProgress(Arc<Mutex<&'static str>>);
+
+impl LaunchProgress {
+    /// A marker at `request`: nothing past argument handling has run.
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new("request")))
+    }
+
+    /// Record that the launch is now at `step`.
+    fn reach(&self, step: &'static str) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = step;
+    }
+
+    /// The last step recorded.
+    fn last(&self) -> &'static str {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Runs `launch` as its own task under `budget` so `harness_spawn` always
+/// answers (#185): Tauri never settles an async command's promise when its
+/// future panics, and a stalled await would leave it pending too.
+///
+/// A panicked (or cancelled) task answers [`ShellErrorCode::LaunchPanicked`]
+/// and an elapsed budget [`ShellErrorCode::LaunchTimedOut`], each naming the
+/// last step `progress` recorded; every other result passes through
+/// unchanged. The task is not aborted on timeout -- it may already hold a
+/// forked process -- so a launch that completes after its caller was
+/// answered hands its outcome to `on_late`, which must stop or log the
+/// process it may carry.
+async fn run_launch_watchdog<T, Fut, L>(
+    budget: Duration,
+    progress: LaunchProgress,
+    launch: Fut,
+    on_late: L,
+) -> Result<T, ShellError>
+where
+    Fut: std::future::Future<Output = Result<T, ShellError>> + Send + 'static,
+    T: Send + 'static,
+    L: FnOnce(Result<T, ShellError>) + Send + 'static,
+{
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        // A failed send means the caller already gave up: the receiver was
+        // closed after the budget elapsed, so the outcome is late.
+        if let Err(outcome) = sender.send(launch.await) {
+            on_late(outcome);
+        }
+    });
+    match tokio::time::timeout(budget, &mut receiver).await {
+        Ok(Ok(outcome)) => outcome,
+        // The sender dropped without sending: the task panicked or was
+        // cancelled before it finished.
+        Ok(Err(_)) => {
+            let cause = match task.await {
+                Err(error) if error.is_panic() => "panicked",
+                _ => "was cancelled",
+            };
+            Err(ShellError::new(
+                ShellErrorCode::LaunchPanicked,
+                &format!(
+                    "the launch {cause} after reaching step `{}`",
+                    progress.last()
+                ),
+            ))
+        }
+        Err(_elapsed) => {
+            // Close first, then look once more: an outcome sent in the
+            // instant before the close is still delivered, and any later
+            // one reaches `on_late`.
+            receiver.close();
+            match receiver.try_recv() {
+                Ok(outcome) => outcome,
+                Err(_) => Err(ShellError::new(
+                    ShellErrorCode::LaunchTimedOut,
+                    &format!(
+                        "the launch did not finish within {} seconds; last step reached: `{}`",
+                        budget.as_secs().max(1),
+                        progress.last()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2119,6 +2270,120 @@ mod tests {
         CandidateIdDto, HarnessFrame, ProcessIdDto, ShellErrorCode, ShellErrorDetail,
     };
     use omnifrons_app::{EnvPlan, LineAssembler, StdinPlan, SupervisorError};
+
+    /// Drives `run_launch_watchdog` on the shell's async runtime.
+    fn watchdog<T, Fut>(
+        budget: std::time::Duration,
+        progress: super::LaunchProgress,
+        launch: Fut,
+        on_late: impl FnOnce(Result<T, ShellError>) + Send + 'static,
+    ) -> Result<T, ShellError>
+    where
+        Fut: std::future::Future<Output = Result<T, ShellError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        tauri::async_runtime::block_on(super::run_launch_watchdog(
+            budget, progress, launch, on_late,
+        ))
+    }
+
+    /// A launch that finishes inside the budget passes its result, success
+    /// or existing error, through unchanged.
+    #[test]
+    fn watchdog_passes_a_completing_launch_through() {
+        let ok = watchdog(
+            std::time::Duration::from_secs(5),
+            super::LaunchProgress::new(),
+            async { Ok(7_u32) },
+            |_| panic!("not late"),
+        );
+        assert_eq!(ok.expect("completes"), 7);
+
+        let err = watchdog(
+            std::time::Duration::from_secs(5),
+            super::LaunchProgress::new(),
+            async {
+                Err::<u32, _>(ShellError::new(
+                    ShellErrorCode::UnknownAdapter,
+                    "unknown adapter",
+                ))
+            },
+            |_| panic!("not late"),
+        )
+        .expect_err("the error passes through");
+        assert_eq!(err.code, ShellErrorCode::UnknownAdapter);
+        assert_eq!(err.message, "unknown adapter");
+    }
+
+    /// Stands in for a launch step that panics while producing a value.
+    fn explode(message: &str) -> u32 {
+        panic!("{message}")
+    }
+
+    /// A launch that panics answers `launch-panicked` naming the last step.
+    #[test]
+    fn watchdog_maps_a_panicking_launch_to_launch_panicked() {
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_secs(5),
+            progress,
+            async move {
+                marker.reach("gate");
+                marker.reach("launch-plan");
+                Ok(explode("boom"))
+            },
+            |_| panic!("not late"),
+        )
+        .expect_err("a panic is an error");
+        assert_eq!(err.code, ShellErrorCode::LaunchPanicked);
+        assert!(err.message.contains("launch-plan"), "{}", err.message);
+    }
+
+    /// A launch that never completes answers `launch-timed-out` naming the
+    /// last step.
+    #[test]
+    fn watchdog_maps_a_stalled_launch_to_launch_timed_out() {
+        let progress = super::LaunchProgress::new();
+        let marker = progress.clone();
+        let err = watchdog(
+            std::time::Duration::from_millis(50),
+            progress,
+            async move {
+                marker.reach("spawn");
+                std::future::pending::<Result<u32, ShellError>>().await
+            },
+            |_| panic!("never completes"),
+        )
+        .expect_err("a stall is an error");
+        assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
+        assert!(err.message.contains("spawn"), "{}", err.message);
+    }
+
+    /// A launch that finishes after the budget has already been answered
+    /// is handed to `on_late`, so its process cannot leak unseen.
+    #[test]
+    fn watchdog_hands_a_late_completion_to_on_late() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let err = watchdog(
+            std::time::Duration::from_millis(30),
+            super::LaunchProgress::new(),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(9_u32)
+            },
+            move |outcome| {
+                tx.send(outcome.expect("late success"))
+                    .expect("receiver alive");
+            },
+        )
+        .expect_err("the budget elapsed first");
+        assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
+        let late = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the late outcome is reported");
+        assert_eq!(late, 9);
+    }
 
     /// R1-001: a `kind: "approved"` launch must never inherit this shell's
     /// own environment. Its plan carries the same base allowlist an
