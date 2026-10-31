@@ -547,6 +547,9 @@ pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
     }
     entry.reaper_claimed = true;
     entry.claimed_at = Some(std::time::Instant::now());
+    entry.reap_polls = 0;
+    entry.last_reap_poll_at = None;
+    entry.deferral_expired_logged = false;
     true
 }
 

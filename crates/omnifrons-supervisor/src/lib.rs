@@ -287,9 +287,14 @@ struct ReapPacing {
     /// How often it is retaken in the idle phase.
     census_idle_refresh: Duration,
     /// How long `observe` keeps deferring to a claimed reaper that has not
-    /// polled: longer than the slowest poll (2 s idle), so a healthy reaper
-    /// is never mistaken for a stalled one.
+    /// polled: three times the slowest poll (2 s idle), so a healthy reaper
+    /// delayed by runtime load is not mistaken for a stalled one.
     stall_grace: Duration,
+    /// How long `stop` waits for a settling child's verdict, and how long
+    /// `observe` defers to it before taking the settle over. The sweep
+    /// itself is bounded at two signal rounds of about 300 ms each, so this
+    /// is only a backstop against a stuck blocking pool.
+    settle_wait: Duration,
 }
 
 impl ReapPacing {
@@ -301,7 +306,8 @@ impl ReapPacing {
         idle_poll: Duration::from_secs(2),
         census_refresh: Duration::from_millis(250),
         census_idle_refresh: CENSUS_IDLE_REFRESH,
-        stall_grace: Duration::from_secs(3),
+        stall_grace: Duration::from_secs(6),
+        settle_wait: Duration::from_secs(5),
     };
 
     fn interval(&self, elapsed: Duration) -> Duration {
@@ -379,10 +385,7 @@ impl Drop for SettlingGuard {
     }
 }
 
-/// How long `stop` waits for a settling child's verdict. The sweep itself
-/// is bounded at two signal rounds of about 300 ms each, so this is only a
-/// backstop against a stuck blocking pool.
-const SETTLE_WAIT: Duration = Duration::from_secs(5);
+/// How often `stop` re-checks whether a settle is still in flight.
 const SETTLE_POLL: Duration = Duration::from_millis(5);
 
 impl Drop for StoppingGuard<'_> {
@@ -458,6 +461,8 @@ impl SelfExitReaper {
                 refresh = Some(tokio::task::spawn_blocking(move || take_census(id)));
                 census_at = std::time::Instant::now();
             }
+            // Stamp again so a long sleep is preceded by a fresh poll time.
+            output_capture::note_reap_poll(&self.outputs, self.id);
             tokio::time::sleep(self.pacing.interval(elapsed)).await;
         }
     }
@@ -484,7 +489,7 @@ impl SelfExitReaper {
                     );
                     ProcessTerminalState::OrphanRiskUncertain
                 });
-            if settle_began.elapsed() > SETTLE_WAIT {
+            if settle_began.elapsed() > self.pacing.settle_wait {
                 tracing::warn!(
                     pid = self.id.0,
                     took = ?settle_began.elapsed(),
@@ -1444,7 +1449,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .expect("settling mutex poisoned by a prior panic")
             .contains_key(&id)
         {
-            if waited.elapsed() >= SETTLE_WAIT {
+            if waited.elapsed() >= self.inner.reap_pacing.settle_wait {
                 tracing::warn!(
                     pid = id.0,
                     "settle verdict not recorded in time; stopping anyway"
@@ -1513,7 +1518,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             // The self-exit reaper reaped it but has not recorded its
             // settled verdict: report the child as still running and
             // finalize nothing with the reap-derived state.
-            // Past `SETTLE_WAIT` `observe` takes the settle over: it drops the
+            // Past `settle_wait` `observe` takes the settle over: it drops the
             // id from `settling` inside this `children` critical section, so
             // the reaper's late verdict is discarded and one child never shows
             // two terminal states. `children` may nest `settling`, not back.
@@ -1524,7 +1529,9 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                     .lock()
                     .expect("settling mutex poisoned by a prior panic");
                 match settling.get(&id).map(std::time::Instant::elapsed) {
-                    Some(waited) if waited < SETTLE_WAIT => Some(ProcessStatus::Running),
+                    Some(waited) if waited < self.inner.reap_pacing.settle_wait => {
+                        Some(ProcessStatus::Running)
+                    }
                     Some(waited) => {
                         settling.remove(&id);
                         tracing::warn!(
@@ -1947,13 +1954,12 @@ mod unix {
                 .lock()
                 .expect("settling mutex poisoned by a prior panic");
             if !settling.contains_key(&id) {
-                if let Some(Tracked::Terminal(recorded)) = guard.get(&id)
-                    && *recorded != settled
-                {
+                if let Some(Tracked::Terminal(recorded)) = guard.get(&id) {
                     tracing::warn!(
                         pid = id.0,
                         settled = ?settled,
                         reported = ?recorded,
+                        same_verdict = (*recorded == settled),
                         "late settle verdict discarded; observe already reported \
                          the reap-derived state"
                     );
@@ -2224,7 +2230,21 @@ mod self_exit_tests {
         census_refresh: Duration::from_secs(1),
         census_idle_refresh: Duration::from_secs(10),
         stall_grace: Duration::from_secs(3),
+        settle_wait: Duration::from_secs(5),
     };
+
+    /// Every `State` frame the receiver yields until its channel closes.
+    fn drain_states(
+        frames: &std::sync::mpsc::Receiver<omnifrons_app::OutputFrame>,
+    ) -> Vec<ProcessTerminalState> {
+        let mut states = Vec::new();
+        while let Ok(frame) = frames.recv_timeout(Duration::from_secs(2)) {
+            if let FramePayload::State(state) = frame.payload {
+                states.push(state);
+            }
+        }
+        states
+    }
 
     #[test]
     fn a_child_that_exits_after_the_slow_window_still_gets_its_state_frame() {
@@ -2260,6 +2280,7 @@ mod self_exit_tests {
         census_refresh: Duration::from_secs(3600),
         census_idle_refresh: Duration::from_secs(3600),
         stall_grace: Duration::from_millis(300),
+        settle_wait: Duration::from_secs(5),
     };
 
     #[test]
@@ -2270,7 +2291,7 @@ mod self_exit_tests {
         // the stalled reaper never looks again.
         let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 2"]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
-        let _frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         let claim_end = std::time::Instant::now() + Duration::from_secs(5);
         while super::output_capture::reaper_claim(&supervisor.inner.outputs, id).is_none() {
@@ -2281,9 +2302,13 @@ mod self_exit_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let end = std::time::Instant::now() + NEVER_POLLS.stall_grace + Duration::from_secs(2);
+        let end = std::time::Instant::now() + NEVER_POLLS.stall_grace + Duration::from_secs(5);
+        let mut expired = false;
         let status = loop {
-            match supervisor.observe(id) {
+            let status = supervisor.observe(id);
+            // Read while the entry exists: the final frame removes it.
+            expired |= super::output_capture::deferral_expired(&supervisor.inner.outputs, id);
+            match status {
                 Some(ProcessStatus::Running) if std::time::Instant::now() < end => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -2296,6 +2321,46 @@ mod self_exit_tests {
                 code: Some(0)
             }))
         );
+        assert!(expired, "observe never logged the stalled reaper");
+        let exited = ProcessTerminalState::Exited { code: Some(0) };
+        assert_eq!(drain_states(&frames), vec![exited]);
+    }
+
+    #[test]
+    fn observe_takes_over_a_settle_that_outlasts_the_settle_wait() {
+        let pacing = ReapPacing {
+            settle_wait: Duration::from_millis(50),
+            ..SHORT
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        // The census records the first helper, which ignores TERM, so the
+        // sweep takes at least 300 ms, well past the 50 ms settle wait. The
+        // second helper starts after the census and stays in the group, so
+        // the settled verdict is `OrphanRiskUncertain`, unlike the
+        // reap-derived `Exited` that `observe` reports on taking over.
+        let script = "(trap '' TERM; exec sleep 3) >/dev/null 2>&1 </dev/null & \
+                      exec 1>&- 2>&-; sleep 0.2; \
+                      (exec sleep 2) >/dev/null 2>&1 </dev/null & exit 0";
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        let exited = ProcessTerminalState::Exited { code: Some(0) };
+        let end = std::time::Instant::now() + Duration::from_secs(2);
+        while supervisor.observe(id) != Some(ProcessStatus::Terminal(exited)) {
+            assert!(std::time::Instant::now() < end, "observe never took over");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The reaper's late verdict is discarded: the state never changes.
+        let end = std::time::Instant::now() + Duration::from_millis(600);
+        while std::time::Instant::now() < end {
+            assert_eq!(
+                supervisor.observe(id),
+                Some(ProcessStatus::Terminal(exited))
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(drain_states(&frames), vec![exited]);
     }
 
     #[test]
