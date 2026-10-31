@@ -15,7 +15,7 @@
     "excerpts": []
   },
   "skillPaths": {
-    "indexed": true,
+    "indexed": false,
     "userLevel": false,
     "excerpts": [
       "{\"input\":{\"aggregated_output\":\"bwrap: execvp <home>/.npm-global/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex: No such file or director..."
@@ -23,7 +23,8 @@
   },
   "result": "uncertain",
   "reasons": [
-    "no system/init line together with a line naming AGENTS.md"
+    "no system/init line together with a line naming AGENTS.md",
+    "the only access to the indexed skill path failed (a command execution with a failed status or a non-zero exit code)"
   ],
   "log": {
     "incomplete": false,

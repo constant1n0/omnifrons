@@ -17,7 +17,7 @@ checkpoint-and-restart flow exists, so this run does not discharge the ADR-0005 
 | `variant_scan` | absent |
 | `procedure_ref` | docs/evidence/VP-001/procedures/vp-s29-linux.sh |
 | `claude_code_leg` | uncertain -- Claude Code 2.1.316; loaded-file evidence false; indexed skill path true; user-level skill path false; no system/init line together with a line naming CLAUDE.md or AGENTS.md |
-| `codex_leg` | uncertain -- Codex CLI through codex-stream-bridge 0.163.0; loaded-file evidence false; indexed skill path true; user-level skill path false; no system/init line together with a line naming AGENTS.md |
+| `codex_leg` | uncertain -- Codex CLI through codex-stream-bridge 0.163.0; loaded-file evidence false; indexed skill path false; user-level skill path false; no system/init line together with a line naming AGENTS.md; the only access to the indexed skill path failed (a command execution with a failed status or a non-zero exit code) |
 | `gemini_leg` | uncertain -- the leg was not run or has no observation |
 | `switch_leg` | uncertain -- no checkpoint-and-restart flow exists |
 | `digests_unchanged` | unknown -- digests were not compared |
@@ -25,7 +25,7 @@ checkpoint-and-restart flow exists, so this run does not discharge the ADR-0005 
 | `harness_versions` | Claude Code 2.1.316; Codex CLI through codex-stream-bridge 0.163.0 (bridge reports Codex 0.163.0, bridge 0.1.0); Gemini CLI not run |
 | `run_date` | 2026-10-31 |
 | `operator_role` | maintainer (the repository owner operated the packaged app; the digests, observe and record steps ran in an assistant session under the owner's supervision) |
-| `evidence_artifact` | 572e5ba5f8f2e679f367089f52f3ac53e5fad0f7c3b4657c07a8980e66684456 -- SHA-256 of the retained redacted file docs/evidence/VP-001/artifacts/vp-s29/local-20261031-1/evidence-summary.txt |
+| `evidence_artifact` | 7bc3b861521d570e9c728063cfb0e9d4d7db680b21b25a3561b183cfc7263aa2 -- SHA-256 of the retained redacted file docs/evidence/VP-001/artifacts/vp-s29/local-20261031-1/evidence-summary.txt |
 
 ### How the run went
 
@@ -52,9 +52,15 @@ observation was produced from the redacted copies (below) and is the honest
 one.
 
 `codex_leg`: two runs through `codex-stream-bridge` (Codex CLI 0.163.0), both
-`result: success`; the agent identified itself as Orbit Scribe and drafted the
-notes in the skill's structure. `codex exec --json` emits no line of its own
-naming `AGENTS.md`, so this leg records `uncertain` by design.
+`result: success`; the agent identified itself as Orbit Scribe in both. In the
+task run its only access to the indexed skill path was a `command_execution`
+(`cat skills/release-notes/SKILL.md`) that Codex's sandbox failed to run
+(`bwrap: execvp ...: No such file or directory`, `status: failed`, exit code
+1), and the answer says the local template could not be read and uses a
+fallback layout. A failed access is not a read, so the indexed skill path is
+`false` for this leg; the observer's rule was tightened for exactly this case
+after review. `codex exec --json` also emits no line of its own naming
+`AGENTS.md`, so the leg records `uncertain` on both counts.
 
 `gemini_leg` (`pty-cli`): not run, three causes, each verified. (1) Google
 retired the standalone Gemini CLI for individual accounts after 2026-06-18 and

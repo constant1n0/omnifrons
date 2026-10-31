@@ -475,3 +475,31 @@ test('drops recorded on the state line count towards the dropped total', () => {
   assert.equal(result.result, 'uncertain');
   assert.equal(result.log.droppedBefore, 2);
 });
+
+test('a failed command execution naming the indexed skill path is not a read', () => {
+  const failed = tool('command_execution', {
+    command: "/usr/bin/zsh -lc 'cat skills/release-notes/SKILL.md'", status: 'failed', exit_code: '1', aggregated_output: 'bwrap: execvp: No such file or directory',
+  });
+  const result = observeLeg({
+    adapter: 'stream-json-cli',
+    transcript: lines(init, bridge, failed, say('The local release-notes template could not be read.')),
+    versionText: CODEX_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.skillPaths.indexed, false);
+  assert.equal(result.result, 'uncertain');
+  assert.ok(result.reasons.some((reason) => /access to the indexed skill path failed/.test(reason)));
+  assert.ok(result.skillPaths.excerpts.some((line) => /skills\/release-notes\/SKILL\.md/.test(line)));
+});
+
+test('a completed command execution naming the indexed skill path still counts as a read', () => {
+  const completed = tool('command_execution', { command: 'cat skills/release-notes/SKILL.md', status: 'completed', exit_code: '0' });
+  const result = observeLeg({
+    adapter: 'stream-json-cli',
+    transcript: lines(init, bridge, completed),
+    versionText: CODEX_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.skillPaths.indexed, true);
+  assert.ok(!result.reasons.some((reason) => /access to the indexed skill path failed/.test(reason)));
+});

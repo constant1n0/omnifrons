@@ -113,6 +113,23 @@ function parseJsonLine(line) {
 
 const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** Whether a material line is a `command_execution` tool_use that did not
+ * succeed: a `status` other than `completed` when one is present, or a
+ * non-zero `exit_code`. Such an access names the path without reading it. */
+function isFailedExecution(line) {
+  let block;
+  try {
+    block = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (!block || block.type !== 'tool_use' || block.name !== 'command_execution') return false;
+  const input = block.input ?? {};
+  if (input.status !== undefined && input.status !== 'completed') return true;
+  if (input.exit_code !== undefined && String(input.exit_code) !== '0') return true;
+  return false;
+}
+
 /** The `system` lines and `tool_use` blocks of a stream-json transcript, as
  * strings; every other line (assistant text, results, plain text) is left out. */
 function harnessMaterial(lines, parsed) {
@@ -207,11 +224,17 @@ export function observeLeg({
   const userPath = new RegExp(`\\.(?:claude|agents|gemini|codex)/skills/${skillPattern}/SKILL\\.md`);
   const indexedPath = new RegExp(`(?<!\\.(?:claude|agents|gemini|codex)/)skills/${skillPattern}/SKILL\\.md`);
   const userLines = lines.filter((line) => userPath.test(line) || line.includes(userSkillMarker));
-  const indexedLines = findLines(material, indexedPath);
+  const indexedNamed = findLines(material, indexedPath);
+  // A read that failed (a command execution with a failed status or a non-zero
+  // exit code) names the path without reading it, so it is not evidence.
+  const indexedLines = indexedNamed.filter((line) => !isFailedExecution(line));
+  const indexedFailed = indexedNamed.length - indexedLines.length;
   const userLevel = userLines.length > 0;
   const indexed = indexedLines.length > 0;
   if (userLevel) reasons.push('the transcript names the user-level skill (path or marker)');
-  else if (!indexed && lines.length > 0) reasons.push('the transcript names no skill path');
+  else if (!indexed && indexedFailed > 0) {
+    reasons.push('the only access to the indexed skill path failed (a command execution with a failed status or a non-zero exit code)');
+  } else if (!indexed && lines.length > 0) reasons.push('the transcript names no skill path');
 
   let result = 'pass';
   if (userLevel) result = 'fail';
@@ -228,7 +251,7 @@ export function observeLeg({
     skillPaths: {
       indexed,
       userLevel,
-      excerpts: [...new Set([...userLines, ...indexedLines])].slice(0, 4).map((line) => excerptOf(line, home)),
+      excerpts: [...new Set([...userLines, ...indexedNamed])].slice(0, 4).map((line) => excerptOf(line, home)),
     },
     result,
     reasons,
