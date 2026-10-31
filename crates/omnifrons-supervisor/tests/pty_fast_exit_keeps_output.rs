@@ -87,7 +87,7 @@ fn launch(supervisor: &mut TokioProcessSupervisor, label: &str) -> Delivered {
         match supervisor.observe(id) {
             Some(ProcessStatus::Terminal(state)) => break state,
             _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
-            other => panic!("{label} no terminal state in time: {other:?}"),
+            other => panic!("{label} ({id:?}) no terminal state in time: {other:?}"),
         }
     };
     assert_eq!(
@@ -123,6 +123,11 @@ fn launch(supervisor: &mut TokioProcessSupervisor, label: &str) -> Delivered {
 
 #[test]
 fn every_fast_exiting_pty_child_delivers_its_last_line() {
+    // Supervisor warnings reach the CI log on stderr even when the test passes.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .try_init();
     let supervisor = TokioProcessSupervisor::new();
     let workers: Vec<std::thread::JoinHandle<Vec<Delivered>>> = (0..THREADS)
         .map(|thread| {

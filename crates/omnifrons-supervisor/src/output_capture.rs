@@ -101,6 +101,15 @@ pub(crate) struct OutputChannelState {
     /// ([`claim_reap`]); keeps a second finishing reader from starting a
     /// second poller.
     reaper_claimed: bool,
+    /// When [`claim_reap`] took the claim; cleared by [`release_reap`].
+    claimed_at: Option<std::time::Instant>,
+    /// How many times the claiming reaper has polled ([`note_reap_poll`]).
+    reap_polls: u32,
+    /// When the claiming reaper last polled.
+    last_reap_poll_at: Option<std::time::Instant>,
+    /// Set once `observe` logged that it outlasted the reaper's claim
+    /// ([`note_deferral_expired`]), so the warning appears once per child.
+    deferral_expired_logged: bool,
 }
 
 /// What each reader task holds its own clone of.
@@ -165,6 +174,10 @@ pub(crate) fn new_channel(reader_count: u8) -> (OutputChannelState, ReaderHandle
         active_readers,
         confirmed_state: None,
         reaper_claimed: false,
+        claimed_at: None,
+        reap_polls: 0,
+        last_reap_poll_at: None,
+        deferral_expired_logged: false,
     };
     (state, handles)
 }
@@ -533,19 +546,63 @@ pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
         return false;
     }
     entry.reaper_claimed = true;
+    entry.claimed_at = Some(std::time::Instant::now());
     true
 }
 
-/// Whether a self-exit reaper holds the claim on `id` and the final frame is
-/// still owed: from then on the reaper is the one that confirms the reap,
-/// so `observe` leaves the child to it ([`release_reap`] hands it back).
-pub(crate) fn reaper_active(outputs: &OutputTable, id: ProcessId) -> bool {
+/// What `observe` learns about a self-exit reaper's claim on a child.
+pub(crate) struct ReaperClaim {
+    /// When the reaper took the claim.
+    pub(crate) claimed_at: std::time::Instant,
+    /// How many times the reaper has polled since.
+    pub(crate) polls: u32,
+    /// When it last polled, if it has.
+    pub(crate) last_poll_at: Option<std::time::Instant>,
+}
+
+/// The claim a self-exit reaper holds on `id` while the final frame is still
+/// owed: from then on the reaper is the one that confirms the reap, so
+/// `observe` leaves the child to it for a bounded time ([`release_reap`]
+/// hands it back).
+pub(crate) fn reaper_claim(outputs: &OutputTable, id: ProcessId) -> Option<ReaperClaim> {
     let guard = outputs
         .lock()
         .expect("outputs mutex poisoned by a prior panic");
-    guard
-        .get(&id)
-        .is_some_and(|entry| entry.reaper_claimed && entry.sender.is_some())
+    let entry = guard.get(&id)?;
+    if !(entry.reaper_claimed && entry.sender.is_some()) {
+        return None;
+    }
+    Some(ReaperClaim {
+        claimed_at: entry.claimed_at?,
+        polls: entry.reap_polls,
+        last_poll_at: entry.last_reap_poll_at,
+    })
+}
+
+/// Record one poll by the claiming reaper, for the stall warning.
+pub(crate) fn note_reap_poll(outputs: &OutputTable, id: ProcessId) {
+    let mut guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    if let Some(entry) = guard.get_mut(&id) {
+        entry.reap_polls = entry.reap_polls.saturating_add(1);
+        entry.last_reap_poll_at = Some(std::time::Instant::now());
+    }
+}
+
+/// Mark that `observe` outlasted the reaper's claim on `id`; `true` only the
+/// first time, so the caller logs the stall once per child.
+pub(crate) fn note_deferral_expired(outputs: &OutputTable, id: ProcessId) -> bool {
+    let mut guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    match guard.get_mut(&id) {
+        Some(entry) if !entry.deferral_expired_logged => {
+            entry.deferral_expired_logged = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Give up a claim taken by [`claim_reap`], for a reaper that ends without
@@ -556,6 +613,7 @@ pub(crate) fn release_reap(outputs: &OutputTable, id: ProcessId) {
         .expect("outputs mutex poisoned by a prior panic");
     if let Some(entry) = guard.get_mut(&id) {
         entry.reaper_claimed = false;
+        entry.claimed_at = None;
     }
 }
 

@@ -39,6 +39,10 @@ omnifrons-app = { path = "../omnifrons-app", features = ["contract-tests"] }
 # -p omnifrons-supervisor -e normal` is unchanged, and `sha2` was already
 # in `Cargo.lock` through `omnifrons-adapters`.
 sha2.workspace = true
+# Added so the two PTY stress tests print the supervisor's `tracing`
+# warnings to stderr (a stalled self-exit reaper is otherwise silent in
+# the CI log). A dev-dependency only, with the `fmt` layer alone.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # "resource" (added for the spike slice-4 review fixes) for

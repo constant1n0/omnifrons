@@ -333,7 +333,7 @@ struct SelfExitReaper {
     children: Arc<Mutex<HashMap<ProcessId, Tracked>>>,
     terminal_order: Arc<Mutex<VecDeque<ProcessId>>>,
     stopping: Arc<Mutex<HashSet<ProcessId>>>,
-    settling: Arc<Mutex<HashSet<ProcessId>>>,
+    settling: Arc<Mutex<HashMap<ProcessId, std::time::Instant>>>,
     pacing: ReapPacing,
     outputs: OutputTable,
     id: ProcessId,
@@ -359,18 +359,18 @@ impl<'a> StoppingGuard<'a> {
 /// Marks `id` as settling (see [`Inner::settling`]) until dropped. Owns its
 /// set, so it travels with the reaper task across the blocking sweep.
 struct SettlingGuard {
-    settling: Arc<Mutex<HashSet<ProcessId>>>,
+    settling: Arc<Mutex<HashMap<ProcessId, std::time::Instant>>>,
     id: ProcessId,
 }
 
 impl Drop for SettlingGuard {
     fn drop(&mut self) {
         // Poison-tolerant: this runs during unwinding as readily as not.
-        let mut set = match self.settling.lock() {
+        let mut map = match self.settling.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        set.remove(&self.id);
+        map.remove(&self.id);
     }
 }
 
@@ -379,6 +379,12 @@ impl Drop for SettlingGuard {
 /// backstop against a stuck blocking pool.
 const SETTLE_WAIT: Duration = Duration::from_secs(5);
 const SETTLE_POLL: Duration = Duration::from_millis(5);
+
+/// How long `observe` defers to a self-exit reaper that holds a child. It
+/// equals the reaper's fast window: the reaper's designed job is the
+/// EOF-to-exit window plus the settle, which take milliseconds, so a claim
+/// older than this is a stalled reaper, not a busy one.
+const OBSERVE_DEFERRAL: Duration = Duration::from_secs(3);
 
 impl Drop for StoppingGuard<'_> {
     fn drop(&mut self) {
@@ -412,6 +418,7 @@ impl SelfExitReaper {
             {
                 census = adopt_census(census, fresh);
             }
+            output_capture::note_reap_poll(&self.outputs, self.id);
             match self.try_reap() {
                 // A refresh still in flight is dropped (detached): it may
                 // have walked `/proc` after this reap, and its result is
@@ -468,6 +475,7 @@ impl SelfExitReaper {
         #[cfg(unix)]
         {
             let pid = pid_of(self.id);
+            let settle_began = std::time::Instant::now();
             let settled = tokio::task::spawn_blocking(move || census.settle(pid, reaped))
                 .await
                 .unwrap_or_else(|error| {
@@ -477,6 +485,13 @@ impl SelfExitReaper {
                     );
                     ProcessTerminalState::OrphanRiskUncertain
                 });
+            if settle_began.elapsed() > SETTLE_WAIT {
+                tracing::warn!(
+                    pid = self.id.0,
+                    took = ?settle_began.elapsed(),
+                    "descendant settle took longer than the settle wait"
+                );
+            }
             unix::record_settled_state(&self.children, &self.outputs, self.id, settled);
         }
         #[cfg(not(unix))]
@@ -529,7 +544,7 @@ impl SelfExitReaper {
                     self.settling
                         .lock()
                         .expect("settling mutex poisoned by a prior panic")
-                        .insert(self.id);
+                        .insert(self.id, std::time::Instant::now());
                     *tracked = Tracked::Terminal(state);
                     (
                         state,
@@ -778,7 +793,7 @@ struct Inner {
     /// Their `Tracked::Terminal` carries only the reap-derived state, so
     /// until the settle records the verdict `observe` reports the child as
     /// still running (and finalizes nothing) and `stop` waits.
-    settling: Arc<Mutex<HashSet<ProcessId>>>,
+    settling: Arc<Mutex<HashMap<ProcessId, std::time::Instant>>>,
     /// The self-exit reaper's cadence; only tests use anything but the default.
     reap_pacing: ReapPacing,
     /// Per-child output-capture bookkeeping (`output_capture` module),
@@ -876,7 +891,7 @@ impl TokioProcessSupervisor {
                 children: Arc::new(Mutex::new(HashMap::new())),
                 terminal_order: Arc::new(Mutex::new(VecDeque::new())),
                 stopping: Arc::new(Mutex::new(HashSet::new())),
-                settling: Arc::new(Mutex::new(HashSet::new())),
+                settling: Arc::new(Mutex::new(HashMap::new())),
                 reap_pacing,
                 outputs: Arc::new(Mutex::new(HashMap::new())),
                 demo_launcher,
@@ -1422,7 +1437,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .settling
             .lock()
             .expect("settling mutex poisoned by a prior panic")
-            .contains(&id)
+            .contains_key(&id)
         {
             if waited.elapsed() >= SETTLE_WAIT {
                 tracing::warn!(
@@ -1452,11 +1467,32 @@ impl ProcessSupervisor for TokioProcessSupervisor {
 
     fn observe(&self, id: ProcessId) -> Option<ProcessStatus> {
         let _guard = self.inner.runtime.enter();
-        // Read before `children` is locked. Once the self-exit reaper holds
-        // this child, it alone confirms the reap, so that its descendant
-        // sweep decides the terminal state; `observe` reports `Running`
-        // meanwhile (at most the reaper's next poll plus the sweep).
-        let reaper_active = output_capture::reaper_active(&self.inner.outputs, id);
+        // Read before `children` is locked. While the self-exit reaper
+        // holds this child it alone confirms the reap, so that its
+        // descendant sweep decides the terminal state; `observe` reports
+        // `Running` meanwhile (at most the reaper's next poll plus the
+        // sweep). The deferral is bounded by `OBSERVE_DEFERRAL`: past it the
+        // reaper is stalled, and `observe` confirms the reap itself, as it
+        // did before the reaper existed.
+        let claim = output_capture::reaper_claim(&self.inner.outputs, id);
+        let reaper_active = match &claim {
+            Some(claim) if claim.claimed_at.elapsed() < OBSERVE_DEFERRAL => true,
+            Some(claim) => {
+                if output_capture::note_deferral_expired(&self.inner.outputs, id) {
+                    tracing::warn!(
+                        pid = id.0,
+                        claimed_ago = ?claim.claimed_at.elapsed(),
+                        polls = claim.polls,
+                        last_poll_ago = ?claim.last_poll_at.map(|at| at.elapsed()),
+                        "self-exit reaper held the child past the observe deferral; \
+                         observing it directly"
+                    );
+                }
+                false
+            }
+            None => false,
+        };
+        let claimed = claim.is_some();
         let mut children = self
             .inner
             .children
@@ -1468,13 +1504,16 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             // The self-exit reaper reaped it but has not recorded its
             // settled verdict: report the child as still running and
             // finalize nothing with the reap-derived state.
+            // Bounded by `SETTLE_WAIT`, like `stop`'s wait: past it the
+            // terminal state is reported as recorded.
             Tracked::Terminal(_)
                 if self
                     .inner
                     .settling
                     .lock()
                     .expect("settling mutex poisoned by a prior panic")
-                    .contains(&id) =>
+                    .get(&id)
+                    .is_some_and(|since| since.elapsed() < SETTLE_WAIT) =>
             {
                 Some(ProcessStatus::Running)
             }
@@ -1489,6 +1528,12 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                     // this pid/pgid again.
                     *tracked = Tracked::Terminal(state);
                     just_became_terminal = true;
+                    if claimed {
+                        tracing::warn!(
+                            pid = id.0,
+                            "observe reaped a child the self-exit reaper had claimed"
+                        );
+                    }
                     Some(ProcessStatus::Terminal(state))
                 }
                 Ok(None) => Some(ProcessStatus::Running),
@@ -2103,7 +2148,8 @@ mod self_exit_tests {
     use std::time::Duration;
 
     use omnifrons_app::{
-        FramePayload, ProcessOutput, ProcessSpec, ProcessSupervisor, ProcessTerminalState,
+        FramePayload, ProcessOutput, ProcessSpec, ProcessStatus, ProcessSupervisor,
+        ProcessTerminalState,
     };
 
     use super::{ReapPacing, TokioProcessSupervisor};
@@ -2142,6 +2188,53 @@ mod self_exit_tests {
             }
         };
         assert_eq!(state, Some(ProcessTerminalState::Exited { code: Some(0) }));
+    }
+
+    /// A pacing whose reaper never polls again after its first attempt.
+    const NEVER_POLLS: ReapPacing = ReapPacing {
+        fast_poll: Duration::from_secs(3600),
+        fast_window: Duration::from_secs(3600),
+        slow_poll: Duration::from_secs(3600),
+        slow_window: Duration::from_secs(7200),
+        idle_poll: Duration::from_secs(3600),
+        census_refresh: Duration::from_secs(3600),
+        census_idle_refresh: Duration::from_secs(3600),
+    };
+
+    #[test]
+    fn observe_stops_deferring_to_a_reaper_that_never_polls() {
+        let mut supervisor = TokioProcessSupervisor::build_with(None, NEVER_POLLS);
+        // Output closes at once and the reaper's first attempt finds the
+        // child alive; the child exits by itself a moment later, after which
+        // the stalled reaper never looks again.
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 0.3"]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let _frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        let claim_end = std::time::Instant::now() + Duration::from_secs(5);
+        while super::output_capture::reaper_claim(&supervisor.inner.outputs, id).is_none() {
+            assert!(
+                std::time::Instant::now() < claim_end,
+                "the reaper never claimed the child"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let end = std::time::Instant::now() + super::OBSERVE_DEFERRAL + Duration::from_secs(2);
+        let status = loop {
+            match supervisor.observe(id) {
+                Some(ProcessStatus::Running) if std::time::Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        assert_eq!(
+            status,
+            Some(ProcessStatus::Terminal(ProcessTerminalState::Exited {
+                code: Some(0)
+            }))
+        );
     }
 
     #[test]

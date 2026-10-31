@@ -135,7 +135,7 @@ fn launch(supervisor: &mut TokioProcessSupervisor, label: &str) -> ChildFdReport
             match supervisor.observe(id) {
                 Some(ProcessStatus::Terminal(state)) => break state,
                 _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-                other => panic!("{label} no terminal state in time: {other:?}"),
+                other => panic!("{label} ({id:?}) no terminal state in time: {other:?}"),
             }
         };
         assert_eq!(
@@ -154,6 +154,11 @@ fn launch(supervisor: &mut TokioProcessSupervisor, label: &str) -> ChildFdReport
 
 #[test]
 fn concurrent_pty_spawns_leak_no_descriptor_into_a_sibling() {
+    // Supervisor warnings reach the CI log on stderr even when the test passes.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .try_init();
     let mut supervisor = TokioProcessSupervisor::new();
     // Before any thread exists: what every child inherits from this process.
     let baseline = launch(&mut supervisor, "baseline");
