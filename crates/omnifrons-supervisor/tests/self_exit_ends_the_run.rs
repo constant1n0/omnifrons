@@ -16,6 +16,17 @@ use omnifrons_supervisor::TokioProcessSupervisor;
 /// Generous headroom for a short-lived child on a loaded runner.
 const TERMINAL_DEADLINE: Duration = Duration::from_secs(10);
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
+/// How long the channel may stay open after its `State` frame.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+/// How long the "closes its output but keeps running" child lives after
+/// closing its output (`sleep`, whole seconds).
+#[cfg(unix)]
+const LINGER_SECS: u64 = 2;
+/// How long the test watches for a premature terminal frame. It must stay
+/// well below [`LINGER_SECS`], or a premature frame would be indistinguishable
+/// from the child's real exit.
+#[cfg(unix)]
+const PREMATURE_FRAME_WATCH: Duration = Duration::from_millis(900);
 
 /// The first `State` frame on `frames` within `deadline`, if one arrives.
 fn wait_for_state(
@@ -32,6 +43,23 @@ fn wait_for_state(
                 }
             }
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Drain `frames` until the channel closes and count the `State` frames
+/// seen. Bounded: a channel that stays open past [`CLOSE_DEADLINE`] fails
+/// instead of hanging the test.
+fn count_states_until_closed(frames: &Receiver<OutputFrame>) -> usize {
+    let end = Instant::now() + CLOSE_DEADLINE;
+    let mut states = 0;
+    loop {
+        match frames.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok(frame) => states += usize::from(matches!(frame.payload, FramePayload::State(_))),
+            Err(RecvTimeoutError::Disconnected) => return states,
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("the output channel stayed open past {CLOSE_DEADLINE:?}")
+            }
         }
     }
 }
@@ -101,13 +129,14 @@ fn a_pty_child_that_exits_by_itself_delivers_its_exit_state() {
 #[test]
 fn a_child_that_closes_its_output_but_keeps_running_is_not_finished_early() {
     let mut supervisor = TokioProcessSupervisor::new();
-    let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 2"]);
+    let script = format!("exec 1>&- 2>&-; exec sleep {LINGER_SECS}");
+    let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script.as_str()]);
     let id = supervisor.spawn(spec).expect("spawning sh must succeed");
     let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
     // Both streams are closed almost at once; the child is still alive.
     assert_eq!(
-        wait_for_state(&frames, Duration::from_millis(900)),
+        wait_for_state(&frames, PREMATURE_FRAME_WATCH),
         None,
         "no terminal frame may be delivered while the child is still running"
     );
@@ -144,10 +173,73 @@ fn observe_and_stop_after_a_self_exit_report_the_same_terminal_state() {
         exited
     );
     // Exactly one State frame was ever delivered: the channel is now closed.
-    assert!(
-        frames
-            .iter()
-            .all(|frame| !matches!(frame.payload, FramePayload::State(_))),
+    assert_eq!(
+        count_states_until_closed(&frames),
+        0,
         "a second State frame must never be delivered"
+    );
+}
+
+/// A stop that begins while the reaper is polling a child that closed its
+/// output decides the terminal state: the reaper must not pre-empt it with a
+/// bare `Exited`, and exactly one `State` frame is delivered.
+#[cfg(unix)]
+#[test]
+fn a_stop_while_the_reaper_polls_decides_the_terminal_state() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    // SIGTERM is ignored (and the disposition survives the exec), so the
+    // stop has to escalate to SIGKILL: `Killed` can only come from `stop`.
+    let spec = ProcessSpec::new("/bin/sh")
+        .with_args(["-c", "trap '' TERM; exec 1>&- 2>&-; exec sleep 30"]);
+    let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+    // Output is closed at once, so the reaper is polling by now.
+    assert_eq!(wait_for_state(&frames, Duration::from_millis(400)), None);
+    assert_eq!(supervisor.observe(id), Some(ProcessStatus::Running));
+
+    let stopped = supervisor
+        .stop(id, Duration::from_millis(300))
+        .expect("stop must succeed");
+    assert_eq!(stopped, ProcessTerminalState::Killed);
+    assert_eq!(
+        supervisor.observe(id),
+        Some(ProcessStatus::Terminal(ProcessTerminalState::Killed))
+    );
+
+    let mut states = Vec::new();
+    let end = Instant::now() + CLOSE_DEADLINE;
+    loop {
+        match frames.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok(frame) => {
+                if let FramePayload::State(state) = frame.payload {
+                    states.push(state);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => panic!("the output channel stayed open"),
+        }
+    }
+    assert_eq!(states, vec![ProcessTerminalState::Killed]);
+}
+
+/// Descendants left behind by a child that exits on its own make the self-exit
+/// path report what `stop` would: the helper below keeps running in the
+/// child's process group after its output was redirected away, so the
+/// readers end at the child's exit with a descendant still alive.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_self_exit_that_leaves_a_descendant_reports_orphan_risk() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    // Self-bounding helper: it exits on its own after 3 s.
+    let spec = ProcessSpec::new("/bin/sh")
+        .with_args(["-c", "sleep 3 >/dev/null 2>&1 </dev/null & exit 0"]);
+    let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+    assert_eq!(
+        wait_for_state(&frames, TERMINAL_DEADLINE),
+        Some(ProcessTerminalState::OrphanRiskUncertain),
+        "a leftover descendant must not be reported as a clean exit"
     );
 }

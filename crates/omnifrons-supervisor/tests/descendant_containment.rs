@@ -324,8 +324,12 @@ fn a_child_with_no_descendants_still_reports_its_own_exit_code() {
 /// short and may be missed entirely.
 fn wait_until_exited(pid: u32, deadline: Instant) {
     loop {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return;
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            // Only a missing entry means reaped; any other error is a
+            // failure to look, not evidence.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("reading /proc/{pid}/stat failed: {error}"),
         };
         let after_comm = &stat[stat.rfind(')').expect("stat carries a comm field") + 1..];
         if after_comm.split_whitespace().next() == Some("Z") {

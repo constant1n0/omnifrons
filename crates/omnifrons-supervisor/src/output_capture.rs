@@ -97,6 +97,10 @@ pub(crate) struct OutputChannelState {
     /// Set once `observe`/`stop` confirms the process's terminal state,
     /// independent of whether the readers are done yet.
     confirmed_state: Option<ProcessTerminalState>,
+    /// Set by the one self-exit reaper that claimed this child
+    /// ([`claim_reap`]); keeps a second finishing reader from starting a
+    /// second poller.
+    reaper_claimed: bool,
 }
 
 /// What each reader task holds its own clone of.
@@ -160,6 +164,7 @@ pub(crate) fn new_channel(reader_count: u8) -> (OutputChannelState, ReaderHandle
         pending_drops,
         active_readers,
         confirmed_state: None,
+        reaper_claimed: false,
     };
     (state, handles)
 }
@@ -506,19 +511,38 @@ pub(crate) fn record_confirmed_state(
     try_finalize(outputs, id);
 }
 
-/// Whether `id`'s final `State` frame is owed and only the reap is missing:
-/// not finalized yet, every reader task finished, and no terminal state
-/// confirmed. This is exactly the situation [`try_finalize`] returns from
-/// with "reap not confirmed yet".
-pub(crate) fn awaiting_reap(outputs: &OutputTable, id: ProcessId) -> bool {
+/// Claim the self-exit reap of `id`, at most once per child.
+///
+/// Succeeds only when the final `State` frame is still owed and only the
+/// reap is missing: not finalized, every reader task finished, no terminal
+/// state confirmed, and no earlier claim. Under `Pipes` both drain tasks
+/// can finish at nearly the same instant and both ask; the flag is set
+/// under the table's lock, so exactly one of them gets `true`.
+pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
+    let mut guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    let Some(entry) = guard.get_mut(&id) else {
+        return false;
+    };
+    if entry.reaper_claimed
+        || entry.sender.is_none()
+        || entry.active_readers.load(Ordering::Acquire) != 0
+        || entry.confirmed_state.is_some()
+    {
+        return false;
+    }
+    entry.reaper_claimed = true;
+    true
+}
+
+/// Whether `id`'s final `State` frame is still owed (the entry exists and
+/// was not finalized): the reaper's signal to keep polling or to stop.
+pub(crate) fn final_frame_owed(outputs: &OutputTable, id: ProcessId) -> bool {
     let guard = outputs
         .lock()
         .expect("outputs mutex poisoned by a prior panic");
-    guard.get(&id).is_some_and(|entry| {
-        entry.sender.is_some()
-            && entry.active_readers.load(Ordering::Acquire) == 0
-            && entry.confirmed_state.is_none()
-    })
+    guard.get(&id).is_some_and(|entry| entry.sender.is_some())
 }
 
 /// Send the final `State` frame and drop this channel's sender, but only
