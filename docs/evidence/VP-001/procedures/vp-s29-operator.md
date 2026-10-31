@@ -135,8 +135,10 @@ For each adapter, in this order (`claude-code`, `stream-json-cli`, `pty-cli`):
    Stop, keep the log the run produced, and continue: the leg records
    `uncertain`. Do not retry until it looks like a pass.
 
-A log holds frames as the capture side saw them. A truncated log (size cap) or
-a log with dropped frames makes its leg at most `uncertain`, and a log whose
+A log holds frames as the capture side saw them. A truncated log (size cap), a
+log with dropped frames (including drops recorded on its final state line), a
+log with no final state line (a crash, or a copy taken before the run ended) and
+a log that ends mid-line each make their leg at most `uncertain`, and a log whose
 header names another adapter fails the leg.
 
 ## 5. Derive and record

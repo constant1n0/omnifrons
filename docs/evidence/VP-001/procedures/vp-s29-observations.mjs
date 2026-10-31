@@ -279,8 +279,11 @@ export function parseHarnessLog(text) {
       truncatedFrames = (truncatedFrames ?? 0) + (Number(entry.framesDropped) || 0);
     } else if (entry.kind === 'state') {
       state = entry;
+      // The terminal frame's own backpressure drops ride on the state record.
+      droppedBefore += Number(entry.droppedBefore) || 0;
     }
   }
+  const endsMidLine = pending.stdout || pending.stderr;
   for (const kind of ['stdout', 'stderr']) if (pending[kind]) lines[kind].push(open[kind]);
   return {
     header: { runId: header.runId, adapter: header.adapter, startedAt: header.startedAt },
@@ -288,6 +291,7 @@ export function parseHarnessLog(text) {
     stderrLines: lines.stderr,
     droppedBefore,
     truncatedFrames,
+    endsMidLine,
     state,
   };
 }
@@ -301,6 +305,7 @@ function logSummary(parsed) {
     state: parsed.state,
     truncatedFrames: parsed.truncatedFrames,
     droppedBefore: parsed.droppedBefore,
+    endsMidLine: parsed.endsMidLine,
     stdoutLines: parsed.stdoutLines.length,
     stderrLines: parsed.stderrLines.length,
   };
@@ -322,13 +327,18 @@ export function observeHarnessLogs({ adapter, logs, ...rest }) {
   const observation = observeLeg({ adapter, transcript, ...rest });
   const mismatched = parsed.filter((entry) => entry.header.adapter !== adapter);
   const droppedBefore = parsed.reduce((total, entry) => total + entry.droppedBefore, 0);
-  const incomplete = droppedBefore > 0 || parsed.some((entry) => entry.truncatedFrames !== null);
+  const lossy = droppedBefore > 0 || parsed.some((entry) => entry.truncatedFrames !== null);
+  const noState = parsed.some((entry) => entry.state === null);
+  const midLine = parsed.some((entry) => entry.endsMidLine);
+  const incomplete = lossy || noState || midLine;
   if (mismatched.length > 0) {
     observation.reasons.push(`a log header names the adapter ${mismatched[0].header.adapter}, not ${adapter}`);
     observation.result = 'fail';
   }
+  if (lossy) observation.reasons.push('incomplete log: frames were dropped or the size cap truncated it');
+  if (noState) observation.reasons.push('incomplete log: the log has no final state');
+  if (midLine) observation.reasons.push('incomplete log: the log ends mid-line');
   if (incomplete) {
-    observation.reasons.push('incomplete log: frames were dropped or the size cap truncated it');
     if (observation.result === 'pass') observation.result = 'uncertain';
   }
   observation.log = { incomplete, droppedBefore, logs: parsed.map(logSummary) };

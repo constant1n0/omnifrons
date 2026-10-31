@@ -444,3 +444,34 @@ test('the two runs of a leg combine; a pty-cli log uses its text frames', () => 
   });
   assert.equal(pty.result, 'pass');
 });
+
+test('a log with no final state line is incomplete, and says so', () => {
+  const noState = log(header(), out(init), out(tool('Read', { file_path: 'AGENTS.md' })), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })));
+  assert.equal(parseHarnessLog(noState).state, null);
+  const result = observeHarnessLogs({ adapter: 'claude-code', logs: [noState], versionText: CLAUDE_VERSION, ...OPTIONS });
+  assert.equal(result.result, 'uncertain');
+  assert.equal(result.log.incomplete, true);
+  assert.ok(result.reasons.some((reason) => /log has no final state/.test(reason)));
+});
+
+test('a log ending in a continued fragment is incomplete: the log ends mid-line', () => {
+  const parsed = parseHarnessLog(log(header(), out('part', true), state()));
+  assert.equal(parsed.endsMidLine, true);
+  assert.equal(parseHarnessLog(log(header(), out('whole'), state())).endsMidLine, false);
+  const result = observeHarnessLogs({
+    adapter: 'claude-code', logs: [claudeLog(out('{"type":"assi', true))], versionText: CLAUDE_VERSION, ...OPTIONS,
+  });
+  assert.equal(result.result, 'uncertain');
+  assert.ok(result.reasons.some((reason) => /log ends mid-line/.test(reason)));
+});
+
+test('drops recorded on the state line count towards the dropped total', () => {
+  const lossy = log(
+    header(), out(init), out(tool('Read', { file_path: 'AGENTS.md' })), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })),
+    record({ kind: 'state', droppedBefore: 2, state: 'exited', code: 0 }),
+  );
+  assert.equal(parseHarnessLog(lossy).droppedBefore, 2);
+  const result = observeHarnessLogs({ adapter: 'claude-code', logs: [lossy], versionText: CLAUDE_VERSION, ...OPTIONS });
+  assert.equal(result.result, 'uncertain');
+  assert.equal(result.log.droppedBefore, 2);
+});
