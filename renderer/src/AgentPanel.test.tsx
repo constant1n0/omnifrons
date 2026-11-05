@@ -14567,3 +14567,71 @@ describe('AgentPanel follows approvals recorded in the Executable approval regio
     expect(start.disabled).toBe(true)
   })
 })
+
+describe('AgentPanel says why Start is disabled (#183)', () => {
+  function startButton(): HTMLButtonElement {
+    return screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+  }
+
+  /** The line Start's `aria-describedby` points at, or `null` when it points nowhere. */
+  function startDescription(): string | null {
+    const id = startButton().getAttribute('aria-describedby')
+    if (id === null) return null
+    return document.getElementById(id)?.textContent ?? null
+  }
+
+  it('names the adapter and the approval while neither is chosen', async () => {
+    mockIPC(defaultHandlers())
+    render(<AgentPanel />)
+    await screen.findByRole('option', { name: SAMPLE_EVIDENCE.canonicalPath })
+
+    expect(startButton().disabled).toBe(true)
+    expect(startDescription()).toBe('Start needs: an adapter, an approval.')
+    expect(screen.getByText('Start needs: an adapter, an approval.')).toBeTruthy()
+  })
+
+  it('names only the adapter when the approval and the prompt are chosen (the VP-S29 case)', async () => {
+    mockIPC(defaultHandlers())
+    render(<AgentPanel />)
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'Who are you?' } })
+
+    expect(startButton().disabled).toBe(true)
+    expect(startDescription()).toBe('Start needs: an adapter.')
+  })
+
+  it('names only the approval when the adapter is chosen', async () => {
+    mockIPC(defaultHandlers())
+    render(<AgentPanel />)
+    await selectOption('Adapter', 'claude-code')
+    await screen.findByRole('option', { name: SAMPLE_EVIDENCE.canonicalPath })
+
+    expect(startDescription()).toBe('Start needs: an approval.')
+  })
+
+  it('names the prompt size when only the prompt is over the limit', async () => {
+    await renderReady()
+    fireEvent.change(screen.getByLabelText('Prompt'), {
+      target: { value: 'a'.repeat(PROMPT_MAX_BYTES + 1) },
+    })
+
+    expect(startButton().disabled).toBe(true)
+    expect(startDescription()).toBe('Start needs: a prompt of 16 KiB or less.')
+  })
+
+  it('shows no line and describes nothing once everything is chosen, and none while a run is active', async () => {
+    await startAndCaptureChannel()
+
+    expect(startButton().disabled).toBe(true)
+    expect(startButton().getAttribute('aria-describedby')).toBeNull()
+    expect(screen.queryByText(/^Start needs:/)).toBeNull()
+  })
+
+  it('shows no line with everything chosen before Start', async () => {
+    await renderReady()
+
+    expect(startButton().disabled).toBe(false)
+    expect(startButton().getAttribute('aria-describedby')).toBeNull()
+    expect(screen.queryByText(/^Start needs:/)).toBeNull()
+  })
+})

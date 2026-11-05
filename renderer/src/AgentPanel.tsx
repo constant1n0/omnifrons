@@ -4611,6 +4611,18 @@ export function AgentPanel() {
   const selectedAdapter = adapters.find((adapter) => adapter.id === adapterId) ?? null
   const promptTooLarge = promptByteLength(prompt) > PROMPT_MAX_BYTES
   const startDisabled = runActive || adapterId === null || chosenApprovalId === null || promptTooLarge
+  /**
+   * What Start still needs, named beside it (#183): a disabled Start with
+   * no reason read as a hang during VP-S29's first run. Empty while a run is
+   * active -- Start is disabled for the run then, and the badge says so.
+   */
+  const startNeeds = runActive
+    ? []
+    : [
+        ...(adapterId === null ? ['an adapter'] : []),
+        ...(chosenApprovalId === null ? ['an approval'] : []),
+        ...(promptTooLarge ? ['a prompt of 16 KiB or less'] : []),
+      ]
 
   return (
     <section aria-label="Agent">
@@ -4784,12 +4796,20 @@ export function AgentPanel() {
           </p>
         )}
 
-        <button type="button" onClick={handleStart} disabled={startDisabled}>
+        <button
+          type="button"
+          onClick={handleStart}
+          disabled={startDisabled}
+          aria-describedby={startNeeds.length > 0 ? 'agent-start-needs' : undefined}
+        >
           Start
         </button>
         <button type="button" onClick={handleStop} disabled={activeId === null}>
           Stop
         </button>
+        {startNeeds.length > 0 && (
+          <p id="agent-start-needs">{`Start needs: ${startNeeds.join(', ')}.`}</p>
+        )}
       </div>
 
       <p>
