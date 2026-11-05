@@ -698,14 +698,46 @@ export async function executablePickAndProbe(): Promise<ProbeResult> {
   return invoke('executable_pick_and_probe')
 }
 
+/**
+ * Everyone listening for a change to the approvals on record (#182). The
+ * approval surface and the panels that offer an approval are siblings with
+ * no shared state, so a panel that fetched `approvals_list` at mount kept
+ * offering that list until a restart. The wrappers below are the one path
+ * every approve and revoke takes, so they announce a change here, and a
+ * panel re-reads the list itself -- the shell stays the only source of the
+ * records.
+ */
+const approvalsListeners = new Set<() => void>()
+
+/**
+ * Calls `listener` after every approve or revoke that the shell recorded
+ * through this module (a rejected call announces nothing). Returns the
+ * unsubscribe function. A listener re-reads `approvals_list` and routes its
+ * own failure to its own panel; it must not throw, because it runs inside
+ * the approve or revoke call that announced the change.
+ */
+export function onApprovalsChanged(listener: () => void): () => void {
+  approvalsListeners.add(listener)
+  return () => {
+    approvalsListeners.delete(listener)
+  }
+}
+
+function announceApprovalsChanged(): void {
+  for (const listener of [...approvalsListeners]) listener()
+}
+
 /** Approve a previously probed candidate. */
 export async function executableApprove(candidateId: CandidateId): Promise<Approval> {
-  return invoke('executable_approve', { candidateId })
+  const approval = await invoke<Approval>('executable_approve', { candidateId })
+  announceApprovalsChanged()
+  return approval
 }
 
 /** Revoke a previously recorded approval. */
 export async function executableRevoke(approvalId: ApprovalId): Promise<void> {
   await invoke('executable_revoke', { approvalId })
+  announceApprovalsChanged()
 }
 
 /** List every approval on record. */

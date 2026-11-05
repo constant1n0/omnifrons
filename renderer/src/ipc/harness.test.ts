@@ -39,6 +39,7 @@ import {
   isShellError,
   misplacedList,
   misplacedRemedy,
+  onApprovalsChanged,
   outboxStatus,
   publicationsList,
   recoveryApprove,
@@ -428,6 +429,59 @@ describe('executableRevoke', () => {
 
     await expect(executableRevoke('42')).resolves.toBeUndefined()
     expect(capturedArgs).toEqual({ approvalId: '42' })
+  })
+})
+
+describe('onApprovalsChanged (#182)', () => {
+  it('notifies after a successful approve and a successful revoke, never after a rejected one, and not after unsubscribing', async () => {
+    let reject = false
+    mockIPC((cmd) => {
+      if (reject) return Promise.reject({ code: 'approval-store-unavailable', message: 'down' })
+      if (cmd === 'executable_approve') return sampleApproval({ approvalId: '42' })
+      if (cmd === 'executable_revoke') return null
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    let notified = 0
+    const unsubscribe = onApprovalsChanged(() => {
+      notified += 1
+    })
+
+    await executableApprove(7)
+    expect(notified).toBe(1)
+    await executableRevoke('42')
+    expect(notified).toBe(2)
+
+    reject = true
+    await expect(executableApprove(7)).rejects.toMatchObject({ code: 'approval-store-unavailable' })
+    await expect(executableRevoke('42')).rejects.toMatchObject({
+      code: 'approval-store-unavailable',
+    })
+    expect(notified).toBe(2)
+
+    reject = false
+    unsubscribe()
+    await executableApprove(7)
+    await executableRevoke('42')
+    expect(notified).toBe(2)
+  })
+
+  it('notifies every subscriber, and listing approvals notifies no one', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'executable_approve') return sampleApproval({ approvalId: '42' })
+      if (cmd === 'approvals_list') return [sampleApproval({ approvalId: '42' })]
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    const seen: string[] = []
+    const unsubscribeFirst = onApprovalsChanged(() => seen.push('first'))
+    const unsubscribeSecond = onApprovalsChanged(() => seen.push('second'))
+
+    await approvalsList()
+    expect(seen).toEqual([])
+    await executableApprove(7)
+    expect(seen.sort()).toEqual(['first', 'second'])
+
+    unsubscribeFirst()
+    unsubscribeSecond()
   })
 })
 

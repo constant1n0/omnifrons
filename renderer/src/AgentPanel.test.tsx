@@ -14469,3 +14469,101 @@ describe('AgentPanel recovery gate and publish refusals (slice 5e)', () => {
     expect(countCalls(calls, 'artifact_publish')).toBe(0)
   })
 })
+
+describe('AgentPanel follows approvals recorded in the Executable approval region (#182)', () => {
+  const NEW_EVIDENCE: Evidence = {
+    ...SAMPLE_EVIDENCE,
+    canonicalPath: '/opt/tool/new',
+    sha256: 'b'.repeat(64),
+    sha256Short: 'bbbbbbbb',
+  }
+
+  /**
+   * One approvals store both panels read: `executable_approve` and
+   * `executable_revoke` change it, and `approvals_list` answers from it --
+   * the device store as the shell keeps it, so a panel that never asks again
+   * keeps showing what it saw at mount.
+   */
+  function mockSharedApprovals(initial: Approval[]): void {
+    let records = [...initial]
+    const fallback = defaultHandlers((cmd, args) => {
+      if (cmd === 'executable_pick_and_probe') return { candidateId: 7, evidence: NEW_EVIDENCE }
+      if (cmd === 'executable_approve') {
+        const approved = sampleApproval({ approvalId: '43', evidence: NEW_EVIDENCE })
+        records = [...records, approved]
+        return approved
+      }
+      if (cmd === 'executable_revoke') {
+        records = records.map((record) =>
+          record.approvalId === args.approvalId
+            ? { ...record, status: 'revoked', revokedAt: 900 }
+            : record,
+        )
+        return null
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    mockIPC((cmd, args) => (cmd === 'approvals_list' ? records : fallback(cmd, args)))
+  }
+
+  function agentApprovalValues(): string[] {
+    const agent = screen.getByRole('region', { name: 'Agent' })
+    const select = within(agent).getByLabelText('Approval') as HTMLSelectElement
+    return Array.from(select.options).map((option) => option.value)
+  }
+
+  it('offers an approval recorded after mount without a restart', async () => {
+    mockSharedApprovals([sampleApproval({ approvalId: '42' })])
+    render(
+      <>
+        <ApprovalSurface />
+        <AgentPanel />
+      </>,
+    )
+    await selectOption('Approval', '42')
+    expect(agentApprovalValues()).toEqual(['', '42'])
+
+    const surface = screen.getByRole('region', { name: 'Executable approval' })
+    fireEvent.click(within(surface).getByRole('button', { name: 'Pick executable' }))
+    fireEvent.change(
+      await within(surface).findByLabelText('Type the short digest (bbbbbbbb) to confirm'),
+      { target: { value: 'bbbbbbbb' } },
+    )
+    fireEvent.click(within(surface).getByRole('button', { name: 'Approve' }))
+
+    await waitFor(() => {
+      expect(agentApprovalValues()).toEqual(['', '42', '43'])
+    })
+    // The selection the user had made is left alone.
+    expect((screen.getByLabelText('Approval') as HTMLSelectElement).value).toBe('42')
+  })
+
+  it('withdraws a revoked approval, selected or not, and Start stops counting it as chosen', async () => {
+    mockSharedApprovals([
+      sampleApproval({ approvalId: '42' }),
+      sampleApproval({ approvalId: '43', evidence: NEW_EVIDENCE }),
+    ])
+    render(
+      <>
+        <ApprovalSurface />
+        <AgentPanel />
+      </>,
+    )
+    await selectOption('Adapter', 'claude-code')
+    await selectOption('Approval', '42')
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+    const start = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+    expect(start.disabled).toBe(false)
+
+    const surface = screen.getByRole('region', { name: 'Executable approval' })
+    const row = within(within(surface).getByLabelText('Approvals list')).getByText('/opt/tool/app')
+      .closest('li') as HTMLElement
+    fireEvent.click(within(row).getByRole('button', { name: 'Revoke' }))
+
+    await waitFor(() => {
+      expect(agentApprovalValues()).toEqual(['', '43'])
+    })
+    expect((screen.getByLabelText('Approval') as HTMLSelectElement).value).toBe('')
+    expect(start.disabled).toBe(true)
+  })
+})

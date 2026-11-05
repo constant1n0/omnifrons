@@ -21,6 +21,7 @@ import {
   isShellError,
   misplacedList,
   misplacedRemedy,
+  onApprovalsChanged,
   outboxStatus,
   publicationsList,
   recoveryApprove,
@@ -3000,7 +3001,13 @@ export function AgentPanel() {
    */
   const latestApprovalsRequestRef = useRef(0)
 
-  useEffect(() => {
+  /**
+   * Fetches the approvals on record: on mount, and again whenever an
+   * approve or revoke is recorded anywhere on the page (#182) -- the
+   * Executable approval region is a sibling with its own state, so without
+   * this the select kept offering the list it saw at mount until a restart.
+   */
+  const refreshApprovals = useCallback(() => {
     const requestId = (latestApprovalsRequestRef.current += 1)
     approvalsList()
       .then((records) => {
@@ -3014,6 +3021,24 @@ export function AgentPanel() {
         setError(isShellError(listError) ? listError : 'unexpected')
       })
   }, [])
+
+  useEffect(() => {
+    refreshApprovals()
+    return onApprovalsChanged(refreshApprovals)
+  }, [refreshApprovals])
+
+  /**
+   * The chosen approval, only while the list still holds it as active
+   * (#182). A revocation recorded elsewhere withdraws it from the select;
+   * the stale id left in `approvalId` must not keep Start enabled for a
+   * launch the gate would deny. Derived rather than cleared: nothing
+   * writes the selection while a run is active, as before.
+   */
+  const chosenApprovalId = approvals.some(
+    (approval) => approval.approvalId === approvalId && approval.status === 'active',
+  )
+    ? approvalId
+    : null
 
   /**
    * The id of the current generation's run once known, or `null` while
@@ -3326,7 +3351,7 @@ export function AgentPanel() {
     // Belt-and-suspenders: the Start button is already disabled while a
     // required selection is missing or the prompt exceeds the advisory
     // cap, but never spawn on a value this panel itself considers invalid.
-    if (adapterId === null || approvalId === null) return
+    if (adapterId === null || chosenApprovalId === null) return
     if (promptByteLength(prompt) > PROMPT_MAX_BYTES) return
 
     const sentPrompt = prompt
@@ -3354,7 +3379,7 @@ export function AgentPanel() {
     setPendingSpawns((pending) => pending + 1)
     try {
       const id = await harnessSpawn(
-        { type: 'adapter', adapterId, approvalId, prompt: sentPrompt },
+        { type: 'adapter', adapterId, approvalId: chosenApprovalId, prompt: sentPrompt },
         (frame) => handleFrame(generation, frame),
       )
       if (!mountedRef.current) return
@@ -4585,7 +4610,7 @@ export function AgentPanel() {
   const activeApprovals = approvals.filter((approval) => approval.status === 'active')
   const selectedAdapter = adapters.find((adapter) => adapter.id === adapterId) ?? null
   const promptTooLarge = promptByteLength(prompt) > PROMPT_MAX_BYTES
-  const startDisabled = runActive || adapterId === null || approvalId === null || promptTooLarge
+  const startDisabled = runActive || adapterId === null || chosenApprovalId === null || promptTooLarge
 
   return (
     <section aria-label="Agent">
@@ -4731,7 +4756,7 @@ export function AgentPanel() {
         <label htmlFor="agent-approval">Approval</label>
         <select
           id="agent-approval"
-          value={approvalId === null ? '' : String(approvalId)}
+          value={chosenApprovalId === null ? '' : String(chosenApprovalId)}
           disabled={runActive}
           onChange={(event) => {
             if (runActiveRef.current || runActive) return
