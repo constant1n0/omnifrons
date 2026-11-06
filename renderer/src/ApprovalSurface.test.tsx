@@ -1,5 +1,5 @@
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ApprovalSurface } from './ApprovalSurface'
@@ -29,6 +29,7 @@ function sampleApproval(overrides: Partial<Approval> = {}): Approval {
     approvedAt: 500,
     status: 'active',
     revokedAt: null,
+    presence: 'present',
     ...overrides,
   }
 }
@@ -312,7 +313,7 @@ describe('ApprovalSurface', () => {
       if (cmd === 'approvals_list') {
         listCallCount += 1
         if (listCallCount === 1) return [sampleApproval({ approvalId: '42' })]
-        return [sampleApproval({ approvalId: '42', status: 'revoked', revokedAt: 600 })]
+        return [sampleApproval({ approvalId: '42', status: 'revoked', revokedAt: 600, presence: null })]
       }
       if (cmd === 'executable_revoke') {
         capturedArgs = args as Record<string, unknown>
@@ -342,7 +343,7 @@ describe('ApprovalSurface', () => {
       if (cmd === 'approvals_list') {
         listCallCount += 1
         if (listCallCount === 1) return [sampleApproval({ approvalId: '42' })]
-        return [sampleApproval({ approvalId: '42', status: 'revoked', revokedAt: 600 })]
+        return [sampleApproval({ approvalId: '42', status: 'revoked', revokedAt: 600, presence: null })]
       }
       if (cmd === 'executable_revoke') {
         revokeCallCount += 1
@@ -627,5 +628,55 @@ describe('ApprovalSurface', () => {
 
     expect(consoleErrorSpy).not.toHaveBeenCalled()
     consoleErrorSpy.mockRestore()
+  })
+})
+
+describe('ApprovalSurface marks an active approval whose executable is gone or changed (#184)', () => {
+  it('names a missing or changed executable in its row and keeps Revoke there', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'approvals_list') {
+        return [
+          sampleApproval({
+            approvalId: '42',
+            evidence: { ...SAMPLE_EVIDENCE, canonicalPath: '/tmp/vp-s6/gone' },
+            presence: 'missing',
+          }),
+          sampleApproval({
+            approvalId: '43',
+            evidence: { ...SAMPLE_EVIDENCE, canonicalPath: '/opt/tool/rebuilt' },
+            presence: 'changed',
+          }),
+          sampleApproval({
+            approvalId: '44',
+            evidence: { ...SAMPLE_EVIDENCE, canonicalPath: '/opt/tool/fine' },
+          }),
+          sampleApproval({
+            approvalId: '45',
+            evidence: { ...SAMPLE_EVIDENCE, canonicalPath: '/opt/tool/old' },
+            status: 'revoked',
+            revokedAt: 600,
+            presence: null,
+          }),
+        ]
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+
+    render(<ApprovalSurface />)
+    const row = async (path: string) => (await screen.findByText(path)).closest('li') as HTMLElement
+
+    const missing = await row('/tmp/vp-s6/gone')
+    expect(missing.textContent).toContain('active -- executable missing')
+    expect(within(missing).getByRole('button', { name: 'Revoke' })).toBeTruthy()
+
+    const changed = await row('/opt/tool/rebuilt')
+    expect(changed.textContent).toContain('active -- executable changed since approval')
+    expect(within(changed).getByRole('button', { name: 'Revoke' })).toBeTruthy()
+
+    const fine = await row('/opt/tool/fine')
+    expect(fine.textContent).not.toContain('executable')
+
+    const revoked = await row('/opt/tool/old')
+    expect(revoked.textContent).not.toContain('executable')
   })
 })

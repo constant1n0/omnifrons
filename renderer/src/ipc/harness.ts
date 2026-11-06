@@ -584,6 +584,15 @@ export interface ProbeResult {
 /** An approval's status tag, as it crosses IPC. */
 export type ApprovalStatus = 'active' | 'revoked'
 
+/**
+ * Whether an active approval's executable is still where, and the size, it
+ * was approved (#184), judged by the shell when it lists the approvals, from
+ * metadata alone. A hint for the lists: the launch gate's re-probe stays the
+ * authority, so `present` means nothing was seen against the file, not that
+ * its content was verified.
+ */
+export type ExecutablePresence = 'present' | 'missing' | 'changed'
+
 /** One approval on record, as it crosses IPC. */
 export interface Approval {
   approvalId: ApprovalId
@@ -592,6 +601,8 @@ export interface Approval {
   status: ApprovalStatus
   /** Ms since epoch once `status` is `revoked`; `null` while `active`. */
   revokedAt: number | null
+  /** The executable's presence while `active`; `null` once `revoked`. */
+  presence: ExecutablePresence | null
 }
 
 // -- Slice 3: workspace, adapters, and the "event" harness frame --

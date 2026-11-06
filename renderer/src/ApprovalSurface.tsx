@@ -12,6 +12,7 @@ import {
   type ProbeResult,
   type ShellError,
 } from './ipc/harness'
+import { executablePresenceNote } from './approvalText'
 import { PlainTextLine } from './PlainTextLine'
 
 /**
@@ -336,6 +337,9 @@ export function ApprovalSurface() {
             <PlainTextLine text={approval.evidence.canonicalPath} />
             {' -- '}
             <span>{approval.status}</span>
+            {executablePresenceNote(approval) !== null && (
+              <span>{` -- ${executablePresenceNote(approval)}`}</span>
+            )}
             {approval.status === 'active' && (
               <button
                 type="button"

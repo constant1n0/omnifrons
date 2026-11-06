@@ -62,6 +62,7 @@ import {
   type CandidateState,
   type CatalogRepairPreview,
   type Evidence,
+  type ExecutablePresence,
   type GuidanceAction,
   type GuidanceApplied,
   type GuidanceKind,
@@ -150,6 +151,7 @@ function sampleApproval(overrides: Partial<Approval> = {}): Approval {
     approvedAt: 500,
     status: 'active',
     revokedAt: null,
+    presence: 'present',
     ...overrides,
   }
 }
@@ -3741,6 +3743,8 @@ const SHELL_ERROR_CODES = [
 ] as const
 /** Every token {@link ApprovalStatus} declares. */
 const APPROVAL_STATUSES = ['active', 'revoked'] as const
+/** Every token {@link ExecutablePresence} declares (#184). */
+const EXECUTABLE_PRESENCES = ['present', 'missing', 'changed'] as const
 /** Every token {@link WorkAreaState} declares. */
 const WORK_AREA_STATES = ['valid', 'work-area-invalid'] as const
 /** Every token {@link TransportClass} declares. */
@@ -3859,6 +3863,7 @@ const _assertions: [
   CoversExactly<TerminalActionKind, typeof TERMINAL_ACTION_KINDS>,
   CoversExactly<ShellErrorCode, typeof SHELL_ERROR_CODES>,
   CoversExactly<ApprovalStatus, typeof APPROVAL_STATUSES>,
+  CoversExactly<ExecutablePresence, typeof EXECUTABLE_PRESENCES>,
   CoversExactly<WorkAreaState, typeof WORK_AREA_STATES>,
   CoversExactly<TransportClass, typeof TRANSPORT_CLASSES>,
   CoversExactly<PromptChannel, typeof PROMPT_CHANNELS>,
@@ -3929,6 +3934,7 @@ const _assertions: [
   true,
   true,
   true,
+  true,
 ]
 
 /**
@@ -3943,6 +3949,7 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['TerminalActionKindDto', TERMINAL_ACTION_KINDS],
   ['ShellErrorCode', SHELL_ERROR_CODES],
   ['ApprovalStatusTag', APPROVAL_STATUSES],
+  ['ExecutablePresenceTag', EXECUTABLE_PRESENCES],
   ['WorkAreaStateTag', WORK_AREA_STATES],
   ['TransportClassDto', TRANSPORT_CLASSES],
   ['PromptChannelDto', PROMPT_CHANNELS],
@@ -4006,7 +4013,7 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(37)
+    expect(enums).toHaveLength(38)
   })
 })
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
+import { executablePresenceNote, isLaunchableApproval } from './approvalText'
 import { stripControlCharacters } from './controlCharacters'
 import {
   adaptersList,
@@ -3028,14 +3029,16 @@ export function AgentPanel() {
   }, [refreshApprovals])
 
   /**
-   * The chosen approval, only while the list still holds it as active
-   * (#182). A revocation recorded elsewhere withdraws it from the select;
+   * The chosen approval, only while the list still holds it as active and
+   * its executable as present (#182, #184). A revocation recorded elsewhere
+   * withdraws it from the select, and a file the shell found gone or
+   * changed disables its option;
    * the stale id left in `approvalId` must not keep Start enabled for a
    * launch the gate would deny. Derived rather than cleared: nothing
    * writes the selection while a run is active, as before.
    */
   const chosenApprovalId = approvals.some(
-    (approval) => approval.approvalId === approvalId && approval.status === 'active',
+    (approval) => approval.approvalId === approvalId && isLaunchableApproval(approval),
   )
     ? approvalId
     : null
@@ -4776,11 +4779,22 @@ export function AgentPanel() {
           }}
         >
           <option value="">Select an approval</option>
-          {activeApprovals.map((approval) => (
-            <option key={approval.approvalId} value={approval.approvalId}>
-              {stripControlCharacters(approval.evidence.canonicalPath)}
-            </option>
-          ))}
+          {activeApprovals.map((approval) => {
+            // An approval whose executable the shell found gone or changed
+            // stays listed, named and disabled, rather than vanishing: the
+            // operator learns why it cannot be picked (#184).
+            const note = executablePresenceNote(approval)
+            const path = stripControlCharacters(approval.evidence.canonicalPath)
+            return (
+              <option
+                key={approval.approvalId}
+                value={approval.approvalId}
+                disabled={!isLaunchableApproval(approval)}
+              >
+                {note === null ? path : `${path} (${note})`}
+              </option>
+            )
+          })}
         </select>
 
         <label htmlFor="agent-prompt">Prompt</label>

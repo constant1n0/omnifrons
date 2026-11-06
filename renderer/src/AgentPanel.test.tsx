@@ -11,6 +11,7 @@ import { AgentPanel } from './AgentPanel'
 import PANEL_SOURCE from './AgentPanel.tsx?raw'
 import { ApprovalSurface } from './ApprovalSurface'
 import { HarnessPanel } from './HarnessPanel'
+import { executableRevoke } from './ipc/harness'
 import type {
   AdapterDescriptor,
   Approval,
@@ -61,6 +62,7 @@ function sampleApproval(overrides: Partial<Approval> = {}): Approval {
     approvedAt: 500,
     status: 'active',
     revokedAt: null,
+    presence: 'present',
     ...overrides,
   }
 }
@@ -940,7 +942,7 @@ describe('AgentPanel', () => {
       if (cmd === 'approvals_list') {
         return [
           sampleApproval({ approvalId: '1', status: 'active' }),
-          sampleApproval({ approvalId: '2', status: 'revoked', revokedAt: 600 }),
+          sampleApproval({ approvalId: '2', status: 'revoked', revokedAt: 600, presence: null }),
         ]
       }
       throw new Error(`unexpected command: ${cmd}`)
@@ -14496,7 +14498,7 @@ describe('AgentPanel follows approvals recorded in the Executable approval regio
       if (cmd === 'executable_revoke') {
         records = records.map((record) =>
           record.approvalId === args.approvalId
-            ? { ...record, status: 'revoked', revokedAt: 900 }
+            ? { ...record, status: 'revoked', revokedAt: 900, presence: null }
             : record,
         )
         return null
@@ -14635,3 +14637,75 @@ describe('AgentPanel says why Start is disabled (#183)', () => {
     expect(screen.queryByText(/^Start needs:/)).toBeNull()
   })
 })
+
+describe('AgentPanel does not offer an approval whose executable is gone or changed (#184)', () => {
+  const GONE: Evidence = { ...SAMPLE_EVIDENCE, canonicalPath: '/tmp/vp-s6/gone' }
+  const REBUILT: Evidence = { ...SAMPLE_EVIDENCE, canonicalPath: '/opt/tool/rebuilt' }
+
+  function approvalOption(value: string): HTMLOptionElement {
+    const select = screen.getByLabelText('Approval') as HTMLSelectElement
+    const option = Array.from(select.options).find((candidate) => candidate.value === value)
+    if (!option) throw new Error(`no option ${value}`)
+    return option
+  }
+
+  it('lists a missing or changed executable as a disabled option that names why', async () => {
+    mockIPC((cmd, args) =>
+      cmd === 'approvals_list'
+        ? [
+            sampleApproval({ approvalId: '42' }),
+            sampleApproval({ approvalId: '43', evidence: GONE, presence: 'missing' }),
+            sampleApproval({ approvalId: '44', evidence: REBUILT, presence: 'changed' }),
+          ]
+        : defaultHandlers()(cmd, args),
+    )
+    render(<AgentPanel />)
+    await screen.findByRole('option', { name: '/tmp/vp-s6/gone (executable missing)' })
+
+    expect(approvalOption('42').disabled).toBe(false)
+    expect(approvalOption('42').textContent).toBe(SAMPLE_EVIDENCE.canonicalPath)
+    expect(approvalOption('43').disabled).toBe(true)
+    expect(approvalOption('43').textContent).toBe('/tmp/vp-s6/gone (executable missing)')
+    expect(approvalOption('44').disabled).toBe(true)
+    expect(approvalOption('44').textContent).toBe(
+      '/opt/tool/rebuilt (executable changed since approval)',
+    )
+  })
+
+  it('stops counting a chosen approval once a refreshed list marks its executable missing', async () => {
+    let presence: 'present' | 'missing' = 'present'
+    mockIPC((cmd, args) =>
+      cmd === 'approvals_list'
+        ? [sampleApproval({ approvalId: '42', presence })]
+        : defaultHandlers((command) => {
+            if (command === 'executable_revoke') return null
+            throw new Error(`unexpected command: ${command}`)
+          })(cmd, args),
+    )
+    await renderReadyWithoutMock()
+    const start = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement
+    expect(start.disabled).toBe(false)
+
+    presence = 'missing'
+    // Any recorded change re-reads the list (#182); a revoke of another
+    // approval is the realistic trigger.
+    await act(async () => {
+      await executableRevoke('99')
+    })
+
+    await waitFor(() => {
+      expect(approvalOption('42').disabled).toBe(true)
+    })
+    expect((screen.getByLabelText('Approval') as HTMLSelectElement).value).toBe('')
+    expect(start.disabled).toBe(true)
+    expect(screen.getByText('Start needs: an approval.')).toBeTruthy()
+  })
+})
+
+/** {@link renderReady} for a test that installed its own `mockIPC`. */
+async function renderReadyWithoutMock(): Promise<void> {
+  render(<AgentPanel />)
+  await selectOption('Adapter', 'claude-code')
+  await selectOption('Approval', '42')
+  fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'do the thing' } })
+}

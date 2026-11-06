@@ -28,6 +28,7 @@ function sampleApproval(overrides: Partial<Approval> = {}): Approval {
     approvedAt: 500,
     status: 'active',
     revokedAt: null,
+    presence: 'present',
     ...overrides,
   }
 }
@@ -582,7 +583,7 @@ describe('HarnessPanel', () => {
       if (cmd === 'approvals_list') {
         return [
           sampleApproval({ approvalId: '1', status: 'active' }),
-          sampleApproval({ approvalId: '2', status: 'revoked', revokedAt: 600 }),
+          sampleApproval({ approvalId: '2', status: 'revoked', revokedAt: 600, presence: null }),
         ]
       }
       throw new Error(`unexpected command: ${cmd}`)
