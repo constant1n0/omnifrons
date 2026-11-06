@@ -2011,11 +2011,30 @@ pub async fn executable_approve(
         find_candidate(&candidates, candidate_id)?
     };
 
-    let record = with_gate(app, move |gate| gate.approve_candidate(identity))
-        .await
-        .map_err(ShellError::from)?;
+    let approval = with_gate(app, move |gate| {
+        gate.approve_candidate(identity)
+            .map(|record| approval_dto(&record))
+    })
+    .await
+    .map_err(ShellError::from)?;
 
-    Ok(ApprovalDto::from_record(&record))
+    Ok(approval)
+}
+
+/// The DTO for `record`: an active approval carries its executable's
+/// presence, judged now from one metadata read at its canonical path (#184),
+/// so the approval lists can mark a file that is gone or changed before the
+/// operator picks it; a revoked one carries none. Blocking I/O -- called
+/// from the commands' own blocking tasks.
+fn approval_dto(record: &omnifrons_domain::executable::ApprovalRecord) -> ApprovalDto {
+    use omnifrons_domain::executable::ApprovalStatus;
+    let presence = match record.status {
+        ApprovalStatus::Active => Some(omnifrons_adapters::fs_prober::executable_presence(
+            &record.identity,
+        )),
+        ApprovalStatus::Revoked { .. } => None,
+    };
+    ApprovalDto::from_record(record, presence)
 }
 
 /// Revoke a previously recorded approval.
@@ -2049,7 +2068,7 @@ pub async fn approvals_list(app: AppHandle) -> Result<Vec<ApprovalDto>, ShellErr
         let state = app.state::<ExecutableState>();
         let store = state.open_store()?;
         let records = ApprovalStore::list(&store)?;
-        Ok::<_, ApprovalStoreError>(records.iter().map(ApprovalDto::from_record).collect())
+        Ok::<_, ApprovalStoreError>(records.iter().map(approval_dto).collect())
     })
     .await
     .expect("the blocking approvals-list task panicked")
@@ -2452,8 +2471,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterWireSequencer, PtyForwarder, ShellError, adapter_wire_frames, find_candidate,
-        pty_wire_frames,
+        AdapterWireSequencer, PtyForwarder, ShellError, adapter_wire_frames, approval_dto,
+        find_candidate, pty_wire_frames,
     };
     use crate::executable_state::CandidateTable;
     use crate::ipc::dto::{
@@ -5364,5 +5383,57 @@ mod tests {
             lines[1],
             serde_json::json!({"kind":"state","droppedBefore":4,"state":"exited","code":1})
         );
+    }
+
+    /// #184: an active approval carries its executable's presence, judged
+    /// at listing time from the canonical path; a revoked one carries none.
+    #[test]
+    fn approval_dto_judges_presence_for_active_records_only() {
+        use omnifrons_domain::executable::{
+            ApprovalId, ApprovalRecord, ApprovalStatus, DeviceLocalUser, ExecutableIdentity,
+            PlatformEvidence,
+        };
+        use std::time::SystemTime;
+
+        let dir = std::env::temp_dir().join(format!(
+            "omnifrons-shell-approval-presence-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let path = dir.join("tool");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
+        let record = |status| ApprovalRecord {
+            approval_id: ApprovalId(7),
+            identity: ExecutableIdentity {
+                canonical_path: path.clone(),
+                size: 10,
+                sha256: Sha256Digest([0xaa; 32]),
+                modified_at: None,
+                platform: PlatformEvidence::Unix { mode: 0o755 },
+            },
+            approved_at: SystemTime::UNIX_EPOCH,
+            approver: DeviceLocalUser,
+            status,
+        };
+        let presence = |status| {
+            serde_json::to_value(approval_dto(&record(status))).expect("serializes")["presence"]
+                .clone()
+        };
+        let revoked = ApprovalStatus::Revoked {
+            revoked_at: SystemTime::UNIX_EPOCH,
+        };
+
+        assert_eq!(
+            presence(ApprovalStatus::Active),
+            serde_json::json!("present")
+        );
+        assert_eq!(presence(revoked), serde_json::json!(null));
+
+        std::fs::remove_dir_all(&dir).expect("remove the fixture directory");
+        assert_eq!(
+            presence(ApprovalStatus::Active),
+            serde_json::json!("missing")
+        );
+        assert_eq!(presence(revoked), serde_json::json!(null));
     }
 }

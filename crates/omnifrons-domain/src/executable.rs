@@ -191,6 +191,41 @@ pub struct ApprovalRecord {
     pub status: ApprovalStatus,
 }
 
+/// Whether an approved executable is still where it was approved, at the
+/// size it was approved (#184) -- a hint for the approval lists, judged from
+/// one metadata read at the canonical path, so an operator is not offered an
+/// approval whose file is gone.
+///
+/// Never a launch decision: a file of the recorded size can still hold
+/// other bytes, and only the pre-launch re-probe's digest comparison can
+/// tell. [`Self::Present`] is therefore "nothing seen against it", not
+/// "verified".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutablePresence {
+    /// A regular file of the recorded size is at the canonical path.
+    Present,
+    /// The canonical path no longer leads to a regular file this user can
+    /// read the metadata of: deleted, its directory deleted, or something
+    /// other than a regular file in its place.
+    Missing,
+    /// A regular file is at the canonical path, but not of the recorded
+    /// size: its content changed since the approval.
+    Changed,
+}
+
+impl ExecutablePresence {
+    /// Judge from what a metadata read observed at the canonical path:
+    /// `None` when no regular file was found there, otherwise its size.
+    #[must_use]
+    pub const fn judge(recorded_size: u64, observed_regular_file_size: Option<u64>) -> Self {
+        match observed_regular_file_size {
+            None => Self::Missing,
+            Some(size) if size == recorded_size => Self::Present,
+            Some(_) => Self::Changed,
+        }
+    }
+}
+
 /// Why a launch was denied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenialReason {
@@ -294,6 +329,26 @@ mod tests {
             modified_at: Some(SystemTime::UNIX_EPOCH),
             platform: PlatformEvidence::Unix { mode: 0o755 },
         }
+    }
+
+    #[test]
+    fn presence_is_judged_from_the_regular_file_at_the_path_and_its_size() {
+        assert_eq!(
+            ExecutablePresence::judge(4096, Some(4096)),
+            ExecutablePresence::Present
+        );
+        assert_eq!(
+            ExecutablePresence::judge(4096, Some(4097)),
+            ExecutablePresence::Changed
+        );
+        assert_eq!(
+            ExecutablePresence::judge(4096, Some(0)),
+            ExecutablePresence::Changed
+        );
+        assert_eq!(
+            ExecutablePresence::judge(4096, None),
+            ExecutablePresence::Missing
+        );
     }
 
     #[test]

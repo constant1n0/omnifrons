@@ -2055,6 +2055,30 @@ pub enum ApprovalStatusTag {
     Revoked,
 }
 
+/// Whether an active approval's executable is still where, and the size,
+/// it was approved (#184), as it crosses IPC -- mirrors
+/// `omnifrons_domain::executable::ExecutablePresence`. A hint judged at
+/// listing time from metadata alone; the launch gate's re-probe stays the
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutablePresenceTag {
+    Present,
+    Missing,
+    Changed,
+}
+
+impl From<omnifrons_domain::executable::ExecutablePresence> for ExecutablePresenceTag {
+    fn from(presence: omnifrons_domain::executable::ExecutablePresence) -> Self {
+        use omnifrons_domain::executable::ExecutablePresence;
+        match presence {
+            ExecutablePresence::Present => Self::Present,
+            ExecutablePresence::Missing => Self::Missing,
+            ExecutablePresence::Changed => Self::Changed,
+        }
+    }
+}
+
 /// One approval on record, as it crosses IPC.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2064,11 +2088,20 @@ pub struct ApprovalDto {
     pub approved_at: u64,
     pub status: ApprovalStatusTag,
     pub revoked_at: Option<u64>,
+    /// The executable's presence for an active approval (#184); `null` for
+    /// a revoked one, whose file nobody will launch.
+    pub presence: Option<ExecutablePresenceTag>,
 }
 
 impl ApprovalDto {
+    /// The DTO for `record`, carrying `presence` as the caller judged it
+    /// (the shell's commands judge it for active records only; this
+    /// conversion does no I/O of its own).
     #[must_use]
-    pub fn from_record(record: &omnifrons_domain::executable::ApprovalRecord) -> Self {
+    pub fn from_record(
+        record: &omnifrons_domain::executable::ApprovalRecord,
+        presence: Option<omnifrons_domain::executable::ExecutablePresence>,
+    ) -> Self {
         use omnifrons_domain::executable::ApprovalStatus;
         let (status, revoked_at) = match record.status {
             ApprovalStatus::Active => (ApprovalStatusTag::Active, None),
@@ -2083,6 +2116,7 @@ impl ApprovalDto {
             approved_at: system_time_to_millis(record.approved_at),
             status,
             revoked_at,
+            presence: presence.map(ExecutablePresenceTag::from),
         }
     }
 }
@@ -3162,10 +3196,10 @@ impl DefinitionCreateApplyDto {
 mod tests {
     use super::{
         AdapterDescriptorDto, ApprovalDto, ApprovalIdDto, ApprovalStatusTag, CandidateIdDto,
-        EvidenceDto, HarnessFrame, HarnessKindDto, PlatformEvidenceDto, ProbeResultDto,
-        ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto, ProcessTerminalStateTag,
-        PromptChannelDto, ScopeModeDto, ShellError, ShellErrorCode, ShellErrorDetail,
-        TransportClassDto, WorkspaceDto,
+        EvidenceDto, ExecutablePresenceTag, HarnessFrame, HarnessKindDto, PlatformEvidenceDto,
+        ProbeResultDto, ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto,
+        ProcessTerminalStateTag, PromptChannelDto, ScopeModeDto, ShellError, ShellErrorCode,
+        ShellErrorDetail, TransportClassDto, WorkspaceDto,
     };
 
     use omnifrons_domain::executable::Sha256Digest;
@@ -3602,9 +3636,11 @@ mod tests {
             approved_at: 500,
             status: ApprovalStatusTag::Active,
             revoked_at: None,
+            presence: Some(ExecutablePresenceTag::Present),
         };
         assert_eq!(json(&active)["status"], serde_json::json!("active"));
         assert_eq!(json(&active)["revokedAt"], serde_json::json!(null));
+        assert_eq!(json(&active)["presence"], serde_json::json!("present"));
 
         let revoked = ApprovalDto {
             approval_id: ApprovalIdDto(7),
@@ -3612,9 +3648,49 @@ mod tests {
             approved_at: 500,
             status: ApprovalStatusTag::Revoked,
             revoked_at: Some(600),
+            presence: None,
         };
         assert_eq!(json(&revoked)["status"], serde_json::json!("revoked"));
         assert_eq!(json(&revoked)["revokedAt"], serde_json::json!(600));
+        assert_eq!(json(&revoked)["presence"], serde_json::json!(null));
+    }
+
+    /// #184: `from_record` carries the presence the caller judged, as its
+    /// kebab-case token, and `null` when it was given none.
+    #[test]
+    fn approval_dto_from_record_carries_the_presence_it_was_given() {
+        use omnifrons_domain::executable::{
+            ApprovalId, ApprovalRecord, ApprovalStatus, DeviceLocalUser, ExecutableIdentity,
+            ExecutablePresence, PlatformEvidence,
+        };
+        use std::time::{Duration, SystemTime};
+
+        let record = ApprovalRecord {
+            approval_id: ApprovalId(7),
+            identity: ExecutableIdentity {
+                canonical_path: "/opt/tool/app".into(),
+                size: 4096,
+                sha256: Sha256Digest([0xaa; 32]),
+                modified_at: None,
+                platform: PlatformEvidence::Unix { mode: 0o755 },
+            },
+            approved_at: SystemTime::UNIX_EPOCH + Duration::from_millis(500),
+            approver: DeviceLocalUser,
+            status: ApprovalStatus::Active,
+        };
+
+        for (presence, token) in [
+            (ExecutablePresence::Present, "present"),
+            (ExecutablePresence::Missing, "missing"),
+            (ExecutablePresence::Changed, "changed"),
+        ] {
+            let dto = ApprovalDto::from_record(&record, Some(presence));
+            assert_eq!(json(&dto)["presence"], serde_json::json!(token));
+        }
+        assert_eq!(
+            json(&ApprovalDto::from_record(&record, None))["presence"],
+            serde_json::json!(null)
+        );
     }
 
     // -- Slice 3: workspace, adapters, and the "event" harness frame --

@@ -22,7 +22,9 @@ use std::io::Read as _;
 use std::path::Path;
 
 use omnifrons_app::{ExecHandle, ExecutableProber, ProbeOutcome, ProbedExecutable};
-use omnifrons_domain::executable::{ExecutableIdentity, PlatformEvidence, Sha256Digest};
+use omnifrons_domain::executable::{
+    ExecutableIdentity, ExecutablePresence, PlatformEvidence, Sha256Digest,
+};
 use sha2::{Digest, Sha256};
 
 /// The maximum size this prober will hash. A candidate strictly larger is
@@ -90,6 +92,22 @@ impl ExecutableProber for FsExecutableProber {
 
         build_identity(file, canonical_path, size, modified_at, platform)
     }
+}
+
+/// The [`ExecutablePresence`] of an approved `identity` (#184): one
+/// metadata read at its canonical path, following symlinks as the probe's
+/// own canonicalization does, compared with the recorded size. Any failure
+/// to read that metadata counts as missing -- the error itself is dropped,
+/// like every probe error here, since its text names the path. Never hashes
+/// and never opens the file: this is a hint for the approval lists, and the
+/// launch gate's re-probe stays the authority.
+#[must_use]
+pub fn executable_presence(identity: &ExecutableIdentity) -> ExecutablePresence {
+    let observed = fs::metadata(&identity.canonical_path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|metadata| metadata.len());
+    ExecutablePresence::judge(identity.size, observed)
 }
 
 /// Open `candidate` (already canonicalized by the caller) for hashing,

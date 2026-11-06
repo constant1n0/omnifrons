@@ -57,6 +57,84 @@ fn expect_identity(outcome: ProbeOutcome) -> omnifrons_app::ProbedExecutable {
     }
 }
 
+/// `executable_presence` (#184): the approval lists' hint about an
+/// approved executable, from one metadata read at its canonical path.
+mod presence_tests {
+    use std::path::PathBuf;
+
+    use omnifrons_adapters::fs_prober::executable_presence;
+    use omnifrons_domain::executable::{
+        ExecutableIdentity, ExecutablePresence, PlatformEvidence, Sha256Digest,
+    };
+
+    use super::TempDir;
+
+    /// An approval's recorded identity for `path` at `size` bytes; the digest
+    /// and platform evidence play no part in a presence judgement.
+    fn recorded(path: PathBuf, size: u64) -> ExecutableIdentity {
+        ExecutableIdentity {
+            canonical_path: path,
+            size,
+            sha256: Sha256Digest([0; 32]),
+            modified_at: None,
+            platform: PlatformEvidence::Unix { mode: 0o755 },
+        }
+    }
+
+    #[test]
+    fn a_file_of_the_recorded_size_is_present() {
+        let dir = TempDir::new("presence-present");
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
+
+        assert_eq!(
+            executable_presence(&recorded(path, 10)),
+            ExecutablePresence::Present
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_or_a_deleted_directory_above_it_is_missing() {
+        let dir = TempDir::new("presence-missing");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("fixture directory");
+        let path = scratch.join("tool");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
+        let identity = recorded(path.clone(), 10);
+
+        std::fs::remove_file(&path).expect("remove the fixture file");
+        assert_eq!(executable_presence(&identity), ExecutablePresence::Missing);
+
+        // The VP-S29 case: the whole scratch directory is gone.
+        std::fs::remove_dir(&scratch).expect("remove the fixture directory");
+        assert_eq!(executable_presence(&identity), ExecutablePresence::Missing);
+    }
+
+    #[test]
+    fn a_directory_at_the_path_is_missing() {
+        let dir = TempDir::new("presence-directory");
+        let path = dir.path().join("tool");
+        std::fs::create_dir(&path).expect("fixture directory");
+
+        assert_eq!(
+            executable_presence(&recorded(path, 10)),
+            ExecutablePresence::Missing
+        );
+    }
+
+    #[test]
+    fn a_file_whose_size_is_not_the_recorded_one_is_changed() {
+        let dir = TempDir::new("presence-changed");
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"#!/bin/sh\nexit 1\n").expect("fixture file");
+
+        assert_eq!(
+            executable_presence(&recorded(path, 10)),
+            ExecutablePresence::Changed
+        );
+    }
+}
+
 #[cfg(unix)]
 mod unix_tests {
     use std::os::unix::fs::PermissionsExt;
