@@ -2022,7 +2022,7 @@ pub async fn executable_approve(
 }
 
 /// The DTO for `record`: an active approval carries its executable's
-/// presence, judged now from one metadata read at its canonical path (#184),
+/// presence, judged now from the metadata at its canonical path (#184),
 /// so the approval lists can mark a file that is gone or changed before the
 /// operator picks it; a revoked one carries none. Blocking I/O -- called
 /// from the commands' own blocking tasks.
@@ -5400,6 +5400,8 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("fixture directory");
+        // A recorded path is canonical; the system temp directory need not be.
+        let dir = std::fs::canonicalize(&dir).expect("canonical fixture directory");
         let path = dir.join("tool");
         std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
         let record = |status| ApprovalRecord {

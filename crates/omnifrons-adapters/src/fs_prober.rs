@@ -94,17 +94,23 @@ impl ExecutableProber for FsExecutableProber {
     }
 }
 
-/// The [`ExecutablePresence`] of an approved `identity` (#184): one
-/// metadata read at its canonical path, following symlinks as the probe's
-/// own canonicalization does, compared with the recorded size. Any failure
-/// to read that metadata counts as missing -- the error itself is dropped,
-/// like every probe error here, since its text names the path. Never hashes
-/// and never opens the file: this is a hint for the approval lists, and the
-/// launch gate's re-probe stays the authority.
+/// The [`ExecutablePresence`] of an approved `identity` (#184): resolve its
+/// canonical path, then read the metadata there and compare the size.
+///
+/// A path that no longer resolves to itself counts as missing, whatever it
+/// now reaches: a symlink put in place of the file or of a directory above
+/// it is exactly what the launch gate denies as `ShadowedPath`, by the same
+/// comparison, so a same-sized file behind one must not read as present. Any
+/// failure to resolve or read counts as missing too -- the error itself is
+/// dropped, like every probe error here, since its text names the path.
+/// Never hashes and never opens the file: this is a hint for the approval
+/// lists, and the launch gate's re-probe stays the authority.
 #[must_use]
 pub fn executable_presence(identity: &ExecutableIdentity) -> ExecutablePresence {
-    let observed = fs::metadata(&identity.canonical_path)
+    let observed = fs::canonicalize(&identity.canonical_path)
         .ok()
+        .filter(|resolved| *resolved == identity.canonical_path)
+        .and_then(|resolved| fs::metadata(resolved).ok())
         .filter(fs::Metadata::is_file)
         .map(|metadata| metadata.len());
     ExecutablePresence::judge(identity.size, observed)

@@ -193,8 +193,8 @@ pub struct ApprovalRecord {
 
 /// Whether an approved executable is still where it was approved, at the
 /// size it was approved (#184) -- a hint for the approval lists, judged from
-/// one metadata read at the canonical path, so an operator is not offered an
-/// approval whose file is gone.
+/// the filesystem's metadata at the canonical path, so an operator is not
+/// offered an approval whose file is gone.
 ///
 /// Never a launch decision: a file of the recorded size can still hold
 /// other bytes, and only the pre-launch re-probe's digest comparison can
@@ -205,8 +205,9 @@ pub enum ExecutablePresence {
     /// A regular file of the recorded size is at the canonical path.
     Present,
     /// The canonical path no longer leads to a regular file this user can
-    /// read the metadata of: deleted, its directory deleted, or something
-    /// other than a regular file in its place.
+    /// read the metadata of: deleted, its directory deleted, something other
+    /// than a regular file in its place, or a symlink that now takes the path
+    /// somewhere else.
     Missing,
     /// A regular file is at the canonical path, but not of the recorded
     /// size: its content changed since the approval.

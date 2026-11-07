@@ -69,6 +69,13 @@ mod presence_tests {
 
     use super::TempDir;
 
+    /// The fixture directory's own canonical path: a recorded path always is
+    /// canonical, and the system temp directory need not be (macOS `/var`,
+    /// Windows `\\?\`).
+    fn canonical_root(dir: &TempDir) -> PathBuf {
+        std::fs::canonicalize(dir.path()).expect("canonical fixture directory")
+    }
+
     /// An approval's recorded identity for `path` at `size` bytes; the digest
     /// and platform evidence play no part in a presence judgement.
     fn recorded(path: PathBuf, size: u64) -> ExecutableIdentity {
@@ -84,7 +91,7 @@ mod presence_tests {
     #[test]
     fn a_file_of_the_recorded_size_is_present() {
         let dir = TempDir::new("presence-present");
-        let path = dir.path().join("tool");
+        let path = canonical_root(&dir).join("tool");
         std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
 
         assert_eq!(
@@ -96,7 +103,7 @@ mod presence_tests {
     #[test]
     fn a_deleted_file_or_a_deleted_directory_above_it_is_missing() {
         let dir = TempDir::new("presence-missing");
-        let scratch = dir.path().join("scratch");
+        let scratch = canonical_root(&dir).join("scratch");
         std::fs::create_dir(&scratch).expect("fixture directory");
         let path = scratch.join("tool");
         std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
@@ -113,7 +120,7 @@ mod presence_tests {
     #[test]
     fn a_directory_at_the_path_is_missing() {
         let dir = TempDir::new("presence-directory");
-        let path = dir.path().join("tool");
+        let path = canonical_root(&dir).join("tool");
         std::fs::create_dir(&path).expect("fixture directory");
 
         assert_eq!(
@@ -125,7 +132,7 @@ mod presence_tests {
     #[test]
     fn a_file_whose_size_is_not_the_recorded_one_is_changed() {
         let dir = TempDir::new("presence-changed");
-        let path = dir.path().join("tool");
+        let path = canonical_root(&dir).join("tool");
         std::fs::write(&path, b"#!/bin/sh\nexit 1\n").expect("fixture file");
 
         assert_eq!(
@@ -147,7 +154,53 @@ mod unix_tests {
     use omnifrons_app::{ExecutableProber, ProbeOutcome};
     use sha2::{Digest, Sha256};
 
+    use omnifrons_adapters::fs_prober::executable_presence;
+    use omnifrons_domain::executable::{ExecutableIdentity, ExecutablePresence, PlatformEvidence};
+
     use super::{TempDir, expect_identity};
+
+    /// Asserts both halves of a redirected path: the probe the launch gate
+    /// runs resolves `recorded` somewhere else, which `decide` denies as
+    /// `ShadowedPath`, and the approval lists therefore do not call it
+    /// present, however closely the file it now reaches matches (#184).
+    fn assert_redirected_path_is_missing(recorded: PathBuf, size: u64) {
+        let probed = expect_identity(FsExecutableProber::new().probe(&recorded));
+        assert_ne!(probed.identity.canonical_path, recorded);
+        assert_eq!(probed.identity.size, size);
+
+        let identity = ExecutableIdentity {
+            canonical_path: recorded,
+            size,
+            sha256: probed.identity.sha256,
+            modified_at: None,
+            platform: PlatformEvidence::Unix { mode: 0o755 },
+        };
+        assert_eq!(executable_presence(&identity), ExecutablePresence::Missing);
+    }
+
+    #[test]
+    fn a_symlink_in_place_of_the_file_is_missing_even_to_a_file_of_the_recorded_size() {
+        let dir = TempDir::new("presence-symlink-file");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture directory");
+        let elsewhere = write_file(&root, "elsewhere", b"#!/bin/sh\n", 0o755);
+        let path = root.join("tool");
+        std::os::unix::fs::symlink(&elsewhere, &path).expect("fixture symlink");
+
+        assert_redirected_path_is_missing(path, 10);
+    }
+
+    #[test]
+    fn a_symlink_in_place_of_a_parent_directory_is_missing() {
+        let dir = TempDir::new("presence-symlink-parent");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture directory");
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("fixture directory");
+        write_file(&real, "tool", b"#!/bin/sh\n", 0o755);
+        let approved = root.join("approved");
+        std::os::unix::fs::symlink(&real, &approved).expect("fixture symlink");
+
+        assert_redirected_path_is_missing(approved.join("tool"), 10);
+    }
 
     fn write_file(dir: &Path, name: &str, contents: &[u8], mode: u32) -> PathBuf {
         let path = dir.join(name);
