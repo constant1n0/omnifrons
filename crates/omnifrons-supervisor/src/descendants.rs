@@ -38,8 +38,9 @@
 //! taken at the exit -- the child's descendants are reparented the moment
 //! it exits, before it is even reaped, so a walk then finds none -- so the
 //! self-exit reaper (`crate::SelfExitReaper`) walks while the child lives
-//! and merges every walk ([`Census::merge`]: a union of sightings, never a
-//! replacement):
+//! and folds every walk into one census ([`Census::refresh`]: a union of
+//! sightings, never a replacement, that forgets only the sightings no
+//! longer alive, so its bound counts the descendants alive at once):
 //!
 //! - **Interval.** One walk at spawn, then one every 250 ms for the first
 //!   minute, then one every 30 s for as long as the child lives; the
@@ -171,7 +172,7 @@ pub(crate) enum Unproven {
     /// A recorded descendant was still running when the child that exited
     /// on its own was reaped ([`Census::leftovers`], which never sweeps).
     DescendantOutlivedChild,
-    /// The census reached [`MAX_SIGHTINGS`] and stopped recording.
+    /// The census reached its sighting bound and stopped recording.
     TooManySightings,
 }
 
@@ -195,11 +196,6 @@ impl std::fmt::Display for Unproven {
         }
     }
 }
-
-/// The most distinct `(pid, starttime)` sightings one census keeps
-/// ([`Census::merge`]). Far above what any real agent leaves alive at once;
-/// a bound only so a pathological child cannot grow it without limit.
-const MAX_SIGHTINGS: usize = 4096;
 
 /// Shown for a descendant whose command name could no longer be read.
 const UNKNOWN_COMM: &str = "?";
@@ -225,6 +221,7 @@ pub(crate) struct Leftovers {
 }
 
 /// What was recorded about a child's descendants before it was signalled.
+#[derive(Clone)]
 pub(crate) enum Census {
     /// A `(pid, starttime)` snapshot of every descendant observed while
     /// the child was still alive. Possibly empty -- which is a real
@@ -249,10 +246,55 @@ impl Census {
     fn take_in(proc_root: &Path, child: Pid) -> Self {
         match read_table(proc_root) {
             Err(reason) => Self::Unavailable(reason),
-            Ok(table) if !table.contains_key(&child) => {
-                Self::Unavailable(Unproven::ChildEntryMissing)
+            Ok(table) => Self::from_table(&table, child),
+        }
+    }
+
+    fn from_table(table: &HashMap<Pid, Stat>, child: Pid) -> Self {
+        if table.contains_key(&child) {
+            Self::Snapshot(descendants_of(table, child))
+        } else {
+            Self::Unavailable(Unproven::ChildEntryMissing)
+        }
+    }
+
+    /// Walk again and fold the walk into this census: first forget every
+    /// recorded sighting that is no longer alive, judged by the same walk,
+    /// then merge the walk's own sightings ([`Self::merge`]), keeping at
+    /// most `bound`.
+    ///
+    /// Forgetting changes no verdict: a sighting that is gone, a zombie, or
+    /// a pid now carrying another start time can never count as a
+    /// leftover ([`Self::leftovers`]) or a survivor ([`Self::settle`]), and
+    /// a process that ended never comes back. What it changes is what the
+    /// bound counts: the descendants alive at the same time, not every one
+    /// the child ever ran. A walk of the unreaped zombie child still erases
+    /// nothing that is alive.
+    pub(crate) fn refresh(self, child: Pid, bound: usize) -> Self {
+        self.refresh_in(Path::new(PROC_ROOT), child, bound)
+    }
+
+    fn refresh_in(self, proc_root: &Path, child: Pid, bound: usize) -> Self {
+        match read_table(proc_root) {
+            Err(reason) => self.merge(Self::Unavailable(reason), bound),
+            Ok(table) => self
+                .without_the_dead(&table)
+                .merge(Self::from_table(&table, child), bound),
+        }
+    }
+
+    /// This census without the sightings `table` shows are no longer alive.
+    fn without_the_dead(self, table: &HashMap<Pid, Stat>) -> Self {
+        match self {
+            Self::Snapshot(mut seen) => {
+                seen.retain(|identity| {
+                    table.get(&identity.pid).is_some_and(|stat| {
+                        stat.starttime == identity.starttime && stat.state != ZOMBIE_STATE
+                    })
+                });
+                Self::Snapshot(seen)
             }
-            Ok(table) => Self::Snapshot(descendants_of(&table, child)),
+            unavailable @ Self::Unavailable(_) => unavailable,
         }
     }
 
@@ -267,12 +309,10 @@ impl Census {
     /// descendant, so from then on the census is unproven and keeps that
     /// reason, whatever later walks see.
     ///
-    /// Bounded: past [`MAX_SIGHTINGS`] distinct sightings the census
-    /// becomes unproven ([`Unproven::TooManySightings`]) instead of growing
-    /// or forgetting one. Walks only run while the child lives, at the
-    /// self-exit reaper's census interval, so a census holds one entry per
-    /// distinct descendant alive at some walk.
-    pub(crate) fn merge(self, fresh: Self) -> Self {
+    /// Bounded: past `bound` distinct sightings the census becomes unproven
+    /// ([`Unproven::TooManySightings`]) instead of growing or forgetting
+    /// one.
+    pub(crate) fn merge(self, fresh: Self, bound: usize) -> Self {
         match (self, fresh) {
             (Self::Snapshot(mut seen), Self::Snapshot(new)) => {
                 for identity in new {
@@ -280,7 +320,7 @@ impl Census {
                         seen.push(identity);
                     }
                 }
-                if seen.len() > MAX_SIGHTINGS {
+                if seen.len() > bound {
                     Self::Unavailable(Unproven::TooManySightings)
                 } else {
                     Self::Snapshot(seen)
@@ -631,6 +671,9 @@ mod tests {
         Census, Identity, Stat, Unproven, descendants_of, member_still_in_group_in, parse_comm,
         parse_stat, survivors_in,
     };
+
+    /// The bound the supervisor runs with.
+    const BOUND: usize = crate::CENSUS_SIGHTINGS_BOUND;
 
     /// A throwaway directory holding a synthetic `/proc` tree, so the
     /// census and the survivor probe can be exercised over entries that
@@ -986,10 +1029,39 @@ mod tests {
         root.entry(100, 'Z', 1, 100, 10).entry(101, 'S', 1, 101, 11);
         let zombie = Census::take_in(root.path(), pid(100));
 
-        let Census::Snapshot(recorded) = alive.merge(zombie) else {
+        let Census::Snapshot(recorded) = alive.merge(zombie, BOUND) else {
             panic!("two readable walks must merge into a snapshot")
         };
         assert_eq!(recorded, vec![identity(101, 11)]);
+    }
+
+    /// A refresh forgets every recorded sighting that is no longer alive --
+    /// gone, a recycled pid with another start time, or a zombie -- so the
+    /// bound counts only descendants alive at once: more finished sightings
+    /// than the bound, plus a live one, stays a proven snapshot. A walk of
+    /// the zombie child still erases nothing that is alive.
+    #[test]
+    fn a_refresh_forgets_dead_sightings_so_the_bound_counts_only_the_living() {
+        let root = ProcRoot::new("refresh-prune");
+        root.entry(100, 'Z', 1, 100, 10) // the child: exited, not yet reaped
+            .entry(101, 'S', 1, 101, 11) // escaped earlier, still running
+            .entry(102, 'S', 1, 100, 99) // pid 102 recycled by another process
+            .entry(103, 'Z', 1, 100, 13); // finished, not yet reaped
+        let finished = BOUND + 10;
+        let mut recorded: Vec<Identity> = (0..finished)
+            .map(|n| {
+                let raw = 10_000 + i32::try_from(n).expect("a small test pid");
+                identity(raw, u64::try_from(n).expect("a small start time"))
+            })
+            .collect();
+        recorded.extend([identity(101, 11), identity(102, 12), identity(103, 13)]);
+
+        let refreshed = Census::Snapshot(recorded).refresh_in(root.path(), pid(100), BOUND);
+
+        let Census::Snapshot(kept) = refreshed else {
+            panic!("finished descendants must not leave the census unproven")
+        };
+        assert_eq!(kept, vec![identity(101, 11)]);
     }
 
     /// Two walks merge as a union without duplicates; a walk that found no
@@ -999,21 +1071,22 @@ mod tests {
     fn merge_is_a_union_and_only_a_failed_walk_other_than_a_missing_child_sticks() {
         let first = Census::Snapshot(vec![identity(101, 11)]);
         let second = Census::Snapshot(vec![identity(101, 11), identity(102, 12)]);
-        let Census::Snapshot(union) = first.merge(second) else {
+        let Census::Snapshot(union) = first.merge(second, BOUND) else {
             panic!("two snapshots merge into a snapshot")
         };
         assert_eq!(union, vec![identity(101, 11), identity(102, 12)]);
 
         let late = Census::Unavailable(Unproven::ChildEntryMissing);
-        let Census::Snapshot(kept) = Census::Snapshot(vec![identity(101, 11)]).merge(late) else {
+        let Census::Snapshot(kept) = Census::Snapshot(vec![identity(101, 11)]).merge(late, BOUND)
+        else {
             panic!("a walk after the reap must not erase the snapshot")
         };
         assert_eq!(kept, vec![identity(101, 11)]);
 
         let unreadable = Census::Unavailable(Unproven::EntryUnreadable);
         let after = Census::Snapshot(vec![identity(101, 11)])
-            .merge(unreadable)
-            .merge(Census::Snapshot(vec![identity(102, 12)]));
+            .merge(unreadable, BOUND)
+            .merge(Census::Snapshot(vec![identity(102, 12)]), BOUND);
         assert!(matches!(
             after,
             Census::Unavailable(Unproven::EntryUnreadable)

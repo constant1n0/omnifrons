@@ -265,6 +265,13 @@ fn record_terminal_order(
 /// running for over a minute changes slowly.
 const CENSUS_IDLE_REFRESH: Duration = Duration::from_secs(30);
 
+/// The most `(pid, starttime)` sightings one self-exit census keeps
+/// (`descendants::Census::refresh`). Every refresh forgets the sightings
+/// that are no longer alive, so this bounds the descendants alive at the
+/// same time -- far above what any real agent keeps at once -- not how many
+/// the child ever ran.
+const CENSUS_SIGHTINGS_BOUND: usize = 4096;
+
 /// The cadence at which the self-exit reaper asks `try_wait`, from spawn.
 ///
 /// While the child's output is open it asks every `slow_poll` until
@@ -288,11 +295,18 @@ struct ReapPacing {
     census_refresh: Duration,
     /// How often it is retaken after that.
     census_idle_refresh: Duration,
-    /// How long, from the child's exit, its readers may keep the run open:
-    /// a descendant that inherited the output holds it past the exit, and
-    /// past this grace the run ends without it (`output_capture`'s own doc
-    /// comment). Shorter than `settle_wait`, which bounds the whole settle
-    /// this grace is part of.
+    /// The most sightings the census keeps ([`CENSUS_SIGHTINGS_BOUND`]).
+    census_bound: usize,
+    /// How long, from the moment the reaper notices the child's exit, its
+    /// readers may keep the run open: a descendant that inherited the
+    /// output holds it past the exit, and past this grace the run ends
+    /// without it (`output_capture`'s own doc comment). The exit is noticed
+    /// at the next poll, which while the output is open comes within
+    /// `slow_poll` (250 ms) in the child's first minute and within
+    /// `idle_poll` (2 s) after it, so with the defaults the run ends at most
+    /// about 4 s after the exit (measured: 2.07 s for a young child, 2.81 s
+    /// for one older than a minute). Shorter than `settle_wait`, which
+    /// bounds the whole settle this grace is part of.
     exit_grace: Duration,
     /// How long `observe` keeps deferring to a claimed reaper that has not
     /// polled: three times the slowest poll (2 s idle), so a healthy reaper
@@ -314,6 +328,7 @@ impl ReapPacing {
         idle_poll: Duration::from_secs(2),
         census_refresh: Duration::from_millis(250),
         census_idle_refresh: CENSUS_IDLE_REFRESH,
+        census_bound: CENSUS_SIGHTINGS_BOUND,
         exit_grace: Duration::from_secs(2),
         stall_grace: Duration::from_secs(6),
         settle_wait: Duration::from_secs(5),
@@ -583,21 +598,23 @@ impl SelfExitReaper {
         let mut output_closed = false;
         let mut logged_long_running = false;
         loop {
-            // Merge a finished refresh (an unfinished one is left running).
+            // Adopt a finished refresh (an unfinished one is left running).
+            // While one runs, `census` is unchanged: the refresh started
+            // from a copy of it.
             if refresh.as_ref().is_some_and(JoinHandle::is_finished)
                 && let Some(handle) = refresh.take()
             {
-                census = merge_refresh(census, handle).await;
+                census = adopt_refresh(census, handle).await;
             }
             output_capture::note_reap_poll(&self.outputs, self.id);
             match self.try_reap() {
                 ReapAttempt::Reaped(state, settling) => {
-                    // A walk still in flight is awaited: merged as a union,
-                    // one that ran after the exit adds nothing and erases
-                    // nothing, and one that ran before it may have seen a
-                    // descendant no other walk did.
+                    // A walk still in flight is awaited: one that ran after
+                    // the exit adds nothing and erases nothing alive, and
+                    // one that ran before it may have seen a descendant no
+                    // other walk did.
                     if let Some(handle) = refresh.take() {
-                        census = merge_refresh(census, handle).await;
+                        census = adopt_refresh(census, handle).await;
                     }
                     self.end_after_reap(census, state).await;
                     drop(settling);
@@ -633,8 +650,10 @@ impl SelfExitReaper {
             // pool, every `census_refresh` early in a phase and every
             // `census_idle_refresh` after.
             if refresh.is_none() && census_at.elapsed() >= self.pacing.census_interval(elapsed) {
-                let id = self.id;
-                refresh = Some(tokio::task::spawn_blocking(move || take_census(id)));
+                let (id, bound, recorded) = (self.id, self.pacing.census_bound, census.clone());
+                refresh = Some(tokio::task::spawn_blocking(move || {
+                    refresh_census(recorded, id, bound)
+                }));
                 census_at = std::time::Instant::now();
             }
             // Stamp again so a long sleep is preceded by a fresh poll time.
@@ -867,12 +886,13 @@ fn record_self_exit_verdict(
     );
 }
 
-/// Merge a finished census refresh into `census` ([`Census::merge`]). A
-/// refresh task that failed (it panicked, or the runtime is shutting down)
-/// adds nothing.
-async fn merge_refresh(census: Census, refresh: JoinHandle<Census>) -> Census {
+/// Adopt a finished census refresh ([`refresh_census`]): it started from a
+/// copy of `census`, which has not changed since, so its result replaces
+/// it. A refresh task that failed (it panicked, or the runtime is shutting
+/// down) changes nothing.
+async fn adopt_refresh(census: Census, refresh: JoinHandle<Census>) -> Census {
     match refresh.await {
-        Ok(fresh) => census.merge(fresh),
+        Ok(refreshed) => refreshed,
         Err(error) => {
             tracing::error!(%error, "census refresh task failed; keeping the earlier census");
             census
@@ -904,6 +924,7 @@ use descendants::Census;
 /// Generic over the process-group argument (`nix`'s `Pid` on unix, nothing
 /// on Windows) so one placeholder serves every call site.
 #[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
 struct Census;
 
 #[cfg(not(target_os = "linux"))]
@@ -921,12 +942,6 @@ impl Census {
     #[cfg_attr(not(unix), allow(dead_code))]
     fn settle<P>(&self, _pgid: P, reaped: ProcessTerminalState) -> ProcessTerminalState {
         reaped
-    }
-
-    /// Nothing was recorded, so nothing is merged.
-    #[allow(clippy::needless_pass_by_value)]
-    fn merge(self, _fresh: Self) -> Self {
-        self
     }
 }
 
@@ -988,6 +1003,27 @@ async fn take_census_blocking(id: ProcessId) -> Census {
             tracing::error!(%error, "census task failed; taking it inline");
             take_census(id)
         }
+    }
+}
+
+/// Walk again for `id` and fold the walk into `census`, keeping at most
+/// `bound` sightings (`descendants::Census::refresh`: sightings no longer
+/// alive are forgotten, everything alive is kept). Blocking: a procfs walk.
+fn refresh_census(census: Census, id: ProcessId, bound: usize) -> Census {
+    #[cfg(test)]
+    CENSUS_TAKES
+        .lock()
+        .expect("census counter poisoned")
+        .push(id.0);
+    #[cfg(target_os = "linux")]
+    {
+        census.refresh(pid_of(id), bound)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Nothing to walk: the stub census records nothing.
+        let _ = (id, bound);
+        census
     }
 }
 
@@ -2578,6 +2614,7 @@ mod self_exit_tests {
         idle_poll: Duration::from_millis(20),
         census_refresh: Duration::from_secs(1),
         census_idle_refresh: Duration::from_secs(10),
+        census_bound: super::CENSUS_SIGHTINGS_BOUND,
         exit_grace: Duration::from_secs(2),
         stall_grace: Duration::from_secs(3),
         settle_wait: Duration::from_secs(5),
@@ -2629,6 +2666,7 @@ mod self_exit_tests {
         idle_poll: Duration::from_secs(3600),
         census_refresh: Duration::from_secs(3600),
         census_idle_refresh: Duration::from_secs(3600),
+        census_bound: super::CENSUS_SIGHTINGS_BOUND,
         exit_grace: Duration::from_secs(2),
         stall_grace: Duration::from_millis(300),
         settle_wait: Duration::from_secs(5),
@@ -2739,6 +2777,52 @@ mod self_exit_tests {
             takes <= 2,
             "census taken {takes} times for one long-lived child"
         );
+    }
+
+    /// The verifier's probe c6, scaled down: a child that ran many
+    /// short-lived processes, every one finished before it exits cleanly,
+    /// must still end `Exited`. Only descendants alive at once count against
+    /// the census bound; here a walk every 10 ms over 300 short `sleep`s,
+    /// ten at a time, sights far more of them than the lowered bound of 32.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn many_finished_descendants_never_exhaust_the_census_bound() {
+        let pacing = ReapPacing {
+            census_refresh: Duration::from_millis(10),
+            slow_window: Duration::from_secs(60),
+            census_bound: 32,
+            ..SHORT
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        let script = "i=0; while [ \"$i\" -lt 300 ]; do sleep 0.05 & i=$((i+1)); \
+                      if [ $((i % 10)) -eq 0 ]; then wait; fi; done; wait; exit 0";
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        let state = loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            match frames.recv_timeout(left) {
+                Ok(frame) => {
+                    if let FramePayload::State(state) = frame.payload {
+                        break Some(state);
+                    }
+                }
+                Err(_) => break None,
+            }
+        };
+        let walks = super::CENSUS_TAKES
+            .lock()
+            .expect("census counter poisoned")
+            .iter()
+            .filter(|pid| **pid == id.0)
+            .count();
+        assert!(
+            walks > 20,
+            "only {walks} census walks: the probe saw too little"
+        );
+        assert_eq!(state, Some(ProcessTerminalState::Exited { code: Some(0) }));
     }
 
     #[test]

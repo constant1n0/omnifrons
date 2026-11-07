@@ -39,16 +39,20 @@
 //! output (`sh -c 'sleep 3600 & exit 0'`) holds it open after the child has
 //! exited, and its reader then never ends. The self-exit reaper (which polls
 //! for the child's exit from spawn, not from the readers' end) gives the
-//! readers a grace of 2 s from that exit; if one is still running after it,
-//! the reaper *abandons* them: the run ends with `orphan-risk/uncertain`,
+//! readers a grace of 2 s from the moment it notices that exit -- one poll
+//! after it at most, 250 ms in the child's first minute and 2 s after that
+//! while the output is open, so the run ends at most about 4 s after the
+//! exit; if a reader is still running after the grace, the reaper
+//! *abandons* the readers: the run ends with `orphan-risk/uncertain`,
 //! preceded by a diagnostic `stderr` frame saying a descendant still holds
 //! the output open. The same grace applies when `stop` reaped the child.
 //! From then on the `State` frame stays the last frame on the channel: the
 //! readers' sending slot is closed under the same lock that assigns the
 //! `State` frame's `seq` ([`ReaderHandles`]), so whatever a lingering
 //! reader reads afterwards is discarded, never delivered. Each such reader
-//! counts what it discarded and logs that count once, in a `tracing`
-//! warning, when it finally ends. Closing the slot also drops the readers'
+//! counts what it discarded and, when that is more than nothing, logs the
+//! count once, in a `tracing` warning, when it finally ends. Closing the
+//! slot also drops the readers'
 //! last sender, so a subscriber's iterator ends after the `State` frame even
 //! while a reader lingers; the descendant itself is left running.
 
@@ -307,7 +311,7 @@ pub(crate) fn take_receiver(
 /// asks [`try_finalize`] to send the final state frame (a no-op if the
 /// terminal state is not confirmed yet). A reader that ends after its run's
 /// final frames were already assigned -- one the reaper abandoned -- first
-/// logs, once, how many bytes it read and discarded since.
+/// logs, once, how many bytes it read and discarded since, if any.
 ///
 /// A split is decided *lazily*: a full buffer is never emitted the moment
 /// it fills, only once the next byte of input proves the line goes on --
@@ -449,8 +453,9 @@ fn finish_stream(
 
     // Still counted among the active readers here, so a closed slot can
     // only mean the run's final frames went out without waiting for this
-    // reader: it was abandoned.
-    if !handles.slot_open() {
+    // reader: it was abandoned. One that discarded nothing has nothing to
+    // report.
+    if handles.discarded.get() > 0 && !handles.slot_open() {
         tracing::warn!(
             pid = id.0,
             ?stream,

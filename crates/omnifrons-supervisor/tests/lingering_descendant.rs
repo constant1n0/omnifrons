@@ -53,6 +53,48 @@ fn escaped_note(pid: i32, comm: &str) -> String {
     format!("descendant {pid} ({comm}) left the run's process group and is still running")
 }
 
+/// The supervisor's `tracing` output in this test binary, as text.
+static LOG: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Where the global `tracing` subscriber writes: into [`LOG`].
+struct Capture;
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Route the supervisor's warnings into [`LOG`] (once per binary).
+fn capture_warnings() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(|| Capture)
+        .try_init();
+}
+
+/// The captured log lines for process `pid` that contain `needle`.
+fn warnings_for(pid: u32, needle: &str) -> Vec<String> {
+    let log = String::from_utf8_lossy(
+        &LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    let field = format!("pid={pid} ");
+    log.lines()
+        .filter(|line| line.contains(&field) && line.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Kills the helper it names when dropped, so a failing assertion never
 /// leaves a process behind.
 struct Helper(nix::unistd::Pid);
@@ -346,6 +388,48 @@ fn output_written_after_the_grace_never_follows_the_state_frame() {
     );
 }
 
+/// The verifier's probe c2: what a lingering descendant writes after the
+/// run ended is discarded, and the reader that discarded it logs how many
+/// bytes, once, when it ends. The other reader (stderr, which the helper
+/// also holds but never writes to) discarded nothing and logs nothing.
+#[test]
+fn only_a_reader_that_discarded_output_logs_it_once() {
+    const NEEDLE: &str = "outlived its run's final state frame";
+    capture_warnings();
+    let mut supervisor = TokioProcessSupervisor::new();
+    let started = Instant::now();
+    let id = spawn_sh(
+        &mut supervisor,
+        "(i=0; while [ \"$i\" -lt 100 ]; do echo late; sleep 0.1; i=$((i+1)); done) & \
+         echo \"$!\"; exit 0",
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+    let _ = collect_until_closed(&frames, &mut seen, started, EXIT_GRACE + MARGIN);
+
+    // Let the helper write past the end of the run, then end it: both
+    // readers reach EOF within its last `sleep 0.1`.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(helper);
+    let end = Instant::now() + LINE_DEADLINE;
+    while warnings_for(id.0, NEEDLE).is_empty() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let warnings = warnings_for(id.0, NEEDLE);
+    assert_eq!(warnings.len(), 1, "one warning, from stdout: {warnings:#?}");
+    assert!(warnings[0].contains("stream=Stdout"), "{warnings:#?}");
+    let discarded: u64 = warnings[0]
+        .split("discarded_bytes=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .expect("the warning names its discarded byte count");
+    assert!(discarded > 0, "{warnings:#?}");
+}
+
 /// After a self-exit whose descendant holds the output, Stop still reaches
 /// the process group: a recorded member with its original start time is
 /// alive, so the group is provably the original one.
@@ -416,6 +500,149 @@ fn a_stopped_run_ends_after_the_grace_while_an_escaped_descendant_holds_its_outp
         helper.is_running(),
         "the escaped helper is beyond stop's reach"
     );
+}
+
+/// The verifier's probe c4: a Stop that arrives during the exit grace waits
+/// for the settled verdict, reports it, and still reaches the lingering
+/// group.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_during_the_grace_reports_the_verdict_and_reaches_the_group() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let id = spawn_sh(
+        &mut supervisor,
+        &format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    // The child exits at once: 800 ms in, its readers are inside the grace.
+    std::thread::sleep(Duration::from_millis(800));
+    let stopped = supervisor
+        .stop(id, Duration::from_secs(1))
+        .expect("stop during the grace must succeed");
+
+    assert!(
+        helper.ends_within(Duration::from_secs(3)),
+        "stop must reach the lingering descendant through its process group"
+    );
+    assert_eq!(stopped, ProcessTerminalState::OrphanRiskUncertain);
+    let _ = collect_until_closed(&frames, &mut seen, Instant::now(), LINE_DEADLINE);
+    assert_eq!(last_state(&seen), stopped);
+    assert_eq!(diagnostic_before_state(&seen), LINGERING_NOTE);
+}
+
+/// Collect every frame until the channel closes, at most `budget` after
+/// `since`, polling `observe` every 5 ms meanwhile when `observing`. Returns
+/// whether the channel closed in time.
+fn collect_while_observing(
+    supervisor: &TokioProcessSupervisor,
+    id: ProcessId,
+    observing: bool,
+    frames: &Receiver<OutputFrame>,
+    seen: &mut Vec<OutputFrame>,
+    since: Instant,
+    budget: Duration,
+) -> bool {
+    let end = since + budget;
+    loop {
+        let wait = if observing {
+            let _ = supervisor.observe(id);
+            Duration::from_millis(5)
+        } else {
+            end.saturating_duration_since(Instant::now())
+        };
+        match frames.recv_timeout(wait) {
+            Ok(frame) => seen.push(frame),
+            Err(RecvTimeoutError::Disconnected) => return true,
+            Err(RecvTimeoutError::Timeout) if Instant::now() >= end => return false,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// One `State` frame, last, and every `seq` from 0 without a gap.
+fn run_invariants_hold(frames: &[OutputFrame]) -> bool {
+    let states = frames
+        .iter()
+        .filter(|frame| matches!(frame.payload, FramePayload::State(_)))
+        .count();
+    let contiguous = frames
+        .iter()
+        .zip(0_u64..)
+        .all(|(frame, expected)| frame.seq == expected);
+    states == 1
+        && matches!(
+            frames.last().map(|frame| &frame.payload),
+            Some(FramePayload::State(_))
+        )
+        && contiguous
+}
+
+/// The verifier's probe c5: clean exits, lingering descendants, Stop of a
+/// running child, Stop during the grace, and a child that closes its output
+/// before it exits, on twelve threads sharing one supervisor, half of them
+/// observing while they collect. Every run ends, with exactly one `State`
+/// frame, last, and frame numbers without a gap.
+#[test]
+fn a_concurrent_mix_of_runs_keeps_every_run_invariant() {
+    let supervisor = TokioProcessSupervisor::new();
+    let workers: Vec<_> = (0..12_usize)
+        .map(|thread| {
+            let mut supervisor = supervisor.clone();
+            std::thread::spawn(move || {
+                let mut broken = Vec::new();
+                for run in 0..4 {
+                    let scenario = (thread + run) % 5;
+                    let script = match scenario {
+                        0 => "echo a; echo b >&2; exit 0".to_string(),
+                        1 | 4 => format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+                        2 => format!("echo up; exec sleep {HELPER_SECS}"),
+                        _ => "echo up; exec >&- 2>&-; sleep 0.3; exit 2".to_string(),
+                    };
+                    let started = Instant::now();
+                    let id = spawn_sh(&mut supervisor, &script);
+                    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+                    let mut seen = Vec::new();
+                    // Killed when this run ends, whatever Stop did.
+                    let _helper = matches!(scenario, 1 | 4)
+                        .then(|| helper_from_first_line(&frames, &mut seen));
+                    if scenario == 2 {
+                        if let Ok(frame) = frames.recv_timeout(LINE_DEADLINE) {
+                            seen.push(frame);
+                        }
+                        let _ = supervisor.stop(id, Duration::from_secs(1));
+                    } else if scenario == 4 {
+                        std::thread::sleep(Duration::from_millis(700));
+                        let _ = supervisor.stop(id, Duration::from_secs(1));
+                    }
+                    let closed = collect_while_observing(
+                        &supervisor,
+                        id,
+                        thread % 2 == 0,
+                        &frames,
+                        &mut seen,
+                        started,
+                        Duration::from_secs(12),
+                    );
+                    if !closed || !run_invariants_hold(&seen) {
+                        broken.push(format!(
+                            "thread {thread} run {run} scenario {scenario} closed={closed}: \
+                             {:#?}",
+                            tail(&seen)
+                        ));
+                    }
+                }
+                broken
+            })
+        })
+        .collect();
+    let broken: Vec<String> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().expect("a worker thread panicked"))
+        .collect();
+    assert!(broken.is_empty(), "{broken:#?}");
 }
 
 /// A scratch directory under the system temp dir, removed on drop.
