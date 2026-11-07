@@ -260,20 +260,22 @@ fn record_terminal_order(
     }
 }
 
-/// The cadence at which the self-exit reaper asks `try_wait` after a
-/// child's last reader finished.
-///
-/// A child that closes its output is normally about to exit, so the run
-/// ends promptly: `fast_poll` for the first `fast_window`, then `slow_poll`
-/// until `slow_window` has passed. Past that the reaper logs once that the
-/// child is still running and keeps asking every `idle_poll`, with no end:
-/// a child that exits later still gets its `State` frame, at the price of
-/// one cheap `try_wait` per `idle_poll` per such child.
 /// How often the idle-phase reaper retakes its descendant census: a procfs
 /// walk is far costlier than a `try_wait`, and a child that has been
-/// running for over a minute with its output closed changes slowly.
+/// running for over a minute changes slowly.
 const CENSUS_IDLE_REFRESH: Duration = Duration::from_secs(30);
 
+/// The cadence at which the self-exit reaper asks `try_wait`, from spawn.
+///
+/// While the child's output is open it asks every `slow_poll` until
+/// `slow_window` has passed since spawn, then every `idle_poll`; the last
+/// reader's end wakes it at once. A child that closes its output is
+/// normally about to exit, so from then on the run ends promptly:
+/// `fast_poll` for the first `fast_window`, then `slow_poll` until
+/// `slow_window` has passed. Past that the reaper logs once that the child
+/// is still running and keeps asking every `idle_poll`, with no end: a
+/// child that exits later still gets its `State` frame, at the price of one
+/// cheap `try_wait` per `idle_poll` per such child.
 #[derive(Clone, Copy)]
 struct ReapPacing {
     fast_poll: Duration,
@@ -281,11 +283,17 @@ struct ReapPacing {
     slow_poll: Duration,
     slow_window: Duration,
     idle_poll: Duration,
-    /// How often the descendant census is retaken during the fast and slow
-    /// windows.
+    /// How often the descendant census is retaken while less than
+    /// `slow_window` has passed since spawn, or since the output closed.
     census_refresh: Duration,
-    /// How often it is retaken in the idle phase.
+    /// How often it is retaken after that.
     census_idle_refresh: Duration,
+    /// How long, from the child's exit, its readers may keep the run open:
+    /// a descendant that inherited the output holds it past the exit, and
+    /// past this grace the run ends without it (`output_capture`'s own doc
+    /// comment). Shorter than `settle_wait`, which bounds the whole settle
+    /// this grace is part of.
+    exit_grace: Duration,
     /// How long `observe` keeps deferring to a claimed reaper that has not
     /// polled: three times the slowest poll (2 s idle), so a healthy reaper
     /// delayed by runtime load is not mistaken for a stalled one.
@@ -306,10 +314,12 @@ impl ReapPacing {
         idle_poll: Duration::from_secs(2),
         census_refresh: Duration::from_millis(250),
         census_idle_refresh: CENSUS_IDLE_REFRESH,
+        exit_grace: Duration::from_secs(2),
         stall_grace: Duration::from_secs(6),
         settle_wait: Duration::from_secs(5),
     };
 
+    /// The poll interval `elapsed` after the output closed.
     fn interval(&self, elapsed: Duration) -> Duration {
         if elapsed < self.fast_window {
             self.fast_poll
@@ -319,35 +329,195 @@ impl ReapPacing {
             self.idle_poll
         }
     }
+
+    /// The poll interval `elapsed` after spawn, while the output is open.
+    fn open_interval(&self, elapsed: Duration) -> Duration {
+        if elapsed < self.slow_window {
+            self.slow_poll
+        } else {
+            self.idle_poll
+        }
+    }
+
+    /// The census interval `elapsed` into the current phase.
+    fn census_interval(&self, elapsed: Duration) -> Duration {
+        if elapsed < self.slow_window {
+            self.census_refresh
+        } else {
+            self.census_idle_refresh
+        }
+    }
 }
 
 /// Ends a run whose child exited on its own, with no operator action.
 ///
 /// `output_capture::try_finalize` sends the final `State` frame only once
-/// the reap is confirmed, and only `observe`/`stop` confirmed it. After a
-/// child's last reader finishes (pipe EOF on both streams, or the PTY
-/// master's EOF/EIO), [`Self::confirm_reap_after_readers`] polls `try_wait`
-/// through the same children table and evicts the entry exactly as `observe`
-/// does, then settles the state with the same proof `stop` uses
-/// (`take_census` says what the census can and cannot see), so leftover
-/// descendants report `OrphanRiskUncertain` rather than a clean exit. Until
-/// the settled state is recorded the id is in `Inner::settling`: `observe`
-/// reports the child as running and `stop` waits, so the output is finalized
-/// only with the settled verdict.
+/// the reap is confirmed. One reaper per child starts at spawn
+/// ([`Self::run`], spawned by `finish_spawn`): it polls `try_wait` through
+/// the same children table and evicts the entry exactly as `observe` does,
+/// independently of whether the child's output has closed, and takes the
+/// descendant census while the child lives (`crate::descendants` states its
+/// interval and blind spot). Once the child is reaped its readers get
+/// [`ReapPacing::exit_grace`] to finish; then the verdict is settled
+/// without signalling anything ([`self_exit_verdict`]): leftover
+/// descendants report `OrphanRiskUncertain` rather than a clean exit, a
+/// recorded one that left the process group is named in a diagnostic, and a
+/// reader that outlasted the grace -- a descendant holding the output open
+/// -- is abandoned so the run still ends. Until the verdict is recorded the
+/// id is in `Inner::settling`: `observe` reports the child as running and
+/// `stop` waits, so the output is finalized only with the settled verdict.
 ///
-/// One reaper per child: every finishing reader task calls it, and
-/// `output_capture::claim_reap` lets exactly one of them proceed. It polls
-/// without an end (see [`ReapPacing`]) and stops once the child is reaped
-/// by anyone or the channel is finalized. It holds the tables, never
-/// `Inner`, and never holds a lock across an await.
+/// It polls without an end (see [`ReapPacing`]) and stops once the child
+/// is reaped by anyone or the channel is finalized; when `stop` (or
+/// `observe` taking over) reaped it, the reaper still gives the readers the
+/// same grace before ending the run with the state that reap recorded. It
+/// holds the tables, never `Inner`, and never holds a lock across an await.
 struct SelfExitReaper {
     children: Arc<Mutex<HashMap<ProcessId, Tracked>>>,
     terminal_order: Arc<Mutex<VecDeque<ProcessId>>>,
     stopping: Arc<Mutex<HashSet<ProcessId>>>,
     settling: Arc<Mutex<HashMap<ProcessId, std::time::Instant>>>,
+    lingering: LingeringGroups,
     pacing: ReapPacing,
     outputs: OutputTable,
+    /// Notified by the child's last reader to finish.
+    readers_done: Arc<tokio::sync::Notify>,
     id: ProcessId,
+}
+
+/// A recorded member of a self-exited child's process group: what lets a
+/// later Stop prove the group is still the original one before signalling
+/// it (`descendants::member_still_in_group`). Nothing can be proven without
+/// `/proc`, so elsewhere none is ever recorded.
+#[cfg(target_os = "linux")]
+type GroupMember = descendants::Identity;
+#[cfg(not(target_os = "linux"))]
+type GroupMember = ();
+
+/// The live members of each self-exited child's process group whose
+/// descendant held its output past the exit grace, recorded when its
+/// verdict was; see [`Inner::lingering`].
+type LingeringGroups = Arc<Mutex<HashMap<ProcessId, Vec<GroupMember>>>>;
+
+/// The diagnostic delivered just before the `State` frame of a run whose
+/// readers outlasted the exit grace.
+const LINGERING_NOTE: &str = "the child exited, but a descendant still holds its output open: \
+                              the run ends here and later output is discarded";
+
+/// At most this many escaped descendants are named one by one; the rest
+/// are counted in one more line.
+#[cfg(target_os = "linux")]
+const MAX_NAMED_ESCAPES: usize = 8;
+
+/// The diagnostic lines naming recorded descendants that left the child's
+/// process group and outlived it, by pid and command name (never a path).
+#[cfg(target_os = "linux")]
+fn escape_notes(escaped: &[(nix::unistd::Pid, String)]) -> Vec<String> {
+    let mut notes: Vec<String> = escaped
+        .iter()
+        .take(MAX_NAMED_ESCAPES)
+        .map(|(pid, comm)| {
+            format!(
+                "descendant {} ({comm}) left the run's process group and is still running",
+                pid.as_raw()
+            )
+        })
+        .collect();
+    if escaped.len() > MAX_NAMED_ESCAPES {
+        notes.push(format!(
+            "and {} more descendants left the run's process group and are still running",
+            escaped.len() - MAX_NAMED_ESCAPES
+        ));
+    }
+    notes
+}
+
+/// What the self-exit reaper settled for a child it reaped.
+struct SelfExitVerdict {
+    state: ProcessTerminalState,
+    /// Diagnostic texts delivered just before the `State` frame.
+    notes: Vec<String>,
+    /// The group's live members, recorded only when a reader outlasted the
+    /// grace: what lets Stop still signal that group.
+    members: Vec<GroupMember>,
+    /// Whether a reader outlasted the grace and the run ends without it.
+    abandon_readers: bool,
+}
+
+impl SelfExitVerdict {
+    /// The verdict when the settle itself could not run.
+    fn unproven(lingering: bool) -> Self {
+        Self {
+            state: ProcessTerminalState::OrphanRiskUncertain,
+            notes: lingering
+                .then(|| LINGERING_NOTE.to_string())
+                .into_iter()
+                .collect(),
+            members: Vec::new(),
+            abandon_readers: lingering,
+        }
+    }
+}
+
+/// Settle a reaped self-exited child's verdict from its census, signalling
+/// nothing: the reap-derived state stands only when no recorded descendant
+/// is still running and the process group is empty, and never when a
+/// reader outlasted the exit grace (`lingering`), since something then
+/// still holds the output open.
+#[cfg(target_os = "linux")]
+fn self_exit_verdict(
+    census: &Census,
+    id: ProcessId,
+    reaped: ProcessTerminalState,
+    lingering: bool,
+) -> SelfExitVerdict {
+    let found = census.leftovers(pid_of(id));
+    if let Some(reason) = found.unproven {
+        tracing::warn!(
+            pid = id.0,
+            %reason,
+            "a self-exited child's descendants are not proven gone; orphan-risk/uncertain"
+        );
+    }
+    let state = if lingering || found.unproven.is_some() {
+        ProcessTerminalState::OrphanRiskUncertain
+    } else {
+        reaped
+    };
+    let mut notes = Vec::new();
+    if lingering {
+        notes.push(LINGERING_NOTE.to_string());
+    }
+    notes.extend(escape_notes(&found.escaped));
+    SelfExitVerdict {
+        state,
+        notes,
+        members: if lingering { found.members } else { Vec::new() },
+        abandon_readers: lingering,
+    }
+}
+
+/// Without `/proc` there is no census to settle from (see the `Census`
+/// stub): the reap-derived state stands, unless a reader outlasted the
+/// exit grace.
+#[cfg(not(target_os = "linux"))]
+fn self_exit_verdict(
+    census: &Census,
+    id: ProcessId,
+    reaped: ProcessTerminalState,
+    lingering: bool,
+) -> SelfExitVerdict {
+    let _ = (census, id);
+    if lingering {
+        SelfExitVerdict::unproven(true)
+    } else {
+        SelfExitVerdict {
+            state: reaped,
+            notes: Vec::new(),
+            members: Vec::new(),
+            abandon_readers: false,
+        }
+    }
 }
 
 /// Marks `id` as being stopped for as long as it lives (see
@@ -400,34 +570,41 @@ impl Drop for StoppingGuard<'_> {
 }
 
 impl SelfExitReaper {
-    /// Runs after one reader task ended; a no-op unless this is the one
-    /// claim on a child whose readers are all done and whose final frame is
-    /// still owed.
-    async fn confirm_reap_after_readers(self) {
-        if !output_capture::claim_reap(&self.outputs, self.id) {
-            return;
-        }
-        let began = std::time::Instant::now();
+    /// Polls for the child's exit from spawn until its run's final frame is
+    /// sent. `finish_spawn` takes this reaper's claim before the child is
+    /// visible to anyone, so `observe` defers to it from the first instant.
+    async fn run(self) {
         let mut census = take_census_blocking(self.id).await;
-        let mut census_at = began;
+        let mut census_at = std::time::Instant::now();
         let mut refresh: Option<JoinHandle<Census>> = None;
+        // The current cadence phase began at spawn, and begins again when
+        // the child's output closes.
+        let mut phase_began = std::time::Instant::now();
+        let mut output_closed = false;
         let mut logged_long_running = false;
         loop {
-            // Adopt a finished refresh (an unfinished one is left running).
+            // Merge a finished refresh (an unfinished one is left running).
             if refresh.as_ref().is_some_and(JoinHandle::is_finished)
                 && let Some(handle) = refresh.take()
-                && let Ok(fresh) = handle.await
             {
-                census = adopt_census(census, fresh);
+                census = merge_refresh(census, handle).await;
             }
             output_capture::note_reap_poll(&self.outputs, self.id);
             match self.try_reap() {
-                // A refresh still in flight is dropped (detached): it may
-                // have walked `/proc` after this reap, and its result is
-                // not wanted.
                 ReapAttempt::Reaped(state, settling) => {
-                    self.settle_and_record(census, state).await;
+                    // A walk still in flight is awaited: merged as a union,
+                    // one that ran after the exit adds nothing and erases
+                    // nothing, and one that ran before it may have seen a
+                    // descendant no other walk did.
+                    if let Some(handle) = refresh.take() {
+                        census = merge_refresh(census, handle).await;
+                    }
+                    self.end_after_reap(census, state).await;
                     drop(settling);
+                    return;
+                }
+                ReapAttempt::ReapedElsewhere => {
+                    self.end_after_reap_elsewhere().await;
                     return;
                 }
                 ReapAttempt::Finished => return,
@@ -437,8 +614,12 @@ impl SelfExitReaper {
             if !output_capture::final_frame_owed(&self.outputs, self.id) {
                 return;
             }
-            let elapsed = began.elapsed();
-            if elapsed >= self.pacing.slow_window && !logged_long_running {
+            if !output_closed && !output_capture::readers_active(&self.outputs, self.id) {
+                output_closed = true;
+                phase_began = std::time::Instant::now();
+            }
+            let elapsed = phase_began.elapsed();
+            if output_closed && elapsed >= self.pacing.slow_window && !logged_long_running {
                 logged_long_running = true;
                 tracing::warn!(
                     pid = self.id.0,
@@ -447,90 +628,128 @@ impl SelfExitReaper {
                      polling for its exit at a slow rate"
                 );
             }
-            // Keep the census fresh for a child that lives on: a procfs
-            // walk costs far more than a `try_wait`, so it runs on the
-            // blocking pool, every `census_refresh` while the child is
-            // young and every `census_idle_refresh` once it is idle.
-            let wanted = if elapsed < self.pacing.slow_window {
-                self.pacing.census_refresh
-            } else {
-                self.pacing.census_idle_refresh
-            };
-            if refresh.is_none() && census_at.elapsed() >= wanted {
+            // Keep the census fresh while the child lives: a procfs walk
+            // costs far more than a `try_wait`, so it runs on the blocking
+            // pool, every `census_refresh` early in a phase and every
+            // `census_idle_refresh` after.
+            if refresh.is_none() && census_at.elapsed() >= self.pacing.census_interval(elapsed) {
                 let id = self.id;
                 refresh = Some(tokio::task::spawn_blocking(move || take_census(id)));
                 census_at = std::time::Instant::now();
             }
             // Stamp again so a long sleep is preceded by a fresh poll time.
             output_capture::note_reap_poll(&self.outputs, self.id);
-            tokio::time::sleep(self.pacing.interval(elapsed)).await;
+            if output_closed {
+                tokio::time::sleep(self.pacing.interval(elapsed)).await;
+            } else {
+                // The last reader's end wakes the reaper at once: a child
+                // whose output closes is normally exiting.
+                let _ = tokio::time::timeout(
+                    self.pacing.open_interval(elapsed),
+                    self.readers_done.notified(),
+                )
+                .await;
+            }
         }
     }
 
-    /// Prove the leftover-descendant state the way `stop` does, then record
-    /// the settled state. The sweep sleeps in bounded steps, so it runs on
-    /// the blocking pool, never on the runtime thread that drives every
-    /// reader task.
+    /// Give the readers the exit grace, counted from now: `true` when one
+    /// is still running after it.
+    async fn readers_outlast_grace(&self) -> bool {
+        let until = std::time::Instant::now() + self.pacing.exit_grace;
+        loop {
+            if !output_capture::readers_active(&self.outputs, self.id) {
+                return false;
+            }
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            let _ = tokio::time::timeout(left, self.readers_done.notified()).await;
+        }
+    }
+
+    /// This reaper reaped the child: give its readers the exit grace, then
+    /// settle the verdict and record it. The census is read on the blocking
+    /// pool, never on the runtime thread that drives every reader task.
     ///
     /// The caller holds this id's [`SettlingGuard`] across the call, so
     /// until the verdict is recorded `observe` does not report (or finalize
-    /// with) the reap-derived state and `stop` waits for it.
-    async fn settle_and_record(&self, census: Census, reaped: ProcessTerminalState) {
-        #[cfg(unix)]
-        {
-            let pid = pid_of(self.id);
-            let settle_began = std::time::Instant::now();
-            let settled = tokio::task::spawn_blocking(move || census.settle(pid, reaped))
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::error!(
-                        %error,
-                        "descendant settle task failed; orphan-risk/uncertain"
-                    );
-                    ProcessTerminalState::OrphanRiskUncertain
-                });
-            if settle_began.elapsed() > self.pacing.settle_wait {
-                tracing::warn!(
-                    pid = self.id.0,
-                    took = ?settle_began.elapsed(),
-                    "descendant settle took longer than the settle wait"
-                );
-            }
-            unix::record_reaper_settled_state(
-                &self.children,
-                &self.settling,
-                &self.outputs,
-                self.id,
-                settled,
+    /// with) the reap-derived state and `stop` waits for it. The grace is
+    /// shorter than `settle_wait`, which bounds that wait.
+    async fn end_after_reap(&self, census: Census, reaped: ProcessTerminalState) {
+        let lingering = self.readers_outlast_grace().await;
+        let id = self.id;
+        let settle_began = std::time::Instant::now();
+        let verdict = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            hold_settle(id);
+            self_exit_verdict(&census, id, reaped, lingering)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "descendant settle task failed; orphan-risk/uncertain");
+            SelfExitVerdict::unproven(lingering)
+        });
+        if settle_began.elapsed() > self.pacing.settle_wait {
+            tracing::warn!(
+                pid = self.id.0,
+                took = ?settle_began.elapsed(),
+                "descendant settle took longer than the settle wait"
             );
         }
-        #[cfg(not(unix))]
-        {
-            // No sweep exists here; the yield keeps this an honest `async fn`
-            // on every platform (clippy's `unused_async` otherwise fires on
-            // Windows alone) and lets the runtime schedule between reap and
-            // record exactly as the unix branch's blocking task does.
-            let _ = census;
-            tokio::task::yield_now().await;
-            output_capture::record_confirmed_state(&self.outputs, self.id, reaped);
+        record_self_exit_verdict(
+            &self.children,
+            &self.settling,
+            &self.lingering,
+            &self.outputs,
+            self.id,
+            verdict,
+        );
+    }
+
+    /// `stop` (or `observe` taking over) reaped the child and records its
+    /// state. If the readers still hold the final frame back, give them the
+    /// same exit grace, then end the run without them, with that recorded
+    /// state.
+    async fn end_after_reap_elsewhere(&self) {
+        if !output_capture::final_frame_owed(&self.outputs, self.id) {
+            return;
+        }
+        if self.readers_outlast_grace().await {
+            output_capture::abandon_readers(
+                &self.outputs,
+                self.id,
+                vec![LINGERING_NOTE.to_string()],
+            );
         }
     }
 
     /// One non-blocking reap attempt. `Reaped` when this call reaped the
-    /// child (it is already `Terminal` and ordered); `Finished` when nothing
-    /// is left to poll for -- someone else reaped it (then `observe`/`stop`
-    /// own the state), the entry is gone, or `try_wait` failed (logged).
+    /// child (it is already `Terminal` and ordered); `ReapedElsewhere` when
+    /// someone else did (then `observe`/`stop` own the state); `Finished`
+    /// when nothing is left to poll for -- the entry is gone, or `try_wait`
+    /// failed (logged).
     fn try_reap(&self) -> ReapAttempt {
         let (state, settling) = {
-            let mut children = self
-                .children
-                .lock()
-                .expect("children mutex poisoned by a prior panic");
+            // Never waits for the table: this runs on the runtime thread
+            // that also drives every reader task, and `Inner`'s `Drop` holds
+            // `children` while it kills and reaps, relying on those readers
+            // to drain a killed PTY child (see its doc comment). The reaper
+            // polls every child from spawn, flooding ones included, so a
+            // busy table is simply polled again later.
+            let mut children = match self.children.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return ReapAttempt::Pending,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("children mutex poisoned by a prior panic")
+                }
+            };
             let Some(tracked) = children.get_mut(&self.id) else {
                 return ReapAttempt::Finished;
             };
             let Tracked::Running(child) = tracked else {
-                return ReapAttempt::Finished;
+                return ReapAttempt::ReapedElsewhere;
             };
             // Checked with `children` held (the only nesting of the two
             // locks): a `stop` that registered before this point owns the
@@ -570,7 +789,7 @@ impl SelfExitReaper {
                     tracing::warn!(
                         pid = self.id.0,
                         %error,
-                        "try_wait failed for a child that closed its output; \
+                        "try_wait failed for a child the self-exit reaper polls; \
                          leaving the reap to observe/stop"
                     );
                     output_capture::release_reap(&self.outputs, self.id);
@@ -581,6 +800,83 @@ impl SelfExitReaper {
         // With `children` unlocked, as `observe` does.
         record_terminal_order(&self.children, &self.terminal_order, self.id);
         ReapAttempt::Reaped(state, settling)
+    }
+}
+
+/// Record the self-exit reaper's verdict as this child's settled terminal
+/// state -- only while `id` is still in `settling`. Once `observe` took the
+/// settle over it has reported the reap-derived state, so a late verdict is
+/// discarded; a run whose readers outlasted the grace is still ended then,
+/// with the state `observe` recorded, rather than left open.
+///
+/// When the verdict carries the group's live members (a reader outlasted
+/// the grace), they are kept for a later `stop` ([`Inner::lingering`]),
+/// pruned of ids no longer in `children` so the table stays bounded by it.
+/// Locks `children`, then `settling`, then `lingering`; `outputs` is locked
+/// alone after.
+fn record_self_exit_verdict(
+    children: &Mutex<HashMap<ProcessId, Tracked>>,
+    settling: &Mutex<HashMap<ProcessId, std::time::Instant>>,
+    lingering: &Mutex<HashMap<ProcessId, Vec<GroupMember>>>,
+    outputs: &OutputTable,
+    id: ProcessId,
+    verdict: SelfExitVerdict,
+) {
+    {
+        let mut guard = children
+            .lock()
+            .expect("children mutex poisoned by a prior panic");
+        let settling = settling
+            .lock()
+            .expect("settling mutex poisoned by a prior panic");
+        if !settling.contains_key(&id) {
+            if let Some(Tracked::Terminal(recorded)) = guard.get(&id) {
+                tracing::warn!(
+                    pid = id.0,
+                    settled = ?verdict.state,
+                    reported = ?recorded,
+                    same_verdict = (*recorded == verdict.state),
+                    "late settle verdict discarded; observe already reported \
+                     the reap-derived state"
+                );
+            }
+            drop(settling);
+            drop(guard);
+            if verdict.abandon_readers {
+                output_capture::abandon_readers(outputs, id, verdict.notes);
+            }
+            return;
+        }
+        if let Some(tracked) = guard.get_mut(&id) {
+            *tracked = Tracked::Terminal(verdict.state);
+        }
+        if !verdict.members.is_empty() {
+            let mut groups = lingering
+                .lock()
+                .expect("lingering mutex poisoned by a prior panic");
+            groups.retain(|kept, _| guard.contains_key(kept));
+            groups.insert(id, verdict.members);
+        }
+    }
+    output_capture::record_final_state(
+        outputs,
+        id,
+        verdict.state,
+        verdict.notes,
+        verdict.abandon_readers,
+    );
+}
+
+/// Merge a finished census refresh into `census` ([`Census::merge`]). A
+/// refresh task that failed (it panicked, or the runtime is shutting down)
+/// adds nothing.
+async fn merge_refresh(census: Census, refresh: JoinHandle<Census>) -> Census {
+    match refresh.await {
+        Ok(fresh) => census.merge(fresh),
+        Err(error) => {
+            tracing::error!(%error, "census refresh task failed; keeping the earlier census");
+            census
+        }
     }
 }
 
@@ -626,6 +922,12 @@ impl Census {
     fn settle<P>(&self, _pgid: P, reaped: ProcessTerminalState) -> ProcessTerminalState {
         reaped
     }
+
+    /// Nothing was recorded, so nothing is merged.
+    #[allow(clippy::needless_pass_by_value)]
+    fn merge(self, _fresh: Self) -> Self {
+        self
+    }
 }
 
 /// The pid as the kernel's `pid_t`. A pid beyond `i32::MAX` cannot be a real
@@ -635,18 +937,31 @@ fn pid_of(id: ProcessId) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(i32::try_from(id.0).unwrap_or(i32::MAX))
 }
 
+/// Whether `pgid` is still the process group `members` were recorded in
+/// (`descendants::member_still_in_group`): only then may a self-exited
+/// child's group be signalled by its id.
+#[cfg(target_os = "linux")]
+fn group_still_original(pgid: nix::unistd::Pid, members: &[GroupMember]) -> bool {
+    descendants::member_still_in_group(pgid, members)
+}
+
+/// Without `/proc` no member is ever recorded, so nothing is provable.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_still_original(_pgid: nix::unistd::Pid, _members: &[GroupMember]) -> bool {
+    false
+}
+
 /// Take a descendant census for `id` now.
 ///
 /// What it can see depends on when it runs. A census names the processes
 /// that are still the child's descendants at that instant; they are
-/// reparented to init the moment the child *exits*, not when it is reaped.
-/// The first census here runs after the child's last reader finished, which
-/// on a self-exit is usually when the child has just exited: it then sees
-/// nothing, and a helper that outlived the child is caught only by the
-/// process-group survivor check in `settle` (it stays in the child's group
-/// unless it called `setsid`). The refreshes taken while the child is still
-/// running record helpers a later exit would hide. Either way the result is
-/// `stop`'s own proof, with `stop`'s own documented gaps.
+/// reparented to init the moment the child *exits*, not when it is reaped,
+/// so a walk after the exit sees none of them. The self-exit reaper
+/// therefore walks from spawn, while the child lives, and merges every walk
+/// (`crate::descendants` states the interval and its blind spot); a helper
+/// that stayed in the child's group is also caught afterwards by the
+/// process-group check, but one that called `setsid` only by a walk that
+/// saw it while the child lived.
 fn take_census(id: ProcessId) -> Census {
     #[cfg(test)]
     CENSUS_TAKES
@@ -676,26 +991,28 @@ async fn take_census_blocking(id: ProcessId) -> Census {
     }
 }
 
-/// Keep `old` when `fresh` was taken after the child's reap: a walk that
-/// found no `/proc` entry for the child ran too late to say anything.
-#[cfg(target_os = "linux")]
-fn adopt_census(old: Census, fresh: Census) -> Census {
-    use descendants::Unproven;
-    if matches!(fresh, Census::Unavailable(Unproven::ChildEntryMissing)) {
-        old
-    } else {
-        fresh
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn adopt_census(_old: Census, fresh: Census) -> Census {
-    fresh
-}
-
 /// Every pid a census was taken for, in order; unit tests count their own.
 #[cfg(test)]
 static CENSUS_TAKES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Pids whose self-exit settle a unit test holds for the given time, so a
+/// settle can be made to outlast the settle wait without a sweep.
+#[cfg(test)]
+static HELD_SETTLES: Mutex<Vec<(u32, Duration)>> = Mutex::new(Vec::new());
+
+/// Sleep for the time a unit test registered for `id` in [`HELD_SETTLES`].
+#[cfg(test)]
+fn hold_settle(id: ProcessId) {
+    let held = HELD_SETTLES
+        .lock()
+        .expect("held settles poisoned")
+        .iter()
+        .find(|(pid, _)| *pid == id.0)
+        .map(|(_, hold)| *hold);
+    if let Some(hold) = held {
+        std::thread::sleep(hold);
+    }
+}
 
 /// What one [`SelfExitReaper::try_reap`] concluded.
 enum ReapAttempt {
@@ -704,6 +1021,8 @@ enum ReapAttempt {
     /// This call reaped the child with this reap-derived state; the guard
     /// keeps the id settling until the verdict is recorded.
     Reaped(ProcessTerminalState, SettlingGuard),
+    /// `stop` or `observe` reaped it; they record its state.
+    ReapedElsewhere,
     /// Nothing left to poll for.
     Finished,
 }
@@ -783,7 +1102,7 @@ pub struct TokioProcessSupervisor {
 /// construct runtime-dependent resources on that thread.
 struct Inner {
     runtime: Arc<Runtime>,
-    /// `Arc`-shared so the self-exit reaper task ([`confirm_reap_after_readers`])
+    /// `Arc`-shared so the self-exit reaper task ([`SelfExitReaper::run`])
     /// can hold the table without holding `Inner` itself: `Inner`'s `Drop`
     /// joins the driver thread, which a task running on that thread must
     /// never be the one to trigger.
@@ -804,6 +1123,13 @@ struct Inner {
     /// until the settle records the verdict `observe` reports the child as
     /// still running (and finalizes nothing) and `stop` waits.
     settling: Arc<Mutex<HashMap<ProcessId, std::time::Instant>>>,
+    /// The live members of a self-exited child's process group, recorded
+    /// with its verdict when a descendant still held its output after the
+    /// exit grace. A later `stop` signals that group only while one of them
+    /// is provably still in it, so the group id cannot have been recycled
+    /// (`unix::signal_lingering_group`). Never recorded without `/proc`.
+    /// Kept no longer than the id's own `children` entry.
+    lingering: LingeringGroups,
     /// The self-exit reaper's cadence; only tests use anything but the default.
     reap_pacing: ReapPacing,
     /// Per-child output-capture bookkeeping (`output_capture` module),
@@ -902,6 +1228,7 @@ impl TokioProcessSupervisor {
                 terminal_order: Arc::new(Mutex::new(VecDeque::new())),
                 stopping: Arc::new(Mutex::new(HashSet::new())),
                 settling: Arc::new(Mutex::new(HashMap::new())),
+                lingering: Arc::new(Mutex::new(HashMap::new())),
                 reap_pacing,
                 outputs: Arc::new(Mutex::new(HashMap::new())),
                 demo_launcher,
@@ -1120,11 +1447,17 @@ impl TokioProcessSupervisor {
         let id = ProcessId(pid);
 
         let (output_state, handles) = output_capture::new_channel(wiring.reader_count());
+        let readers_done = handles.readers_done();
         self.inner
             .outputs
             .lock()
             .expect("outputs mutex poisoned by a prior panic")
             .insert(id, output_state);
+        // The self-exit reaper's claim, taken here rather than by its task:
+        // the child is not in `children` yet, so no `observe` can reap it
+        // ahead of the reaper that owns the verdict.
+        let claimed = output_capture::claim_reap(&self.inner.outputs, id);
+        debug_assert!(claimed, "a fresh output entry is always claimable");
 
         // Every reader and writer task is attached before this child is
         // ever inserted into `children`, so no other code path can observe
@@ -1149,20 +1482,27 @@ impl TokioProcessSupervisor {
             .expect("children mutex poisoned by a prior panic")
             .insert(id, Tracked::Running(Box::new(child)));
 
+        // From spawn, not from the readers' end: a descendant that inherited
+        // the output can keep the readers running long after the child has
+        // exited. Spawned only now, with the entry in `children` to poll.
+        self.spawn_on_runtime(self.reaper(id, readers_done).run());
+
         tracing::debug!(program = %program_label, pid, "spawned process");
         Ok(id)
     }
 
     /// The handles the self-exit reaper needs for `id`, cloned out of
     /// `Inner` so the reaper task never keeps `Inner` itself alive.
-    fn reaper(&self, id: ProcessId) -> SelfExitReaper {
+    fn reaper(&self, id: ProcessId, readers_done: Arc<tokio::sync::Notify>) -> SelfExitReaper {
         SelfExitReaper {
             children: Arc::clone(&self.inner.children),
             terminal_order: Arc::clone(&self.inner.terminal_order),
             stopping: Arc::clone(&self.inner.stopping),
             settling: Arc::clone(&self.inner.settling),
+            lingering: Arc::clone(&self.inner.lingering),
             pacing: self.inner.reap_pacing,
             outputs: Arc::clone(&self.inner.outputs),
+            readers_done,
             id,
         }
     }
@@ -1212,16 +1552,8 @@ impl TokioProcessSupervisor {
                     Arc::clone(&self.inner.outputs),
                     id,
                 );
-                let stdout_reaper = self.reaper(id);
-                let stderr_reaper = self.reaper(id);
-                self.spawn_on_runtime(async move {
-                    stdout_drain.await;
-                    stdout_reaper.confirm_reap_after_readers().await;
-                });
-                self.spawn_on_runtime(async move {
-                    stderr_drain.await;
-                    stderr_reaper.confirm_reap_after_readers().await;
-                });
+                self.spawn_on_runtime(stdout_drain);
+                self.spawn_on_runtime(stderr_drain);
 
                 if let Some(prompt_bytes) = prompt {
                     let mut stdin_handle = child
@@ -1252,11 +1584,7 @@ impl TokioProcessSupervisor {
                     Arc::clone(&self.inner.outputs),
                     id,
                 );
-                let reaper = self.reaper(id);
-                self.spawn_on_runtime(async move {
-                    drain.await;
-                    reaper.confirm_reap_after_readers().await;
-                });
+                self.spawn_on_runtime(drain);
                 if let Some(prompt_bytes) = prompt {
                     self.spawn_on_runtime(pty::type_prompt(
                         master,
@@ -1464,6 +1792,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             unix::stop(
                 &self.inner.children,
                 &self.inner.terminal_order,
+                &self.inner.lingering,
                 &self.inner.outputs,
                 id,
                 deadline,
@@ -1753,9 +2082,9 @@ mod unix {
     use nix::unistd::Pid;
     use omnifrons_app::{ProcessId, ProcessTerminalState, SupervisorError};
 
-    use crate::Tracked;
     use crate::output_capture::{self, OutputTable};
     use crate::record_terminal_order;
+    use crate::{GroupMember, Tracked};
 
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
     const KILL_GRACE: Duration = Duration::from_millis(500);
@@ -1789,23 +2118,38 @@ mod unix {
     pub(crate) fn stop(
         children: &Mutex<HashMap<ProcessId, Tracked>>,
         terminal_order: &Mutex<VecDeque<ProcessId>>,
+        lingering: &Mutex<HashMap<ProcessId, Vec<GroupMember>>>,
         outputs: &OutputTable,
         id: ProcessId,
         deadline: Duration,
     ) -> Result<ProcessTerminalState, SupervisorError> {
-        {
+        let (recorded, members) = {
             let guard = children
                 .lock()
                 .expect("children mutex poisoned by a prior panic");
             match guard.get(&id) {
                 None => return Err(SupervisorError::UnknownProcess),
-                // Already confirmed terminal: report the same recorded
-                // state again, without ever touching this pid/pgid --
-                // which the OS may since have recycled for something
-                // else.
-                Some(Tracked::Terminal(state)) => return Ok(*state),
-                Some(Tracked::Running(_)) => {}
+                Some(Tracked::Terminal(state)) => (
+                    Some(*state),
+                    lingering
+                        .lock()
+                        .expect("lingering mutex poisoned by a prior panic")
+                        .get(&id)
+                        .cloned(),
+                ),
+                Some(Tracked::Running(_)) => (None, None),
             }
+        };
+        // Already confirmed terminal: report the same recorded state again.
+        // The pid/pgid is touched again only for a self-exit whose
+        // descendant held the output past the exit grace, and then only
+        // while that group is provably the original one -- the OS may
+        // otherwise have recycled the id for something else.
+        if let Some(state) = recorded {
+            if let Some(members) = members {
+                signal_lingering_group(id, &members, deadline);
+            }
+            return Ok(state);
         }
 
         // `process_group(0)` at spawn time made the child its own group
@@ -1935,42 +2279,47 @@ mod unix {
         output_capture::record_confirmed_state(outputs, id, state);
     }
 
-    /// [`record_settled_state`] for the self-exit reaper: writes only while
-    /// `id` is still in `settling`. Once `observe` took the settle over it
-    /// has reported the reap-derived state, so a late verdict is discarded.
-    /// Locks `children`, then `settling`; `outputs` is locked alone after.
-    pub(crate) fn record_reaper_settled_state(
-        children: &Mutex<HashMap<ProcessId, Tracked>>,
-        settling: &Mutex<HashMap<ProcessId, std::time::Instant>>,
-        outputs: &OutputTable,
-        id: ProcessId,
-        settled: ProcessTerminalState,
-    ) {
-        {
-            let mut guard = children
-                .lock()
-                .expect("children mutex poisoned by a prior panic");
-            let settling = settling
-                .lock()
-                .expect("settling mutex poisoned by a prior panic");
-            if !settling.contains_key(&id) {
-                if let Some(Tracked::Terminal(recorded)) = guard.get(&id) {
-                    tracing::warn!(
-                        pid = id.0,
-                        settled = ?settled,
-                        reported = ?recorded,
-                        same_verdict = (*recorded == settled),
-                        "late settle verdict discarded; observe already reported \
-                         the reap-derived state"
-                    );
-                }
+    /// Stop's reach into the process group of a child that already exited
+    /// on its own, while a descendant still held its output (S5d): the
+    /// recorded state does not change -- the run already ended with it --
+    /// but its lingering group is signalled like a running child's,
+    /// `SIGTERM` then, after `deadline`, `SIGKILL`.
+    ///
+    /// Only while the group is provably the original one: a member
+    /// recorded with the verdict is still in it with its recorded start
+    /// time, so the group id (the reaped child's pid) cannot have been
+    /// recycled ([`crate::group_still_original`]). Once no recorded member
+    /// is left, nothing more is signalled, even if a process that joined
+    /// the group later is still in it.
+    fn signal_lingering_group(id: ProcessId, members: &[GroupMember], deadline: Duration) {
+        let Ok(raw_pid) = i32::try_from(id.0) else {
+            return;
+        };
+        let pgid = Pid::from_raw(raw_pid);
+        for (signal, budget) in [(Signal::SIGTERM, deadline), (Signal::SIGKILL, KILL_GRACE)] {
+            if !crate::group_still_original(pgid, members) {
                 return;
             }
-            if let Some(tracked) = guard.get_mut(&id) {
-                *tracked = Tracked::Terminal(settled);
+            tracing::debug!(pid = id.0, ?signal, "signalling a lingering process group");
+            if let SignalOutcome::Uncertain(errno) = classify_killpg_result(killpg(pgid, signal)) {
+                tracing::warn!(
+                    pid = id.0,
+                    %errno,
+                    "killpg on a lingering process group failed unexpectedly"
+                );
+                return;
+            }
+            let start = Instant::now();
+            while crate::group_still_original(pgid, members) && start.elapsed() < budget {
+                std::thread::sleep(POLL_INTERVAL);
             }
         }
-        output_capture::record_confirmed_state(outputs, id, settled);
+        if crate::group_still_original(pgid, members) {
+            tracing::warn!(
+                pid = id.0,
+                "a recorded member of a lingering process group outlived SIGKILL"
+            );
+        }
     }
 
     /// Poll `try_wait` until the child is reaped or `budget` elapses.
@@ -2229,6 +2578,7 @@ mod self_exit_tests {
         idle_poll: Duration::from_millis(20),
         census_refresh: Duration::from_secs(1),
         census_idle_refresh: Duration::from_secs(10),
+        exit_grace: Duration::from_secs(2),
         stall_grace: Duration::from_secs(3),
         settle_wait: Duration::from_secs(5),
     };
@@ -2279,6 +2629,7 @@ mod self_exit_tests {
         idle_poll: Duration::from_secs(3600),
         census_refresh: Duration::from_secs(3600),
         census_idle_refresh: Duration::from_secs(3600),
+        exit_grace: Duration::from_secs(2),
         stall_grace: Duration::from_millis(300),
         settle_wait: Duration::from_secs(5),
     };
@@ -2333,16 +2684,21 @@ mod self_exit_tests {
             ..SHORT
         };
         let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
-        // The census records the first helper, which ignores TERM, so the
-        // sweep takes at least 300 ms, well past the 50 ms settle wait. The
-        // second helper starts after the census and stays in the group, so
-        // the settled verdict is `OrphanRiskUncertain`, unlike the
-        // reap-derived `Exited` that `observe` reports on taking over.
+        // A self-exit settle sweeps nothing, so this one is held for 300 ms
+        // (`HELD_SETTLES`), well past the 50 ms settle wait. Both helpers
+        // stay in the group, so the settled verdict is
+        // `OrphanRiskUncertain`, unlike the reap-derived `Exited` that
+        // `observe` reports on taking over.
         let script = "(trap '' TERM; exec sleep 3) >/dev/null 2>&1 </dev/null & \
                       exec 1>&- 2>&-; sleep 0.2; \
                       (exec sleep 2) >/dev/null 2>&1 </dev/null & exit 0";
         let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        // Registered while the child still sleeps its 0.2 s: before its settle.
+        super::HELD_SETTLES
+            .lock()
+            .expect("held settles poisoned")
+            .push((id.0, Duration::from_millis(300)));
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         let exited = ProcessTerminalState::Exited { code: Some(0) };

@@ -1,12 +1,13 @@
-//! Output capture: pipes a spawned child's stdout/stderr, frames the bytes
-//! into [`OutputFrame`]s bounded by [`MAX_LINE_BYTES`], and delivers them
-//! through a bounded per-child channel with best-effort backpressure for
-//! text (`try_send` only -- a full channel drops the newest frame and
-//! counts it, never blocks the reader). The one exception is the final
-//! `State` frame ([`try_finalize`]): it is guaranteed-delivered via a
-//! dedicated blocking-send thread rather than dropped alongside text when
-//! the channel is full, since it is the only signal a subscriber has that
-//! the process is truly done.
+//! Output capture: pipes a spawned child's stdout/stderr (or reads its
+//! pseudo-terminal master), frames the bytes into [`OutputFrame`]s bounded
+//! by [`MAX_LINE_BYTES`], and delivers them through a bounded per-child
+//! channel with best-effort backpressure for text (`try_send` only -- a
+//! full channel drops the newest frame and counts it, never blocks the
+//! reader). The one exception is the end of the run ([`try_finalize`]):
+//! its diagnostics and the final `State` frame are guaranteed-delivered via
+//! a dedicated blocking-send thread rather than dropped alongside text when
+//! the channel is full, since the `State` frame is the only signal a
+//! subscriber has that the run is truly done.
 //!
 //! Line-framing contract ([`drain_stream`]): a line ends at a bare `\n` or
 //! at `\r\n` (that `\r` is stripped, never delivered as content); a final
@@ -20,17 +21,38 @@
 //! different reads. Only the *next* byte after a full buffer, never the
 //! buffer's length, decides whether a split happens.
 //!
+//! ## When the final `State` frame is sent
+//!
 //! Deliberately independent of this crate's own `Tracked` bookkeeping
 //! (`docs/spike-log.md` § IPC contract): `Tracked`'s Running/Terminal
 //! transition is the `ProcessSupervisor` port's own contract and must keep
 //! reporting a confirmed reap immediately, regardless of whether stdout/
 //! stderr have finished draining. The final `State` frame this module
 //! sends therefore waits for *both* the confirmed terminal state
-//! ([`record_confirmed_state`], called from `observe`/`stop`) and both
-//! reader tasks finishing ([`drain_stream`]'s own bookkeeping) -- whichever
-//! happens second performs the send, so the state frame is never emitted
-//! ahead of output that was already read but not yet delivered.
+//! ([`record_final_state`], from `observe`, `stop`, or the self-exit
+//! reaper) and every reader task finishing ([`drain_stream`]'s own
+//! bookkeeping) -- whichever happens second performs the send, so the state
+//! frame is never emitted ahead of output that was already read but not yet
+//! delivered.
+//!
+//! One case bounds that wait. A descendant that inherited the child's
+//! output (`sh -c 'sleep 3600 & exit 0'`) holds it open after the child has
+//! exited, and its reader then never ends. The self-exit reaper (which polls
+//! for the child's exit from spawn, not from the readers' end) gives the
+//! readers a grace of 2 s from that exit; if one is still running after it,
+//! the reaper *abandons* them: the run ends with `orphan-risk/uncertain`,
+//! preceded by a diagnostic `stderr` frame saying a descendant still holds
+//! the output open. The same grace applies when `stop` reaped the child.
+//! From then on the `State` frame stays the last frame on the channel: the
+//! readers' sending slot is closed under the same lock that assigns the
+//! `State` frame's `seq` ([`ReaderHandles`]), so whatever a lingering
+//! reader reads afterwards is discarded, never delivered. Each such reader
+//! counts what it discarded and logs that count once, in a `tracing`
+//! warning, when it finally ends. Closing the slot also drops the readers'
+//! last sender, so a subscriber's iterator ends after the `State` frame even
+//! while a reader lingers; the descendant itself is left running.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -38,6 +60,7 @@ use std::sync::{Arc, Mutex};
 
 use omnifrons_app::{FramePayload, OutputFrame, OutputStream, ProcessId, ProcessTerminalState};
 use tokio::io::AsyncReadExt;
+use tokio::sync::Notify;
 
 /// The maximum text bytes one frame carries. A line longer than this is
 /// split into consecutive frames instead of growing one frame unbounded,
@@ -59,6 +82,9 @@ const CHANNEL_CAPACITY: usize = 1024;
 /// The shared map of every spawned child's output-capture bookkeeping.
 pub(crate) type OutputTable = Arc<Mutex<HashMap<ProcessId, OutputChannelState>>>;
 
+/// The readers' sending slot: `Some` until [`try_finalize`] closes it.
+type Gate = Arc<Mutex<Option<SyncSender<OutputFrame>>>>;
+
 /// Per-child output-capture bookkeeping, independent of this crate's own
 /// `Tracked` entry for the same id.
 ///
@@ -77,16 +103,19 @@ pub(crate) type OutputTable = Arc<Mutex<HashMap<ProcessId, OutputChannelState>>>
 pub(crate) struct OutputChannelState {
     /// Taken by `ProcessOutput::subscribe`, exactly once.
     receiver: Option<Receiver<OutputFrame>>,
-    /// `None` once the final `State` frame has been sent (or, on a
-    /// platform where reap is never confirmed, forever `Some` -- see this
-    /// module's own doc comment): dropping every sender clone is what lets
-    /// a subscriber's `Receiver` iterator end.
+    /// The sender the final frames go out on. `None` once they have been
+    /// handed to the delivery thread (or, on a platform where reap is never
+    /// confirmed, forever `Some` -- see this module's own doc comment):
+    /// dropping every sender is what lets a subscriber's `Receiver`
+    /// iterator end.
     sender: Option<SyncSender<OutputFrame>>,
-    /// Shared with both of this process's reader tasks via their own
+    /// The readers' own sender, closed by [`try_finalize`]; shared with
+    /// every reader task via its [`ReaderHandles`].
+    gate: Gate,
+    /// Shared with this process's reader tasks via their own
     /// [`ReaderHandles`] clone. See [`ReaderHandles`]'s own doc comment for
-    /// why plain, unlocked atomics are sound here despite `seq`'s
-    /// read-then-write sequence (`try_send`) not itself being one atomic
-    /// operation.
+    /// why a frame's `seq` stays unique although its read-then-write
+    /// sequence (`try_send`) is not itself one atomic operation.
     seq: Arc<AtomicU64>,
     pending_drops: Arc<AtomicU64>,
     /// Starts at the number of reader tasks actually spawned for this
@@ -94,12 +123,21 @@ pub(crate) struct OutputChannelState {
     /// master -- `docs/spike-log.md` § Slice 4); each reader task
     /// decrements it once, on EOF or a read error.
     active_readers: Arc<AtomicU8>,
-    /// Set once `observe`/`stop` confirms the process's terminal state,
-    /// independent of whether the readers are done yet.
+    /// Notified once by the last reader task to finish: the self-exit
+    /// reaper waits on it.
+    readers_done: Arc<Notify>,
+    /// Set once `observe`/`stop`/the self-exit reaper confirms the
+    /// process's terminal state, independent of whether the readers are
+    /// done yet.
     confirmed_state: Option<ProcessTerminalState>,
-    /// Set by the one self-exit reaper that claimed this child
-    /// ([`claim_reap`]); keeps a second finishing reader from starting a
-    /// second poller.
+    /// Diagnostic `stderr` texts to deliver just before the `State` frame
+    /// ([`record_final_state`], [`abandon_readers`]).
+    final_notes: Vec<String>,
+    /// Set when the self-exit reaper gave up waiting for a reader that
+    /// outlasted the exit grace: the final frames no longer wait for it.
+    readers_abandoned: bool,
+    /// Set by the self-exit reaper when it starts, at spawn
+    /// ([`claim_reap`]).
     reaper_claimed: bool,
     /// When [`claim_reap`] took the claim; cleared by [`release_reap`].
     claimed_at: Option<std::time::Instant>,
@@ -114,38 +152,79 @@ pub(crate) struct OutputChannelState {
 
 /// What each reader task holds its own clone of.
 ///
-/// ## Why plain atomics, with no lock around `try_send`'s own critical
-/// section, are sound
+/// ## Why each frame's `seq` stays unique, and none follows the `State`
+/// frame
 ///
 /// [`try_send`] reads `seq`/`pending_drops`, builds a frame from what it
 /// read, attempts delivery, and only *then* writes `seq`/`pending_drops`
-/// back -- three separate atomic operations, not one, with no `.await`
-/// between them. A genuinely concurrent second caller (this process's
-/// *other* stream's reader task, the only other code that ever calls
-/// `try_send` for the same [`OutputChannelState`]) interleaving between
-/// that read and that write would let both readers capture the same `seq`
-/// value and emit two frames claiming it -- silently breaking the
+/// back -- three separate atomic operations, not one. Two callers
+/// interleaving between that read and that write would capture the same
+/// `seq` and emit two frames claiming it, silently breaking the
 /// contiguous-per-process-`seq` guarantee `docs/spike-log.md` § IPC
 /// contract makes.
 ///
-/// This is safe *only* because `TokioProcessSupervisor` always builds a
-/// `new_current_thread()` runtime, driven by exactly one dedicated OS
-/// thread (`TokioProcessSupervisor::build`'s own doc comment). A process's
-/// stdout and stderr reader tasks are both spawned onto that one runtime,
-/// so at most one of them is ever actually *executing* at a given instant
-/// -- Tokio only switches between them at an `.await` point, and
-/// `try_send`'s own critical section contains none. If this runtime were
-/// ever built as a genuine multi-thread runtime instead, the two reader
-/// tasks could run on separate OS threads in true parallel, and this
-/// reasoning would no longer hold.
-/// `tests/runtime_drives_tasks.rs`'s `the_supervisors_runtime_is_current_thread_flavor`
-/// test stands guard on that assumption directly.
+/// `try_send` therefore holds `gate`'s lock for that whole sequence, and
+/// [`try_finalize`] holds the same lock while it assigns the final frames'
+/// `seq` and closes the slot. That matters since a reader can be abandoned
+/// ([`abandon_readers`]): the final frames are then assigned on whichever
+/// thread confirmed the state while that reader still runs on the
+/// supervisor's runtime thread. Every reader frame sent before the slot
+/// closed has a lower `seq` and is already in the channel; every one after
+/// it is discarded. (The two reader tasks of one process still share one
+/// current-thread runtime -- `tests/runtime_drives_tasks.rs`'s
+/// `the_supervisors_runtime_is_current_thread_flavor` -- but the lock, not
+/// that, is what the guarantee now rests on.)
+///
+/// `discarded` is the one per-reader field: a clone starts its own count.
 #[derive(Clone)]
 pub(crate) struct ReaderHandles {
-    sender: SyncSender<OutputFrame>,
+    gate: Gate,
     seq: Arc<AtomicU64>,
     pending_drops: Arc<AtomicU64>,
     active_readers: Arc<AtomicU8>,
+    readers_done: Arc<Notify>,
+    /// Bytes of text this reader read after the slot closed, discarded.
+    discarded: Cell<u64>,
+}
+
+impl ReaderHandles {
+    /// What the self-exit reaper waits on: notified once, by the last
+    /// reader task to finish.
+    pub(crate) fn readers_done(&self) -> Arc<Notify> {
+        Arc::clone(&self.readers_done)
+    }
+
+    /// Whether the readers' slot is still open (the final frames are not
+    /// assigned yet).
+    fn slot_open(&self) -> bool {
+        self.gate
+            .lock()
+            .expect("output gate mutex poisoned by a prior panic")
+            .is_some()
+    }
+}
+
+impl OutputChannelState {
+    /// A fresh [`ReaderHandles`] onto this channel, for a frame sent from
+    /// outside the reader tasks.
+    fn handles(&self) -> ReaderHandles {
+        ReaderHandles {
+            gate: Arc::clone(&self.gate),
+            seq: Arc::clone(&self.seq),
+            pending_drops: Arc::clone(&self.pending_drops),
+            active_readers: Arc::clone(&self.active_readers),
+            readers_done: Arc::clone(&self.readers_done),
+            discarded: Cell::new(0),
+        }
+    }
+
+    /// The next frame in this channel's `seq` order, carrying the drops
+    /// pending before it. Called only with `gate` locked.
+    fn next_frame(&self, payload: FramePayload) -> OutputFrame {
+        let seq = self.seq.fetch_add(1, Ordering::AcqRel);
+        let dropped_before = self.pending_drops.swap(0, Ordering::AcqRel);
+        OutputFrame::with_dropped_before(seq, dropped_before, payload)
+    }
 }
 
 /// Build a fresh channel and bookkeeping for a newly spawned child, and the
@@ -156,29 +235,24 @@ pub(crate) struct ReaderHandles {
 /// exist.
 pub(crate) fn new_channel(reader_count: u8) -> (OutputChannelState, ReaderHandles) {
     let (sender, receiver) = sync_channel(CHANNEL_CAPACITY);
-    let seq = Arc::new(AtomicU64::new(0));
-    let pending_drops = Arc::new(AtomicU64::new(0));
-    let active_readers = Arc::new(AtomicU8::new(reader_count));
-
-    let handles = ReaderHandles {
-        sender: sender.clone(),
-        seq: Arc::clone(&seq),
-        pending_drops: Arc::clone(&pending_drops),
-        active_readers: Arc::clone(&active_readers),
-    };
     let state = OutputChannelState {
         receiver: Some(receiver),
+        gate: Arc::new(Mutex::new(Some(sender.clone()))),
         sender: Some(sender),
-        seq,
-        pending_drops,
-        active_readers,
+        seq: Arc::new(AtomicU64::new(0)),
+        pending_drops: Arc::new(AtomicU64::new(0)),
+        active_readers: Arc::new(AtomicU8::new(reader_count)),
+        readers_done: Arc::new(Notify::new()),
         confirmed_state: None,
+        final_notes: Vec::new(),
+        readers_abandoned: false,
         reaper_claimed: false,
         claimed_at: None,
         reap_polls: 0,
         last_reap_poll_at: None,
         deferral_expired_logged: false,
     };
+    let handles = state.handles();
     (state, handles)
 }
 
@@ -229,8 +303,11 @@ pub(crate) fn take_receiver(
 /// message -- and logs the error via `tracing::warn!`.
 ///
 /// Either way, once the loop ends this stream marks itself done and, if it
-/// was the last of the two, asks [`try_finalize`] to send the final state
-/// frame (a no-op if the terminal state is not confirmed yet).
+/// was the last of its process's readers, wakes the self-exit reaper and
+/// asks [`try_finalize`] to send the final state frame (a no-op if the
+/// terminal state is not confirmed yet). A reader that ends after its run's
+/// final frames were already assigned -- one the reaper abandoned -- first
+/// logs, once, how many bytes it read and discarded since.
 ///
 /// A split is decided *lazily*: a full buffer is never emitted the moment
 /// it fills, only once the next byte of input proves the line goes on --
@@ -337,6 +414,18 @@ pub(crate) async fn drain_stream<R>(
         emit_text(&handles, stream, &buf, false);
     }
 
+    finish_stream(&handles, stream, read_error, &outputs, id);
+}
+
+/// [`drain_stream`]'s end, after its last line: report a read error, log a
+/// reader that outlived its run's final frame, then mark this stream done.
+fn finish_stream(
+    handles: &ReaderHandles,
+    stream: OutputStream,
+    read_error: Option<std::io::Error>,
+    outputs: &OutputTable,
+    id: ProcessId,
+) {
     if let Some(error) = read_error {
         tracing::warn!(
             pid = id.0,
@@ -346,11 +435,34 @@ pub(crate) async fn drain_stream<R>(
             "output capture ended by a read error"
         );
         let diagnostic = read_error_diagnostic(stream, &error);
-        emit_text(&handles, OutputStream::Stderr, diagnostic.as_bytes(), false);
+        // The supervisor's own text, not the child's: never counted as
+        // discarded output.
+        let _ = try_send(
+            handles,
+            FramePayload::Text {
+                stream: OutputStream::Stderr,
+                text: diagnostic,
+                continued: false,
+            },
+        );
+    }
+
+    // Still counted among the active readers here, so a closed slot can
+    // only mean the run's final frames went out without waiting for this
+    // reader: it was abandoned.
+    if !handles.slot_open() {
+        tracing::warn!(
+            pid = id.0,
+            ?stream,
+            discarded_bytes = handles.discarded.get(),
+            "a reader outlived its run's final state frame; what it read after that frame \
+             was discarded"
+        );
     }
 
     if handles.active_readers.fetch_sub(1, Ordering::AcqRel) == 1 {
-        try_finalize(&outputs, id);
+        handles.readers_done.notify_one();
+        try_finalize(outputs, id);
     }
 }
 
@@ -421,12 +533,15 @@ fn utf8_safe_boundary(bytes: &[u8]) -> usize {
     }
 }
 
-/// Frame and best-effort-deliver one decoded text chunk. `continued` is
-/// `true` only for a chunk that the per-frame cap forced to end early with
-/// more of the same logical line still to come (see [`drain_stream`]).
-fn emit_text(handles: &ReaderHandles, stream: OutputStream, bytes: &[u8], continued: bool) {
+/// Frame and best-effort-deliver one decoded text chunk of the child's
+/// output. `continued` is `true` only for a chunk that the per-frame cap
+/// forced to end early with more of the same logical line still to come
+/// (see [`drain_stream`]). A chunk read after the readers' slot closed is
+/// discarded and its bytes counted (`ReaderHandles::discarded`); returns
+/// whether it was accepted.
+fn emit_text(handles: &ReaderHandles, stream: OutputStream, bytes: &[u8], continued: bool) -> bool {
     let text = String::from_utf8_lossy(bytes).into_owned();
-    try_send(
+    let accepted = try_send(
         handles,
         FramePayload::Text {
             stream,
@@ -434,17 +549,34 @@ fn emit_text(handles: &ReaderHandles, stream: OutputStream, bytes: &[u8], contin
             continued,
         },
     );
+    if !accepted {
+        let discarded = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        handles
+            .discarded
+            .set(handles.discarded.get().saturating_add(discarded));
+    }
+    accepted
 }
 
-/// Best-effort delivery shared by text frames and (via [`try_finalize`])
-/// the final state frame: `try_send` only. A full channel increments the
-/// pending-drop count, surfaced as `dropped_before` on the next frame that
-/// does get through, rather than blocking the caller.
-fn try_send(handles: &ReaderHandles, payload: FramePayload) {
+/// Best-effort delivery of one text frame through the readers' slot:
+/// `try_send` only. A full channel increments the pending-drop count,
+/// surfaced as `dropped_before` on the next frame that does get through,
+/// rather than blocking the caller. Holds the slot's lock throughout (see
+/// [`ReaderHandles`]); returns `false` only when the slot is already closed
+/// -- the run's final frames are assigned -- and the frame was discarded
+/// rather than delivered after them.
+fn try_send(handles: &ReaderHandles, payload: FramePayload) -> bool {
+    let slot = handles
+        .gate
+        .lock()
+        .expect("output gate mutex poisoned by a prior panic");
+    let Some(sender) = slot.as_ref() else {
+        return false;
+    };
     let seq = handles.seq.load(Ordering::Acquire);
     let dropped_before = handles.pending_drops.load(Ordering::Acquire);
     let frame = OutputFrame::with_dropped_before(seq, dropped_before, payload);
-    match handles.sender.try_send(frame) {
+    match sender.try_send(frame) {
         Ok(()) => {
             handles.seq.fetch_add(1, Ordering::AcqRel);
             handles.pending_drops.store(0, Ordering::Release);
@@ -456,6 +588,7 @@ fn try_send(handles: &ReaderHandles, payload: FramePayload) {
             // The subscriber dropped its receiver; nothing left to do.
         }
     }
+    true
 }
 
 /// Emit a synthetic stderr text frame reporting that writing an adapter
@@ -476,29 +609,28 @@ fn try_send(handles: &ReaderHandles, payload: FramePayload) {
 /// from the same background task that already gave up on writing to
 /// stdin, and simply reports the fact.
 pub(crate) fn emit_stdin_write_failed(outputs: &OutputTable, id: ProcessId) {
-    let mut guard = outputs
-        .lock()
-        .expect("outputs mutex poisoned by a prior panic");
-    let Some(entry) = guard.get_mut(&id) else {
-        return;
+    let handles = {
+        let guard = outputs
+            .lock()
+            .expect("outputs mutex poisoned by a prior panic");
+        let Some(entry) = guard.get(&id) else {
+            return;
+        };
+        if entry.sender.is_none() {
+            return; // already finalized; nothing left to deliver to
+        }
+        entry.handles()
     };
-    let Some(sender) = entry.sender.clone() else {
-        return; // already finalized; nothing left to deliver to
-    };
-    let seq = entry.seq.fetch_add(1, Ordering::AcqRel);
-    let dropped_before = entry.pending_drops.swap(0, Ordering::AcqRel);
-    drop(guard);
-
-    let frame = OutputFrame::with_dropped_before(
-        seq,
-        dropped_before,
+    // Through the readers' slot, like any reader frame: it takes the next
+    // `seq` and can never follow the `State` frame.
+    let _ = try_send(
+        &handles,
         FramePayload::Text {
             stream: OutputStream::Stderr,
             text: "stdin write failed".to_string(),
             continued: false,
         },
     );
-    let _ = sender.try_send(frame);
 }
 
 /// Record that `id`'s process reached `state`, and finalize its output
@@ -512,6 +644,21 @@ pub(crate) fn record_confirmed_state(
     id: ProcessId,
     state: ProcessTerminalState,
 ) {
+    record_final_state(outputs, id, state, Vec::new(), false);
+}
+
+/// [`record_confirmed_state`], plus what the self-exit reaper settled with
+/// it: `notes`, diagnostic `stderr` texts delivered in order just before the
+/// `State` frame (an empty list keeps any already recorded), and, when
+/// `abandon` is set, that the final frames no longer wait for a reader that
+/// outlasted the exit grace (see this module's own doc comment).
+pub(crate) fn record_final_state(
+    outputs: &OutputTable,
+    id: ProcessId,
+    state: ProcessTerminalState,
+    notes: Vec<String>,
+    abandon: bool,
+) {
     {
         let mut guard = outputs
             .lock()
@@ -520,17 +667,52 @@ pub(crate) fn record_confirmed_state(
             return;
         };
         entry.confirmed_state = Some(state);
+        if !notes.is_empty() {
+            entry.final_notes = notes;
+        }
+        entry.readers_abandoned |= abandon;
     }
     try_finalize(outputs, id);
 }
 
+/// Stop waiting for `id`'s readers, with `notes` to deliver before the
+/// `State` frame: for a run whose child was reaped by someone else
+/// (`stop`, or `observe` taking a settle over) while a reader still
+/// outlasted the exit grace. The frame carries whatever state that reap
+/// recorded, now or once it is recorded.
+pub(crate) fn abandon_readers(outputs: &OutputTable, id: ProcessId, notes: Vec<String>) {
+    {
+        let mut guard = outputs
+            .lock()
+            .expect("outputs mutex poisoned by a prior panic");
+        let Some(entry) = guard.get_mut(&id) else {
+            return;
+        };
+        if !notes.is_empty() {
+            entry.final_notes = notes;
+        }
+        entry.readers_abandoned = true;
+    }
+    try_finalize(outputs, id);
+}
+
+/// Whether any of `id`'s reader tasks is still running. `false` for an
+/// entry already removed (finalized and subscribed-out).
+pub(crate) fn readers_active(outputs: &OutputTable, id: ProcessId) -> bool {
+    let guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    guard
+        .get(&id)
+        .is_some_and(|entry| entry.active_readers.load(Ordering::Acquire) != 0)
+}
+
 /// Claim the self-exit reap of `id`, at most once per child.
 ///
-/// Succeeds only when the final `State` frame is still owed and only the
-/// reap is missing: not finalized, every reader task finished, no terminal
-/// state confirmed, and no earlier claim. Under `Pipes` both drain tasks
-/// can finish at nearly the same instant and both ask; the flag is set
-/// under the table's lock, so exactly one of them gets `true`.
+/// The reaper claims its child when it starts, at spawn, and keeps the
+/// claim while it polls: `observe` defers to it meanwhile
+/// ([`reaper_claim`]). Succeeds only when the final `State` frame is still
+/// owed: not finalized, no terminal state confirmed, and no earlier claim.
 pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
     let mut guard = outputs
         .lock()
@@ -538,11 +720,7 @@ pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
     let Some(entry) = guard.get_mut(&id) else {
         return false;
     };
-    if entry.reaper_claimed
-        || entry.sender.is_none()
-        || entry.active_readers.load(Ordering::Acquire) != 0
-        || entry.confirmed_state.is_some()
-    {
+    if entry.reaper_claimed || entry.sender.is_none() || entry.confirmed_state.is_some() {
         return false;
     }
     entry.reaper_claimed = true;
@@ -637,22 +815,28 @@ pub(crate) fn final_frame_owed(outputs: &OutputTable, id: ProcessId) -> bool {
     guard.get(&id).is_some_and(|entry| entry.sender.is_some())
 }
 
-/// Send the final `State` frame and drop this channel's sender, but only
-/// once the process's terminal state is confirmed *and* both reader tasks
-/// have finished -- whichever of the two happens second performs the send.
-/// A no-op if either condition is not yet met, or if this channel was
-/// already finalized.
+/// Send the final frames -- the recorded diagnostics, then the `State`
+/// frame -- and drop this channel's senders, but only once the process's
+/// terminal state is confirmed *and* every reader task has finished (or
+/// was abandoned, [`record_final_state`]) -- whichever happens second
+/// performs the send. A no-op if either condition is not yet met, or if
+/// this channel was already finalized.
+///
+/// The readers' slot is closed in the same step, under its own lock, so
+/// the `State` frame is the last frame this channel ever carries (see
+/// [`ReaderHandles`]).
 ///
 /// Unlike a text frame (`try_send`, best-effort, `emit_text`/`try_send`
-/// above), the terminal frame is guaranteed-delivered: it is the one signal
-/// a subscriber needs to know the process is truly done, so it must reach
-/// them even against a delivery channel that is completely full and
-/// undrained at this exact moment. Delivery is handed to a dedicated
-/// `std::thread` doing a blocking [`SyncSender::send`], which ends once the
-/// frame is delivered (room eventually frees up, since no further text
-/// frames are produced once this point is reached) or the subscriber drops
-/// its receiver (the `send` then fails harmlessly) -- never on the async
-/// runtime, which must never block on a slow or absent consumer.
+/// above), the final frames are guaranteed-delivered: the `State` frame is
+/// the one signal a subscriber needs to know the process is truly done, so
+/// it must reach them even against a delivery channel that is completely
+/// full and undrained at this exact moment. Delivery is handed to a
+/// dedicated `std::thread` doing blocking [`SyncSender::send`]s, which ends
+/// once the frames are delivered (room eventually frees up, since no
+/// further text frames are produced once this point is reached) or the
+/// subscriber drops its receiver (the `send` then fails harmlessly) --
+/// never on the async runtime, which must never block on a slow or absent
+/// consumer.
 ///
 /// Also removes `id`'s whole entry from `outputs` if it is already
 /// subscribed-out (`receiver` already taken) at this point: finalized and
@@ -662,7 +846,7 @@ pub(crate) fn final_frame_owed(outputs: &OutputTable, id: ProcessId) -> bool {
 /// about to hand to the delivery thread) is left in place, so a later
 /// `subscribe` still finds it.
 fn try_finalize(outputs: &OutputTable, id: ProcessId) {
-    let (sender, frame) = {
+    let (sender, frames) = {
         let mut guard = outputs
             .lock()
             .expect("outputs mutex poisoned by a prior panic");
@@ -672,17 +856,33 @@ fn try_finalize(outputs: &OutputTable, id: ProcessId) {
         if entry.sender.is_none() {
             return; // already finalized
         }
-        if entry.active_readers.load(Ordering::Acquire) != 0 {
-            return; // one or both reader tasks still running
+        if entry.active_readers.load(Ordering::Acquire) != 0 && !entry.readers_abandoned {
+            return; // a reader task is still running
         }
         let Some(state) = entry.confirmed_state else {
             return; // reap not confirmed yet
         };
 
-        let seq = entry.seq.fetch_add(1, Ordering::AcqRel);
-        let dropped_before = entry.pending_drops.swap(0, Ordering::AcqRel);
-        let frame =
-            OutputFrame::with_dropped_before(seq, dropped_before, FramePayload::State(state));
+        let notes = std::mem::take(&mut entry.final_notes);
+        let gate = Arc::clone(&entry.gate);
+        let mut slot = gate
+            .lock()
+            .expect("output gate mutex poisoned by a prior panic");
+        // Closed before any final `seq` is assigned, under the lock every
+        // reader frame is sent under: nothing can follow the `State` frame.
+        *slot = None;
+        let mut frames: Vec<OutputFrame> = notes
+            .into_iter()
+            .map(|text| {
+                entry.next_frame(FramePayload::Text {
+                    stream: OutputStream::Stderr,
+                    text,
+                    continued: false,
+                })
+            })
+            .collect();
+        frames.push(entry.next_frame(FramePayload::State(state)));
+        drop(slot);
         // Taken (not merely read) and cleared here, under the lock, so a
         // second concurrent call (from the other reader task finishing at
         // nearly the same instant as a `stop`/`observe` confirming reap)
@@ -696,13 +896,17 @@ fn try_finalize(outputs: &OutputTable, id: ProcessId) {
         if subscribed_out {
             guard.remove(&id);
         }
-        (sender, frame)
+        (sender, frames)
     };
 
     if let Err(error) = std::thread::Builder::new()
         .name("omnifrons-output-state-frame".to_string())
         .spawn(move || {
-            let _ = sender.send(frame);
+            for frame in frames {
+                if sender.send(frame).is_err() {
+                    break; // the subscriber is gone
+                }
+            }
         })
     {
         tracing::error!(
@@ -726,8 +930,54 @@ mod tests {
 
     use super::{
         CHANNEL_CAPACITY, MAX_LINE_BYTES, OutputTable, drain_stream, emit_stdin_write_failed,
-        new_channel, record_confirmed_state, take_receiver, try_send,
+        emit_text, new_channel, record_confirmed_state, record_final_state, take_receiver,
+        try_send,
     };
+
+    /// A run whose reader the reaper abandoned still ends while that reader
+    /// runs: the notes, then the `State` frame, close the channel, and what
+    /// the reader produces afterwards is discarded and counted, never
+    /// delivered after the `State` frame.
+    #[test]
+    fn an_abandoned_reader_never_delivers_after_the_state_frame() {
+        let id = ProcessId(13);
+        let (state, handles) = new_channel(1);
+        let outputs: OutputTable = Arc::new(Mutex::new(HashMap::from([(id, state)])));
+
+        assert!(emit_text(&handles, OutputStream::Stdout, b"before", false));
+        record_final_state(
+            &outputs,
+            id,
+            ProcessTerminalState::OrphanRiskUncertain,
+            vec!["first note".to_string(), "second note".to_string()],
+            true,
+        );
+        assert!(!emit_text(&handles, OutputStream::Stdout, b"after", false));
+        assert_eq!(handles.discarded.get(), 5);
+
+        let receiver = take_receiver(&outputs, id).expect("subscribing must succeed");
+        // Blocking `iter()`: it ends although `handles` is still alive.
+        let frames: Vec<_> = receiver.iter().collect();
+        let shape: Vec<(u64, String)> = frames
+            .iter()
+            .map(|frame| {
+                let label = match &frame.payload {
+                    FramePayload::Text { stream, text, .. } => format!("{stream:?}:{text}"),
+                    FramePayload::State(state) => format!("state:{state:?}"),
+                };
+                (frame.seq, label)
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, "Stdout:before".to_string()),
+                (1, "Stderr:first note".to_string()),
+                (2, "Stderr:second note".to_string()),
+                (3, "state:OrphanRiskUncertain".to_string()),
+            ]
+        );
+    }
 
     /// An `AsyncRead` handing out exactly one predefined chunk per read
     /// call, then EOF -- so a test controls precisely where a line's bytes

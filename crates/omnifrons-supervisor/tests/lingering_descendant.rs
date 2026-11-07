@@ -1,0 +1,446 @@
+//! A run whose child has exited ends after a bounded grace even when a
+//! descendant keeps the child's output open, and the settled verdict names a
+//! descendant that left the process group (issue #191).
+//!
+//! Case 1: `sh -c 'sleep N & exit 0'` -- the helper inherits stdout, so the
+//! readers never reach EOF. The supervisor polls for the child's exit from
+//! spawn, gives the readers a grace of 2 s from that exit, then ends the run
+//! as `orphan-risk/uncertain`, preceded by a diagnostic `stderr` frame. The
+//! helper stays alive, and whatever it writes later is discarded: the `State`
+//! frame stays the last frame on the channel. Stop can still signal the
+//! process group while a recorded member of it is alive.
+//!
+//! Case 2 (Linux): a descendant that calls `setsid` leaves the group, so the
+//! group check cannot see it; the census taken while the child lives can, and
+//! the verdict names it.
+//!
+//! Every helper here is self-bounding ([`HELPER_SECS`]) and killed by the
+//! test's own [`Helper`] guard, even when an assertion fails first.
+
+#![cfg(unix)]
+
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use omnifrons_app::{
+    FramePayload, OutputFrame, OutputStream, ProcessId, ProcessOutput, ProcessSpec, ProcessStatus,
+    ProcessSupervisor, ProcessTerminalState,
+};
+use omnifrons_supervisor::TokioProcessSupervisor;
+
+/// The grace the supervisor gives a run's readers after its child exits.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Scheduling headroom on top of [`EXIT_GRACE`]: noticing the exit (one
+/// 250 ms poll while the output is still open) and settling the verdict take
+/// well under a second; the rest is room for a loaded runner.
+const MARGIN: Duration = Duration::from_secs(4);
+
+/// How long a test waits for a line the child prints at once.
+const LINE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long every helper sleeps if nothing kills it first.
+const HELPER_SECS: u32 = 30;
+
+/// The diagnostic that precedes the `State` frame when a descendant still
+/// holds the output open once the grace is over.
+const LINGERING_NOTE: &str = "the child exited, but a descendant still holds its output open: \
+                              the run ends here and later output is discarded";
+
+/// The diagnostic naming a recorded descendant that left the process group.
+#[cfg(target_os = "linux")]
+fn escaped_note(pid: i32, comm: &str) -> String {
+    format!("descendant {pid} ({comm}) left the run's process group and is still running")
+}
+
+/// Kills the helper it names when dropped, so a failing assertion never
+/// leaves a process behind.
+struct Helper(nix::unistd::Pid);
+
+impl Helper {
+    #[cfg(target_os = "linux")]
+    fn pid(&self) -> i32 {
+        self.0.as_raw()
+    }
+
+    /// Whether the helper is still running (a zombie counts as gone).
+    fn is_running(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string(format!("/proc/{}/stat", self.pid())) {
+                Ok(stat) => {
+                    let after_comm = &stat[stat.rfind(')').map_or(0, |at| at + 1)..];
+                    after_comm.split_whitespace().next() != Some("Z")
+                }
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            nix::sys::signal::kill(self.0, None).is_ok()
+        }
+    }
+
+    /// Whether the helper is gone within `budget`.
+    #[cfg(target_os = "linux")]
+    fn ends_within(&self, budget: Duration) -> bool {
+        let end = Instant::now() + budget;
+        loop {
+            if !self.is_running() {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+/// Wait for the first text frame and read it as the helper's pid (the
+/// scripts below print `$!` before anything else).
+fn helper_from_first_line(frames: &Receiver<OutputFrame>, seen: &mut Vec<OutputFrame>) -> Helper {
+    let end = Instant::now() + LINE_DEADLINE;
+    loop {
+        let frame = frames
+            .recv_timeout(end.saturating_duration_since(Instant::now()))
+            .expect("the child must print the helper's pid");
+        let pid = match &frame.payload {
+            FramePayload::Text { text, .. } => text.trim().parse::<i32>().ok(),
+            FramePayload::State(_) => None,
+        };
+        seen.push(frame);
+        if let Some(pid) = pid {
+            return Helper(nix::unistd::Pid::from_raw(pid));
+        }
+    }
+}
+
+/// Collect every frame until the channel closes, or fail once `budget` has
+/// passed since `since`. Returns the frames and when the channel closed.
+fn collect_until_closed(
+    frames: &Receiver<OutputFrame>,
+    seen: &mut Vec<OutputFrame>,
+    since: Instant,
+    budget: Duration,
+) -> Duration {
+    let end = since + budget;
+    loop {
+        match frames.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok(frame) => seen.push(frame),
+            Err(RecvTimeoutError::Disconnected) => return since.elapsed(),
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "the run did not end within {budget:?}; frames so far: {:#?}",
+                tail(seen)
+            ),
+        }
+    }
+}
+
+/// The last few frames, for a failure message.
+fn tail(frames: &[OutputFrame]) -> &[OutputFrame] {
+    &frames[frames.len().saturating_sub(4)..]
+}
+
+/// The run's one `State` frame, asserting it is the last frame received.
+fn last_state(frames: &[OutputFrame]) -> ProcessTerminalState {
+    let states: Vec<_> = frames
+        .iter()
+        .filter(|frame| matches!(frame.payload, FramePayload::State(_)))
+        .collect();
+    assert_eq!(
+        states.len(),
+        1,
+        "exactly one State frame per run: {frames:#?}"
+    );
+    match frames.last().map(|frame| &frame.payload) {
+        Some(FramePayload::State(state)) => *state,
+        _ => panic!(
+            "the State frame must be the last frame: {:#?}",
+            tail(frames)
+        ),
+    }
+}
+
+/// The text of the frame right before the `State` frame, asserting it is a
+/// `stderr` diagnostic.
+fn diagnostic_before_state(frames: &[OutputFrame]) -> String {
+    let before = frames
+        .len()
+        .checked_sub(2)
+        .and_then(|at| frames.get(at))
+        .map(|frame| &frame.payload);
+    match before {
+        Some(FramePayload::Text {
+            stream: OutputStream::Stderr,
+            text,
+            ..
+        }) => text.clone(),
+        _ => panic!(
+            "a stderr diagnostic must precede the State frame: {:#?}",
+            tail(frames)
+        ),
+    }
+}
+
+fn spawn_sh(supervisor: &mut TokioProcessSupervisor, script: &str) -> ProcessId {
+    let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script]);
+    supervisor.spawn(spec).expect("spawning sh must succeed")
+}
+
+/// Issue #191, case 1, through the pipe transport: the helper inherits
+/// stdout, the child exits at once, and the run still ends after the grace.
+#[test]
+fn a_pipe_run_ends_after_the_grace_while_a_descendant_holds_its_output() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let started = Instant::now();
+    let id = spawn_sh(
+        &mut supervisor,
+        &format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let closed_after = collect_until_closed(&frames, &mut seen, started, EXIT_GRACE + MARGIN);
+
+    assert_eq!(
+        last_state(&seen),
+        ProcessTerminalState::OrphanRiskUncertain,
+        "a descendant holding the output open is not a clean exit"
+    );
+    assert_eq!(diagnostic_before_state(&seen), LINGERING_NOTE);
+    assert!(
+        closed_after >= EXIT_GRACE,
+        "the readers get the whole grace after the exit; the run ended after {closed_after:?}"
+    );
+    assert!(
+        helper.is_running(),
+        "the descendant stays alive: ending the run signals nothing"
+    );
+    assert_eq!(
+        supervisor.observe(id),
+        Some(ProcessStatus::Terminal(
+            ProcessTerminalState::OrphanRiskUncertain
+        ))
+    );
+}
+
+/// Issue #191, case 1, through the PTY transport. The child is the session
+/// leader, so its exit hangs up the terminal's foreground group: the helper
+/// ignores SIGHUP to keep holding the slave open, as a real lingering one
+/// would.
+#[test]
+fn a_pty_run_ends_after_the_grace_while_a_descendant_holds_the_terminal() {
+    use std::path::PathBuf;
+
+    use omnifrons_app::{EnvPlan, ExecHandle, LaunchPlan, StdinPlan, WorkspaceRoot};
+    use omnifrons_domain::adapter::TransportClass;
+    use omnifrons_domain::scope::ScopeMode;
+
+    let workspace = Scratch::new("pty-lingering");
+    let shell = PathBuf::from("/bin/sh");
+    let file = std::fs::File::open(&shell).expect("opening /bin/sh must succeed");
+    let plan = LaunchPlan {
+        argv: vec![
+            "-c".to_string(),
+            format!("trap '' HUP; sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+        ],
+        env: EnvPlan::new(&[]).expect("an empty declared-key list can never be secret-shaped"),
+        cwd: WorkspaceRoot::new(workspace.path()).expect("the scratch dir is a valid workspace"),
+        stdin: StdinPlan::Null,
+        prompt: None,
+        scope_mode: ScopeMode::Advisory,
+        transport: TransportClass::Pty,
+        output_dir: None,
+    };
+
+    let mut supervisor = TokioProcessSupervisor::new();
+    let started = Instant::now();
+    let id = supervisor
+        .spawn_approved(ExecHandle::File(file), shell, &plan)
+        .expect("spawning sh on the PTY path must succeed");
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let closed_after = collect_until_closed(&frames, &mut seen, started, EXIT_GRACE + MARGIN);
+
+    assert_eq!(last_state(&seen), ProcessTerminalState::OrphanRiskUncertain);
+    assert_eq!(diagnostic_before_state(&seen), LINGERING_NOTE);
+    assert!(closed_after >= EXIT_GRACE, "ended after {closed_after:?}");
+    assert!(helper.is_running(), "the descendant stays alive");
+}
+
+/// Issue #191, case 2: the helper calls `setsid`, so the process-group check
+/// cannot see it. The child lives on for a second -- longer than the census
+/// interval -- so a census taken while it lives records the helper, and the
+/// verdict names it. (With the issue's literal `& exit 0`, the helper
+/// escapes within the census's stated blind spot: the child is gone before
+/// any walk can link the two.)
+#[cfg(target_os = "linux")]
+#[test]
+fn an_escaped_descendant_recorded_while_the_child_lived_is_named_in_the_verdict() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let id = spawn_sh(
+        &mut supervisor,
+        &format!(
+            "setsid sleep {HELPER_SECS} >/dev/null 2>&1 </dev/null & echo \"$!\"; sleep 1; exit 0"
+        ),
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let _ = collect_until_closed(&frames, &mut seen, Instant::now(), LINE_DEADLINE);
+
+    let state = last_state(&seen);
+    assert_ne!(
+        state,
+        ProcessTerminalState::Exited { code: Some(0) },
+        "an escaped descendant that outlived the child is not a clean exit"
+    );
+    assert_eq!(state, ProcessTerminalState::OrphanRiskUncertain);
+    assert_eq!(
+        diagnostic_before_state(&seen),
+        escaped_note(helper.pid(), "sleep")
+    );
+    assert!(helper.is_running(), "the verdict signals nothing");
+}
+
+/// The `State` frame stays the last frame even while a lingering descendant
+/// keeps writing after the grace: its later output is discarded.
+#[test]
+fn output_written_after_the_grace_never_follows_the_state_frame() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let started = Instant::now();
+    // Writes a line every 100 ms for ten seconds, far past the grace.
+    let id = spawn_sh(
+        &mut supervisor,
+        "(i=0; while [ \"$i\" -lt 100 ]; do echo late; sleep 0.1; i=$((i+1)); done) & \
+         echo \"$!\"; exit 0",
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let closed_after = collect_until_closed(&frames, &mut seen, started, EXIT_GRACE + MARGIN);
+
+    assert_eq!(last_state(&seen), ProcessTerminalState::OrphanRiskUncertain);
+    assert!(
+        seen.iter().any(|frame| matches!(
+            &frame.payload,
+            FramePayload::Text { text, .. } if text == "late"
+        )),
+        "the helper's output before the end is delivered"
+    );
+    assert!(
+        helper.is_running(),
+        "the helper was still writing when the run ended after {closed_after:?}"
+    );
+}
+
+/// After a self-exit whose descendant holds the output, Stop still reaches
+/// the process group: a recorded member with its original start time is
+/// alive, so the group is provably the original one.
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_after_the_recorded_exit_still_signals_the_lingering_group() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let id = spawn_sh(
+        &mut supervisor,
+        &format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let end = Instant::now() + EXIT_GRACE + MARGIN;
+    let recorded = loop {
+        match supervisor.observe(id) {
+            Some(ProcessStatus::Terminal(state)) => break state,
+            _ if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            other => panic!("the exit was never recorded: {other:?}"),
+        }
+    };
+
+    let stopped = supervisor
+        .stop(id, Duration::from_secs(2))
+        .expect("stop after a recorded exit must succeed");
+
+    assert!(
+        helper.ends_within(Duration::from_secs(3)),
+        "stop must reach the lingering descendant through its process group"
+    );
+    assert_eq!(recorded, ProcessTerminalState::OrphanRiskUncertain);
+    assert_eq!(
+        stopped, recorded,
+        "stop reports the recorded state unchanged"
+    );
+    let _ = collect_until_closed(&frames, &mut seen, Instant::now(), LINE_DEADLINE);
+    assert_eq!(last_state(&seen), recorded);
+}
+
+/// The same grace applies after Stop: a descendant that escaped through a
+/// double fork (its parent exits at once, so no census can link it) keeps
+/// the output open after the stopped child is reaped, and the run still
+/// ends, with the state Stop reported.
+#[test]
+fn a_stopped_run_ends_after_the_grace_while_an_escaped_descendant_holds_its_output() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let id = spawn_sh(
+        &mut supervisor,
+        &format!("(setsid sleep {HELPER_SECS} & echo \"$!\"); exec sleep {HELPER_SECS}"),
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let stopped = supervisor
+        .stop(id, Duration::from_secs(2))
+        .expect("stop must succeed");
+    let stopped_at = Instant::now();
+
+    let closed_after = collect_until_closed(&frames, &mut seen, stopped_at, EXIT_GRACE + MARGIN);
+
+    assert_eq!(last_state(&seen), stopped, "the frame carries stop's state");
+    assert_eq!(diagnostic_before_state(&seen), LINGERING_NOTE);
+    assert!(closed_after <= EXIT_GRACE + MARGIN);
+    assert!(
+        helper.is_running(),
+        "the escaped helper is beyond stop's reach"
+    );
+}
+
+/// A scratch directory under the system temp dir, removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "omnifrons-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("the scratch dir must be creatable");
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}

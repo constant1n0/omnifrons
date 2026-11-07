@@ -30,6 +30,33 @@
 //! and never swept, because this module will not signal a pid it cannot
 //! identify.
 //!
+//! # The census of a child that exits on its own
+//!
+//! A child that exits by itself is not being stopped, so nothing is swept
+//! for it: [`Census::leftovers`] reports what is still running and leaves it
+//! running (Stop stays the operator's way to end it). Its census cannot be
+//! taken at the exit -- the child's descendants are reparented the moment
+//! it exits, before it is even reaped, so a walk then finds none -- so the
+//! self-exit reaper (`crate::SelfExitReaper`) walks while the child lives
+//! and merges every walk ([`Census::merge`]: a union of sightings, never a
+//! replacement):
+//!
+//! - **Interval.** One walk at spawn, then one every 250 ms for the first
+//!   minute, then one every 30 s for as long as the child lives; the
+//!   250 ms cadence restarts for a minute when the child's output closes.
+//!   A full `/proc` walk reads every process's `stat`, which is what bounds
+//!   how often it can run.
+//! - **Blind spot.** A walk links a descendant to the child only through
+//!   its parent chain, and that chain breaks the moment the child -- or any
+//!   process between them -- exits. A descendant that calls `setsid` (or
+//!   otherwise leaves the process group) and loses that link between two
+//!   walks, before any walk saw it, is never seen: neither by the census
+//!   nor by the group check. That covers one forked within the last
+//!   interval before the child exits (at most 250 ms early on, 30 s later)
+//!   and one double-forked through an intermediate that exits at once.
+//!   `sh -c 'setsid sleep 3600 & exit 0'` is the shortest form: the child
+//!   is gone within a millisecond of the fork, before any walk.
+//!
 //! # What this still cannot prove
 //!
 //! This is **not** cgroup containment, and nothing here should be read as
@@ -141,6 +168,11 @@ pub(crate) enum Unproven {
     /// snapshot, which is exactly the residual race this module cannot
     /// close.
     GroupNotEmpty,
+    /// A recorded descendant was still running when the child that exited
+    /// on its own was reaped ([`Census::leftovers`], which never sweeps).
+    DescendantOutlivedChild,
+    /// The census reached [`MAX_SIGHTINGS`] and stopped recording.
+    TooManySightings,
 }
 
 impl std::fmt::Display for Unproven {
@@ -156,8 +188,40 @@ impl std::fmt::Display for Unproven {
             Self::GroupNotEmpty => {
                 f.write_str("the child's process group still held a process the census never saw")
             }
+            Self::DescendantOutlivedChild => {
+                f.write_str("a recorded descendant outlived the child that exited on its own")
+            }
+            Self::TooManySightings => f.write_str("the census reached its sighting bound"),
         }
     }
+}
+
+/// The most distinct `(pid, starttime)` sightings one census keeps
+/// ([`Census::merge`]). Far above what any real agent leaves alive at once;
+/// a bound only so a pathological child cannot grow it without limit.
+const MAX_SIGHTINGS: usize = 4096;
+
+/// Shown for a descendant whose command name could no longer be read.
+const UNKNOWN_COMM: &str = "?";
+
+/// What a child that exited on its own left behind ([`Census::leftovers`]).
+///
+/// Nothing here was signalled: a self-exit is not a stop, so its
+/// descendants are reported and left running, and Stop stays the operator's
+/// way to end them. [`Census::settle`] is the stop-time counterpart, which
+/// sweeps.
+pub(crate) struct Leftovers {
+    /// Why the reap-derived state cannot stand, if it cannot: a recorded
+    /// descendant still running, a process still in the child's group, or a
+    /// census that proves nothing.
+    pub(crate) unproven: Option<Unproven>,
+    /// Recorded descendants still running *outside* the child's process
+    /// group, as `(pid, command name)`: the ones a group check cannot see.
+    pub(crate) escaped: Vec<(Pid, String)>,
+    /// Every process still running in the child's process group, with its
+    /// start time: what lets a later Stop prove the group is still the
+    /// original one ([`member_still_in_group`]).
+    pub(crate) members: Vec<Identity>,
 }
 
 /// What was recorded about a child's descendants before it was signalled.
@@ -190,6 +254,100 @@ impl Census {
             }
             Ok(table) => Self::Snapshot(descendants_of(&table, child)),
         }
+    }
+
+    /// Merge a later walk into this census: the union of every
+    /// `(pid, starttime)` either one sighted, never a replacement.
+    ///
+    /// A walk only adds what it saw. One taken once the child has exited
+    /// (an unreaped zombie, whose descendants were reparented at its exit,
+    /// so the walk finds none) adds nothing and erases nothing; one that
+    /// found no entry for the child at all ran after the reap and is no
+    /// evidence either way. Any other failed walk may have missed a
+    /// descendant, so from then on the census is unproven and keeps that
+    /// reason, whatever later walks see.
+    ///
+    /// Bounded: past [`MAX_SIGHTINGS`] distinct sightings the census
+    /// becomes unproven ([`Unproven::TooManySightings`]) instead of growing
+    /// or forgetting one. Walks only run while the child lives, at the
+    /// self-exit reaper's census interval, so a census holds one entry per
+    /// distinct descendant alive at some walk.
+    pub(crate) fn merge(self, fresh: Self) -> Self {
+        match (self, fresh) {
+            (Self::Snapshot(mut seen), Self::Snapshot(new)) => {
+                for identity in new {
+                    if !seen.contains(&identity) {
+                        seen.push(identity);
+                    }
+                }
+                if seen.len() > MAX_SIGHTINGS {
+                    Self::Unavailable(Unproven::TooManySightings)
+                } else {
+                    Self::Snapshot(seen)
+                }
+            }
+            (kept, Self::Unavailable(Unproven::ChildEntryMissing))
+            | (Self::Unavailable(Unproven::ChildEntryMissing), kept) => kept,
+            (Self::Unavailable(reason), _) | (_, Self::Unavailable(reason)) => {
+                Self::Unavailable(reason)
+            }
+        }
+    }
+
+    /// What a child that exited on its own left behind, read without
+    /// signalling anything (see [`Leftovers`]). Called after the child's
+    /// reap, like [`Self::settle`].
+    pub(crate) fn leftovers(&self, pgid: Pid) -> Leftovers {
+        self.leftovers_in(Path::new(PROC_ROOT), pgid)
+    }
+
+    fn leftovers_in(&self, proc_root: &Path, pgid: Pid) -> Leftovers {
+        let mut found = Leftovers {
+            unproven: None,
+            escaped: Vec::new(),
+            members: Vec::new(),
+        };
+        let table = match read_table(proc_root) {
+            Ok(table) => table,
+            Err(reason) => {
+                found.unproven = Some(reason);
+                return found;
+            }
+        };
+        found.members = table
+            .iter()
+            .filter(|(_, stat)| stat.pgrp == pgid && stat.state != ZOMBIE_STATE)
+            .map(|(pid, stat)| Identity {
+                pid: *pid,
+                starttime: stat.starttime,
+            })
+            .collect();
+        found.members.sort_by_key(|identity| identity.pid.as_raw());
+        match self {
+            Self::Unavailable(reason) => found.unproven = Some(*reason),
+            Self::Snapshot(recorded) => {
+                for identity in recorded {
+                    let Some(stat) = table.get(&identity.pid) else {
+                        continue;
+                    };
+                    if stat.starttime != identity.starttime || stat.state == ZOMBIE_STATE {
+                        continue;
+                    }
+                    found
+                        .unproven
+                        .get_or_insert(Unproven::DescendantOutlivedChild);
+                    if stat.pgrp != pgid {
+                        let comm = read_comm(proc_root, identity.pid)
+                            .unwrap_or_else(|| UNKNOWN_COMM.to_string());
+                        found.escaped.push((identity.pid, comm));
+                    }
+                }
+            }
+        }
+        if !found.members.is_empty() {
+            found.unproven.get_or_insert(Unproven::GroupNotEmpty);
+        }
+        found
     }
 
     /// Sweep whatever survived, then answer what the caller may honestly
@@ -317,6 +475,49 @@ fn group_survivors_in(proc_root: &Path, pgid: Pid) -> Result<Vec<Pid>, Unproven>
         .collect())
 }
 
+/// Whether `pgid` is provably still the process group `members` were
+/// recorded in: at least one of them is still running, with its recorded
+/// start time, inside that group.
+///
+/// Only then may the group be signalled by its id after the child's reap.
+/// A process-group id is not reused while any process is still in that
+/// group, but once the group is empty its id (the reaped child's pid) can
+/// be handed to an unrelated process that starts a group of its own. A
+/// member that cannot be read is not evidence: it does not count. As with
+/// [`sweep`], the member could in principle leave the group between this
+/// read and the signal that follows it.
+pub(crate) fn member_still_in_group(pgid: Pid, members: &[Identity]) -> bool {
+    member_still_in_group_in(Path::new(PROC_ROOT), pgid, members)
+}
+
+fn member_still_in_group_in(proc_root: &Path, pgid: Pid, members: &[Identity]) -> bool {
+    members.iter().any(|identity| {
+        matches!(
+            read_stat(proc_root, identity.pid),
+            Ok(Some(stat)) if stat.starttime == identity.starttime
+                && stat.state != ZOMBIE_STATE
+                && stat.pgrp == pgid
+        )
+    })
+}
+
+/// The command name (`proc(5)` field 2, `comm`) of `pid`, if it can still
+/// be read: the executable's file name, never its path, cut at 15 bytes by
+/// the kernel.
+fn read_comm(proc_root: &Path, pid: Pid) -> Option<String> {
+    let contents =
+        std::fs::read_to_string(proc_root.join(pid.as_raw().to_string()).join("stat")).ok()?;
+    parse_comm(&contents)
+}
+
+/// `comm` sits between the line's first `(` and its *last* `)`: it can
+/// itself contain both (see [`parse_stat`]).
+fn parse_comm(contents: &str) -> Option<String> {
+    let open = contents.find('(')?;
+    let close = contents.rfind(')')?;
+    contents.get(open + 1..close).map(str::to_string)
+}
+
 /// Read and parse one `/proc/<pid>/stat`, or `Ok(None)` if that process
 /// has vanished.
 fn read_stat(proc_root: &Path, pid: Pid) -> Result<Option<Stat>, Unproven> {
@@ -426,7 +627,10 @@ mod tests {
 
     use omnifrons_app::ProcessTerminalState;
 
-    use super::{Census, Identity, Stat, Unproven, descendants_of, parse_stat, survivors_in};
+    use super::{
+        Census, Identity, Stat, Unproven, descendants_of, member_still_in_group_in, parse_comm,
+        parse_stat, survivors_in,
+    };
 
     /// A throwaway directory holding a synthetic `/proc` tree, so the
     /// census and the survivor probe can be exercised over entries that
@@ -767,5 +971,118 @@ mod tests {
         root.entry(100, 'Z', 1, 100, 10);
 
         assert_eq!(census.prove(root.path(), pid(100)), Ok(()));
+    }
+
+    /// The census records sightings: a walk taken once the child is an
+    /// unreaped zombie finds no descendant (they were reparented at its
+    /// exit), and that must never erase the descendant an earlier walk saw.
+    #[test]
+    fn a_walk_of_the_zombie_child_never_erases_an_earlier_sighting() {
+        let root = ProcRoot::new("zombie-walk");
+        root.entry(100, 'S', 1, 100, 10)
+            .entry(101, 'S', 100, 101, 11);
+        let alive = Census::take_in(root.path(), pid(100));
+
+        root.entry(100, 'Z', 1, 100, 10).entry(101, 'S', 1, 101, 11);
+        let zombie = Census::take_in(root.path(), pid(100));
+
+        let Census::Snapshot(recorded) = alive.merge(zombie) else {
+            panic!("two readable walks must merge into a snapshot")
+        };
+        assert_eq!(recorded, vec![identity(101, 11)]);
+    }
+
+    /// Two walks merge as a union without duplicates; a walk that found no
+    /// entry for the child changes nothing; any other failed walk leaves
+    /// the census unproven for good.
+    #[test]
+    fn merge_is_a_union_and_only_a_failed_walk_other_than_a_missing_child_sticks() {
+        let first = Census::Snapshot(vec![identity(101, 11)]);
+        let second = Census::Snapshot(vec![identity(101, 11), identity(102, 12)]);
+        let Census::Snapshot(union) = first.merge(second) else {
+            panic!("two snapshots merge into a snapshot")
+        };
+        assert_eq!(union, vec![identity(101, 11), identity(102, 12)]);
+
+        let late = Census::Unavailable(Unproven::ChildEntryMissing);
+        let Census::Snapshot(kept) = Census::Snapshot(vec![identity(101, 11)]).merge(late) else {
+            panic!("a walk after the reap must not erase the snapshot")
+        };
+        assert_eq!(kept, vec![identity(101, 11)]);
+
+        let unreadable = Census::Unavailable(Unproven::EntryUnreadable);
+        let after = Census::Snapshot(vec![identity(101, 11)])
+            .merge(unreadable)
+            .merge(Census::Snapshot(vec![identity(102, 12)]));
+        assert!(matches!(
+            after,
+            Census::Unavailable(Unproven::EntryUnreadable)
+        ));
+    }
+
+    /// A self-exit settle names a recorded descendant that left the group,
+    /// counts one still in it, records the group's live members, and
+    /// ignores what is gone, recycled, or a zombie.
+    #[test]
+    fn leftovers_name_an_escaped_descendant_and_record_the_groups_members() {
+        let root = ProcRoot::new("leftovers");
+        root.entry(101, 'S', 1, 101, 11) // escaped: its own group now
+            .entry(102, 'S', 1, 100, 12) // still in the child's group
+            .entry(103, 'S', 1, 103, 99) // recycled pid: another process
+            .entry(104, 'Z', 1, 104, 14); // a zombie: already terminated
+        let census = Census::Snapshot(vec![
+            identity(101, 11),
+            identity(102, 12),
+            identity(103, 13),
+            identity(104, 14),
+            identity(105, 15), // gone
+        ]);
+
+        let found = census.leftovers_in(root.path(), pid(100));
+
+        assert_eq!(found.escaped, vec![(pid(101), "fake-agent".to_string())]);
+        assert_eq!(found.members, vec![identity(102, 12)]);
+        assert_eq!(found.unproven, Some(Unproven::DescendantOutlivedChild));
+    }
+
+    #[test]
+    fn leftovers_of_a_clean_exit_prove_nothing_is_left() {
+        let root = ProcRoot::new("leftovers-clean");
+        root.entry(200, 'S', 1, 200, 20);
+        let found = Census::Snapshot(vec![identity(101, 11)]).leftovers_in(root.path(), pid(100));
+
+        assert_eq!(found.unproven, None);
+        assert!(found.escaped.is_empty() && found.members.is_empty());
+    }
+
+    /// A group may be signalled after the child's reap only while a
+    /// recorded member is still in it with its recorded start time.
+    #[test]
+    fn a_group_is_still_the_original_only_while_a_recorded_member_is_in_it() {
+        let root = ProcRoot::new("member");
+        let members = [identity(102, 12)];
+
+        root.entry(102, 'S', 1, 100, 12);
+        assert!(member_still_in_group_in(root.path(), pid(100), &members));
+
+        root.entry(102, 'S', 1, 102, 12); // left the group
+        assert!(!member_still_in_group_in(root.path(), pid(100), &members));
+
+        root.entry(102, 'S', 1, 100, 99); // recycled pid
+        assert!(!member_still_in_group_in(root.path(), pid(100), &members));
+
+        root.entry(102, 'Z', 1, 100, 12); // terminated
+        assert!(!member_still_in_group_in(root.path(), pid(100), &members));
+
+        let gone = ProcRoot::new("member-gone");
+        assert!(!member_still_in_group_in(gone.path(), pid(100), &members));
+    }
+
+    #[test]
+    fn parse_comm_keeps_spaces_and_parens_inside_the_name() {
+        assert_eq!(
+            parse_comm("77 (cmd) with ) parens) R 1 55 55"),
+            Some("cmd) with ) parens".to_string())
+        );
     }
 }
