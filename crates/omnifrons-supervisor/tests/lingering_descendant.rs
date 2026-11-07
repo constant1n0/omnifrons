@@ -524,6 +524,39 @@ fn stop_after_the_recorded_exit_still_signals_the_lingering_group() {
     assert_eq!(last_state(&seen), recorded);
 }
 
+/// The issue's own fast case: the helper is forked and orphaned within a
+/// millisecond, before any census walk can sight it. The supervisor notices
+/// the exit without reaping (`waitid` with `WNOWAIT`) and reads the group
+/// while the zombie child still holds its pid -- so the group id cannot have
+/// been reused -- and only then reaps. After the run has ended, Stop still
+/// reaches the helper through that group.
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_reaches_a_helper_orphaned_before_any_census_walk() {
+    let mut supervisor = TokioProcessSupervisor::new();
+    let started = Instant::now();
+    let id = spawn_sh(
+        &mut supervisor,
+        &format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+    );
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+    let _ = collect_until_closed(&frames, &mut seen, started, EXIT_GRACE + MARGIN);
+    assert_eq!(last_state(&seen), ProcessTerminalState::OrphanRiskUncertain);
+    assert!(helper.is_running(), "ending the run signals nothing");
+
+    let stopped = supervisor
+        .stop(id, Duration::from_secs(2))
+        .expect("stop after the run ended must succeed");
+
+    assert!(
+        helper.ends_within(Duration::from_secs(3)),
+        "stop must reach the helper through the group read at the exit"
+    );
+    assert_eq!(stopped, ProcessTerminalState::OrphanRiskUncertain);
+}
+
 /// The same grace applies after Stop: a descendant that left the process
 /// group and lost its parent link to the child before Stop -- so neither
 /// Stop's group signal nor its census can reach it -- keeps the output open
