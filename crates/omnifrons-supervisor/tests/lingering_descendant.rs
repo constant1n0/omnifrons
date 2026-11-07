@@ -164,6 +164,23 @@ fn helper_from_first_line(frames: &Receiver<OutputFrame>, seen: &mut Vec<OutputF
     }
 }
 
+/// Wait until every one of `wanted` has arrived as a text line, counting
+/// those already in `seen`; every frame received is kept in `seen`.
+fn wait_for_lines(frames: &Receiver<OutputFrame>, seen: &mut Vec<OutputFrame>, wanted: &[&str]) {
+    let has = |seen: &[OutputFrame], line: &str| {
+        seen.iter().any(|frame| {
+            matches!(&frame.payload, FramePayload::Text { text, .. } if text.trim() == line)
+        })
+    };
+    let end = Instant::now() + LINE_DEADLINE;
+    while !wanted.iter().all(|line| has(seen, line)) {
+        let frame = frames
+            .recv_timeout(end.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| panic!("never saw all of {wanted:?}: {:#?}", tail(seen)));
+        seen.push(frame);
+    }
+}
+
 /// Collect every frame until the channel closes, or fail once `budget` has
 /// passed since `since`. Returns the frames and when the channel closed.
 fn collect_until_closed(
@@ -275,9 +292,21 @@ fn a_pipe_run_ends_after_the_grace_while_a_descendant_holds_its_output() {
 }
 
 /// Issue #191, case 1, through the PTY transport. The child is the session
-/// leader, so its exit hangs up the terminal's foreground group: the helper
-/// ignores SIGHUP to keep holding the slave open, as a real lingering one
-/// would.
+/// leader, and what its exit does to the terminal differs by kernel:
+///
+/// - Linux (`drivers/tty/tty_jobctrl.c`, `disassociate_ctty`): on exit, a
+///   session leader's *pseudo*-terminal is not hung up; its foreground group
+///   only gets SIGHUP. The helper ignores SIGHUP, keeps holding the slave
+///   open, and the run ends after the grace, `orphan-risk/uncertain`.
+/// - macOS (XNU `bsd/kern/kern_exit.c`, `proc_exit`): for a session leader
+///   with a controlling terminal the kernel signals the foreground group,
+///   drains the terminal, and revokes access to it (`VNOP_REVOKE` with
+///   `REVOKEALL`), so the helper's slave descriptors stop holding it: the
+///   master reaches EOF and the run ends then, without the grace. With no
+///   `/proc` there is no census or group check either, so the helper that
+///   is still running goes unseen and the state is the child's own
+///   `Exited(0)` -- the documented gap of the platforms without `/proc`.
+///   (Read from the kernel source; not measured here, only by CI.)
 #[test]
 fn a_pty_run_ends_after_the_grace_while_a_descendant_holds_the_terminal() {
     use std::path::PathBuf;
@@ -314,9 +343,29 @@ fn a_pty_run_ends_after_the_grace_while_a_descendant_holds_the_terminal() {
 
     let closed_after = collect_until_closed(&frames, &mut seen, started, EXIT_GRACE + MARGIN);
 
-    assert_eq!(last_state(&seen), ProcessTerminalState::OrphanRiskUncertain);
-    assert_eq!(diagnostic_before_state(&seen), LINGERING_NOTE);
-    assert!(closed_after >= EXIT_GRACE, "ended after {closed_after:?}");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(last_state(&seen), ProcessTerminalState::OrphanRiskUncertain);
+        assert_eq!(diagnostic_before_state(&seen), LINGERING_NOTE);
+        assert!(closed_after >= EXIT_GRACE, "ended after {closed_after:?}");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No hang either: the revoked terminal reaches EOF and the run ends
+        // there, so no lingering note precedes the state.
+        let _ = closed_after;
+        assert_eq!(
+            last_state(&seen),
+            ProcessTerminalState::Exited { code: Some(0) }
+        );
+        assert!(
+            !seen.iter().any(|frame| matches!(
+                &frame.payload,
+                FramePayload::Text { text, .. } if text == LINGERING_NOTE
+            )),
+            "a revoked terminal ends the run at EOF: {seen:#?}"
+        );
+    }
     assert!(helper.is_running(), "the descendant stays alive");
 }
 
@@ -431,21 +480,25 @@ fn only_a_reader_that_discarded_output_logs_it_once() {
 }
 
 /// After a self-exit whose descendant holds the output, Stop still reaches
-/// the process group: a recorded member with its original start time is
-/// alive, so the group is provably the original one.
+/// the process group: a member the census sighted while the child lived is
+/// alive with its original start time, so the group is provably the
+/// original one. The child lives a second after forking the helper, longer
+/// than the census interval, so a walk sights the helper; one forked and
+/// orphaned within a millisecond (`sleep N & exit 0`) is never sighted, and
+/// Stop then signals nothing (`descendants::Leftovers::members`).
 #[cfg(target_os = "linux")]
 #[test]
 fn stop_after_the_recorded_exit_still_signals_the_lingering_group() {
     let mut supervisor = TokioProcessSupervisor::new();
     let id = spawn_sh(
         &mut supervisor,
-        &format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+        &format!("sleep {HELPER_SECS} & echo \"$!\"; sleep 1; exit 0"),
     );
     let frames = supervisor.subscribe(id).expect("subscribe must succeed");
     let mut seen = Vec::new();
     let helper = helper_from_first_line(&frames, &mut seen);
 
-    let end = Instant::now() + EXIT_GRACE + MARGIN;
+    let end = Instant::now() + Duration::from_secs(1) + EXIT_GRACE + MARGIN;
     let recorded = loop {
         match supervisor.observe(id) {
             Some(ProcessStatus::Terminal(state)) => break state,
@@ -471,20 +524,36 @@ fn stop_after_the_recorded_exit_still_signals_the_lingering_group() {
     assert_eq!(last_state(&seen), recorded);
 }
 
-/// The same grace applies after Stop: a descendant that escaped through a
-/// double fork (its parent exits at once, so no census can link it) keeps
-/// the output open after the stopped child is reaped, and the run still
-/// ends, with the state Stop reported.
+/// The same grace applies after Stop: a descendant that left the process
+/// group and lost its parent link to the child before Stop -- so neither
+/// Stop's group signal nor its census can reach it -- keeps the output open
+/// after the stopped child is reaped, and the run still ends, with the state
+/// Stop reported.
+///
+/// Stop is called only once both are established. The escapee
+/// (`fake-agent --setsid-sleep`, since macOS has no `setsid(1)`) prints
+/// `descendant-ready` after its own `setsid(2)`, and the child prints
+/// `escaped` only after the subshell that forked it has exited. The pid line
+/// alone proves neither: a Stop that arrives earlier still reaches the
+/// escapee, through the group signal or by sweeping it as a recorded
+/// descendant -- correctly -- and the run then ends at EOF without the grace
+/// (the CI failure on #196).
 #[test]
 fn a_stopped_run_ends_after_the_grace_while_an_escaped_descendant_holds_its_output() {
     let mut supervisor = TokioProcessSupervisor::new();
-    let id = spawn_sh(
-        &mut supervisor,
-        &format!("(setsid sleep {HELPER_SECS} & echo \"$!\"); exec sleep {HELPER_SECS}"),
-    );
+    let script =
+        format!("(\"$1\" --setsid-sleep & echo \"$!\"); echo escaped; exec sleep {HELPER_SECS}");
+    let spec = ProcessSpec::new("/bin/sh").with_args([
+        "-c".to_string(),
+        script,
+        "sh".to_string(),
+        env!("CARGO_BIN_EXE_fake-agent").to_string(),
+    ]);
+    let id = supervisor.spawn(spec).expect("spawning sh must succeed");
     let frames = supervisor.subscribe(id).expect("subscribe must succeed");
     let mut seen = Vec::new();
     let helper = helper_from_first_line(&frames, &mut seen);
+    wait_for_lines(&frames, &mut seen, &["descendant-ready", "escaped"]);
 
     let stopped = supervisor
         .stop(id, Duration::from_secs(2))
@@ -504,21 +573,28 @@ fn a_stopped_run_ends_after_the_grace_while_an_escaped_descendant_holds_its_outp
 
 /// The verifier's probe c4: a Stop that arrives during the exit grace waits
 /// for the settled verdict, reports it, and still reaches the lingering
-/// group.
+/// group. As above, the child lives long enough for a census walk to sight
+/// the helper.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_stop_during_the_grace_reports_the_verdict_and_reaches_the_group() {
     let mut supervisor = TokioProcessSupervisor::new();
     let id = spawn_sh(
         &mut supervisor,
-        &format!("sleep {HELPER_SECS} & echo \"$!\"; exit 0"),
+        &format!("sleep {HELPER_SECS} & echo \"$!\"; sleep 1; exit 0"),
     );
     let frames = supervisor.subscribe(id).expect("subscribe must succeed");
     let mut seen = Vec::new();
     let helper = helper_from_first_line(&frames, &mut seen);
 
-    // The child exits at once: 800 ms in, its readers are inside the grace.
-    std::thread::sleep(Duration::from_millis(800));
+    // Once the reaper has reaped the child its grace is running, and the
+    // helper keeps the readers inside it.
+    let child = std::path::PathBuf::from(format!("/proc/{}", id.0));
+    let end = Instant::now() + LINE_DEADLINE;
+    while child.exists() {
+        assert!(Instant::now() < end, "the child was never reaped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let stopped = supervisor
         .stop(id, Duration::from_secs(1))
         .expect("stop during the grace must succeed");

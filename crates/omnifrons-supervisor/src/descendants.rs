@@ -214,9 +214,12 @@ pub(crate) struct Leftovers {
     /// Recorded descendants still running *outside* the child's process
     /// group, as `(pid, command name)`: the ones a group check cannot see.
     pub(crate) escaped: Vec<(Pid, String)>,
-    /// Every process still running in the child's process group, with its
-    /// start time: what lets a later Stop prove the group is still the
-    /// original one ([`member_still_in_group`]).
+    /// The recorded descendants -- sighted while the child lived -- that are
+    /// still running in its process group with their recorded start time:
+    /// what lets a later Stop prove the group is still the original one
+    /// ([`member_still_in_group`]). Never a process first seen after the
+    /// reap: by then the group may have emptied and its id been recycled
+    /// for an unrelated group, whose members would prove nothing.
     pub(crate) members: Vec<Identity>,
 }
 
@@ -354,15 +357,6 @@ impl Census {
                 return found;
             }
         };
-        found.members = table
-            .iter()
-            .filter(|(_, stat)| stat.pgrp == pgid && stat.state != ZOMBIE_STATE)
-            .map(|(pid, stat)| Identity {
-                pid: *pid,
-                starttime: stat.starttime,
-            })
-            .collect();
-        found.members.sort_by_key(|identity| identity.pid.as_raw());
         match self {
             Self::Unavailable(reason) => found.unproven = Some(*reason),
             Self::Snapshot(recorded) => {
@@ -376,7 +370,12 @@ impl Census {
                     found
                         .unproven
                         .get_or_insert(Unproven::DescendantOutlivedChild);
-                    if stat.pgrp != pgid {
+                    if stat.pgrp == pgid {
+                        // Sighted while the child lived, and still in its
+                        // group: only such a process proves the group id
+                        // still names the original group.
+                        found.members.push(*identity);
+                    } else {
                         let comm = read_comm(proc_root, identity.pid)
                             .unwrap_or_else(|| UNKNOWN_COMM.to_string());
                         found.escaped.push((identity.pid, comm));
@@ -384,7 +383,16 @@ impl Census {
                 }
             }
         }
-        if !found.members.is_empty() {
+        found.members.sort_by_key(|identity| identity.pid.as_raw());
+        // Anything in the group makes the verdict uncertain, even a process
+        // first seen now: once the reaped child's group has emptied, its id
+        // can name an unrelated group. Reporting it is harmless; it is never
+        // recorded as a member, since it cannot prove the group is the
+        // original one.
+        if table
+            .values()
+            .any(|stat| stat.pgrp == pgid && stat.state != ZOMBIE_STATE)
+        {
             found.unproven.get_or_insert(Unproven::GroupNotEmpty);
         }
         found
@@ -522,10 +530,14 @@ fn group_survivors_in(proc_root: &Path, pgid: Pid) -> Result<Vec<Pid>, Unproven>
 /// Only then may the group be signalled by its id after the child's reap.
 /// A process-group id is not reused while any process is still in that
 /// group, but once the group is empty its id (the reaped child's pid) can
-/// be handed to an unrelated process that starts a group of its own. A
-/// member that cannot be read is not evidence: it does not count. As with
-/// [`sweep`], the member could in principle leave the group between this
-/// read and the signal that follows it.
+/// be handed to an unrelated process that starts a group of its own. So
+/// `members` must hold only identities the census sighted while the child
+/// lived ([`Leftovers::members`]): a process first seen in the group after
+/// the reap may belong to such an unrelated group, and the check would
+/// then vouch for the very group it must refuse. A member that cannot be
+/// read is not evidence: it does not count. As with [`sweep`], the member
+/// could in principle leave the group between this read and the signal
+/// that follows it.
 pub(crate) fn member_still_in_group(pgid: Pid, members: &[Identity]) -> bool {
     member_still_in_group_in(Path::new(PROC_ROOT), pgid, members)
 }
@@ -1116,6 +1128,35 @@ mod tests {
         assert_eq!(found.escaped, vec![(pid(101), "fake-agent".to_string())]);
         assert_eq!(found.members, vec![identity(102, 12)]);
         assert_eq!(found.unproven, Some(Unproven::DescendantOutlivedChild));
+    }
+
+    /// Codex P1 on #196: the child's group emptied and its id was recycled
+    /// before the settle, so every process now in "the group" was first seen
+    /// after the reap. They still make the verdict `orphan-risk` (reporting
+    /// is harmless), but none may be recorded as a member, and Stop's check
+    /// must refuse to signal that group.
+    #[test]
+    fn a_process_first_seen_after_the_reap_never_authorizes_a_group_signal() {
+        let root = ProcRoot::new("recycled-group");
+        root.entry(100, 'S', 1, 100, 500) // pid 100 recycled: a new group leader
+            .entry(301, 'S', 100, 100, 501); // a member of that unrelated group
+        // The census saw the original member 102 while the child lived; it
+        // is gone now.
+        let census = Census::Snapshot(vec![identity(102, 12)]);
+
+        let found = census.leftovers_in(root.path(), pid(100));
+
+        assert!(
+            found.members.is_empty(),
+            "a process first seen after the reap was recorded: {:?}",
+            found.members
+        );
+        assert!(!member_still_in_group_in(
+            root.path(),
+            pid(100),
+            &found.members
+        ));
+        assert_eq!(found.unproven, Some(Unproven::GroupNotEmpty));
     }
 
     #[test]

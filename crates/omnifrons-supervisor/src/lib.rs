@@ -400,9 +400,11 @@ struct SelfExitReaper {
     id: ProcessId,
 }
 
-/// A recorded member of a self-exited child's process group: what lets a
-/// later Stop prove the group is still the original one before signalling
-/// it (`descendants::member_still_in_group`). Nothing can be proven without
+/// A recorded member of a self-exited child's process group -- always a
+/// descendant the census sighted while the child lived, never a process
+/// first seen after the reap: what lets a later Stop prove the group is
+/// still the original one before signalling it
+/// (`descendants::member_still_in_group`). Nothing can be proven without
 /// `/proc`, so elsewhere none is ever recorded.
 #[cfg(target_os = "linux")]
 type GroupMember = descendants::Identity;
@@ -452,8 +454,10 @@ struct SelfExitVerdict {
     state: ProcessTerminalState,
     /// Diagnostic texts delivered just before the `State` frame.
     notes: Vec<String>,
-    /// The group's live members, recorded only when a reader outlasted the
-    /// grace: what lets Stop still signal that group.
+    /// The group's live members that the census sighted while the child
+    /// lived, recorded only when a reader outlasted the grace: what lets
+    /// Stop still signal that group. Never a process first seen after the
+    /// reap (`descendants::Leftovers::members`).
     members: Vec<GroupMember>,
     /// Whether a reader outlasted the grace and the run ends without it.
     abandon_readers: bool,
@@ -609,13 +613,13 @@ impl SelfExitReaper {
             output_capture::note_reap_poll(&self.outputs, self.id);
             match self.try_reap() {
                 ReapAttempt::Reaped(state, settling) => {
-                    // A walk still in flight is awaited: one that ran after
-                    // the exit adds nothing and erases nothing alive, and
-                    // one that ran before it may have seen a descendant no
-                    // other walk did.
-                    if let Some(handle) = refresh.take() {
-                        census = adopt_refresh(census, handle).await;
-                    }
+                    // A walk still in flight is dropped (detached), never
+                    // adopted: it may read `/proc` after this reap, once the
+                    // child's pid is free for an unrelated process, and only
+                    // sightings taken while the child held its pid may later
+                    // authorize a group signal (`descendants::Leftovers`).
+                    // Every adopted walk finished before this reap.
+                    drop(refresh.take());
                     self.end_after_reap(census, state).await;
                     drop(settling);
                     return;
@@ -1161,8 +1165,10 @@ struct Inner {
     settling: Arc<Mutex<HashMap<ProcessId, std::time::Instant>>>,
     /// The live members of a self-exited child's process group, recorded
     /// with its verdict when a descendant still held its output after the
-    /// exit grace. A later `stop` signals that group only while one of them
-    /// is provably still in it, so the group id cannot have been recycled
+    /// exit grace -- only descendants the census sighted while the child
+    /// lived, never a process first seen after the reap. A later `stop`
+    /// signals that group only while one of them is provably still in it,
+    /// so the group id cannot have been recycled
     /// (`unix::signal_lingering_group`). Never recorded without `/proc`.
     /// Kept no longer than the id's own `children` entry.
     lingering: LingeringGroups,
@@ -2324,9 +2330,15 @@ mod unix {
     /// Only while the group is provably the original one: a member
     /// recorded with the verdict is still in it with its recorded start
     /// time, so the group id (the reaped child's pid) cannot have been
-    /// recycled ([`crate::group_still_original`]). Once no recorded member
-    /// is left, nothing more is signalled, even if a process that joined
-    /// the group later is still in it.
+    /// recycled ([`crate::group_still_original`]). Those members are only
+    /// descendants the census sighted while the child lived: a process
+    /// first seen in the group after the reap may belong to an unrelated
+    /// group that took over the id, and never authorizes a signal. Once no
+    /// recorded member is left, nothing more is signalled, even if a
+    /// process that joined the group later is still in it. A lingering
+    /// helper the census never sighted (one forked and orphaned within a
+    /// census interval) therefore leaves Stop nothing to signal: Stop then
+    /// reports the recorded state alone.
     fn signal_lingering_group(id: ProcessId, members: &[GroupMember], deadline: Duration) {
         let Ok(raw_pid) = i32::try_from(id.0) else {
             return;
