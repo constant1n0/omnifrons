@@ -603,6 +603,11 @@ impl Drop for ClaimRelease {
         if let Some(token) = self.token {
             output_capture::release_reap(&self.outputs, self.id, token);
         }
+        #[cfg(test)]
+        ENDED_REAPERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.id.0);
     }
 }
 
@@ -1307,6 +1312,30 @@ async fn hold_reaper_end(id: ProcessId) {
 /// can be exercised.
 #[cfg(test)]
 static FAILING_CENSUSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Pids whose self-exit reaper task has ended (its [`ClaimRelease`] has
+/// dropped), so a unit test can wait for that end instead of sleeping.
+#[cfg(test)]
+static ENDED_REAPERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Whether the reaper of `id` has ended ([`ENDED_REAPERS`]).
+#[cfg(test)]
+fn reaper_ended(id: ProcessId) -> bool {
+    ENDED_REAPERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&id.0)
+}
+
+/// Forget earlier ends recorded for `id`: a pid recycled from an earlier
+/// test's child must not read as this run's reaper having ended.
+#[cfg(test)]
+fn forget_reaper_end(id: ProcessId) {
+    ENDED_REAPERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|pid| *pid != id.0);
+}
 
 /// An entry of one of the test hook tables above, keyed by pid.
 #[cfg(test)]
@@ -2172,11 +2201,12 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         // holds this child it alone confirms the reap, so that its
         // descendant census decides the terminal state; `observe` reports
         // `Running` meanwhile. After the child exits, that lasts until the
-        // reaper's next poll notices the exit (at most `idle_poll`, 2 s;
-        // `slow_poll`, 250 ms, or less within a minute of the spawn or of
-        // the output closing), then while a reader still holds the output,
-        // at most `exit_grace` (2 s), then for the verdict's census walk:
-        // about 4 s with the defaults
+        // reaper's next poll notices the exit, then while a reader still
+        // holds the output, then for the verdict's census walk. With
+        // `ReapPacing::DEFAULT` (whose values are quoted here) that is at
+        // most `idle_poll`, 2 s (`slow_poll`, 250 ms, or less within a
+        // minute of the spawn or of the output closing), plus `exit_grace`,
+        // 2 s, plus the walk: about 4 s
         // (`observe_turns_terminal_within_a_poll_and_the_grace_of_a_self_exit`).
         // Two caps hold whatever the reaper does. Before the reap the
         // deferral ends once its last poll (its claim, before the first) is
@@ -3391,7 +3421,9 @@ mod self_exit_tests {
         let spec =
             ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; sleep 0.2; exit 0"]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
-        // Registered while the child still sleeps its 0.2 s: before its reap.
+        // Both registered while the child still sleeps its 0.2 s: before its
+        // reap, and before its reaper can have ended.
+        super::forget_reaper_end(id);
         let _held =
             super::register_hook(&super::HELD_REAPER_ENDS, (id.0, Duration::from_millis(500)));
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
@@ -3403,9 +3435,22 @@ mod self_exit_tests {
         let (state, _new_handles) = super::output_capture::new_channel(1);
         outputs.lock().expect("outputs poisoned").insert(id, state);
         assert!(super::output_capture::claim_reap(&outputs, id).is_some());
+        // Otherwise the old release ran first and this test proves nothing.
+        assert!(
+            !super::reaper_ended(id),
+            "the old reaper ended before the new claim was taken"
+        );
 
-        // Past the held end: the old guard has dropped.
-        std::thread::sleep(Duration::from_millis(1500));
+        // Wait for the old reaper's end: its guard has dropped by then.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !super::reaper_ended(id) {
+            assert!(
+                std::time::Instant::now() < end,
+                "the old reaper never ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        super::forget_reaper_end(id);
         let survived = super::output_capture::reaper_claim(&outputs, id).is_some();
         outputs.lock().expect("outputs poisoned").remove(&id);
         assert!(

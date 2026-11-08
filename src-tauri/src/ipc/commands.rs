@@ -1206,6 +1206,9 @@ const ORPHAN_STOP_DEADLINE: Duration = Duration::from_secs(5);
 /// deadline, then a 500 ms kill grace and a descendant sweep of two 300 ms
 /// rounds -- about 11.1 s with [`ORPHAN_STOP_DEADLINE`]. The rest is margin
 /// for a supervisor held up by another command, the scenario this serves.
+/// Those figures are `omnifrons-supervisor`'s `ReapPacing::settle_wait`,
+/// `KILL_GRACE` and `descendants::SWEEP_GRACE`; this crate cannot name
+/// them, so a change there must be carried here by hand.
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Stops the child of a launch whose caller was already answered (or whose
@@ -2779,9 +2782,11 @@ mod tests {
     /// of the timer. However the caller is answered -- the launch's own
     /// error in budget, the same error found by the last look after the
     /// timeout, or `LaunchTimedOut` -- the child is stopped exactly once.
-    /// The last look is reached in about a quarter of these runs, and
-    /// before `answer_caller` it left the child running there, so a hundred
-    /// runs cover it with certainty to spare (the verifier's probe).
+    /// Which arm answers depends on the scheduler, and nothing records it:
+    /// in the verifier's probe the last look answered about a quarter of
+    /// the runs (before `answer_caller` it left the child running there),
+    /// so a hundred runs reach it many times, though only in all
+    /// likelihood.
     #[test]
     fn a_launch_error_at_the_budget_always_stops_its_child_exactly_once() {
         let budget = std::time::Duration::from_millis(5);
@@ -2812,7 +2817,15 @@ mod tests {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 },
             );
-            // Longer than the sweep, one budget after the timeout.
+            // The stop may come from the sweep, one budget after the
+            // timeout: wait for it rather than for a fixed time, then a
+            // little longer, so a second stop would be seen.
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while stops.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && std::time::Instant::now() < end
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             std::thread::sleep(budget * 4);
             let code = result.expect_err("the launch never succeeds").code;
             assert!(
@@ -2859,8 +2872,10 @@ mod tests {
     /// A launch that forks after the timeout and then stalls forever has
     /// its child stopped by the delayed sweep. The task forks only when the
     /// test, already answered `LaunchTimedOut`, tells it to: after the
-    /// timeout's own look found nothing, and one 300 ms budget before the
-    /// sweep, so the order is set by the signal, not by a timing margin.
+    /// timeout's own look found nothing, and with the whole 300 ms budget
+    /// left before the sweep. That is still a margin -- a test thread
+    /// stalled longer than the budget between the answer and the signal
+    /// would see the sweep find nothing -- but twenty times the old 15 ms.
     #[test]
     fn watchdog_sweeps_a_child_forked_after_the_timeout_by_a_stalled_task() {
         let (stop, stopped) = recording_stop();
