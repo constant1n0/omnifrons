@@ -159,9 +159,13 @@ pub trait ProcessSupervisor {
     ///
     /// # Blocking
     ///
-    /// An implementation may block the calling thread for up to `deadline`
-    /// while polling for a terminal state (e.g. `omnifrons-supervisor`'s
-    /// poll loop uses `std::thread::sleep`). A caller running on an async
+    /// An implementation may block the calling thread while polling for a
+    /// terminal state (e.g. `omnifrons-supervisor`'s poll loop uses
+    /// `std::thread::sleep`), and for longer than `deadline`: before the
+    /// deadline starts it may wait for a terminal verdict already being
+    /// settled, and after it for a kill and a descendant sweep
+    /// (`omnifrons-supervisor`: up to 5 s, then `deadline`, then about
+    /// 1.1 s). A caller running on an async
     /// executor must invoke `stop` from a blocking context -- e.g. Tokio's
     /// `spawn_blocking` -- rather than from an async task, to avoid
     /// stalling the executor.

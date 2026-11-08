@@ -1201,9 +1201,12 @@ pub async fn harness_spawn(
 const ORPHAN_STOP_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How long `stop_orphaned_launch` waits for the supervisor before it gives
-/// up and logs: longer than the stop deadline, because the scenario it
-/// serves may have the supervisor stuck.
-const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// up and logs. A stop takes longer than its deadline: the supervisor first
+/// waits up to 5 s for a self-exit verdict already being settled, then the
+/// deadline, then a 500 ms kill grace and a descendant sweep of two 300 ms
+/// rounds -- about 11.1 s with [`ORPHAN_STOP_DEADLINE`]. The rest is margin
+/// for a supervisor held up by another command, the scenario this serves.
+const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Stops the child of a launch whose caller was already answered (or whose
 /// task died) and logs the result with the process id: a failed stop is the
@@ -2795,17 +2798,21 @@ mod tests {
     }
 
     /// A launch that forks after the timeout and then stalls forever has
-    /// its child stopped by the delayed sweep.
+    /// its child stopped by the delayed sweep. The task forks only when the
+    /// test, already answered `LaunchTimedOut`, tells it to: after the
+    /// timeout's own look found nothing, and one 300 ms budget before the
+    /// sweep, so the order is set by the signal, not by a timing margin.
     #[test]
     fn watchdog_sweeps_a_child_forked_after_the_timeout_by_a_stalled_task() {
         let (stop, stopped) = recording_stop();
         let progress = super::LaunchProgress::new();
         let marker = progress.clone();
+        let (fork, forked_on_signal) = tokio::sync::oneshot::channel::<()>();
         let err = watchdog(
-            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(300),
             progress,
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+                let _ = forked_on_signal.await;
                 marker.spawned(ProcessId(8));
                 std::future::pending::<Result<u32, ShellError>>().await
             },
@@ -2814,6 +2821,13 @@ mod tests {
         )
         .expect_err("the budget elapsed first");
         assert_eq!(err.code, ShellErrorCode::LaunchTimedOut);
+        // Nothing was recorded at the timeout, so only the sweep can stop it.
+        assert_eq!(
+            stopped.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        fork.send(())
+            .expect("the stalled task still waits for the signal");
         assert_eq!(
             stopped.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(ProcessId(8))
