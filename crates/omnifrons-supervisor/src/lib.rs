@@ -1308,6 +1308,58 @@ async fn hold_reaper_end(id: ProcessId) {
 #[cfg(test)]
 static FAILING_CENSUSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+/// An entry of one of the test hook tables above, keyed by pid.
+#[cfg(test)]
+trait HookEntry {
+    fn pid(&self) -> u32;
+}
+
+#[cfg(test)]
+impl HookEntry for u32 {
+    fn pid(&self) -> u32 {
+        *self
+    }
+}
+
+#[cfg(test)]
+impl HookEntry for (u32, Duration) {
+    fn pid(&self) -> u32 {
+        self.0
+    }
+}
+
+/// A unit test's entry in a hook table, removed when it drops. The tables
+/// are shared by every test in the process and pids are recycled, so an
+/// entry left behind could reach a later test's child.
+#[cfg(test)]
+#[must_use = "dropping the registration removes the hook at once"]
+struct HookRegistration<T: HookEntry + 'static> {
+    table: &'static Mutex<Vec<T>>,
+    pid: u32,
+}
+
+/// Register `entry` in `table` for as long as the returned guard lives.
+#[cfg(test)]
+fn register_hook<T: HookEntry>(table: &'static Mutex<Vec<T>>, entry: T) -> HookRegistration<T> {
+    let pid = entry.pid();
+    table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(entry);
+    HookRegistration { table, pid }
+}
+
+#[cfg(test)]
+impl<T: HookEntry> Drop for HookRegistration<T> {
+    fn drop(&mut self) {
+        // Poison-tolerant: a test's panic must not hide its own failure.
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.pid() != self.pid);
+    }
+}
+
 /// What one [`SelfExitReaper::try_reap`] concluded.
 enum ReapAttempt {
     /// Still running (or a `stop` owns it): ask again later.
@@ -3042,10 +3094,7 @@ mod self_exit_tests {
         let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
         // Registered while the child still sleeps its 0.2 s: before its settle.
-        super::HELD_SETTLES
-            .lock()
-            .expect("held settles poisoned")
-            .push((id.0, Duration::from_millis(300)));
+        let _held = super::register_hook(&super::HELD_SETTLES, (id.0, Duration::from_millis(300)));
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         let exited = ProcessTerminalState::Exited { code: Some(0) };
@@ -3254,10 +3303,7 @@ mod self_exit_tests {
         let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 1"]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
         // The reaper panics at its next poll, while the child still sleeps.
-        super::PANICKING_REAPERS
-            .lock()
-            .expect("panicking reapers poisoned")
-            .push(id.0);
+        let _panics = super::register_hook(&super::PANICKING_REAPERS, id.0);
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         // The child exits after 1 s; 5 s is far short of the stall grace.
@@ -3291,10 +3337,7 @@ mod self_exit_tests {
             ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; sleep 0.2; exit 0"]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
         // Registered while the child still sleeps its 0.2 s: before its reap.
-        super::HELD_REAPER_ENDS
-            .lock()
-            .expect("held reaper ends poisoned")
-            .push((id.0, Duration::from_secs(2)));
+        let _held = super::register_hook(&super::HELD_REAPER_ENDS, (id.0, Duration::from_secs(2)));
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         let exited = ProcessTerminalState::Exited { code: Some(0) };
@@ -3313,10 +3356,7 @@ mod self_exit_tests {
     fn a_failed_census_task_is_unavailable_and_never_retaken_inline() {
         // Never a live pid (`pid_max` is far lower), so no other test uses it.
         let id = omnifrons_app::ProcessId(u32::MAX - 192);
-        super::FAILING_CENSUSES
-            .lock()
-            .expect("failing censuses poisoned")
-            .push(id.0);
+        let _fails = super::register_hook(&super::FAILING_CENSUSES, id.0);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("a current-thread runtime must build");
@@ -3350,10 +3390,8 @@ mod self_exit_tests {
             ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; sleep 0.2; exit 0"]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
         // Registered while the child still sleeps its 0.2 s: before its reap.
-        super::HELD_REAPER_ENDS
-            .lock()
-            .expect("held reaper ends poisoned")
-            .push((id.0, Duration::from_millis(500)));
+        let _held =
+            super::register_hook(&super::HELD_REAPER_ENDS, (id.0, Duration::from_millis(500)));
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
         assert!(first_state(&frames, Duration::from_secs(10)).is_some());
 
@@ -3367,14 +3405,29 @@ mod self_exit_tests {
         // Past the held end: the old guard has dropped.
         std::thread::sleep(Duration::from_millis(1500));
         let survived = super::output_capture::reaper_claim(&outputs, id).is_some();
-        super::HELD_REAPER_ENDS
-            .lock()
-            .expect("held reaper ends poisoned")
-            .retain(|(pid, _)| *pid != id.0);
         outputs.lock().expect("outputs poisoned").remove(&id);
         assert!(
             survived,
             "the old reaper's release cleared the new run's claim"
         );
+    }
+
+    /// #198 review (R3-001): a test's hook entry leaves its table when the
+    /// test's registration drops, so a recycled pid never inherits it.
+    #[test]
+    fn a_hook_registration_is_removed_when_it_drops() {
+        // Never a live pid, so no other test registers it.
+        let pid = u32::MAX - 198;
+        let registered = || {
+            super::PANICKING_REAPERS
+                .lock()
+                .expect("panicking reapers poisoned")
+                .contains(&pid)
+        };
+        {
+            let _panics = super::register_hook(&super::PANICKING_REAPERS, pid);
+            assert!(registered());
+        }
+        assert!(!registered(), "the hook outlived its registration");
     }
 }
