@@ -1319,7 +1319,7 @@ static FAILING_CENSUSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static ENDED_REAPERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Whether the reaper of `id` has ended ([`ENDED_REAPERS`]).
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn reaper_ended(id: ProcessId) -> bool {
     ENDED_REAPERS
         .lock()
@@ -1329,7 +1329,7 @@ fn reaper_ended(id: ProcessId) -> bool {
 
 /// Forget earlier ends recorded for `id`: a pid recycled from an earlier
 /// test's child must not read as this run's reaper having ended.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn forget_reaper_end(id: ProcessId) {
     ENDED_REAPERS
         .lock()
@@ -1337,20 +1337,23 @@ fn forget_reaper_end(id: ProcessId) {
         .retain(|pid| *pid != id.0);
 }
 
-/// An entry of one of the test hook tables above, keyed by pid.
-#[cfg(test)]
+/// An entry of one of the test hook tables above, keyed by pid. This and
+/// the registration below are gated like their only users, the Unix-only
+/// `self_exit_tests` (and `reaper_ended` like its Linux-only tests), so no
+/// other target builds them as dead code.
+#[cfg(all(test, unix))]
 trait HookEntry {
     fn pid(&self) -> u32;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl HookEntry for u32 {
     fn pid(&self) -> u32 {
         *self
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl HookEntry for (u32, Duration) {
     fn pid(&self) -> u32 {
         self.0
@@ -1360,7 +1363,7 @@ impl HookEntry for (u32, Duration) {
 /// A unit test's entry in a hook table, removed when it drops. The tables
 /// are shared by every test in the process and pids are recycled, so an
 /// entry left behind could reach a later test's child.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use = "dropping the registration removes the hook at once"]
 struct HookRegistration<T: HookEntry + 'static> {
     table: &'static Mutex<Vec<T>>,
@@ -1368,7 +1371,7 @@ struct HookRegistration<T: HookEntry + 'static> {
 }
 
 /// Register `entry` in `table` for as long as the returned guard lives.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn register_hook<T: HookEntry>(table: &'static Mutex<Vec<T>>, entry: T) -> HookRegistration<T> {
     let pid = entry.pid();
     table
@@ -1378,7 +1381,7 @@ fn register_hook<T: HookEntry>(table: &'static Mutex<Vec<T>>, entry: T) -> HookR
     HookRegistration { table, pid }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl<T: HookEntry> Drop for HookRegistration<T> {
     fn drop(&mut self) {
         // Poison-tolerant: a test's panic must not hide its own failure.
