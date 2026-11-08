@@ -26,6 +26,7 @@ use omnifrons_domain::adapter::{
     AdapterEvent, AdapterId, PromptChannel, StdinPlan, TransportClass,
 };
 use omnifrons_domain::scope::ScopeMode;
+use omnifrons_domain::terminal_input::line_discipline_interprets;
 
 /// The user-facing disclosure every `adapters_list` caller sees: what this
 /// adapter gives up, what it renders, and what the terminal is not.
@@ -35,18 +36,6 @@ const NOTES: &str = "degraded fallback with no structured events: the executable
                      sanitized and shown as text only; hyperlinks, clipboard access and file \
                      transfer are disabled; the terminal is not a sandbox and grants no \
                      authority; not available on Windows in this slice";
-
-/// Whether a prompt byte would be interpreted by the terminal's line
-/// discipline (default `termios`: canonical mode, `ISIG`, `ICRNL`) rather
-/// than typed: every C0 control except newline (ends a line the child
-/// reads as such) and tab (typed literally), and DEL (`VERASE` on Linux and
-/// macOS). Among the refused bytes are `VINTR` (0x03), `VEOF` (0x04),
-/// `VSUSP` (0x1A), `VQUIT` (0x1C), ESC (would open a sequence), and `\r`
-/// (would act as Enter mid-text). Multi-byte UTF-8 bytes are all
-/// `>= 0x80` and never match.
-fn line_discipline_interprets(byte: u8) -> bool {
-    matches!(byte, 0x00..=0x08 | 0x0B..=0x1F | 0x7F)
-}
 
 /// The pseudo-terminal `HarnessAdapter`: an empty argv template, the
 /// prompt typed into the terminal, the base environment allowlist only.

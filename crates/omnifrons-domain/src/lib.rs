@@ -22,5 +22,6 @@ pub mod skills_index;
 pub mod skills_safety;
 pub mod switch_check;
 pub mod terminal;
+pub mod terminal_input;
 pub mod warnings;
 pub mod wrong_root;
