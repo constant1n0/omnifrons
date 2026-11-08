@@ -174,6 +174,9 @@ pub(crate) enum Unproven {
     DescendantOutlivedChild,
     /// The census reached its sighting bound and stopped recording.
     TooManySightings,
+    /// The blocking task that walks `/proc` for the census failed to run
+    /// (it panicked, or the runtime is shutting down), so no census exists.
+    CensusTaskFailed,
 }
 
 impl std::fmt::Display for Unproven {
@@ -193,6 +196,7 @@ impl std::fmt::Display for Unproven {
                 f.write_str("a recorded descendant outlived the child that exited on its own")
             }
             Self::TooManySightings => f.write_str("the census reached its sighting bound"),
+            Self::CensusTaskFailed => f.write_str("the census task failed to run"),
         }
     }
 }

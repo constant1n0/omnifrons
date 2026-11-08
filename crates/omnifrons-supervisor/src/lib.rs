@@ -567,6 +567,23 @@ impl<'a> StoppingGuard<'a> {
     }
 }
 
+/// Gives the self-exit reaper's claim on `id` back when its task ends, on
+/// every path: a return, a panic, or the runtime dropping the task at
+/// shutdown. A reaper that ends without having reaped the child thus never
+/// leaves `observe` deferring to it until `stall_grace`; once the run is
+/// finalized the release changes nothing, because a claim is honoured only
+/// while the final frame is still owed ([`output_capture::reaper_claim`]).
+struct ClaimRelease {
+    outputs: OutputTable,
+    id: ProcessId,
+}
+
+impl Drop for ClaimRelease {
+    fn drop(&mut self) {
+        output_capture::release_reap(&self.outputs, self.id);
+    }
+}
+
 /// Marks `id` as settling (see [`Inner::settling`]) until dropped. Owns its
 /// set, so it travels with the reaper task across the blocking sweep.
 struct SettlingGuard {
@@ -602,8 +619,14 @@ impl Drop for StoppingGuard<'_> {
 impl SelfExitReaper {
     /// Polls for the child's exit from spawn until its run's final frame is
     /// sent. `finish_spawn` takes this reaper's claim before the child is
-    /// visible to anyone, so `observe` defers to it from the first instant.
+    /// visible to anyone, so `observe` defers to it from the first instant;
+    /// [`ClaimRelease`] gives the claim back when the task ends, however it
+    /// ends.
     async fn run(self) {
+        let _claim = ClaimRelease {
+            outputs: Arc::clone(&self.outputs),
+            id: self.id,
+        };
         let mut census = take_census_blocking(self.id).await;
         let mut census_at = std::time::Instant::now();
         let mut refresh: Option<JoinHandle<Census>> = None;
@@ -622,6 +645,8 @@ impl SelfExitReaper {
                 census = adopt_refresh(census, handle).await;
             }
             output_capture::note_reap_poll(&self.outputs, self.id);
+            #[cfg(test)]
+            panic_if_reaper_registered(self.id);
             // The exit is read without reaping; once it is there, the group
             // is read on the blocking pool while the zombie still holds its
             // id, and only then is the child reaped (`try_reap`).
@@ -646,6 +671,8 @@ impl SelfExitReaper {
                     // Every adopted walk finished before this reap.
                     drop(refresh.take());
                     self.end_after_reap(census, state).await;
+                    #[cfg(test)]
+                    hold_reaper_end(self.id).await;
                     drop(settling);
                     return;
                 }
@@ -849,13 +876,13 @@ impl SelfExitReaper {
                 Ok(None) => return ReapAttempt::Pending,
                 // Not a confirmed reap; retrying an error learns nothing.
                 Err(error) => {
+                    // The reaper ends: its `ClaimRelease` gives the claim back.
                     tracing::warn!(
                         pid = self.id.0,
                         %error,
                         "try_wait failed for a child the self-exit reaper polls; \
                          leaving the reap to observe/stop"
                     );
-                    output_capture::release_reap(&self.outputs, self.id);
                     return ReapAttempt::Finished;
                 }
             }
@@ -875,8 +902,18 @@ impl SelfExitReaper {
 /// When the verdict carries the group's live members (a reader outlasted
 /// the grace), they are kept for a later `stop` ([`Inner::lingering`]),
 /// pruned of ids no longer in `children` so the table stays bounded by it.
-/// Locks `children`, then `settling`, then `lingering`; `outputs` is locked
-/// alone after.
+///
+/// The verdict leaves `settling` before its `State` frame can be sent, so a
+/// consumer that calls `observe` on receiving the frame sees the settled
+/// state. Its notes are staged first, without a state, so nothing that
+/// finalizes the channel (a reader's end, or an `observe` that finds the
+/// child terminal) can send the frame yet; then `id` leaves `settling`;
+/// only then is the state recorded, and whichever finalize runs first
+/// delivers the notes with it. (`stop` on a child already terminal returns
+/// the recorded state without finalizing.)
+///
+/// Locks `children`, then `settling`, then `lingering`; `outputs` and then
+/// `settling` are each locked alone after.
 fn record_self_exit_verdict(
     children: &Mutex<HashMap<ProcessId, Tracked>>,
     settling: &Mutex<HashMap<ProcessId, std::time::Instant>>,
@@ -915,13 +952,12 @@ fn record_self_exit_verdict(
         }
         keep_group_record(lingering, &guard, id, verdict.members);
     }
-    output_capture::record_final_state(
-        outputs,
-        id,
-        verdict.state,
-        verdict.notes,
-        verdict.abandon_readers,
-    );
+    output_capture::stage_final_notes(outputs, id, verdict.notes, verdict.abandon_readers);
+    settling
+        .lock()
+        .expect("settling mutex poisoned by a prior panic")
+        .remove(&id);
+    output_capture::record_confirmed_state(outputs, id, verdict.state);
 }
 
 /// Adopt a finished census refresh ([`refresh_census`]): it started from a
@@ -1134,6 +1170,14 @@ fn take_census(id: ProcessId) -> Census {
         .lock()
         .expect("census counter poisoned")
         .push(id.0);
+    #[cfg(test)]
+    assert!(
+        !FAILING_CENSUSES
+            .lock()
+            .expect("failing censuses poisoned")
+            .contains(&id.0),
+        "census walk panicked on purpose (test)"
+    );
     #[cfg(unix)]
     {
         Census::take(pid_of(id))
@@ -1146,15 +1190,30 @@ fn take_census(id: ProcessId) -> Census {
 }
 
 /// [`take_census`] on the blocking pool (a procfs walk must not run on the
-/// runtime thread that drives every reader task).
+/// runtime thread that drives every reader task). A task that fails (it
+/// panicked, or the runtime is shutting down) is not retried here, on that
+/// thread: the census is recorded as unavailable ([`census_task_failed`]).
 async fn take_census_blocking(id: ProcessId) -> Census {
     match tokio::task::spawn_blocking(move || take_census(id)).await {
         Ok(census) => census,
         Err(error) => {
-            tracing::error!(%error, "census task failed; taking it inline");
-            take_census(id)
+            tracing::error!(%error, "census task failed; recording the census as unavailable");
+            census_task_failed()
         }
     }
+}
+
+/// The census of a failed census task: nothing was seen, so on Linux no
+/// clean exit can be claimed from it (the verdict is `OrphanRiskUncertain`).
+#[cfg(target_os = "linux")]
+fn census_task_failed() -> Census {
+    Census::Unavailable(descendants::Unproven::CensusTaskFailed)
+}
+
+/// Without `/proc` the census records nothing either way.
+#[cfg(not(target_os = "linux"))]
+fn census_task_failed() -> Census {
+    Census
 }
 
 /// Walk again for `id` and fold the walk into `census`, keeping at most
@@ -1200,6 +1259,45 @@ fn hold_settle(id: ProcessId) {
         std::thread::sleep(hold);
     }
 }
+
+/// Pids whose self-exit reaper a unit test makes panic at its next poll,
+/// so a reaper task that ends without reaping can be exercised.
+#[cfg(test)]
+static PANICKING_REAPERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Panic when a unit test registered `id` in [`PANICKING_REAPERS`].
+#[cfg(test)]
+fn panic_if_reaper_registered(id: ProcessId) {
+    let registered = PANICKING_REAPERS
+        .lock()
+        .expect("panicking reapers poisoned")
+        .contains(&id.0);
+    assert!(!registered, "self-exit reaper panicked on purpose (test)");
+}
+
+/// Pids whose reaper a unit test holds for the given time after the
+/// verdict is recorded and before the reaper task ends.
+#[cfg(test)]
+static HELD_REAPER_ENDS: Mutex<Vec<(u32, Duration)>> = Mutex::new(Vec::new());
+
+/// Wait for the time a unit test registered for `id` in [`HELD_REAPER_ENDS`].
+#[cfg(test)]
+async fn hold_reaper_end(id: ProcessId) {
+    let held = HELD_REAPER_ENDS
+        .lock()
+        .expect("held reaper ends poisoned")
+        .iter()
+        .find(|(pid, _)| *pid == id.0)
+        .map(|(_, hold)| *hold);
+    if let Some(hold) = held {
+        tokio::time::sleep(hold).await;
+    }
+}
+
+/// Pids whose census walk a unit test makes panic, so a failed census task
+/// can be exercised.
+#[cfg(test)]
+static FAILING_CENSUSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// What one [`SelfExitReaper::try_reap`] concluded.
 enum ReapAttempt {
@@ -3043,5 +3141,121 @@ mod self_exit_tests {
         };
         let exited = ProcessTerminalState::Exited { code: Some(0) };
         assert_eq!(status, Some(ProcessStatus::Terminal(exited)));
+    }
+
+    /// The first `State` frame the receiver yields within `within`.
+    fn first_state(
+        frames: &std::sync::mpsc::Receiver<omnifrons_app::OutputFrame>,
+        within: Duration,
+    ) -> Option<ProcessTerminalState> {
+        let end = std::time::Instant::now() + within;
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            match frames.recv_timeout(left) {
+                Ok(frame) => {
+                    if let FramePayload::State(state) = frame.payload {
+                        return Some(state);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// #192: a reaper task that ends without reaping (here it panics) gives
+    /// its claim back, so `observe` confirms the exit itself as soon as the
+    /// child exits, instead of deferring until `stall_grace` (30 s here) and
+    /// then logging a stalled reaper.
+    #[test]
+    fn a_reaper_that_panics_hands_the_reap_back_at_once() {
+        let pacing = ReapPacing {
+            stall_grace: Duration::from_secs(30),
+            ..SHORT
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; exec sleep 1"]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        // The reaper panics at its next poll, while the child still sleeps.
+        super::PANICKING_REAPERS
+            .lock()
+            .expect("panicking reapers poisoned")
+            .push(id.0);
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        // The child exits after 1 s; 5 s is far short of the stall grace.
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        let mut expired = false;
+        let status = loop {
+            let status = supervisor.observe(id);
+            // Read while the entry exists: the final frame removes it.
+            expired |= super::output_capture::deferral_expired(&supervisor.inner.outputs, id);
+            match status {
+                Some(ProcessStatus::Running) if std::time::Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        let exited = ProcessTerminalState::Exited { code: Some(0) };
+        assert_eq!(status, Some(ProcessStatus::Terminal(exited)));
+        assert!(!expired, "observe waited out a reaper that no longer ran");
+        assert_eq!(drain_states(&frames), vec![exited]);
+    }
+
+    /// #192: the settled verdict leaves `settling` before its `State` frame
+    /// is sent, so a consumer that calls `observe` on receiving the frame
+    /// sees that same state, even while the reaper task is slow to end
+    /// (held 2 s here, after the verdict is recorded).
+    #[test]
+    fn observe_reports_the_settled_state_once_its_frame_arrives() {
+        let mut supervisor = TokioProcessSupervisor::build_with(None, SHORT);
+        let spec =
+            ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; sleep 0.2; exit 0"]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        // Registered while the child still sleeps its 0.2 s: before its reap.
+        super::HELD_REAPER_ENDS
+            .lock()
+            .expect("held reaper ends poisoned")
+            .push((id.0, Duration::from_secs(2)));
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        let exited = ProcessTerminalState::Exited { code: Some(0) };
+        assert_eq!(first_state(&frames, Duration::from_secs(10)), Some(exited));
+        assert_eq!(
+            supervisor.observe(id),
+            Some(ProcessStatus::Terminal(exited))
+        );
+    }
+
+    /// #192: a census task that fails (here it panics) leaves the census
+    /// unavailable instead of walking `/proc` again inline, on the runtime
+    /// thread its own doc keeps procfs walks off.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_census_task_is_unavailable_and_never_retaken_inline() {
+        // Never a live pid (`pid_max` is far lower), so no other test uses it.
+        let id = omnifrons_app::ProcessId(u32::MAX - 192);
+        super::FAILING_CENSUSES
+            .lock()
+            .expect("failing censuses poisoned")
+            .push(id.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime must build");
+        let census = runtime.block_on(super::take_census_blocking(id));
+        assert!(matches!(
+            census,
+            super::Census::Unavailable(super::descendants::Unproven::CensusTaskFailed)
+        ));
+        let walks = super::CENSUS_TAKES
+            .lock()
+            .expect("census counter poisoned")
+            .iter()
+            .filter(|pid| **pid == id.0)
+            .count();
+        assert_eq!(
+            walks, 1,
+            "the census was walked again after its task failed"
+        );
     }
 }

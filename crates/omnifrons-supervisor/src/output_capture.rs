@@ -652,11 +652,32 @@ pub(crate) fn record_confirmed_state(
     record_final_state(outputs, id, state, Vec::new(), false);
 }
 
-/// [`record_confirmed_state`], plus what the self-exit reaper settled with
-/// it: `notes`, diagnostic `stderr` texts delivered in order just before the
+/// Stage what a settled self-exit verdict carries besides its state --
+/// `notes`, diagnostic `stderr` texts delivered in order just before the
 /// `State` frame (an empty list keeps any already recorded), and, when
 /// `abandon` is set, that the final frames no longer wait for a reader that
-/// outlasted the exit grace (see this module's own doc comment).
+/// outlasted the exit grace (see this module's own doc comment) -- without
+/// finalizing: with no state confirmed yet, no [`try_finalize`] can send
+/// the frame, which waits for [`record_confirmed_state`].
+pub(crate) fn stage_final_notes(
+    outputs: &OutputTable,
+    id: ProcessId,
+    notes: Vec<String>,
+    abandon: bool,
+) {
+    let mut guard = outputs
+        .lock()
+        .expect("outputs mutex poisoned by a prior panic");
+    let Some(entry) = guard.get_mut(&id) else {
+        return;
+    };
+    if !notes.is_empty() {
+        entry.final_notes = notes;
+    }
+    entry.readers_abandoned |= abandon;
+}
+
+/// [`record_confirmed_state`] and [`stage_final_notes`] in one step.
 pub(crate) fn record_final_state(
     outputs: &OutputTable,
     id: ProcessId,
@@ -799,12 +820,16 @@ pub(crate) fn deferral_expired(outputs: &OutputTable, id: ProcessId) -> bool {
     guard.get(&id).is_some_and(|e| e.deferral_expired_logged)
 }
 
-/// Give up a claim taken by [`claim_reap`], for a reaper that ends without
-/// having reaped the child, so `observe` confirms the reap again.
+/// Give up a claim taken by [`claim_reap`] when the reaper ends, so a
+/// reaper that ends without having reaped the child leaves `observe` to
+/// confirm the reap again at once.
+///
+/// Poison-tolerant: it runs from the reaper's drop guard, during unwinding
+/// as readily as not, where a second panic would abort the process.
 pub(crate) fn release_reap(outputs: &OutputTable, id: ProcessId) {
     let mut guard = outputs
         .lock()
-        .expect("outputs mutex poisoned by a prior panic");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(entry) = guard.get_mut(&id) {
         entry.reaper_claimed = false;
         entry.claimed_at = None;
