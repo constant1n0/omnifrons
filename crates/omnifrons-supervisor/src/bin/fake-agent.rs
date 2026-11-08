@@ -65,6 +65,12 @@
 //! report line: echo and the child's own writes share the terminal's
 //! output, and nothing aligns them on line boundaries.
 //!
+//! `--pty-hold-until <path>` (`tests/pty_input.rs`): turns its terminal's
+//! echo off like `--pty-ready-echo`, prints `ready`, then never reads stdin
+//! -- so the terminal's input queue fills -- and exits 0 on its own once
+//! `<path>` exists, or after [`DESCENDANT_LIFETIME_SECS`] at the latest, so
+//! a test chooses the moment the terminal hangs up without calling `stop`.
+//!
 //! `--pty-corpus`: writes the shared terminal corpus
 //! (`omnifrons_app::terminal_normalizer::corpus::bytes`) to stdout
 //! verbatim, then a newline and a final `corpus-done` line, and exits 0.
@@ -177,6 +183,7 @@ struct Flags {
     pty_report: bool,
     pty_echo: bool,
     pty_ready_echo: bool,
+    pty_hold_until: Option<PathBuf>,
     pty_corpus: bool,
     pty_ignore_sigterm: bool,
     report_inherited_fds: bool,
@@ -201,6 +208,12 @@ fn parse_flags(args: &[String]) -> Flags {
             "--pty-report" => flags.pty_report = true,
             "--pty-echo" => flags.pty_echo = true,
             "--pty-ready-echo" => flags.pty_ready_echo = true,
+            "--pty-hold-until" => {
+                i += 1;
+                flags.pty_hold_until = Some(PathBuf::from(
+                    args.get(i).expect("--pty-hold-until requires a path"),
+                ));
+            }
             "--pty-corpus" => flags.pty_corpus = true,
             "--pty-ignore-sigterm" => flags.pty_ignore_sigterm = true,
             "--report-inherited-fds" => flags.report_inherited_fds = true,
@@ -314,13 +327,7 @@ fn main() -> ExitCode {
         return ExitCode::from(exit_code);
     }
 
-    if flags.pty_ready_echo {
-        run_pty_ready_echo(&mut stdout);
-        return ExitCode::from(exit_code);
-    }
-
-    if flags.pty_echo {
-        run_pty_echo(&mut stdout);
+    if run_line_echo_mode(&flags, &mut stdout) {
         return ExitCode::from(exit_code);
     }
 
@@ -983,6 +990,35 @@ mod sha256 {
                 "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
             );
         }
+    }
+}
+
+/// Run whichever of the terminal input modes `flags` selects
+/// (`--pty-ready-echo`, `--pty-hold-until`, `--pty-echo`), returning
+/// whether one ran. Kept out of `main` so its dispatch stays short.
+fn run_line_echo_mode(flags: &Flags, stdout: &mut impl Write) -> bool {
+    if flags.pty_ready_echo {
+        run_pty_ready_echo(stdout);
+    } else if let Some(path) = &flags.pty_hold_until {
+        run_pty_hold_until(stdout, path);
+    } else if flags.pty_echo {
+        run_pty_echo(stdout);
+    } else {
+        return false;
+    }
+    true
+}
+
+/// `--pty-hold-until <path>`: `ready`, then no read at all until `path`
+/// exists or the fixture's lifetime bound passes.
+fn run_pty_hold_until(stdout: &mut impl Write, path: &Path) {
+    #[cfg(unix)]
+    turn_echo_off();
+    emit(stdout, "ready");
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(DESCENDANT_LIFETIME_SECS);
+    while !path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

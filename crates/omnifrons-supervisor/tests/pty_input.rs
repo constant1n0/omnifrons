@@ -14,7 +14,8 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use omnifrons_app::{
@@ -138,6 +139,7 @@ fn stop(supervisor: &mut TokioProcessSupervisor, id: ProcessId, dir: &PathBuf) {
 
 #[test]
 fn a_forwarded_line_reaches_the_child() {
+    let _ptys = shared_ptys();
     let mut supervisor = TokioProcessSupervisor::new();
     let (id, frames, dir) = ready_echo_child(&mut supervisor, "line");
 
@@ -152,6 +154,7 @@ fn a_forwarded_line_reaches_the_child() {
 /// each followed by Enter, which ends the line the child reports.
 #[test]
 fn each_key_reaches_the_child() {
+    let _ptys = shared_ptys();
     let mut supervisor = TokioProcessSupervisor::new();
     let (id, frames, dir) = ready_echo_child(&mut supervisor, "keys");
 
@@ -185,6 +188,7 @@ fn each_key_reaches_the_child() {
 /// lines of under 1,024 bytes so no kernel truncates one.
 #[test]
 fn a_line_sent_during_a_long_typed_prompt_arrives_after_it_both_intact() {
+    let _ptys = shared_ptys();
     let prompt_lines: Vec<String> = (0..30)
         .map(|n| format!("prompt line {n:02} {}", "p".repeat(85)))
         .collect();
@@ -214,6 +218,7 @@ fn a_line_sent_during_a_long_typed_prompt_arrives_after_it_both_intact() {
 /// one intact line.
 #[test]
 fn two_concurrent_sends_each_arrive_intact() {
+    let _ptys = shared_ptys();
     let mut supervisor = TokioProcessSupervisor::new();
     let (id, frames, dir) = ready_echo_child(&mut supervisor, "concurrent");
     let first = "a".repeat(600);
@@ -279,6 +284,7 @@ fn a_pipes_child_is_unavailable() {
 /// and the child never reports a line.
 #[test]
 fn a_stopped_pty_child_is_unavailable_and_nothing_is_written() {
+    let _ptys = shared_ptys();
     let mut supervisor = TokioProcessSupervisor::new();
     let (id, frames, dir) = ready_echo_child(&mut supervisor, "stopped");
     supervisor
@@ -299,4 +305,291 @@ fn a_stopped_pty_child_is_unavailable_and_nothing_is_written() {
     assert!(typed_lines(&texts).is_empty(), "got {texts:#?}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serializes the tests that count this process's open pty masters
+/// (exclusive) against every other test here that opens one (shared), so a
+/// count can only change through the run under test. Poisoning is ignored:
+/// the lock guards no data.
+static PTY_MASTERS: RwLock<()> = RwLock::new(());
+
+fn shared_ptys() -> RwLockReadGuard<'static, ()> {
+    PTY_MASTERS.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn exclusive_ptys() -> RwLockWriteGuard<'static, ()> {
+    PTY_MASTERS.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How many pty masters this process holds open, where `/proc` lists its
+/// descriptors (Linux); `None` elsewhere (no `/proc` on macOS).
+fn open_pty_masters() -> Option<usize> {
+    let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+    let count = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter(|target| target.to_string_lossy().contains("ptmx"))
+        .count();
+    Some(count)
+}
+
+/// The send's own bound (`pty::INPUT_WRITE_WAIT`, 2 s) plus slack for a
+/// loaded runner: an input waiting for room must be resolved by then.
+const IN_FLIGHT_BOUND: Duration = Duration::from_secs(4);
+
+/// The outer bound on a whole hang-up scenario, so a supervisor whose
+/// runtime is stuck fails the test instead of hanging the test binary.
+const SCENARIO_DEADLINE: Duration = Duration::from_secs(40);
+
+/// What a hang-up scenario observed, reported before its supervisor is
+/// dropped (a stuck runtime would make that drop hang).
+#[derive(Debug)]
+struct HangUpOutcome {
+    /// The pending input's result, `None` if unresolved within
+    /// [`IN_FLIGHT_BOUND`] of its start; always `None` without one.
+    in_flight: Option<Result<(), SendInputError>>,
+    /// Whether the hung-up run's final `State` frame arrived.
+    state_frame: bool,
+    /// Whether the open pty master count fell back to its value before the
+    /// run (`None` where it cannot be read).
+    master_closed: Option<bool>,
+    /// Whether a run spawned afterwards on the same supervisor produced
+    /// its output.
+    second_run_output: bool,
+}
+
+/// How the terminal of the first run hangs up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HangUp {
+    /// The test stops the child.
+    Stop,
+    /// The child exits on its own.
+    SelfExit,
+}
+
+/// How long, after its report, a scenario's own clean-up (stopping the
+/// later run, dropping its supervisor) is waited for, so its masters are
+/// closed before the next exclusive test counts them. Never fatal: a stuck
+/// supervisor's drop never returns, and its report already failed the test.
+const CLEAN_UP_WAIT: Duration = Duration::from_secs(10);
+
+/// Run `scenario` on its own thread and return what it reports, failing
+/// once [`SCENARIO_DEADLINE`] passes; then wait up to [`CLEAN_UP_WAIT`]
+/// for the thread to end.
+fn bounded(scenario: impl FnOnce(&mpsc::Sender<HangUpOutcome>) + Send + 'static) -> HangUpOutcome {
+    let (report, outcome) = mpsc::channel();
+    let thread = std::thread::spawn(move || scenario(&report));
+    let outcome = outcome
+        .recv_timeout(SCENARIO_DEADLINE)
+        .expect("the scenario must report within its bound (a panic in it is printed above)");
+    let deadline = Instant::now() + CLEAN_UP_WAIT;
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    outcome
+}
+
+/// Await `future` on a test-owned runtime with a timer, independent of the
+/// supervisor's runtime, giving up after `bound`.
+fn within<F: Future>(bound: Duration, future: F) -> Option<F::Output> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a current-thread runtime must build")
+        .block_on(async { tokio::time::timeout(bound, future).await.ok() })
+}
+
+/// Whether a `State` frame arrives on `frames` within `bound`.
+fn state_frame_within(frames: &Receiver<OutputFrame>, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match frames.recv_timeout(remaining) {
+            Ok(frame) if matches!(frame.payload, FramePayload::State(_)) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Whether the open pty master count returns to `baseline` within `bound`
+/// (`None` where it cannot be read).
+fn masters_back_to(baseline: Option<usize>, bound: Duration) -> Option<bool> {
+    let baseline = baseline?;
+    let deadline = Instant::now() + bound;
+    loop {
+        if open_pty_masters() == Some(baseline) {
+            return Some(true);
+        }
+        if Instant::now() >= deadline {
+            return Some(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Spawn a `--pty-ready-echo` run on `supervisor` and report whether its
+/// `ready` line arrives within `bound`, with its id and workspace so the
+/// caller can stop it once the outcome is reported.
+fn second_run(
+    supervisor: &mut TokioProcessSupervisor,
+    bound: Duration,
+) -> (bool, ProcessId, PathBuf) {
+    let (dir, workspace) = temp_workspace("second");
+    let (handle, canonical) = fake_agent_handle();
+    let plan = pty_plan(workspace, &["--pty-ready-echo"], None);
+    let id = supervisor
+        .spawn_approved(handle, canonical, &plan)
+        .expect("spawn_approved must succeed on the PTY path");
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let deadline = Instant::now() + bound;
+    let mut ready = false;
+    while let Ok(frame) = frames.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if matches!(&frame.payload, FramePayload::Text { text, .. } if text == "ready") {
+            ready = true;
+            break;
+        }
+    }
+    (ready, id, dir)
+}
+
+/// A child that never reads fills its terminal's input queue; one more
+/// input is then left waiting for room while the terminal hangs up
+/// (`hang_up`). Then: does that input resolve, does the run's final frame
+/// arrive and its master close, and does a later run still get its output?
+fn in_flight_hang_up(hang_up: HangUp) -> HangUpOutcome {
+    bounded(move |report| {
+        let baseline = open_pty_masters();
+        let (dir, workspace) = temp_workspace("hang-up");
+        let marker = dir.join("exit-now");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let (handle, canonical) = fake_agent_handle();
+        let plan = pty_plan(workspace, &["--pty-hold-until", &marker_arg], None);
+        let mut supervisor = TokioProcessSupervisor::new();
+        let id = supervisor
+            .spawn_approved(handle, canonical, &plan)
+            .expect("spawn_approved must succeed on the PTY path");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        receive_until(&frames, |text| text == "ready");
+
+        // Lines of 500 bytes stay under every kernel's canonical limit, so
+        // the queue fills instead of a line being discarded; the first send
+        // that finds no room times out.
+        let queue_line = line(&"q".repeat(500));
+        let queue_full =
+            (0..400).any(|_| block_on(supervisor.send_input(id, &queue_line)).is_err());
+        assert!(queue_full, "the terminal input queue never filled");
+
+        let pending = supervisor.send_input(id, &line("in flight"));
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(200));
+        match hang_up {
+            HangUp::Stop => {
+                let _ = supervisor.stop(id, STOP_DEADLINE);
+            }
+            HangUp::SelfExit => std::fs::write(&marker, b"").expect("the marker must be written"),
+        }
+        let in_flight = within(IN_FLIGHT_BOUND.saturating_sub(started.elapsed()), pending);
+        let state_frame = state_frame_within(&frames, Duration::from_secs(5));
+        let master_closed = masters_back_to(baseline, Duration::from_secs(3));
+        let (second_run_output, second, second_dir) =
+            second_run(&mut supervisor, Duration::from_secs(5));
+        let _ = report.send(HangUpOutcome {
+            in_flight,
+            state_frame,
+            master_closed,
+            second_run_output,
+        });
+        let _ = supervisor.stop(second, STOP_DEADLINE);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&second_dir);
+    })
+}
+
+/// A typed prompt larger than the terminal's input queue, to a child that
+/// never reads, then `stop` while the prompt is still waiting for room.
+fn prompt_hang_up() -> HangUpOutcome {
+    bounded(|report| {
+        let baseline = open_pty_masters();
+        let prompt = (0..160)
+            .map(|n| format!("{n:03}{}", "z".repeat(98)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (dir, workspace) = temp_workspace("prompt-hang-up");
+        let never = dir.join("never-created").to_string_lossy().into_owned();
+        let (handle, canonical) = fake_agent_handle();
+        let plan = pty_plan(workspace, &["--pty-hold-until", &never], Some(&prompt));
+        let mut supervisor = TokioProcessSupervisor::new();
+        let id = supervisor
+            .spawn_approved(handle, canonical, &plan)
+            .expect("spawn_approved must succeed on the PTY path");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        // The prompt's echo, typed before the child turns echo off, may end
+        // mid-line just ahead of `ready`.
+        receive_until(&frames, |text| text.ends_with("ready"));
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = supervisor.stop(id, STOP_DEADLINE);
+
+        let state_frame = state_frame_within(&frames, Duration::from_secs(5));
+        let master_closed = masters_back_to(baseline, Duration::from_secs(3));
+        let (second_run_output, second, second_dir) =
+            second_run(&mut supervisor, Duration::from_secs(5));
+        let _ = report.send(HangUpOutcome {
+            in_flight: None,
+            state_frame,
+            master_closed,
+            second_run_output,
+        });
+        let _ = supervisor.stop(second, STOP_DEADLINE);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&second_dir);
+    })
+}
+
+/// The three observations every hang-up must satisfy: the run ends with
+/// its final frame, its master closes, and the supervisor keeps serving.
+fn assert_hang_up_released_everything(outcome: &HangUpOutcome) {
+    assert!(
+        outcome.state_frame,
+        "the hung-up run's state frame: {outcome:#?}"
+    );
+    assert_ne!(
+        outcome.master_closed,
+        Some(false),
+        "the hung-up run's master must close: {outcome:#?}"
+    );
+    assert!(
+        outcome.second_run_output,
+        "a later run must still get its output: {outcome:#?}"
+    );
+}
+
+#[test]
+fn an_input_waiting_for_room_fails_within_its_bound_when_the_child_is_stopped() {
+    let _ptys = exclusive_ptys();
+    let outcome = in_flight_hang_up(HangUp::Stop);
+    assert_eq!(
+        outcome.in_flight,
+        Some(Err(SendInputError::WriteFailed)),
+        "{outcome:#?}"
+    );
+    assert_hang_up_released_everything(&outcome);
+}
+
+#[test]
+fn an_input_waiting_for_room_fails_within_its_bound_when_the_child_exits_by_itself() {
+    let _ptys = exclusive_ptys();
+    let outcome = in_flight_hang_up(HangUp::SelfExit);
+    assert_eq!(
+        outcome.in_flight,
+        Some(Err(SendInputError::WriteFailed)),
+        "{outcome:#?}"
+    );
+    assert_hang_up_released_everything(&outcome);
+}
+
+#[test]
+fn a_typed_prompt_waiting_for_room_never_stalls_the_supervisor_after_stop() {
+    let _ptys = exclusive_ptys();
+    assert_hang_up_released_everything(&prompt_hang_up());
 }

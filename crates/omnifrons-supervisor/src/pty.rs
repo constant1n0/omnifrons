@@ -343,19 +343,37 @@ pub(crate) async fn forward_input(
 }
 
 /// Write every byte of `bytes` to `master`, waiting for writability as
-/// often as the terminal asks. A readiness error, a write error, or a
-/// zero-byte write (no progress possible) ends it with an error.
+/// often as the terminal asks. A readiness error, a hang-up, a write
+/// error, or a zero-byte write (no progress possible) ends it with an
+/// error.
+///
+/// A hang-up -- every slave descriptor closed: the child and whatever
+/// inherited its terminal are gone -- is checked before each write, since
+/// nothing will ever read what follows. It must be: Tokio never clears a
+/// closed readiness (`try_io` clears only the rest), so after the hang-up
+/// `writable` returns at once forever, while on Linux (observed on 7.0)
+/// `write(2)` on a master whose input queue is full keeps failing with
+/// `EAGAIN` rather than `EIO`; without the check this loop never waited
+/// again, starving every other task on the supervisor's runtime, the
+/// surrounding timeout of [`forward_input`] included. Every would-block
+/// also yields before asking again, so no readiness the reactor keeps
+/// reporting can do the same.
 async fn write_all(master: &AsyncFd<OwnedFd>, bytes: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
         let mut guard = master.writable().await?;
+        // A write-interest guard carries only write readiness, so a
+        // hang-up shows here as write-closed.
+        if guard.ready().is_write_closed() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         match guard.try_io(|inner| {
             nix::unistd::write(inner.get_ref(), &bytes[written..]).map_err(io::Error::from)
         }) {
             Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(Ok(count)) => written += count,
             Ok(Err(error)) => return Err(error),
-            Err(_would_block) => {}
+            Err(_would_block) => tokio::task::yield_now().await,
         }
     }
     Ok(())
