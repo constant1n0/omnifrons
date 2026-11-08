@@ -2336,6 +2336,23 @@ fn budget_phrase(budget: Duration) -> String {
     }
 }
 
+/// Answer the caller with the launch's own outcome, received in budget or
+/// by the last look after the budget elapsed: an error leaves nobody
+/// holding a child the launch forked before failing, so that child is
+/// stopped now; a success keeps it.
+fn answer_caller<T, S: Fn(ProcessId)>(
+    outcome: Result<T, ShellError>,
+    progress: &LaunchProgress,
+    stop: &S,
+) -> Result<T, ShellError> {
+    if outcome.is_err()
+        && let Some(id) = progress.take_process()
+    {
+        stop(id);
+    }
+    outcome
+}
+
 /// Stops the child a launch task still holds when the task ends, whatever
 /// the way out (return, panic, cancellation), provided the caller already
 /// gave up on it.
@@ -2365,8 +2382,9 @@ impl<S: Fn(ProcessId)> Drop for TaskExitGuard<S> {
 ///
 /// What is guaranteed about the child `progress` records, each stopped at
 /// most once through `stop`: when the caller is answered with any error
-/// (panic, cancellation, timeout, or an in-budget `Err`), the child
-/// recorded so far is stopped; when the caller gave up on a timeout, the
+/// (panic, cancellation, timeout, or the launch's own `Err`, in budget or
+/// found by the last look after the timeout), the child recorded so far is
+/// stopped ([`answer_caller`]); when the caller gave up on a timeout, the
 /// task stops whatever child it holds as it ends, however it ends; and
 /// one sweep, one `budget` after the timeout, stops a child recorded
 /// meanwhile by a task that is still running. A child forked later than
@@ -2403,16 +2421,7 @@ where
         })
     };
     match tokio::time::timeout(budget, &mut receiver).await {
-        Ok(Ok(outcome)) => {
-            // An error answered to the caller leaves nobody holding a
-            // child the launch forked before failing.
-            if outcome.is_err()
-                && let Some(id) = progress.take_process()
-            {
-                stop(id);
-            }
-            outcome
-        }
+        Ok(Ok(outcome)) => answer_caller(outcome, &progress, &*stop),
         // The sender dropped without sending: the task panicked or was
         // cancelled before it finished.
         Ok(Err(_)) => {
@@ -2439,7 +2448,7 @@ where
             // one reaches `on_late`.
             receiver.close();
             if let Ok(outcome) = receiver.try_recv() {
-                outcome
+                answer_caller(outcome, &progress, &*stop)
             } else {
                 // From here the task stops its own child as it ends; the
                 // child forked so far is stopped now, and a sweep catches
@@ -2718,6 +2727,45 @@ mod tests {
             stopped.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(ProcessId(3))
         );
+    }
+
+    /// #192: the launch's own error stops the child it recorded through the
+    /// one step both arms that answer with that outcome share -- the
+    /// in-budget arm and the `try_recv` that still finds an outcome after
+    /// the budget elapsed. That second arm is reached only when the outcome
+    /// lands between the timer firing and the receiver closing, which no
+    /// test can arrange deterministically without paused time (this crate
+    /// has no tokio `test-util`), so the shared step is pinned here. A
+    /// success stops nothing and keeps its child.
+    #[test]
+    fn an_answered_launch_error_stops_its_recorded_child_and_a_success_keeps_it() {
+        let (stop, stopped) = recording_stop();
+        let failed = super::LaunchProgress::new();
+        failed.spawned(ProcessId(4));
+        let err = super::answer_caller(
+            Err::<u32, _>(ShellError::new(ShellErrorCode::SpawnFailed, "late failure")),
+            &failed,
+            &stop,
+        )
+        .expect_err("the error passes through");
+        assert_eq!(err.code, ShellErrorCode::SpawnFailed);
+        assert_eq!(
+            stopped.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(ProcessId(4))
+        );
+
+        let succeeded = super::LaunchProgress::new();
+        succeeded.spawned(ProcessId(5));
+        let value = super::answer_caller(Ok::<u32, ShellError>(7), &succeeded, &stop)
+            .expect("the success passes through");
+        assert_eq!(value, 7);
+        assert!(
+            stopped
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a success must stop nothing"
+        );
+        assert_eq!(succeeded.take_process(), Some(ProcessId(5)));
     }
 
     /// A launch that forks after the caller was told it timed out and then
