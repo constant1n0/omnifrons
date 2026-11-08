@@ -569,6 +569,20 @@ impl<'a> StoppingGuard<'a> {
     }
 }
 
+impl Drop for StoppingGuard<'_> {
+    fn drop(&mut self) {
+        // Poison-tolerant: this runs during unwinding as readily as not.
+        let mut set = match self.stopping.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        set.remove(&self.id);
+    }
+}
+
+/// How often `stop` re-checks whether a settle is still in flight.
+const SETTLE_POLL: Duration = Duration::from_millis(5);
+
 /// Gives the self-exit reaper's claim on `id` back when its task ends, on
 /// every path: a return, a panic, or the runtime dropping the task at
 /// shutdown. A reaper that ends without having reaped the child thus never
@@ -607,20 +621,6 @@ impl Drop for SettlingGuard {
             Err(poisoned) => poisoned.into_inner(),
         };
         map.remove(&self.id);
-    }
-}
-
-/// How often `stop` re-checks whether a settle is still in flight.
-const SETTLE_POLL: Duration = Duration::from_millis(5);
-
-impl Drop for StoppingGuard<'_> {
-    fn drop(&mut self) {
-        // Poison-tolerant: this runs during unwinding as readily as not.
-        let mut set = match self.stopping.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        set.remove(&self.id);
     }
 }
 
@@ -3074,7 +3074,12 @@ mod self_exit_tests {
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
         // The child outlives `SHORT`'s slow window many times over, and the
         // census refresh interval (1 s) exceeds that window: one census at
-        // the start, none in the idle phase.
+        // the start, none in the idle phase. A second walk is allowed for
+        // two reasons, neither a periodic refresh: the reaper may notice the
+        // output closing up to one poll late, while its new phase is still
+        // inside the slow window, and walk once there; and `CENSUS_TAKES`
+        // is shared by every unit test in this process, so a pid recycled
+        // from an earlier test's child adds that child's walks.
         let _ = frames.recv_timeout(Duration::from_secs(10));
         let takes = super::CENSUS_TAKES
             .lock()

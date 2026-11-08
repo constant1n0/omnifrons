@@ -250,8 +250,9 @@ fn a_self_exit_that_leaves_a_descendant_reports_orphan_risk() {
 /// verdict is `OrphanRiskUncertain` (the group is not empty); the window
 /// between the reap and that verdict is wide enough to hit.
 ///
-/// Returns the supervisor, the id, the subscription and the marker file the
-/// child creates just before it exits.
+/// Returns the supervisor, the id, the subscription and the directory that
+/// holds the marker file the child creates just before it exits (remove it
+/// when done).
 #[cfg(target_os = "linux")]
 fn spawn_late_helper_child() -> (
     TokioProcessSupervisor,
@@ -260,21 +261,30 @@ fn spawn_late_helper_child() -> (
     std::path::PathBuf,
 ) {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let marker = std::env::temp_dir().join(format!(
+    // A directory of this test's own (`create_dir` refuses one already
+    // there), and the marker path handed to the shell as `$1`, never
+    // interpolated into the script.
+    let scratch = std::env::temp_dir().join(format!(
         "omnifrons-settling-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_file(&marker);
-    let script = format!(
-        "(trap '' TERM; exec sleep 5) >/dev/null 2>&1 </dev/null & \
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir(&scratch).expect("failed to create the marker directory");
+    let marker = scratch.join("reached");
+    let script = "(trap '' TERM; exec sleep 5) >/dev/null 2>&1 </dev/null & \
          exec 1>&- 2>&-; sleep 0.4; \
          (exec sleep 3) >/dev/null 2>&1 </dev/null & \
-         : > {marker}; exit 0",
-        marker = marker.display()
-    );
+         : > \"$1\"; exit 0";
     let mut supervisor = TokioProcessSupervisor::new();
-    let spec = ProcessSpec::new("/bin/sh").with_args(["-c", script.as_str()]);
+    let spec = ProcessSpec::new("/bin/sh").with_args([
+        "-c",
+        script,
+        "sh",
+        marker
+            .to_str()
+            .expect("the temp directory path must be UTF-8"),
+    ]);
     let id = supervisor.spawn(spec).expect("spawning sh must succeed");
     let frames = supervisor.subscribe(id).expect("subscribe must succeed");
     let end = Instant::now() + TERMINAL_DEADLINE;
@@ -282,13 +292,13 @@ fn spawn_late_helper_child() -> (
         assert!(Instant::now() < end, "the child never reached its marker");
         std::thread::sleep(Duration::from_millis(5));
     }
-    (supervisor, id, frames, marker)
+    (supervisor, id, frames, scratch)
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn a_concurrent_observe_never_reports_the_unsettled_exit() {
-    let (supervisor, id, frames, marker) = spawn_late_helper_child();
+    let (supervisor, id, frames, scratch) = spawn_late_helper_child();
     // The child exits within milliseconds of its marker; from then on the
     // reaper is sweeping. Observe the whole time.
     let end = Instant::now() + TERMINAL_DEADLINE;
@@ -301,7 +311,7 @@ fn a_concurrent_observe_never_reports_the_unsettled_exit() {
         assert!(Instant::now() < end, "never reached a terminal state");
         std::thread::sleep(Duration::from_millis(2));
     };
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_dir_all(&scratch);
     assert_eq!(
         last,
         ProcessTerminalState::OrphanRiskUncertain,
@@ -321,13 +331,13 @@ fn a_concurrent_observe_never_reports_the_unsettled_exit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_concurrent_stop_waits_for_the_settled_state() {
-    let (mut supervisor, id, frames, marker) = spawn_late_helper_child();
+    let (mut supervisor, id, frames, scratch) = spawn_late_helper_child();
     // Past the child's exit, inside the sweep.
     std::thread::sleep(Duration::from_millis(100));
     let stopped = supervisor
         .stop(id, STOP_DEADLINE)
         .expect("stop must succeed");
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_dir_all(&scratch);
     assert_eq!(stopped, ProcessTerminalState::OrphanRiskUncertain);
     assert_eq!(
         wait_for_state(&frames, TERMINAL_DEADLINE),

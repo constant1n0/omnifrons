@@ -2329,7 +2329,10 @@ impl LaunchProgress {
 }
 
 /// The budget as the message shows it: whole seconds when it is a whole
-/// number of seconds, milliseconds otherwise.
+/// number of seconds, milliseconds otherwise ("30 seconds", "50 ms"). The
+/// human units are deliberate: an intermediate version rendered the budget
+/// with `{budget:?}` (Debug, "30s"), and the message returned to words
+/// people read.
 fn budget_phrase(budget: Duration) -> String {
     if budget.subsec_nanos() == 0 {
         let seconds = budget.as_secs();
