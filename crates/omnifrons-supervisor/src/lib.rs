@@ -2118,11 +2118,20 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         let _guard = self.inner.runtime.enter();
         // Read before `children` is locked. While the self-exit reaper
         // holds this child it alone confirms the reap, so that its
-        // descendant sweep decides the terminal state; `observe` reports
-        // `Running` meanwhile (at most the reaper's next poll plus the
-        // sweep). The deferral lasts while the reaper keeps polling: it ends
-        // once its last poll (its claim, before the first) is older than
-        // `stall_grace`, and `observe` then confirms the reap itself.
+        // descendant census decides the terminal state; `observe` reports
+        // `Running` meanwhile. After the child exits, that lasts until the
+        // reaper's next poll notices the exit (at most `idle_poll`, 2 s;
+        // `slow_poll`, 250 ms, or less within a minute of the spawn or of
+        // the output closing), then while a reader still holds the output,
+        // at most `exit_grace` (2 s), then for the verdict's census walk:
+        // about 4 s with the defaults
+        // (`observe_turns_terminal_within_a_poll_and_the_grace_of_a_self_exit`).
+        // Two caps hold whatever the reaper does. Before the reap the
+        // deferral ends once its last poll (its claim, before the first) is
+        // older than `stall_grace` (6 s), or at once when its task ends
+        // (`ClaimRelease`), and `observe` then confirms the reap itself;
+        // after the reap `observe` takes the settle over past `settle_wait`
+        // (5 s).
         let claim = output_capture::reaper_claim(&self.inner.outputs, id);
         let reaper_active = match &claim {
             Some(claim)
@@ -3175,6 +3184,55 @@ mod self_exit_tests {
                 Err(_) => return None,
             }
         }
+    }
+
+    /// #197 (R3-001): how long `observe` keeps reporting `Running` after a
+    /// self-exit, with the reaper holding its claim from spawn. Here every
+    /// poll is an idle one (`slow_window` is zero) and a backgrounded
+    /// `sleep` keeps the output open past the grace, so the run spends the
+    /// whole of both: `observe` must turn terminal within `idle_poll` plus
+    /// `exit_grace` (300 ms each) of the exit, plus a slack for the
+    /// verdict's census walk and for scheduling. The bound is stated where
+    /// the deferral is implemented, in `observe`.
+    #[test]
+    fn observe_turns_terminal_within_a_poll_and_the_grace_of_a_self_exit() {
+        let pacing = ReapPacing {
+            fast_window: Duration::ZERO,
+            slow_window: Duration::ZERO,
+            idle_poll: Duration::from_millis(300),
+            exit_grace: Duration::from_millis(300),
+            ..SHORT
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        // The child exits after 0.5 s; its `sleep 3` holds stdout for 3 s.
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 3 & sleep 0.5; exit 0"]);
+        let spawned = std::time::Instant::now();
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let _frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        let exit_at = Duration::from_millis(500);
+        let slack = Duration::from_secs(1);
+        let bound = exit_at + pacing.idle_poll + pacing.exit_grace + slack;
+        let status = loop {
+            let status = supervisor.observe(id);
+            if status != Some(ProcessStatus::Running) || spawned.elapsed() > bound {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            matches!(status, Some(ProcessStatus::Terminal(_))),
+            "observe still reported {status:?} {:?} after the spawn, past the \
+             exit at about {exit_at:?} plus a poll and the grace",
+            spawned.elapsed()
+        );
+        // The reader outlasted the grace, so the run cannot be proven clean.
+        assert_eq!(
+            status,
+            Some(ProcessStatus::Terminal(
+                ProcessTerminalState::OrphanRiskUncertain
+            ))
+        );
     }
 
     /// #192: a reaper task that ends without reaping (here it panics) gives
