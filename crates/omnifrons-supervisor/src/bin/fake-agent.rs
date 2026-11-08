@@ -56,6 +56,15 @@
 //! `--pty-echo`: reads one line from stdin and prints `typed: <line>`
 //! (line terminator stripped), then exits 0.
 //!
+//! `--pty-ready-echo` (`tests/pty_input.rs`): turns its terminal's echo
+//! off (unix, when stdin is a terminal), prints `ready`, then reads lines
+//! from stdin until EOF and prints each as `typed: <line>` (line
+//! terminator stripped), every ASCII control byte rendered visibly as
+//! `\xNN` (ESC as the four characters `\x1b`), then exits 0. Echo is off
+//! so that input typed after `ready` is never echoed into the middle of a
+//! report line: echo and the child's own writes share the terminal's
+//! output, and nothing aligns them on line boundaries.
+//!
 //! `--pty-corpus`: writes the shared terminal corpus
 //! (`omnifrons_app::terminal_normalizer::corpus::bytes`) to stdout
 //! verbatim, then a newline and a final `corpus-done` line, and exits 0.
@@ -167,6 +176,7 @@ struct Flags {
     no_eof: bool,
     pty_report: bool,
     pty_echo: bool,
+    pty_ready_echo: bool,
     pty_corpus: bool,
     pty_ignore_sigterm: bool,
     report_inherited_fds: bool,
@@ -190,6 +200,7 @@ fn parse_flags(args: &[String]) -> Flags {
         match args[i].as_str() {
             "--pty-report" => flags.pty_report = true,
             "--pty-echo" => flags.pty_echo = true,
+            "--pty-ready-echo" => flags.pty_ready_echo = true,
             "--pty-corpus" => flags.pty_corpus = true,
             "--pty-ignore-sigterm" => flags.pty_ignore_sigterm = true,
             "--report-inherited-fds" => flags.report_inherited_fds = true,
@@ -303,13 +314,13 @@ fn main() -> ExitCode {
         return ExitCode::from(exit_code);
     }
 
+    if flags.pty_ready_echo {
+        run_pty_ready_echo(&mut stdout);
+        return ExitCode::from(exit_code);
+    }
+
     if flags.pty_echo {
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .expect("reading one line from stdin must succeed");
-        let line = line.trim_end_matches(['\r', '\n']);
-        emit(&mut stdout, &format!("typed: {line}"));
+        run_pty_echo(&mut stdout);
         return ExitCode::from(exit_code);
     }
 
@@ -973,6 +984,64 @@ mod sha256 {
             );
         }
     }
+}
+
+/// `--pty-echo`: one line read from stdin, printed as `typed: <line>`.
+fn run_pty_echo(stdout: &mut impl Write) {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .expect("reading one line from stdin must succeed");
+    let line = line.trim_end_matches(['\r', '\n']);
+    emit(stdout, &format!("typed: {line}"));
+}
+
+/// `--pty-ready-echo`: `ready`, then one `typed: <line>` per line read
+/// until EOF or a read error (the terminal going away), each line's
+/// control bytes rendered by [`visible`].
+fn run_pty_ready_echo(stdout: &mut impl Write) {
+    #[cfg(unix)]
+    turn_echo_off();
+    emit(stdout, "ready");
+    let mut stdin = std::io::stdin().lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match stdin.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        emit(stdout, &format!("typed: {}", visible(&line)));
+    }
+}
+
+/// Clear `ECHO` on this process's stdin terminal; a stdin that is not a
+/// terminal is left alone. Everything else in its settings is kept.
+#[cfg(unix)]
+fn turn_echo_off() {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    let stdin = std::io::stdin();
+    if let Ok(mut settings) = tcgetattr(&stdin) {
+        settings.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(&stdin, SetArg::TCSANOW, &settings).expect("clearing ECHO must succeed");
+    }
+}
+
+/// `bytes` as text with every ASCII control character (C0 and DEL)
+/// written as the four characters `\xNN`, lowercase hex.
+fn visible(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    for character in String::from_utf8_lossy(bytes).chars() {
+        if character.is_ascii_control() {
+            let _ = write!(text, "\\x{:02x}", u32::from(character));
+        } else {
+            text.push(character);
+        }
+    }
+    text
 }
 
 /// Write `line` followed by a newline, then flush -- every emitted line is

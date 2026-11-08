@@ -26,8 +26,9 @@ use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::libc;
@@ -37,7 +38,9 @@ use omnifrons_app::{ProcessId, SupervisorError};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::process::Command;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+use crate::SendInputError;
 use crate::output_capture::{self, OutputTable};
 
 /// The fixed window size every PTY child starts with (spike default:
@@ -62,6 +65,56 @@ pub(crate) const CHILD_ENV: [(&str, &str); 3] =
 /// by the one reader task and the prompt-typing task: `AsyncFd` polls
 /// readiness through `&self`, so one registration serves both.
 pub(crate) type Master = Arc<AsyncFd<OwnedFd>>;
+
+/// How long one forwarded input may take, from the call to its last byte:
+/// waiting for its turn behind the typed prompt or another input, then
+/// writing. A terminal whose child stops reading fills its input queue and
+/// never becomes writable again; past this wait the write is abandoned
+/// rather than left pending.
+pub(crate) const INPUT_WRITE_WAIT: Duration = Duration::from_secs(2);
+
+/// One run's terminal as the supervisor's registry holds it: a `Weak`
+/// reference to the master, never a strong one, so the master still
+/// closes when its reader task drops it at end of input
+/// (`docs/spike-log.md`: "the master is closed once the terminal `state`
+/// frame arrives"), plus the run's write lock. Every write to the
+/// terminal after spawn -- the typed prompt and each forwarded input --
+/// holds that lock for its whole duration, so no two of them interleave.
+pub(crate) struct TerminalEntry {
+    master: Weak<AsyncFd<OwnedFd>>,
+    turn: Arc<AsyncMutex<()>>,
+}
+
+impl TerminalEntry {
+    /// A fresh entry for `master`, with the first turn of its write lock
+    /// already taken and returned: the prompt typist holds it from before
+    /// the entry is ever reachable, so no forwarded input can be written
+    /// ahead of the prompt. Dropped at once when there is no prompt.
+    pub(crate) fn new(master: &Master) -> (Self, OwnedMutexGuard<()>) {
+        let turn = Arc::new(AsyncMutex::new(()));
+        let first_turn = Arc::clone(&turn)
+            .try_lock_owned()
+            .expect("a write lock nobody else has seen yet is free");
+        let entry = Self {
+            master: Arc::downgrade(master),
+            turn,
+        };
+        (entry, first_turn)
+    }
+
+    /// The live master and the write lock, or `None` once the master was
+    /// closed.
+    pub(crate) fn upgrade(&self) -> Option<(Master, Arc<AsyncMutex<()>>)> {
+        let master = self.master.upgrade()?;
+        Some((master, Arc::clone(&self.turn)))
+    }
+
+    /// Whether the master is still open somewhere (a reader, the prompt
+    /// typist, or an input being written).
+    pub(crate) fn is_live(&self) -> bool {
+        self.master.strong_count() > 0
+    }
+}
 
 /// An opened master/slave pair, not yet wired to a child.
 pub(crate) struct PtyPair {
@@ -245,9 +298,12 @@ impl AsyncRead for MasterReader {
 }
 
 /// Type `prompt` into the terminal, followed by a carriage return (the
-/// line discipline's end of line), on the supervisor's own runtime. A
-/// write failure -- the child exited before reading, the terminal went
-/// away -- surfaces exactly like a stdin-pipe write failure
+/// line discipline's end of line), on the supervisor's own runtime,
+/// holding `turn` -- the run's write lock, taken before this task was
+/// spawned ([`TerminalEntry::new`]) -- for the whole write, so a forwarded
+/// input never interleaves with or precedes the prompt. A write failure
+/// -- the child exited before reading, the terminal went away -- surfaces
+/// exactly like a stdin-pipe write failure
 /// (`output_capture::emit_stdin_write_failed`, the same synthetic frame),
 /// never as a hang.
 pub(crate) async fn type_prompt(
@@ -255,26 +311,54 @@ pub(crate) async fn type_prompt(
     prompt: Vec<u8>,
     outputs: OutputTable,
     id: ProcessId,
+    turn: OwnedMutexGuard<()>,
 ) {
     let mut bytes = prompt;
     bytes.push(b'\r');
+    if write_all(&master, &bytes).await.is_err() {
+        output_capture::emit_stdin_write_failed(&outputs, id);
+    }
+    drop(turn);
+}
+
+/// Write `bytes` to `master` on the supervisor's own runtime, holding the
+/// run's write lock `turn` for the whole write, all within
+/// [`INPUT_WRITE_WAIT`]. Unlike [`type_prompt`] it appends nothing and
+/// emits no synthetic frame: the caller gets the typed error instead. On
+/// timeout the pending write is dropped before this returns, so nothing
+/// more is written after the error.
+pub(crate) async fn forward_input(
+    master: Master,
+    turn: Arc<AsyncMutex<()>>,
+    bytes: Vec<u8>,
+) -> Result<(), SendInputError> {
+    let write = async {
+        let _turn = turn.lock().await;
+        write_all(&master, &bytes).await
+    };
+    match tokio::time::timeout(INPUT_WRITE_WAIT, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(SendInputError::WriteFailed),
+    }
+}
+
+/// Write every byte of `bytes` to `master`, waiting for writability as
+/// often as the terminal asks. A readiness error, a write error, or a
+/// zero-byte write (no progress possible) ends it with an error.
+async fn write_all(master: &AsyncFd<OwnedFd>, bytes: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        let Ok(mut guard) = master.writable().await else {
-            output_capture::emit_stdin_write_failed(&outputs, id);
-            return;
-        };
+        let mut guard = master.writable().await?;
         match guard.try_io(|inner| {
             nix::unistd::write(inner.get_ref(), &bytes[written..]).map_err(io::Error::from)
         }) {
-            Ok(Ok(count)) if count > 0 => written += count,
-            Ok(_) => {
-                output_capture::emit_stdin_write_failed(&outputs, id);
-                return;
-            }
+            Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) => return Err(error),
             Err(_would_block) => {}
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -287,7 +371,10 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
     use tokio::io::unix::AsyncFd;
 
-    use super::{MasterReader, open_pair, type_prompt};
+    use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+    use super::{INPUT_WRITE_WAIT, MasterReader, forward_input, open_pair, type_prompt};
+    use crate::SendInputError;
     use crate::output_capture::{OutputTable, new_channel, take_receiver};
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -295,6 +382,13 @@ mod tests {
             .enable_all()
             .build()
             .expect("a current-thread runtime must build")
+    }
+
+    /// A held turn of a write lock nobody else shares.
+    fn own_turn() -> OwnedMutexGuard<()> {
+        Arc::new(AsyncMutex::new(()))
+            .try_lock_owned()
+            .expect("a fresh write lock is free")
     }
 
     /// Reading the master after every slave descriptor is gone is end of
@@ -327,7 +421,7 @@ mod tests {
         runtime.block_on(async move {
             let master =
                 Arc::new(AsyncFd::new(OwnedFd::from(writer)).expect("register the writer"));
-            type_prompt(master, b"hello".to_vec(), outputs, id).await;
+            type_prompt(master, b"hello".to_vec(), outputs, id, own_turn()).await;
         });
         let mut received = Vec::new();
         std::io::Read::read_to_end(&mut &reader, &mut received).expect("read the pipe");
@@ -355,7 +449,7 @@ mod tests {
             async move {
                 let master =
                     Arc::new(AsyncFd::new(OwnedFd::from(writer)).expect("register the write end"));
-                type_prompt(master, b"hello".to_vec(), outputs, id).await;
+                type_prompt(master, b"hello".to_vec(), outputs, id, own_turn()).await;
             }
         });
         let receiver = take_receiver(&outputs, id).expect("subscribing must succeed");
@@ -373,6 +467,72 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "exactly one frame, never more"
+        );
+    }
+
+    /// A forwarded input is written exactly as given: unlike the typed
+    /// prompt, nothing is appended.
+    #[test]
+    fn forward_input_writes_exactly_its_bytes() {
+        let (reader, writer) = std::io::pipe().expect("a pipe must open");
+        let runtime = runtime();
+        let result = runtime.block_on(async move {
+            let master =
+                Arc::new(AsyncFd::new(OwnedFd::from(writer)).expect("register the writer"));
+            let turn = Arc::new(AsyncMutex::new(()));
+            forward_input(master, turn, b"\x1b[A".to_vec()).await
+        });
+        assert_eq!(result, Ok(()));
+        let mut received = Vec::new();
+        std::io::Read::read_to_end(&mut &reader, &mut received).expect("read the pipe");
+        assert_eq!(received, b"\x1b[A");
+    }
+
+    /// A write error is the caller's typed `WriteFailed` (the same `EPIPE`
+    /// fixture as the prompt's failure test above).
+    #[test]
+    fn forward_input_write_failure_is_write_failed() {
+        let (reader, writer) = std::io::pipe().expect("a pipe must open");
+        drop(reader);
+        let runtime = runtime();
+        let result = runtime.block_on(async move {
+            let master =
+                Arc::new(AsyncFd::new(OwnedFd::from(writer)).expect("register the write end"));
+            forward_input(master, Arc::new(AsyncMutex::new(())), b"x".to_vec()).await
+        });
+        assert_eq!(result, Err(SendInputError::WriteFailed));
+    }
+
+    /// An input that cannot get its turn -- here the run's write lock is
+    /// held throughout, as a prompt stuck on a child that never reads would
+    /// hold it -- gives up with `WriteFailed` after the bounded wait, and
+    /// is never written once the lock is released afterwards.
+    #[test]
+    fn forward_input_gives_up_after_the_bounded_wait_and_never_writes_later() {
+        let (reader, writer) = std::io::pipe().expect("a pipe must open");
+        let runtime = runtime();
+        let (result, elapsed) = runtime.block_on(async move {
+            let master =
+                Arc::new(AsyncFd::new(OwnedFd::from(writer)).expect("register the writer"));
+            let turn = Arc::new(AsyncMutex::new(()));
+            let held = Arc::clone(&turn).lock_owned().await;
+            let started = std::time::Instant::now();
+            let result = forward_input(Arc::clone(&master), turn, b"late".to_vec()).await;
+            let elapsed = started.elapsed();
+            drop(held);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            (result, elapsed)
+        });
+        assert_eq!(result, Err(SendInputError::WriteFailed));
+        assert!(elapsed >= INPUT_WRITE_WAIT, "gave up after {elapsed:?}");
+        // Every writer is gone with the runtime's future: end of input.
+        let mut received = Vec::new();
+        std::io::Read::read_to_end(&mut &reader, &mut received).expect("read the pipe");
+        assert!(
+            received.is_empty(),
+            "nothing may be written, got {received:?}"
         );
     }
 }

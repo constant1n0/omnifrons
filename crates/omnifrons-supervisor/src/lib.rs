@@ -22,6 +22,7 @@ use omnifrons_app::{
     HarnessRequest, ProcessId, ProcessOutput, ProcessSpec, ProcessStatus, ProcessSupervisor,
     ProcessTerminalState, StdinPlan, SupervisorError, is_secret_shaped,
 };
+use omnifrons_domain::terminal_input::TerminalInput;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
@@ -1429,6 +1430,38 @@ enum Tracked {
     Terminal(ProcessTerminalState),
 }
 
+/// Why [`TokioProcessSupervisor::send_input`] wrote nothing, or not all of
+/// it. Its own type rather than a [`SupervisorError`] variant: only this
+/// one method returns it, and its callers match it exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendInputError {
+    /// No process with this id is known to this supervisor (never
+    /// spawned, or its retained terminal state already evicted). Nothing
+    /// written.
+    UnknownProcess,
+    /// The process is known but has no live pseudo-terminal: it is
+    /// terminal, it was spawned with pipes, its master is already closed,
+    /// or this platform has no PTY path. Nothing written.
+    Unavailable,
+    /// The write failed, made no progress, or did not finish within the
+    /// bounded wait (2 s); on timeout nothing more is written afterwards.
+    /// Some of the bytes may have reached the terminal.
+    WriteFailed,
+}
+
+impl std::fmt::Display for SendInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnknownProcess => "no such process",
+            Self::Unavailable => "the process has no live terminal",
+            Self::WriteFailed => "writing to the terminal failed or timed out",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for SendInputError {}
+
 /// A `ProcessSupervisor` backed by `tokio::process`, driven from behind a
 /// synchronous interface.
 ///
@@ -1525,6 +1558,20 @@ struct Inner {
     /// output capture), and a `subscribe` call must still find a process
     /// that has already gone terminal.
     outputs: OutputTable,
+    /// Each PTY run's terminal ([`pty::TerminalEntry`]): a `Weak` master
+    /// and the run's write lock, inserted when its reader is attached and
+    /// replaced by any later spawn of the same id (a pipe spawn removes
+    /// it), so a recycled pid never reaches an earlier child's terminal.
+    /// Never a strong reference: the master closes when its reader drops
+    /// it. Entries whose master is closed are pruned on every insert, so
+    /// the table holds about as many entries as there are open masters.
+    ///
+    /// Lock order: `children`, then `terminals`, never the reverse
+    /// ([`TokioProcessSupervisor::send_input`] holds both;
+    /// `attach_output` takes this one alone). Never held across an
+    /// `.await`.
+    #[cfg(unix)]
+    terminals: Mutex<HashMap<ProcessId, pty::TerminalEntry>>,
     /// Set only by [`TokioProcessSupervisor::with_demo_launcher`]; the path
     /// `spawn_harness` execs. No program path or argument vector for a
     /// harness request ever crosses IPC -- this is the one place a real
@@ -1618,6 +1665,8 @@ impl TokioProcessSupervisor {
                 exit_members: Arc::new(Mutex::new(HashMap::new())),
                 reap_pacing,
                 outputs: Arc::new(Mutex::new(HashMap::new())),
+                #[cfg(unix)]
+                terminals: Mutex::new(HashMap::new()),
                 demo_launcher,
                 driver_shutdown: Some(driver_shutdown),
                 driver_thread: Some(driver_thread),
@@ -1679,6 +1728,96 @@ impl TokioProcessSupervisor {
 }
 
 impl TokioProcessSupervisor {
+    /// Write `input` -- a line followed by `\r`, or a key's fixed bytes
+    /// ([`TerminalInput::to_bytes`]) -- to the pseudo-terminal of the live
+    /// run `id`, after the typed prompt and never interleaved with it or
+    /// with another input to the same run.
+    ///
+    /// Everything that can be refused is decided here, synchronously, and
+    /// nothing is written in any refused case; the write itself runs on
+    /// this supervisor's own runtime (the master is registered with its
+    /// reactor). The returned future borrows neither `self` nor `input`
+    /// and holds no lock of this supervisor, so a caller can drop every
+    /// handle and await it elsewhere, on any executor. It resolves to
+    /// `Ok(())` only once every byte was written, or with
+    /// [`SendInputError::WriteFailed`] when the write failed or did not
+    /// finish within the bounded wait (2 s, including waiting for the
+    /// prompt or another input to finish); on timeout the write is
+    /// abandoned before the error is returned. Dropping the future does
+    /// not cancel the write, which stays bounded by the same wait. No
+    /// synthetic "stdin write failed" frame is emitted for these writes.
+    ///
+    /// Whether the run is live is read from this supervisor's own
+    /// bookkeeping as it stands (no reap check is made here): a child that
+    /// exited but is not reaped yet is still running, and a write to its
+    /// terminal either fails or reaches whatever still holds it.
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to [`SendInputError::UnknownProcess`] for an id
+    /// this supervisor does not know, [`SendInputError::Unavailable`] for a
+    /// run that is terminal, has no pseudo-terminal, or whose master is
+    /// already closed (always, on a platform without the PTY path), and
+    /// [`SendInputError::WriteFailed`] as above.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the children or terminals mutex was poisoned by a prior
+    /// panic while held, as every other accessor of them does.
+    pub fn send_input(
+        &self,
+        id: ProcessId,
+        input: &TerminalInput,
+    ) -> impl Future<Output = Result<(), SendInputError>> + Send + use<> {
+        let started = self.start_input(id, input);
+        async move { started?.await.unwrap_or(Err(SendInputError::WriteFailed)) }
+    }
+
+    /// [`Self::send_input`]'s synchronous half: every refusal, then the
+    /// write spawned onto this supervisor's runtime.
+    fn start_input(
+        &self,
+        id: ProcessId,
+        input: &TerminalInput,
+    ) -> Result<JoinHandle<Result<(), SendInputError>>, SendInputError> {
+        // Lock order: `children`, then `terminals` (see `Inner::terminals`).
+        // Both are released before this returns: the write runs elsewhere.
+        let children = self
+            .inner
+            .children
+            .lock()
+            .expect("children mutex poisoned by a prior panic");
+        match children.get(&id) {
+            None => return Err(SendInputError::UnknownProcess),
+            Some(Tracked::Terminal(_)) => return Err(SendInputError::Unavailable),
+            Some(Tracked::Running(_)) => {}
+        }
+        #[cfg(unix)]
+        {
+            let live = {
+                let mut terminals = self
+                    .inner
+                    .terminals
+                    .lock()
+                    .expect("terminals mutex poisoned by a prior panic");
+                let live = terminals.get(&id).and_then(pty::TerminalEntry::upgrade);
+                if live.is_none() {
+                    terminals.remove(&id);
+                }
+                live
+            };
+            drop(children);
+            let (master, turn) = live.ok_or(SendInputError::Unavailable)?;
+            Ok(self.spawn_on_runtime(pty::forward_input(master, turn, input.to_bytes())))
+        }
+        #[cfg(not(unix))]
+        {
+            drop(children);
+            let _ = input;
+            Err(SendInputError::Unavailable)
+        }
+    }
+
     /// The ids of every child currently `Running`, each refreshed through
     /// the same reap check [`ProcessSupervisor::observe`] performs, so a
     /// child that exited but was never observed is not reported as running.
@@ -1907,7 +2046,10 @@ impl TokioProcessSupervisor {
     /// on the master plus the prompt typist under `Pty`. Every task runs on
     /// this supervisor's own runtime, never the calling thread, so a slow
     /// or absent reader on the child's side can never block
-    /// `spawn`/`spawn_approved` itself.
+    /// `spawn`/`spawn_approved` itself. Under `Pty` the run's terminal is
+    /// also registered in `Inner::terminals` for
+    /// [`Self::send_input`]; under `Pipes` any entry left for this id by an
+    /// earlier child is removed.
     ///
     /// `wiring` is consumed on unix (the `Pty` variant moves the master
     /// into its tasks); on a platform without the PTY path it is a
@@ -1931,6 +2073,14 @@ impl TokioProcessSupervisor {
                     .stderr
                     .take()
                     .expect("stderr was configured as piped by configure_stdio");
+                // A recycled pid must never reach an earlier PTY child's
+                // terminal through this id.
+                #[cfg(unix)]
+                self.inner
+                    .terminals
+                    .lock()
+                    .expect("terminals mutex poisoned by a prior panic")
+                    .remove(&id);
                 let stderr_handles = handles.clone();
                 let stdout_drain = output_capture::drain_stream(
                     stdout,
@@ -1979,12 +2129,26 @@ impl TokioProcessSupervisor {
                     id,
                 );
                 self.spawn_on_runtime(drain);
+                // Registered before the prompt typist is spawned, with its
+                // first turn already held for the prompt: an input sent the
+                // moment this id is reachable still waits for the prompt.
+                let (entry, first_turn) = pty::TerminalEntry::new(&master);
+                {
+                    let mut terminals = self
+                        .inner
+                        .terminals
+                        .lock()
+                        .expect("terminals mutex poisoned by a prior panic");
+                    terminals.retain(|_, entry| entry.is_live());
+                    terminals.insert(id, entry);
+                }
                 if let Some(prompt_bytes) = prompt {
                     self.spawn_on_runtime(pty::type_prompt(
                         master,
                         prompt_bytes,
                         Arc::clone(&self.inner.outputs),
                         id,
+                        first_turn,
                     ));
                 }
             }
@@ -3479,5 +3643,90 @@ mod self_exit_tests {
             assert!(registered());
         }
         assert!(!registered(), "the hook outlived its registration");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_registry_tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use omnifrons_app::harness_adapter::{EnvPlan, LaunchPlan, TransportClass};
+    use omnifrons_app::{
+        ExecHandle, FramePayload, ProcessOutput, ProcessTerminalState, StdinPlan, WorkspaceRoot,
+    };
+    use omnifrons_domain::scope::ScopeMode;
+    use omnifrons_domain::terminal_input::{TerminalInput, TypedLine};
+
+    use super::TokioProcessSupervisor;
+
+    /// The registry holds the master only weakly: while the run lives its
+    /// entry reaches the master, and once the run is terminal and its
+    /// reader has ended the entry no longer upgrades -- the master was
+    /// closed, not kept open by the registry.
+    #[test]
+    fn the_registry_never_keeps_a_master_open() {
+        let mut supervisor = TokioProcessSupervisor::new();
+        let plan = LaunchPlan {
+            argv: vec!["-c".to_string(), "read line".to_string()],
+            env: EnvPlan::new(&[]).expect("an empty declared-key list is never secret-shaped"),
+            cwd: WorkspaceRoot::new(std::env::temp_dir()).expect("the temp dir is a directory"),
+            stdin: StdinPlan::Null,
+            prompt: None,
+            scope_mode: ScopeMode::Advisory,
+            transport: TransportClass::Pty,
+            output_dir: None,
+        };
+        let shell = std::fs::File::open("/bin/sh").expect("/bin/sh must open");
+        let id = supervisor
+            .spawn_approved(ExecHandle::File(shell), PathBuf::from("/bin/sh"), &plan)
+            .expect("spawning sh on the PTY path must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        let is_live = || {
+            supervisor
+                .inner
+                .terminals
+                .lock()
+                .expect("terminals mutex poisoned")
+                .get(&id)
+                .is_some_and(super::pty::TerminalEntry::is_live)
+        };
+        assert!(is_live(), "a live run's terminal must be registered");
+
+        // The line ends `read`, and the shell exits on its own.
+        let input = TerminalInput::Line(TypedLine::new("done").expect("a typeable line"));
+        let delivered = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime must build")
+            .block_on(supervisor.send_input(id, &input));
+        assert_eq!(delivered, Ok(()));
+
+        let state = loop {
+            match frames.recv_timeout(Duration::from_secs(20)) {
+                Ok(frame) => {
+                    if let FramePayload::State(state) = frame.payload {
+                        break state;
+                    }
+                }
+                Err(error) => panic!("no state frame: {error}"),
+            }
+        };
+        assert_eq!(state, ProcessTerminalState::Exited { code: Some(0) });
+
+        // The reader drops its master just after the final frame goes out.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_live() {
+            assert!(Instant::now() < deadline, "the master is still open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let entry_upgrades = supervisor
+            .inner
+            .terminals
+            .lock()
+            .expect("terminals mutex poisoned")
+            .get(&id)
+            .and_then(super::pty::TerminalEntry::upgrade)
+            .is_some();
+        assert!(!entry_upgrades, "a closed master must never upgrade");
     }
 }
