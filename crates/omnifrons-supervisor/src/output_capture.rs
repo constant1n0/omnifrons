@@ -145,6 +145,9 @@ pub(crate) struct OutputChannelState {
     reaper_claimed: bool,
     /// When [`claim_reap`] took the claim; cleared by [`release_reap`].
     claimed_at: Option<std::time::Instant>,
+    /// The [`ClaimToken`] of that claim: [`release_reap`] clears only the
+    /// claim whose token it is handed.
+    claim_token: u64,
     /// How many times the claiming reaper has polled ([`note_reap_poll`]).
     reap_polls: u32,
     /// When the claiming reaper last polled.
@@ -252,6 +255,7 @@ pub(crate) fn new_channel(reader_count: u8) -> (OutputChannelState, ReaderHandle
         readers_abandoned: false,
         reaper_claimed: false,
         claimed_at: None,
+        claim_token: 0,
         reap_polls: 0,
         last_reap_poll_at: None,
         deferral_expired_logged: false,
@@ -733,28 +737,39 @@ pub(crate) fn readers_active(outputs: &OutputTable, id: ProcessId) -> bool {
         .is_some_and(|entry| entry.active_readers.load(Ordering::Acquire) != 0)
 }
 
+/// Identifies one claim taken by [`claim_reap`]. A process id alone does
+/// not: once a child is reaped its pid can be recycled for a new child,
+/// whose channel and claim then sit under the same id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimToken(u64);
+
+/// The next [`ClaimToken`]; never 0, which marks an entry with no claim.
+static NEXT_CLAIM_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// Claim the self-exit reap of `id`, at most once per child.
 ///
 /// The reaper claims its child when it starts, at spawn, and keeps the
 /// claim while it polls: `observe` defers to it meanwhile
 /// ([`reaper_claim`]). Succeeds only when the final `State` frame is still
 /// owed: not finalized, no terminal state confirmed, and no earlier claim.
-pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> bool {
+/// The token it returns is the only way to give this claim back
+/// ([`release_reap`]).
+pub(crate) fn claim_reap(outputs: &OutputTable, id: ProcessId) -> Option<ClaimToken> {
     let mut guard = outputs
         .lock()
         .expect("outputs mutex poisoned by a prior panic");
-    let Some(entry) = guard.get_mut(&id) else {
-        return false;
-    };
+    let entry = guard.get_mut(&id)?;
     if entry.reaper_claimed || entry.sender.is_none() || entry.confirmed_state.is_some() {
-        return false;
+        return None;
     }
+    let token = NEXT_CLAIM_TOKEN.fetch_add(1, Ordering::Relaxed);
     entry.reaper_claimed = true;
     entry.claimed_at = Some(std::time::Instant::now());
+    entry.claim_token = token;
     entry.reap_polls = 0;
     entry.last_reap_poll_at = None;
     entry.deferral_expired_logged = false;
-    true
+    Some(ClaimToken(token))
 }
 
 /// What `observe` learns about a self-exit reaper's claim on a child.
@@ -820,19 +835,24 @@ pub(crate) fn deferral_expired(outputs: &OutputTable, id: ProcessId) -> bool {
     guard.get(&id).is_some_and(|e| e.deferral_expired_logged)
 }
 
-/// Give up a claim taken by [`claim_reap`] when the reaper ends, so a
-/// reaper that ends without having reaped the child leaves `observe` to
-/// confirm the reap again at once.
+/// Give up the claim `token` names when the reaper ends, so a reaper that
+/// ends without having reaped the child leaves `observe` to confirm the
+/// reap again at once. Any other claim under `id` -- that of a new child
+/// that reused a reaped child's pid -- is left as it is.
 ///
 /// Poison-tolerant: it runs from the reaper's drop guard, during unwinding
 /// as readily as not, where a second panic would abort the process.
-pub(crate) fn release_reap(outputs: &OutputTable, id: ProcessId) {
+pub(crate) fn release_reap(outputs: &OutputTable, id: ProcessId, token: ClaimToken) {
     let mut guard = outputs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = guard.get_mut(&id) {
+    if let Some(entry) = guard.get_mut(&id)
+        && entry.reaper_claimed
+        && entry.claim_token == token.0
+    {
         entry.reaper_claimed = false;
         entry.claimed_at = None;
+        entry.claim_token = 0;
     }
 }
 
@@ -959,10 +979,36 @@ mod tests {
     use tokio::io::{AsyncRead, ReadBuf};
 
     use super::{
-        CHANNEL_CAPACITY, MAX_LINE_BYTES, OutputTable, drain_stream, emit_stdin_write_failed,
-        emit_text, new_channel, record_confirmed_state, record_final_state, take_receiver,
-        try_send,
+        CHANNEL_CAPACITY, MAX_LINE_BYTES, OutputTable, claim_reap, drain_stream,
+        emit_stdin_write_failed, emit_text, new_channel, reaper_claim, record_confirmed_state,
+        record_final_state, release_reap, take_receiver, try_send,
     };
+
+    /// PR #198 (Codex P2): a reaper's release clears only the claim it took.
+    /// When the pid is recycled for a new run, the new run's channel and its
+    /// reaper's claim sit under the same id; the old reaper's late release
+    /// must leave that claim alone.
+    #[test]
+    fn an_old_runs_release_leaves_the_claim_of_a_run_that_reused_its_pid() {
+        let id = ProcessId(21);
+        let (state, _old_handles) = new_channel(1);
+        let outputs: OutputTable = Arc::new(Mutex::new(HashMap::from([(id, state)])));
+        let old = claim_reap(&outputs, id).expect("the old run's claim succeeds");
+        // The old run ends; its pid comes back for a new child.
+        let (state, _new_handles) = new_channel(1);
+        outputs.lock().expect("outputs").insert(id, state);
+        let new = claim_reap(&outputs, id).expect("the new run's claim succeeds");
+        assert_ne!(old, new);
+
+        release_reap(&outputs, id, old);
+        assert!(
+            reaper_claim(&outputs, id).is_some(),
+            "the old run's release cleared the new run's claim"
+        );
+        // The new run's own release still gives its claim back.
+        release_reap(&outputs, id, new);
+        assert!(reaper_claim(&outputs, id).is_none());
+    }
 
     /// A run whose reader the reaper abandoned still ends while that reader
     /// runs: the notes, then the `State` frame, close the channel, and what

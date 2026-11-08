@@ -403,6 +403,8 @@ struct SelfExitReaper {
     /// Notified by the child's last reader to finish.
     readers_done: Arc<tokio::sync::Notify>,
     id: ProcessId,
+    /// The claim `finish_spawn` took for this reaper, if it got one.
+    claim: Option<output_capture::ClaimToken>,
 }
 
 /// A recorded member of a self-exited child's process group -- always a
@@ -573,14 +575,20 @@ impl<'a> StoppingGuard<'a> {
 /// leaves `observe` deferring to it until `stall_grace`; once the run is
 /// finalized the release changes nothing, because a claim is honoured only
 /// while the final frame is still owed ([`output_capture::reaper_claim`]).
+/// The release names its own claim's token, so once the child is reaped
+/// and its pid recycled, it never clears the claim of the new child's
+/// reaper under the same id.
 struct ClaimRelease {
     outputs: OutputTable,
     id: ProcessId,
+    token: Option<output_capture::ClaimToken>,
 }
 
 impl Drop for ClaimRelease {
     fn drop(&mut self) {
-        output_capture::release_reap(&self.outputs, self.id);
+        if let Some(token) = self.token {
+            output_capture::release_reap(&self.outputs, self.id, token);
+        }
     }
 }
 
@@ -626,6 +634,7 @@ impl SelfExitReaper {
         let _claim = ClaimRelease {
             outputs: Arc::clone(&self.outputs),
             id: self.id,
+            token: self.claim,
         };
         let mut census = take_census_blocking(self.id).await;
         let mut census_at = std::time::Instant::now();
@@ -1750,8 +1759,8 @@ impl TokioProcessSupervisor {
         // The self-exit reaper's claim, taken here rather than by its task:
         // the child is not in `children` yet, so no `observe` can reap it
         // ahead of the reaper that owns the verdict.
-        let claimed = output_capture::claim_reap(&self.inner.outputs, id);
-        debug_assert!(claimed, "a fresh output entry is always claimable");
+        let claim = output_capture::claim_reap(&self.inner.outputs, id);
+        debug_assert!(claim.is_some(), "a fresh output entry is always claimable");
 
         // Every reader and writer task is attached before this child is
         // ever inserted into `children`, so no other code path can observe
@@ -1779,7 +1788,7 @@ impl TokioProcessSupervisor {
         // From spawn, not from the readers' end: a descendant that inherited
         // the output can keep the readers running long after the child has
         // exited. Spawned only now, with the entry in `children` to poll.
-        self.spawn_on_runtime(self.reaper(id, readers_done).run());
+        self.spawn_on_runtime(self.reaper(id, readers_done, claim).run());
 
         tracing::debug!(program = %program_label, pid, "spawned process");
         Ok(id)
@@ -1787,7 +1796,12 @@ impl TokioProcessSupervisor {
 
     /// The handles the self-exit reaper needs for `id`, cloned out of
     /// `Inner` so the reaper task never keeps `Inner` itself alive.
-    fn reaper(&self, id: ProcessId, readers_done: Arc<tokio::sync::Notify>) -> SelfExitReaper {
+    fn reaper(
+        &self,
+        id: ProcessId,
+        readers_done: Arc<tokio::sync::Notify>,
+        claim: Option<output_capture::ClaimToken>,
+    ) -> SelfExitReaper {
         SelfExitReaper {
             children: Arc::clone(&self.inner.children),
             terminal_order: Arc::clone(&self.inner.terminal_order),
@@ -1799,6 +1813,7 @@ impl TokioProcessSupervisor {
             outputs: Arc::clone(&self.inner.outputs),
             readers_done,
             id,
+            claim,
         }
     }
 
