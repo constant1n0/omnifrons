@@ -3123,12 +3123,11 @@ mod self_exit_tests {
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
         // The child outlives `SHORT`'s slow window many times over, and the
         // census refresh interval (1 s) exceeds that window: one census at
-        // the start, none in the idle phase. A second walk is allowed for
-        // two reasons, neither a periodic refresh: the reaper may notice the
-        // output closing up to one poll late, while its new phase is still
-        // inside the slow window, and walk once there; and `CENSUS_TAKES`
-        // is shared by every unit test in this process, so a pid recycled
-        // from an earlier test's child adds that child's walks.
+        // the start, none in the idle phase (a walk inside the slow window
+        // needs the last one to be `census_refresh` old). The second walk
+        // the bound allows is not this child's: `CENSUS_TAKES` is shared by
+        // every unit test in this process, so a pid recycled from an earlier
+        // test's child adds that child's walks.
         let _ = frames.recv_timeout(Duration::from_secs(10));
         let takes = super::CENSUS_TAKES
             .lock()
@@ -3287,6 +3286,9 @@ mod self_exit_tests {
                 ProcessTerminalState::OrphanRiskUncertain
             ))
         );
+        // Stop the lingering `sleep 3` through its recorded group rather
+        // than leave it to outlive the test.
+        let _ = supervisor.stop(id, Duration::from_secs(2));
     }
 
     /// #192: a reaper task that ends without reaping (here it panics) gives

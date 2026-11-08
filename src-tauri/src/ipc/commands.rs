@@ -2774,6 +2774,62 @@ mod tests {
         assert_eq!(succeeded.take_process(), Some(ProcessId(5)));
     }
 
+    /// #192 (S8), through the watchdog itself: a launch that records a child
+    /// and fails at about the budget lands, run after run, on either side
+    /// of the timer. However the caller is answered -- the launch's own
+    /// error in budget, the same error found by the last look after the
+    /// timeout, or `LaunchTimedOut` -- the child is stopped exactly once.
+    /// The last look is reached in about a quarter of these runs, and
+    /// before `answer_caller` it left the child running there, so a hundred
+    /// runs cover it with certainty to spare (the verifier's probe).
+    #[test]
+    fn a_launch_error_at_the_budget_always_stops_its_child_exactly_once() {
+        let budget = std::time::Duration::from_millis(5);
+        for run in 0..100_u32 {
+            let stops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&stops);
+            let progress = super::LaunchProgress::new();
+            let marker = progress.clone();
+            // Mostly the timer's own tick; some half a millisecond either way.
+            let delay = match run % 4 {
+                0 | 1 => budget,
+                2 => std::time::Duration::from_micros(5_500),
+                _ => std::time::Duration::from_micros(4_500),
+            };
+            let result = watchdog(
+                budget,
+                progress,
+                async move {
+                    marker.spawned(ProcessId(1000 + run));
+                    tokio::time::sleep(delay).await;
+                    Err::<u32, _>(ShellError::new(
+                        ShellErrorCode::SpawnFailed,
+                        "fails at about the budget",
+                    ))
+                },
+                |_| {},
+                move |_| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            );
+            // Longer than the sweep, one budget after the timeout.
+            std::thread::sleep(budget * 4);
+            let code = result.expect_err("the launch never succeeds").code;
+            assert!(
+                matches!(
+                    code,
+                    ShellErrorCode::SpawnFailed | ShellErrorCode::LaunchTimedOut
+                ),
+                "run {run}: unexpected {code:?}"
+            );
+            assert_eq!(
+                stops.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "run {run}, answered {code:?}: its child must be stopped exactly once"
+            );
+        }
+    }
+
     /// A launch that forks after the caller was told it timed out and then
     /// panics still has its child stopped, on the way out of the task.
     #[test]
