@@ -3273,4 +3273,45 @@ mod self_exit_tests {
             "the census was walked again after its task failed"
         );
     }
+
+    /// PR #198 (Codex P2), end to end: a run's reaper ends (its
+    /// `ClaimRelease` drops) only after the run's pid came back for a new
+    /// run, whose channel and claim sit under the same id. The old
+    /// reaper's release must leave the new claim alone. The reaper's end is
+    /// held (`HELD_REAPER_ENDS`) so the new claim lands first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_old_reapers_end_leaves_the_claim_of_a_run_that_reused_its_pid() {
+        let mut supervisor = TokioProcessSupervisor::new();
+        let spec =
+            ProcessSpec::new("/bin/sh").with_args(["-c", "exec 1>&- 2>&-; sleep 0.2; exit 0"]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        // Registered while the child still sleeps its 0.2 s: before its reap.
+        super::HELD_REAPER_ENDS
+            .lock()
+            .expect("held reaper ends poisoned")
+            .push((id.0, Duration::from_millis(500)));
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        assert!(first_state(&frames, Duration::from_secs(10)).is_some());
+
+        // The old reaper now waits out its held end, its guard still alive.
+        // The pid comes back: a new run's channel and claim, same id.
+        let outputs = std::sync::Arc::clone(&supervisor.inner.outputs);
+        let (state, _new_handles) = super::output_capture::new_channel(1);
+        outputs.lock().expect("outputs poisoned").insert(id, state);
+        assert!(super::output_capture::claim_reap(&outputs, id).is_some());
+
+        // Past the held end: the old guard has dropped.
+        std::thread::sleep(Duration::from_millis(1500));
+        let survived = super::output_capture::reaper_claim(&outputs, id).is_some();
+        super::HELD_REAPER_ENDS
+            .lock()
+            .expect("held reaper ends poisoned")
+            .retain(|(pid, _)| *pid != id.0);
+        outputs.lock().expect("outputs poisoned").remove(&id);
+        assert!(
+            survived,
+            "the old reaper's release cleared the new run's claim"
+        );
+    }
 }
