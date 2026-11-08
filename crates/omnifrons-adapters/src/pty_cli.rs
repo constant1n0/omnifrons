@@ -34,7 +34,10 @@ const NOTES: &str = "degraded fallback with no structured events: the executable
                      pseudo-terminal and its output is rendered as plain text with layout \
                      controls dropped and counted; a title or notification it asks for is \
                      sanitized and shown as text only; hyperlinks, clipboard access and file \
-                     transfer are disabled; the terminal is not a sandbox and grants no \
+                     transfer are disabled; the prompt is typed when the executable starts, \
+                     possibly before it is ready for input, and the operator can then send \
+                     it a line or a key (Enter, Esc or an arrow) from the panel, for example \
+                     to answer a dialog; the terminal is not a sandbox and grants no \
                      authority; not available on Windows in this slice";
 
 /// The pseudo-terminal `HarnessAdapter`: an empty argv template, the

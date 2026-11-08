@@ -17,6 +17,7 @@ import {
   guidanceRestore,
   guidanceSnapshots,
   guidanceStatus,
+  harnessSendInput,
   harnessSpawn,
   harnessStop,
   isShellError,
@@ -76,6 +77,8 @@ import {
   type Snapshot,
   type TerminalActionKind,
   type TerminalDropCounts,
+  type TerminalInput,
+  type TerminalKey,
   type WorkAreaState,
   type Workspace,
   type WrongRootReason,
@@ -189,6 +192,28 @@ function formatStateEventLine(payload: {
  */
 const PTY_TRANSPORT_DISCLOSURE =
   'transport: pty — degraded fallback; plain text, layout controls dropped'
+
+/** One key control of the terminal input group: the key it sends, its accessible name, its visible text. */
+interface TerminalKeyControl {
+  key: TerminalKey
+  name: string
+  text: string
+}
+
+/**
+ * The key controls shown while a pseudo-terminal run is active (#187), in
+ * layout order: the closed set {@link TerminalKey} names, each sent as a
+ * key and never as text. Fixed copy; none of it may contain the lowercase
+ * transport token, which the panel shows only in its transport disclosure.
+ */
+const TERMINAL_KEY_CONTROLS: readonly TerminalKeyControl[] = [
+  { key: 'enter', name: 'Send Enter key', text: 'Enter' },
+  { key: 'escape', name: 'Send Esc key', text: 'Esc' },
+  { key: 'up', name: 'Send Up arrow', text: '↑' },
+  { key: 'down', name: 'Send Down arrow', text: '↓' },
+  { key: 'left', name: 'Send Left arrow', text: '←' },
+  { key: 'right', name: 'Send Right arrow', text: '→' },
+]
 
 /** The visible label on every `terminal-text` transcript entry. */
 const TERMINAL_TEXT_LABEL = 'terminal output, plain text'
@@ -2339,6 +2364,27 @@ export function AgentPanel() {
   const runActiveRef = useRef(false)
 
   /**
+   * The line the operator types to answer a live pseudo-terminal child
+   * (#187). Kept across runs like {@link prompt}; cleared only by a send of
+   * it the shell confirmed for the run it was sent to.
+   */
+  const [terminalLine, setTerminalLine] = useState('')
+  /**
+   * True while one `harness_send_input` call is pending: the terminal
+   * input controls are disabled and the field is held, so a second send
+   * waits for the first to settle and the child receives them in order.
+   * One flag for the panel, not one per run: at most one send exists at a
+   * time, so the flag a late answer clears is always its own.
+   */
+  const [sendingInput, setSendingInput] = useState(false)
+  /**
+   * The same fact as {@link sendingInput}, readable synchronously: two
+   * clicks dispatched before the disabled state renders must still send
+   * once, the {@link runActiveRef} rule applied to this one control group.
+   */
+  const sendingInputRef = useRef(false)
+
+  /**
    * Tracks whether this component instance is still mounted, guarding
    * every async continuation below against a post-unmount state update --
    * mirrors `HarnessPanel`/`ApprovalSurface`'s own `mountedRef` (R3-001).
@@ -3466,6 +3512,47 @@ export function AgentPanel() {
       if (generation !== spawnGenerationRef.current) return
       setError(isShellError(stopError) ? stopError : 'unexpected')
     }
+  }
+
+  /**
+   * Sends one line or one key to the live pseudo-terminal child `activeId`
+   * names, so the operator answers a dialog the child shows (#187).
+   *
+   * One send at a time: the synchronous {@link sendingInputRef} refuses a
+   * second while the first is pending, which keeps the child's input in
+   * the order the operator gave it. The generation is captured before the
+   * await and re-read after it, as {@link handleStop} does: the run can end
+   * on its own channel and the next one start while the shell answers, and
+   * that late answer must neither raise a banner over the next run nor
+   * clear the line its operator is looking at. The in-flight flag is
+   * cleared whatever the generation, since no other send can be pending.
+   * A refusal leaves the line in the field for the operator to correct.
+   */
+  async function handleSendInput(input: TerminalInput) {
+    if (activeId === null || sendingInputRef.current) return
+    sendingInputRef.current = true
+    setSendingInput(true)
+    setError(null)
+    const generation = spawnGenerationRef.current
+    try {
+      await harnessSendInput(activeId, input)
+      if (!mountedRef.current) return
+      if (generation !== spawnGenerationRef.current) return
+      if (input.kind === 'line') setTerminalLine('')
+    } catch (sendError: unknown) {
+      if (!mountedRef.current) return
+      if (generation !== spawnGenerationRef.current) return
+      setError(isShellError(sendError) ? sendError : 'unexpected')
+    } finally {
+      sendingInputRef.current = false
+      if (mountedRef.current) setSendingInput(false)
+    }
+  }
+
+  /** Sends the field's line exactly as typed; a blank field sends nothing. */
+  function handleSendLine() {
+    if (terminalLine === '') return
+    void handleSendInput({ kind: 'line', text: terminalLine })
   }
 
   /**
@@ -4823,6 +4910,53 @@ export function AgentPanel() {
         </button>
         {startNeeds.length > 0 && (
           <p id="agent-start-needs">{`Start needs: ${startNeeds.join(', ')}.`}</p>
+        )}
+
+        {/* #187: the operator answers a dialog the child shows -- only while
+            a run is live and its adapter's transport is the pseudo-terminal
+            one (the adapter select is frozen for the run, so the selected
+            adapter is the run's own). The field is held read-only rather
+            than disabled while a send is pending, so it keeps focus for the
+            next Enter. */}
+        {activeId !== null && selectedAdapter?.transportClass === 'pty' && (
+          <fieldset>
+            <legend>Answer the terminal</legend>
+            <p>A line is sent followed by Enter; a key is sent on its own.</p>
+            <label htmlFor="agent-terminal-line">Line to send</label>
+            <input
+              id="agent-terminal-line"
+              type="text"
+              value={terminalLine}
+              readOnly={sendingInput}
+              onChange={(event) => {
+                if (sendingInputRef.current) return
+                setTerminalLine(event.target.value)
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter' || event.nativeEvent.isComposing) return
+                event.preventDefault()
+                handleSendLine()
+              }}
+            />
+            <button
+              type="button"
+              onClick={handleSendLine}
+              disabled={sendingInput || terminalLine === ''}
+            >
+              Send line
+            </button>
+            {TERMINAL_KEY_CONTROLS.map((control) => (
+              <button
+                key={control.key}
+                type="button"
+                aria-label={control.name}
+                onClick={() => void handleSendInput({ kind: 'key', key: control.key })}
+                disabled={sendingInput}
+              >
+                {control.text}
+              </button>
+            ))}
+          </fieldset>
         )}
       </div>
 

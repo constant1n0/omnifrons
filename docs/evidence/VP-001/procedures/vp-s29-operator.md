@@ -126,8 +126,10 @@ never committed. The `codex` CLI itself is not approved: the bridge runs it.
 Before the `pty-cli` leg, trust the definition root in Antigravity CLI once
 from a terminal: `cd <root> && agy`, answer "Yes, I trust this folder" and
 quit. The PTY adapter types the prompt as soon as the child starts, so a trust
-or sign-in dialog in the TUI swallows it; a leg that stops at such a dialog
-records `uncertain`.
+or sign-in dialog in the TUI can swallow it. If a dialog still appears, answer
+it from the panel's "Answer the terminal" controls (a line, Enter, Esc or an
+arrow) and note that in the leg's record; a leg that stays at a dialog records
+`uncertain`.
 
 ## 4. Run each leg
 

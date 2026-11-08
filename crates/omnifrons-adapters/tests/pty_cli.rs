@@ -44,6 +44,8 @@ fn pty_cli_notes_disclose_the_degraded_fallback_in_plain_english() {
         "hyperlink",
         "clipboard",
         "file transfer",
+        "typed when the executable starts",
+        "a line or a key",
         "not a sandbox",
         "Windows",
     ] {

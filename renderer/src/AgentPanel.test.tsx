@@ -88,7 +88,7 @@ const PTY_ADAPTER: AdapterDescriptor = {
   promptChannel: 'pty-typed',
   scopeMode: 'advisory',
   notes:
-    'degraded fallback with no structured events: the executable runs inside a pseudo-terminal and its output is rendered as plain text with layout controls dropped and counted; a title or notification it asks for is sanitized and shown as text only; hyperlinks, clipboard access and file transfer are disabled; the terminal is not a sandbox and grants no authority; not available on Windows in this slice',
+    'degraded fallback with no structured events: the executable runs inside a pseudo-terminal and its output is rendered as plain text with layout controls dropped and counted; a title or notification it asks for is sanitized and shown as text only; hyperlinks, clipboard access and file transfer are disabled; the prompt is typed when the executable starts, possibly before it is ready for input, and the operator can then send it a line or a key (Enter, Esc or an arrow) from the panel, for example to answer a dialog; the terminal is not a sandbox and grants no authority; not available on Windows in this slice',
 }
 
 /**
@@ -2760,6 +2760,355 @@ describe('AgentPanel selection controls frozen during a run (slice 4 review, R3-
 
     await selectOption('Adapter', 'claude-code')
     expect(screen.queryByTestId('agent-transport-disclosure')).toBeNull()
+  })
+})
+
+// -- #187: answering a live pseudo-terminal child from the panel --
+
+/** The accessible name of the group that answers a live pseudo-terminal child (#187). */
+const TERMINAL_INPUT_GROUP = 'Answer the terminal'
+
+/** Every key control of that group, in layout order: the key it sends, its accessible name, its visible text. */
+const TERMINAL_KEY_CONTROLS = [
+  ['enter', 'Send Enter key', 'Enter'],
+  ['escape', 'Send Esc key', 'Esc'],
+  ['up', 'Send Up arrow', '↑'],
+  ['down', 'Send Down arrow', '↓'],
+  ['left', 'Send Left arrow', '←'],
+  ['right', 'Send Right arrow', '→'],
+] as const
+
+function queryTerminalInputGroup(): HTMLElement | null {
+  return screen.queryByRole('group', { name: TERMINAL_INPUT_GROUP })
+}
+
+function lineField(): HTMLInputElement {
+  return within(screen.getByRole('group', { name: TERMINAL_INPUT_GROUP })).getByLabelText(
+    'Line to send',
+  ) as HTMLInputElement
+}
+
+function sendLineButton(): HTMLButtonElement {
+  return within(screen.getByRole('group', { name: TERMINAL_INPUT_GROUP })).getByRole('button', {
+    name: 'Send line',
+  }) as HTMLButtonElement
+}
+
+/** The group's key control whose accessible name is `name`. */
+function keyControl(name: string): HTMLButtonElement {
+  return within(screen.getByRole('group', { name: TERMINAL_INPUT_GROUP })).getByRole('button', {
+    name,
+  }) as HTMLButtonElement
+}
+
+/** Every button of the group: Send line, then the six key controls. */
+function terminalInputButtons(): HTMLButtonElement[] {
+  return within(screen.getByRole('group', { name: TERMINAL_INPUT_GROUP })).getAllByRole(
+    'button',
+  ) as HTMLButtonElement[]
+}
+
+/**
+ * A `harness_send_input` mock whose answers the test settles one at a
+ * time, recording every call's args; `harness_stop` resolves `killed`, and
+ * any other command is a test error.
+ */
+function deferredSends(): {
+  calls: unknown[]
+  settles: { resolve: (value: null) => void; reject: (reason: unknown) => void }[]
+  handle: (cmd: string, args: Record<string, unknown>) => unknown
+} {
+  const calls: unknown[] = []
+  const settles: { resolve: (value: null) => void; reject: (reason: unknown) => void }[] = []
+  return {
+    calls,
+    settles,
+    handle: (cmd, args) => {
+      if (cmd === 'harness_send_input') {
+        calls.push(args)
+        return new Promise<null>((resolve, reject) => {
+          settles.push({ resolve, reject })
+        })
+      }
+      if (cmd === 'harness_stop') return { state: 'killed', code: null }
+      throw new Error(`unexpected command: ${cmd}`)
+    },
+  }
+}
+
+/** Runs `settle` and drains its continuations plus one macrotask, like {@link settleSpawn}. */
+async function settleSend(settle: () => void): Promise<void> {
+  await act(async () => {
+    settle()
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+  })
+}
+
+describe('AgentPanel terminal input (#187)', () => {
+  it('shows the group while a pseudo-terminal run is active: a line field, a Send line control disabled while the field is blank, one control per key, and "pty" still only in the transport disclosure', async () => {
+    await startAndCaptureChannel(undefined, 'pty-cli')
+
+    expect(queryTerminalInputGroup()).not.toBeNull()
+    expect(lineField().value).toBe('')
+    expect(sendLineButton().disabled).toBe(true)
+    expect(terminalInputButtons().map((button) => button.textContent)).toEqual([
+      'Send line',
+      ...TERMINAL_KEY_CONTROLS.map(([, , text]) => text),
+    ])
+    for (const [, name] of TERMINAL_KEY_CONTROLS) {
+      expect(keyControl(name).disabled).toBe(false)
+    }
+    expect(leavesContaining('pty')).toEqual([screen.getByTestId('agent-transport-disclosure')])
+  })
+
+  it('is absent for an active run of an adapter whose transport is not the pseudo-terminal one', async () => {
+    await startAndCaptureChannel()
+
+    expect(screen.getByText('running')).toBeTruthy()
+    expect(queryTerminalInputGroup()).toBeNull()
+    expect(screen.queryByLabelText('Line to send')).toBeNull()
+  })
+
+  it('is absent while no run is active: before Start, and again once the run\'s terminal state frame arrives', async () => {
+    const { channels } = await renderMultiRun(undefined, 'pty-cli')
+    expect(queryTerminalInputGroup()).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    expect(queryTerminalInputGroup()).not.toBeNull()
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 1, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+    expect(queryTerminalInputGroup()).toBeNull()
+  })
+
+  it('Send line invokes harness_send_input with exactly { id, input: { kind: "line", text } }, the text unchanged, then clears the field and shows no banner', async () => {
+    const calls: unknown[] = []
+    await startAndCaptureChannel((cmd, args) => {
+      if (cmd === 'harness_send_input') {
+        calls.push(args)
+        return null
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+
+    fireEvent.change(lineField(), { target: { value: ' yes, trust it ' } })
+    expect(sendLineButton().disabled).toBe(false)
+    fireEvent.click(sendLineButton())
+
+    await waitFor(() => {
+      expect(lineField().value).toBe('')
+    })
+    expect(calls).toEqual([{ id: 7, input: { kind: 'line', text: ' yes, trust it ' } }])
+    expect(sendLineButton().disabled).toBe(true)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByText('running')).toBeTruthy()
+  })
+
+  it('pressing Enter in the field sends its line the same way, and sends nothing while the field is blank', async () => {
+    const calls: unknown[] = []
+    await startAndCaptureChannel((cmd, args) => {
+      if (cmd === 'harness_send_input') {
+        calls.push(args)
+        return null
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    }, 'pty-cli')
+
+    fireEvent.keyDown(lineField(), { key: 'Enter' })
+    expect(calls).toEqual([])
+
+    fireEvent.change(lineField(), { target: { value: '2' } })
+    fireEvent.keyDown(lineField(), { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(lineField().value).toBe('')
+    })
+    expect(calls).toEqual([{ id: 7, input: { kind: 'line', text: '2' } }])
+  })
+
+  it.each(TERMINAL_KEY_CONTROLS)(
+    'the %s control invokes harness_send_input with exactly { id, input: { kind: "key", key } } and leaves the field as it was',
+    async (key, name) => {
+      const calls: unknown[] = []
+      await startAndCaptureChannel((cmd, args) => {
+        if (cmd === 'harness_send_input') {
+          calls.push(args)
+          return null
+        }
+        throw new Error(`unexpected command: ${cmd}`)
+      }, 'pty-cli')
+      fireEvent.change(lineField(), { target: { value: 'draft' } })
+
+      const control = keyControl(name)
+      fireEvent.click(control)
+
+      await waitFor(() => {
+        expect(calls).toEqual([{ id: 7, input: { kind: 'key', key } }])
+      })
+      await waitFor(() => {
+        expect(control.disabled).toBe(false)
+      })
+      expect(lineField().value).toBe('draft')
+      expect(screen.queryByRole('alert')).toBeNull()
+    },
+  )
+
+  it.each([
+    ['input-unavailable', 'the run is not live in a terminal'],
+    ['input-not-typeable', 'the line holds a character the terminal would interpret'],
+    ['input-too-large', 'the line is over 1023 bytes'],
+    ['input-write-failed', 'the write did not finish in time'],
+    ['unknown-process', 'no process with that id'],
+  ] as const)(
+    'a send rejected with %s shows the typed error in the banner, keeps the field and the run, and re-enables the controls',
+    async (code, message) => {
+      await startAndCaptureChannel((cmd) => {
+        if (cmd === 'harness_send_input') return Promise.reject({ code, message })
+        throw new Error(`unexpected command: ${cmd}`)
+      }, 'pty-cli')
+
+      fireEvent.change(lineField(), { target: { value: 'yes' } })
+      fireEvent.click(sendLineButton())
+
+      const banner = await screen.findByRole('alert')
+      expect(banner.textContent).toBe(`${code}: ${message}`)
+      expect(lineField().value).toBe('yes')
+      expect(screen.getByText('running')).toBeTruthy()
+      expect((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled).toBe(
+        false,
+      )
+      expect(terminalInputButtons().map((button) => button.disabled)).toEqual(
+        terminalInputButtons().map(() => false),
+      )
+    },
+  )
+
+  it('disables every control and holds the field while a send is pending, so a second send waits for the first to settle', async () => {
+    const sends = deferredSends()
+    await startAndCaptureChannel(sends.handle, 'pty-cli')
+
+    fireEvent.change(lineField(), { target: { value: 'yes' } })
+    fireEvent.click(sendLineButton())
+
+    await waitFor(() => {
+      expect(terminalInputButtons().every((button) => button.disabled)).toBe(true)
+    })
+    expect(lineField().readOnly).toBe(true)
+    // Neither a key control nor Enter in the field reaches the shell, and the
+    // field keeps the line being sent.
+    fireEvent.click(keyControl('Send Enter key'))
+    fireEvent.keyDown(lineField(), { key: 'Enter' })
+    fireEvent.change(lineField(), { target: { value: 'typed meanwhile' } })
+    expect(lineField().value).toBe('yes')
+    expect(sends.calls).toHaveLength(1)
+
+    await settleSend(() => sends.settles[0]!.resolve(null))
+
+    expect(lineField().value).toBe('')
+    expect(lineField().readOnly).toBe(false)
+    expect(
+      terminalInputButtons()
+        .slice(1)
+        .every((button) => !button.disabled),
+    ).toBe(true)
+    fireEvent.click(keyControl('Send Up arrow'))
+    await waitFor(() => {
+      expect(sends.calls).toEqual([
+        { id: 7, input: { kind: 'line', text: 'yes' } },
+        { id: 7, input: { kind: 'key', key: 'up' } },
+      ])
+    })
+  })
+
+  it('two clicks in the same tick, before the disabled state renders, send once', async () => {
+    const sends = deferredSends()
+    await startAndCaptureChannel(sends.handle, 'pty-cli')
+    const control = keyControl('Send Esc key')
+
+    act(() => {
+      control.click()
+      control.click()
+    })
+
+    await waitFor(() => {
+      expect(control.disabled).toBe(true)
+    })
+    expect(sends.calls).toEqual([{ id: 7, input: { kind: 'key', key: 'escape' } }])
+  })
+
+  it('ignores a rejection that lands after the run changed: no banner over the next run, whose controls come back once it settles', async () => {
+    const sends = deferredSends()
+    const { channels } = await renderMultiRun(sends.handle, 'pty-cli')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    fireEvent.change(lineField(), { target: { value: 'yes' } })
+    fireEvent.click(sendLineButton())
+    await waitFor(() => {
+      expect(sends.calls).toHaveLength(1)
+    })
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 1, droppedBefore: 0, state: 'exited', code: 0 },
+      })
+    })
+    await screen.findByText('exited (code 0)')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+
+    await settleSend(() =>
+      sends.settles[0]!.reject({
+        code: 'input-unavailable',
+        message: 'the run is not live in a terminal',
+      }),
+    )
+
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(lineField().value).toBe('yes')
+    fireEvent.click(sendLineButton())
+    await waitFor(() => {
+      expect(sends.calls).toEqual([
+        { id: 7, input: { kind: 'line', text: 'yes' } },
+        { id: 8, input: { kind: 'line', text: 'yes' } },
+      ])
+    })
+  })
+
+  it('ignores a success that lands after the run changed: the next run\'s field is not cleared', async () => {
+    const sends = deferredSends()
+    const { channels } = await renderMultiRun(sends.handle, 'pty-cli')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+    fireEvent.change(lineField(), { target: { value: 'yes' } })
+    fireEvent.click(sendLineButton())
+    await waitFor(() => {
+      expect(sends.calls).toHaveLength(1)
+    })
+
+    act(() => {
+      channels[0]!.onmessage({
+        stream: 'state',
+        body: { id: 7, seq: 1, droppedBefore: 0, state: 'killed', code: null },
+      })
+    })
+    await screen.findByText('killed')
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await screen.findByText('running')
+
+    await settleSend(() => sends.settles[0]!.resolve(null))
+
+    expect(lineField().value).toBe('yes')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(sendLineButton().disabled).toBe(false)
   })
 })
 
