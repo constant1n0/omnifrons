@@ -47,6 +47,7 @@ Three typed commands, registered next to `shell_health`:
 | `harness_spawn` | `kind: HarnessKindDto`, `rateHz: number`, `lines: number`, `onFrame: Channel<HarnessFrame>` | `ProcessIdDto` |
 | `harness_stop` | `id: ProcessIdDto`, `deadlineMs: number` | `ProcessTerminalStateDto` |
 | `harness_observe` | `id: ProcessIdDto` | `ProcessStatusDto` |
+| `harness_send_input` (added by #187) | `id: ProcessIdDto`, `input: TerminalInputDto` (`{ kind: "line", text }` \| `{ kind: "key", key: "enter" \| "escape" \| "up" \| "down" \| "left" \| "right" }`) | `null` |
 
 No program path or argument vector ever crosses this boundary in either direction: `kind` names one of two closed, synthetic behaviors, and `rateHz`/`lines` are small bounded numbers, validated (`1..=1000`, `1..=100_000`) into an `omnifrons_app::HarnessRequest` before the supervisor ever sees them. The supervisor turns a validated request into a real `ProcessSpec` internally, execing a launcher path fixed once at construction (`tauri::process::current_binary`) — never a path carried by any command argument.
 

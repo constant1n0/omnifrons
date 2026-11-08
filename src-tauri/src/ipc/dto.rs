@@ -62,6 +62,77 @@ pub enum HarnessKindDto {
     },
 }
 
+/// A key `harness_send_input` can send, as it crosses IPC (input only):
+/// the closed set of [`omnifrons_domain::terminal_input::TerminalKey`] and
+/// nothing else (#187). The renderer names a key; the bytes it writes are
+/// fixed on the Rust side
+/// ([`omnifrons_domain::terminal_input::TerminalKey::bytes`]), never sent
+/// raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalKeyDto {
+    Enter,
+    Escape,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl From<TerminalKeyDto> for omnifrons_domain::terminal_input::TerminalKey {
+    fn from(key: TerminalKeyDto) -> Self {
+        match key {
+            TerminalKeyDto::Enter => Self::Enter,
+            TerminalKeyDto::Escape => Self::Escape,
+            TerminalKeyDto::Up => Self::Up,
+            TerminalKeyDto::Down => Self::Down,
+            TerminalKeyDto::Left => Self::Left,
+            TerminalKeyDto::Right => Self::Right,
+        }
+    }
+}
+
+/// What `harness_send_input` forwards to a live pseudo-terminal child, as
+/// it crosses IPC (input only, #187).
+///
+/// Internally tagged on `kind`, like [`HarnessKindDto`]:
+/// `{"kind": "line", "text": ...}` or `{"kind": "key", "key": ...}`, and
+/// strict -- an unknown `kind` or `key`, a missing field or an extra one is
+/// refused by deserialization rather than interpreted. `text` is only
+/// carried here; it becomes a domain
+/// [`omnifrons_domain::terminal_input::TypedLine`] through the
+/// [`TryFrom`] conversion below, which applies the same rule that refuses
+/// an untypeable prompt before any supervisor is reached.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum TerminalInputDto {
+    /// One line of text; the shell appends its carriage return.
+    Line { text: String },
+    /// One key of the closed set.
+    Key { key: TerminalKeyDto },
+}
+
+impl TryFrom<TerminalInputDto> for omnifrons_domain::terminal_input::TerminalInput {
+    type Error = ShellError;
+
+    /// `Err` with the code [`ShellError`]'s `From<TypedLineError>` maps
+    /// the refusal to: `input-not-typeable` for an empty line or one
+    /// holding a line break or an interpreted byte, `input-too-large` for
+    /// one over the byte limit. A key always converts.
+    fn try_from(input: TerminalInputDto) -> Result<Self, Self::Error> {
+        use omnifrons_domain::terminal_input::TypedLine;
+        match input {
+            TerminalInputDto::Line { text } => Ok(Self::Line(TypedLine::new(text)?)),
+            TerminalInputDto::Key { key } => Ok(Self::Key(key.into())),
+        }
+    }
+}
+
 /// A workspace directory, as it crosses IPC. `display_path` is the
 /// workspace's canonical filesystem path -- the second explicit exception
 /// to RCS-001-R14's no-raw-path rule, alongside
@@ -1805,6 +1876,27 @@ pub enum ShellErrorCode {
     /// forked by then, or by the launch finishing later, is stopped through
     /// the supervisor and the result logged with its id (#185).
     LaunchTimedOut,
+    /// `harness_send_input` named a run that is known but not live in a
+    /// pseudo-terminal: it has reached its terminal state, it was launched
+    /// with pipes rather than a terminal, its terminal is already closed,
+    /// or this platform has no pseudo-terminal path. Nothing was written
+    /// (#187).
+    InputUnavailable,
+    /// `harness_send_input`'s line is empty, holds a line break, or holds a
+    /// byte the terminal's line discipline would interpret rather than
+    /// type -- the rule [`ShellErrorCode::PromptNotTypeable`] applies to a
+    /// typed prompt. Refused before the supervisor is reached; nothing was
+    /// written (#187).
+    InputNotTypeable,
+    /// `harness_send_input`'s line exceeds 1,023 UTF-8 bytes, the most that
+    /// fits with its Enter in the smallest supported canonical input queue
+    /// (macOS, 1,024 bytes). Refused before the supervisor is reached;
+    /// nothing was written (#187).
+    InputTooLarge,
+    /// `harness_send_input`'s write to the run's terminal failed, made no
+    /// progress, or did not finish within the supervisor's bounded wait;
+    /// part of the input may have reached the terminal (#187).
+    InputWriteFailed,
 }
 
 /// Structured detail for a [`ShellError`], carrying values a fixed
@@ -1903,6 +1995,30 @@ impl ShellError {
             ProbeOutcome::Identity(_) => Self::new(
                 ShellErrorCode::ProbeFailed,
                 "an unexpected probe result was returned",
+            ),
+        }
+    }
+}
+
+impl From<omnifrons_domain::terminal_input::TypedLineError> for ShellError {
+    /// Maps a refused `harness_send_input` line to its catalogue error
+    /// (#187). An empty line and a line the terminal would interpret share
+    /// `input-not-typeable` -- neither can be typed as one line -- and keep
+    /// their own messages; an oversized line is `input-too-large`.
+    fn from(error: omnifrons_domain::terminal_input::TypedLineError) -> Self {
+        use omnifrons_domain::terminal_input::TypedLineError;
+        match error {
+            TypedLineError::Empty => Self::new(
+                ShellErrorCode::InputNotTypeable,
+                "the line to send is empty",
+            ),
+            TypedLineError::NotTypeable => Self::new(
+                ShellErrorCode::InputNotTypeable,
+                "the line holds a line break or control characters a terminal would interpret",
+            ),
+            TypedLineError::TooLarge => Self::new(
+                ShellErrorCode::InputTooLarge,
+                "the line exceeds the 1023-byte limit of a terminal line",
             ),
         }
     }
@@ -4342,6 +4458,190 @@ mod tests {
                 serde_json::json!({"code": token, "message": "message"})
             );
         }
+    }
+
+    // -- #187: the terminal input `harness_send_input` forwards, and its
+    // four error codes --
+
+    /// The four terminal-input codes render as their documented kebab-case
+    /// tokens: the closed set the renderer's `ShellErrorCode` union
+    /// mirrors.
+    #[test]
+    fn terminal_input_error_codes_serialize_as_kebab_case() {
+        let cases = [
+            (ShellErrorCode::InputUnavailable, "input-unavailable"),
+            (ShellErrorCode::InputNotTypeable, "input-not-typeable"),
+            (ShellErrorCode::InputTooLarge, "input-too-large"),
+            (ShellErrorCode::InputWriteFailed, "input-write-failed"),
+        ];
+        for (code, token) in cases {
+            let error = ShellError::new(code, "message");
+            assert_eq!(
+                json(&error),
+                serde_json::json!({"code": token, "message": "message"})
+            );
+        }
+    }
+
+    /// A `line` payload deserializes to its text and converts to the
+    /// domain line unchanged: the shell appends the carriage return, the
+    /// renderer never sends one.
+    #[test]
+    fn terminal_input_dto_deserializes_a_line_and_converts_it() {
+        use omnifrons_domain::terminal_input::{TerminalInput, TypedLine};
+
+        let dto: super::TerminalInputDto =
+            serde_json::from_str(r#"{"kind":"line","text":"yes, trust it"}"#)
+                .expect("a line payload must deserialize");
+        assert_eq!(
+            dto,
+            super::TerminalInputDto::Line {
+                text: "yes, trust it".to_string()
+            }
+        );
+        let input = TerminalInput::try_from(dto).expect("a plain line converts");
+        assert_eq!(
+            input,
+            TerminalInput::Line(TypedLine::new("yes, trust it").expect("typeable"))
+        );
+    }
+
+    /// Every `key` token deserializes and converts to its own domain key,
+    /// and only the six tokens of the closed set do.
+    #[test]
+    fn terminal_input_dto_deserializes_every_key_and_converts_it() {
+        use omnifrons_domain::terminal_input::{TerminalInput, TerminalKey};
+
+        let cases = [
+            ("enter", super::TerminalKeyDto::Enter, TerminalKey::Enter),
+            ("escape", super::TerminalKeyDto::Escape, TerminalKey::Escape),
+            ("up", super::TerminalKeyDto::Up, TerminalKey::Up),
+            ("down", super::TerminalKeyDto::Down, TerminalKey::Down),
+            ("left", super::TerminalKeyDto::Left, TerminalKey::Left),
+            ("right", super::TerminalKeyDto::Right, TerminalKey::Right),
+        ];
+        for (token, dto_key, domain_key) in cases {
+            let dto: super::TerminalInputDto =
+                serde_json::from_str(&format!(r#"{{"kind":"key","key":"{token}"}}"#))
+                    .unwrap_or_else(|error| panic!("key {token} must deserialize: {error}"));
+            assert_eq!(dto, super::TerminalInputDto::Key { key: dto_key });
+            assert_eq!(
+                TerminalInput::try_from(dto).expect("a key always converts"),
+                TerminalInput::Key(domain_key),
+                "{token}"
+            );
+        }
+    }
+
+    /// Rejection, not best-effort interpretation (VP-S13): an unknown
+    /// `kind` or `key`, a missing or mistyped field, an extra field (raw
+    /// bytes riding next to a key, say), a differently cased token, and
+    /// anything that is not an object are all refused by deserialization.
+    #[test]
+    fn terminal_input_dto_rejects_malformed_payloads() {
+        let malformed = [
+            r#"{"kind":"paste","text":"x"}"#,
+            r#"{"kind":"bytes","bytes":[27,91,65]}"#,
+            r#"{"kind":"Line","text":"x"}"#,
+            r#"{"kind":"key","key":"tab"}"#,
+            r#"{"kind":"key","key":"Enter"}"#,
+            r#"{"kind":"key","key":"page-up"}"#,
+            r#"{"kind":"line"}"#,
+            r#"{"kind":"key"}"#,
+            r#"{"text":"x"}"#,
+            r#"{"key":"enter"}"#,
+            "{}",
+            r#"{"kind":"line","text":5}"#,
+            r#"{"kind":"line","text":null}"#,
+            r#"{"kind":"line","text":["x"]}"#,
+            r#"{"kind":"key","key":1}"#,
+            r#"{"kind":"key","key":null}"#,
+            r#"{"kind":1,"text":"x"}"#,
+            r#"{"kind":"line","text":"x","key":"enter"}"#,
+            r#"{"kind":"key","key":"enter","text":"x"}"#,
+            r#"{"kind":"key","key":"escape","bytes":"\u001b[A"}"#,
+            r#""enter""#,
+            "null",
+        ];
+        // Not listed: the sequence form `["key", "enter"]`, which serde's
+        // internally tagged enums accept as the tag followed by the fields
+        // in order -- `HarnessKindDto` accepts it the same way. It decodes
+        // to the same closed values or is refused, never to anything else.
+        for payload in malformed {
+            assert!(
+                serde_json::from_str::<super::TerminalInputDto>(payload).is_err(),
+                "must be rejected: {payload}"
+            );
+        }
+    }
+
+    /// Each reason a line is refused maps to its own closed code with a
+    /// fixed, slash-free catalogue message: an empty line and a line the
+    /// terminal would interpret are both `input-not-typeable`, an oversized
+    /// one `input-too-large`.
+    #[test]
+    fn each_typed_line_error_maps_to_its_input_code() {
+        use omnifrons_domain::terminal_input::TypedLineError;
+
+        let cases = [
+            (
+                TypedLineError::Empty,
+                "input-not-typeable",
+                "the line to send is empty",
+            ),
+            (
+                TypedLineError::NotTypeable,
+                "input-not-typeable",
+                "the line holds a line break or control characters a terminal would interpret",
+            ),
+            (
+                TypedLineError::TooLarge,
+                "input-too-large",
+                "the line exceeds the 1023-byte limit of a terminal line",
+            ),
+        ];
+        for (reason, token, message) in cases {
+            let error = ShellError::from(reason);
+            assert_eq!(
+                json(&error),
+                serde_json::json!({"code": token, "message": message}),
+                "{reason:?}"
+            );
+            assert!(!error.message.contains('/'), "{reason:?}");
+        }
+    }
+
+    /// A line payload the domain refuses is refused by the conversion with
+    /// its code -- empty, carrying a line break, carrying an escape
+    /// sequence, one byte over the limit -- while a line of exactly
+    /// [`omnifrons_domain::terminal_input::TypedLine::MAX_BYTES`] converts.
+    #[test]
+    fn a_refused_line_converts_to_its_input_code() {
+        use omnifrons_domain::terminal_input::{TerminalInput, TypedLine};
+
+        let line = |text: String| super::TerminalInputDto::Line { text };
+        let cases = [
+            (String::new(), ShellErrorCode::InputNotTypeable),
+            ("yes\nno".to_string(), ShellErrorCode::InputNotTypeable),
+            ("yes\r".to_string(), ShellErrorCode::InputNotTypeable),
+            ("\u{1b}[A".to_string(), ShellErrorCode::InputNotTypeable),
+            ("\u{3}".to_string(), ShellErrorCode::InputNotTypeable),
+            (
+                "a".repeat(TypedLine::MAX_BYTES + 1),
+                ShellErrorCode::InputTooLarge,
+            ),
+        ];
+        for (text, code) in cases {
+            let error = TerminalInput::try_from(line(text.clone()))
+                .expect_err("a refused line must not convert");
+            assert_eq!(error.code, code, "{text:?}");
+            assert_eq!(error.detail, None, "{text:?}");
+        }
+        let longest = "a".repeat(TypedLine::MAX_BYTES);
+        assert_eq!(
+            TerminalInput::try_from(line(longest.clone())).expect("the limit itself is accepted"),
+            TerminalInput::Line(TypedLine::new(longest).expect("typeable"))
+        );
     }
 
     /// The five new slice-3 error codes each render as their documented

@@ -20,8 +20,8 @@ use health::ShellHealth;
 use ipc::catalog_repair::{catalog_repair, catalog_repair_preview};
 use ipc::commands::{
     adapters_list, approvals_list, candidates_list, executable_approve, executable_pick_and_probe,
-    executable_revoke, harness_observe, harness_spawn, harness_stop, outbox_status,
-    workspace_current, workspace_pick,
+    executable_revoke, harness_observe, harness_send_input, harness_spawn, harness_stop,
+    outbox_status, workspace_current, workspace_pick,
 };
 use ipc::definition::{
     definition_apply, definition_create_apply, definition_create_fields, definition_create_preview,
@@ -126,6 +126,7 @@ pub fn run() {
             shell_health,
             harness_spawn,
             harness_stop,
+            harness_send_input,
             harness_observe,
             executable_pick_and_probe,
             executable_approve,

@@ -470,6 +470,31 @@ export type ShellErrorCode =
    * message names the last launch step reached.
    */
   | 'launch-timed-out'
+  /**
+   * {@link harnessSendInput} named a run that is not live in a
+   * pseudo-terminal: it has reached its terminal state, it was launched
+   * without a terminal, or its terminal is already closed. Nothing was
+   * written (#187).
+   */
+  | 'input-unavailable'
+  /**
+   * {@link harnessSendInput}'s line is empty, holds a line break, or holds a
+   * character a terminal's line discipline would interpret rather than
+   * type -- the rule `prompt-not-typeable` applies to a typed prompt.
+   * Nothing was written (#187).
+   */
+  | 'input-not-typeable'
+  /**
+   * {@link harnessSendInput}'s line is over 1,023 UTF-8 bytes, the most that
+   * fits with its Enter in the smallest supported canonical input queue
+   * (macOS, 1,024 bytes). Nothing was written (#187).
+   */
+  | 'input-too-large'
+  /**
+   * {@link harnessSendInput}'s write to the child's terminal failed or did
+   * not finish within the shell's bounded wait (#187).
+   */
+  | 'input-write-failed'
 
 /** `changed-since-approval`'s detail: both digests as short hex prefixes. */
 export interface ChangedSinceApprovalDetail {
@@ -693,6 +718,37 @@ export async function harnessStop(
   deadlineMs: number,
 ): Promise<ProcessTerminalState> {
   return invoke('harness_stop', { id, deadlineMs })
+}
+
+/**
+ * One key {@link harnessSendInput} can send to a live pseudo-terminal child
+ * (#187): a closed set the shell maps to fixed bytes -- Enter to a carriage
+ * return, Escape to `ESC`, each arrow to its normal cursor-mode sequence.
+ * The renderer names a key and never sends raw bytes.
+ */
+export type TerminalKey = 'enter' | 'escape' | 'up' | 'down' | 'left' | 'right'
+
+/**
+ * What {@link harnessSendInput} delivers to a live pseudo-terminal child
+ * (#187), internally tagged on `kind`: a `line` is typed and followed by a
+ * carriage return the shell appends, a `key` is one {@link TerminalKey}.
+ */
+export type TerminalInput = { kind: 'line'; text: string } | { kind: 'key'; key: TerminalKey }
+
+/**
+ * Send one line or one key to the live pseudo-terminal child `id` names,
+ * so the operator can answer a dialog the child shows (#187).
+ *
+ * Invokes `harness_send_input` with exactly `{ id, input }`. Resolves once
+ * the shell has written the bytes; rejects with a {@link ShellError}
+ * otherwise -- `unknown-process` for an id it does not know,
+ * `input-unavailable` for a run that is not live in a terminal,
+ * `input-not-typeable` or `input-too-large` for a line it refuses, and
+ * `input-write-failed` for a write that failed or did not finish in time.
+ * Nothing is written in any refused case.
+ */
+export async function harnessSendInput(id: ProcessId, input: TerminalInput): Promise<void> {
+  await invoke('harness_send_input', { id, input })
 }
 
 /** Observe a spawned demo harness's current status. */

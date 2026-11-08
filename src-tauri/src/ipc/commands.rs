@@ -3,8 +3,10 @@
 //! commands (`executable_pick_and_probe`, `executable_approve`,
 //! `executable_revoke`, `approvals_list`), and the spike slice-3 built-in
 //! adapter surface (`workspace_pick`, `workspace_current`,
-//! `adapters_list`, and `harness_spawn`'s `kind: "adapter"` case).
-//! Registered next to `shell_health` (`crate::shell_health`).
+//! `adapters_list`, and `harness_spawn`'s `kind: "adapter"` case), plus
+//! `harness_send_input`, which forwards a line or a key to a live
+//! pseudo-terminal run (#187). Registered next to `shell_health`
+//! (`crate::shell_health`).
 //!
 //! No program path or argument vector for a demo-harness request ever
 //! crosses IPC (`docs/spike-log.md` § IPC contract): the renderer names a
@@ -45,7 +47,8 @@ use omnifrons_domain::adapter::{
 use omnifrons_domain::executable::{ApprovalId, DenialReason};
 use omnifrons_domain::outbox::{OutboxFailure, PublishProposal, RunId};
 use omnifrons_domain::scope::ScopeMode;
-use omnifrons_supervisor::TokioProcessSupervisor;
+use omnifrons_domain::terminal_input::TerminalInput;
+use omnifrons_supervisor::{SendInputError, TokioProcessSupervisor};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -57,7 +60,7 @@ use crate::ipc::dto::{
     AdapterDescriptorDto, AdapterEventDto, ApprovalDto, CandidateDto, CandidateIdDto, EvidenceDto,
     HarnessFrame, HarnessKindDto, OutboxReasonTag, OutboxStateTag, OutboxStatusDto, ProbeResultDto,
     ProcessIdDto, ProcessStatusDto, ProcessTerminalStateDto, ShellError, ShellErrorCode,
-    ShellErrorDetail, WorkAreaStateTag, WorkspaceDto,
+    ShellErrorDetail, TerminalInputDto, WorkAreaStateTag, WorkspaceDto,
 };
 use crate::outbox_state::{MAX_PROPOSED_ENTRIES, OutboxState, RunRecord, RunTable};
 use crate::publication_state::PublicationState;
@@ -92,6 +95,27 @@ impl From<SupervisorError> for ShellError {
             ),
         };
         Self::new(code, message)
+    }
+}
+
+impl From<SendInputError> for ShellError {
+    /// Maps every reason `TokioProcessSupervisor::send_input` wrote nothing,
+    /// or not all of it, to a fixed catalogue message (#187). An unknown id
+    /// is the very `unknown-process` error `harness_stop` and
+    /// `harness_observe` give, so the renderer handles a forgotten run one
+    /// way whichever command met it.
+    fn from(error: SendInputError) -> Self {
+        match error {
+            SendInputError::UnknownProcess => Self::from(SupervisorError::UnknownProcess),
+            SendInputError::Unavailable => Self::new(
+                ShellErrorCode::InputUnavailable,
+                "that process has no live terminal to send input to",
+            ),
+            SendInputError::WriteFailed => Self::new(
+                ShellErrorCode::InputWriteFailed,
+                "writing to the terminal failed or timed out, and part of the input may have reached it",
+            ),
+        }
     }
 }
 
@@ -2237,6 +2261,56 @@ pub async fn harness_stop(
     .await
 }
 
+/// Send one line or one key to the pseudo-terminal of the live run `id`, so
+/// the operator can answer a dialog the child shows after its typed prompt
+/// (#187). A line is typed followed by the carriage return the supervisor
+/// appends; a key is written as its fixed bytes. Returns once every byte
+/// was written.
+///
+/// `input` is converted and validated first, so a refused line never
+/// reaches the supervisor. The supervisor decides everything else that can
+/// be refused synchronously, inside a short [`with_supervisor`] call; its
+/// write future borrows nothing and holds no lock, and is awaited after
+/// that call returns, within the supervisor's own bounded wait.
+///
+/// # Errors
+///
+/// Returns [`ShellError`] with [`ShellErrorCode::InputNotTypeable`] if the
+/// line is empty or holds a line break or a byte the terminal would
+/// interpret, [`ShellErrorCode::InputTooLarge`] if it exceeds 1,023 UTF-8
+/// bytes, [`ShellErrorCode::UnknownProcess`] if `id` is not known to the
+/// supervisor, [`ShellErrorCode::InputUnavailable`] if the run is terminal,
+/// has no pseudo-terminal, or its terminal is already closed, and
+/// [`ShellErrorCode::InputWriteFailed`] if the write failed or did not
+/// finish within the bounded wait. Nothing is written in any refused case.
+#[tauri::command]
+pub async fn harness_send_input(
+    app: AppHandle,
+    id: ProcessIdDto,
+    input: TerminalInputDto,
+) -> Result<(), ShellError> {
+    forward_terminal_input(input, |input| async move {
+        with_supervisor(app, move |supervisor| {
+            supervisor.send_input(id.into(), &input)
+        })
+        .await
+        .await
+    })
+    .await
+}
+
+/// `harness_send_input`'s own steps, with the supervisor call injected:
+/// convert `input` into the domain [`TerminalInput`], refusing it before
+/// `send` is ever called, then await `send` and map its error.
+async fn forward_terminal_input<F, W>(input: TerminalInputDto, send: F) -> Result<(), ShellError>
+where
+    F: FnOnce(TerminalInput) -> W,
+    W: std::future::Future<Output = Result<(), SendInputError>>,
+{
+    let input = TerminalInput::try_from(input)?;
+    send(input).await.map_err(ShellError::from)
+}
+
 /// Observe a spawned demo harness's current status.
 ///
 /// # Errors
@@ -2987,6 +3061,163 @@ mod tests {
             "prompt contains control characters a terminal would interpret"
         );
         assert!(!mapped.message.contains('/'));
+    }
+
+    // -- #187: `harness_send_input`'s validation and error mapping --
+
+    /// Each way the supervisor refuses or fails a terminal input maps to
+    /// its own closed code with a fixed, slash-free catalogue message; an
+    /// unknown id is exactly the `unknown-process` error `harness_stop`
+    /// and `harness_observe` give.
+    #[test]
+    fn send_input_errors_map_to_their_own_codes() {
+        use omnifrons_supervisor::SendInputError;
+
+        let cases = [
+            (
+                SendInputError::UnknownProcess,
+                ShellErrorCode::UnknownProcess,
+                "no process with that id is known",
+            ),
+            (
+                SendInputError::Unavailable,
+                ShellErrorCode::InputUnavailable,
+                "that process has no live terminal to send input to",
+            ),
+            (
+                SendInputError::WriteFailed,
+                ShellErrorCode::InputWriteFailed,
+                "writing to the terminal failed or timed out, and part of the input may have reached it",
+            ),
+        ];
+        for (error, code, message) in cases {
+            let mapped = ShellError::from(error);
+            assert_eq!(mapped.code, code, "{error:?}");
+            assert_eq!(mapped.message, message, "{error:?}");
+            assert_eq!(mapped.detail, None, "{error:?}");
+            assert!(!mapped.message.contains('/'), "{error:?}");
+        }
+        assert_eq!(
+            ShellError::from(SendInputError::UnknownProcess),
+            ShellError::from(SupervisorError::UnknownProcess)
+        );
+    }
+
+    /// A line the domain refuses is answered with its code and never
+    /// reaches the supervisor: the send step is not called at all.
+    #[test]
+    fn a_refused_line_never_reaches_the_supervisor() {
+        use omnifrons_domain::terminal_input::TypedLine;
+
+        let cases = [
+            (String::new(), ShellErrorCode::InputNotTypeable),
+            ("yes\nno".to_string(), ShellErrorCode::InputNotTypeable),
+            ("\u{1b}[A".to_string(), ShellErrorCode::InputNotTypeable),
+            (
+                "a".repeat(TypedLine::MAX_BYTES + 1),
+                ShellErrorCode::InputTooLarge,
+            ),
+        ];
+        for (text, code) in cases {
+            let reached = std::cell::Cell::new(false);
+            let error = tauri::async_runtime::block_on(super::forward_terminal_input(
+                crate::ipc::dto::TerminalInputDto::Line { text: text.clone() },
+                |_input| {
+                    reached.set(true);
+                    std::future::ready(Ok(()))
+                },
+            ))
+            .expect_err("a refused line must be refused");
+            assert_eq!(error.code, code, "{text:?}");
+            assert!(!reached.get(), "{text:?} must never reach the supervisor");
+        }
+    }
+
+    /// A valid line or key reaches the send step exactly once, as the
+    /// domain input it converts to, and the step's answer is passed back
+    /// mapped: `null` on success, the mapped code otherwise.
+    #[test]
+    fn a_valid_input_reaches_the_supervisor_once_and_its_answer_is_mapped() {
+        use crate::ipc::dto::{TerminalInputDto, TerminalKeyDto};
+        use omnifrons_domain::terminal_input::{TerminalInput, TerminalKey, TypedLine};
+        use omnifrons_supervisor::SendInputError;
+
+        let inputs = [
+            (
+                TerminalInputDto::Line {
+                    text: "yes, trust it".to_string(),
+                },
+                TerminalInput::Line(TypedLine::new("yes, trust it").expect("typeable")),
+            ),
+            (
+                TerminalInputDto::Key {
+                    key: TerminalKeyDto::Escape,
+                },
+                TerminalInput::Key(TerminalKey::Escape),
+            ),
+        ];
+        let answers = [
+            (Ok(()), None),
+            (
+                Err(SendInputError::UnknownProcess),
+                Some(ShellErrorCode::UnknownProcess),
+            ),
+            (
+                Err(SendInputError::Unavailable),
+                Some(ShellErrorCode::InputUnavailable),
+            ),
+            (
+                Err(SendInputError::WriteFailed),
+                Some(ShellErrorCode::InputWriteFailed),
+            ),
+        ];
+        for (dto, expected) in &inputs {
+            for (answer, code) in answers {
+                let received = std::cell::RefCell::new(Vec::new());
+                let result = tauri::async_runtime::block_on(super::forward_terminal_input(
+                    dto.clone(),
+                    |input| {
+                        received.borrow_mut().push(input);
+                        std::future::ready(answer)
+                    },
+                ));
+                assert_eq!(
+                    *received.borrow(),
+                    std::slice::from_ref(expected),
+                    "{dto:?}"
+                );
+                assert_eq!(result.map_err(|error| error.code).err(), code, "{dto:?}");
+            }
+        }
+    }
+
+    /// Against a real supervisor that runs nothing: a key for an unknown id
+    /// is `unknown-process`, while a refused line for the same id is still
+    /// its own `input-not-typeable` -- the input is validated before the
+    /// supervisor is asked about the id at all.
+    #[test]
+    fn a_real_supervisor_refuses_an_unknown_id_after_the_input_is_validated() {
+        use crate::ipc::dto::{TerminalInputDto, TerminalKeyDto};
+
+        let supervisor = omnifrons_supervisor::TokioProcessSupervisor::new();
+        let unknown = ProcessId(4242);
+        let send = |input: TerminalInputDto| {
+            tauri::async_runtime::block_on(super::forward_terminal_input(input, |input| {
+                supervisor.send_input(unknown, &input)
+            }))
+        };
+
+        let key = send(TerminalInputDto::Key {
+            key: TerminalKeyDto::Enter,
+        })
+        .expect_err("an unknown id is refused");
+        assert_eq!(key.code, ShellErrorCode::UnknownProcess);
+
+        let line = send(TerminalInputDto::Line {
+            text: "yes\rno".to_string(),
+        })
+        .expect_err("a refused line is refused");
+        assert_eq!(line.code, ShellErrorCode::InputNotTypeable);
     }
 
     /// The live forwarder branches on the adapter's transport class alone:

@@ -34,6 +34,7 @@ import {
   guidanceSnapshots,
   guidanceStatus,
   harnessObserve,
+  harnessSendInput,
   harnessSpawn,
   harnessStop,
   isShellError,
@@ -93,6 +94,8 @@ import {
   type ScanSummary,
   type Snapshot,
   type TerminalActionKind,
+  type TerminalInput,
+  type TerminalKey,
   type TransportClass,
   type WorkAreaState,
   type WrongRootReason,
@@ -341,6 +344,77 @@ describe('harnessStop', () => {
 
     expect(result).toEqual({ state: 'killed', code: null })
   })
+})
+
+/** Every token {@link TerminalKey} declares, in the order the panel lays its controls out (#187). */
+const TERMINAL_KEYS = ['enter', 'escape', 'up', 'down', 'left', 'right'] as const
+
+/**
+ * Mocks `harness_send_input` with `answer`, recording the args object of
+ * every call; any other command is a test error.
+ */
+function mockSendInput(answer: () => unknown): unknown[] {
+  const calls: unknown[] = []
+  mockIPC((cmd, args) => {
+    if (cmd === 'harness_send_input') {
+      calls.push(args)
+      return answer()
+    }
+    throw new Error(`unexpected command: ${cmd}`)
+  })
+  return calls
+}
+
+describe('harnessSendInput (#187)', () => {
+  it('invokes harness_send_input with exactly { id, input } for a line, the text unchanged, and resolves to undefined on the shell\'s null', async () => {
+    const calls = mockSendInput(() => null)
+    const input: TerminalInput = { kind: 'line', text: ' yes, trust this folder ' }
+
+    await expect(harnessSendInput(7, input)).resolves.toBeUndefined()
+
+    expect(calls).toEqual([{ id: 7, input: { kind: 'line', text: ' yes, trust this folder ' } }])
+  })
+
+  it.each(TERMINAL_KEYS)(
+    'invokes harness_send_input with exactly { id, input: { kind: "key", key: "%s" } } and resolves to undefined',
+    async (key) => {
+      const calls = mockSendInput(() => null)
+
+      await expect(harnessSendInput(7, { kind: 'key', key })).resolves.toBeUndefined()
+
+      expect(calls).toEqual([{ id: 7, input: { kind: 'key', key } }])
+    },
+  )
+
+  it('rejects with the existing unknown-process ShellError verbatim for an id the shell does not know', async () => {
+    const error: ShellError = { code: 'unknown-process', message: 'no process with that id' }
+    mockSendInput(() => Promise.reject(error))
+
+    await expect(harnessSendInput(99, { kind: 'key', key: 'enter' })).rejects.toEqual(error)
+  })
+})
+
+describe('ShellErrorCode terminal input codes (#187)', () => {
+  it.each([
+    ['input-unavailable', 'the run is not live in a terminal'],
+    ['input-not-typeable', 'the line holds a character the terminal would interpret'],
+    ['input-too-large', 'the line is over 1023 bytes'],
+    ['input-write-failed', 'the write did not finish in time'],
+  ] as const)(
+    'harnessSendInput rejects with the typed %s ShellError verbatim, carrying no detail',
+    async (code, message) => {
+      const error: ShellError = { code, message }
+      mockSendInput(() => Promise.reject(error))
+
+      const rejected: unknown = await harnessSendInput(7, { kind: 'line', text: 'yes' }).catch(
+        (reason: unknown) => reason,
+      )
+
+      expect(rejected).toEqual(error)
+      expect(isShellError(rejected)).toBe(true)
+      expect((rejected as ShellError).detail).toBeUndefined()
+    },
+  )
 })
 
 describe('harnessObserve', () => {
@@ -1638,7 +1712,7 @@ describe('slice 5b closed sets', () => {
     expect(availabilities.map(availabilityLabel)).toEqual(availabilities)
   })
 
-  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes, the three slice 5d codes and the four slice 5e codes and the one ADR-0005 sub-slice 1h code among the forty-six -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
+  it('compile-time guard, enforced by tsc -b in pnpm -r build and not by vitest: a switch over the whole ShellErrorCode union with a never default compiles -- the nine slice 5b codes, the six slice 5c codes, the three slice 5d codes and the four slice 5e codes, the one ADR-0005 sub-slice 1h code and the four #187 terminal input codes among the fifty-three -- and at runtime maps each code to itself; artifact-state is the one closed frame kind of the publish channel', () => {
     function codeLabel(code: ShellErrorCode): string {
       switch (code) {
         case 'unknown-process':
@@ -1690,6 +1764,10 @@ describe('slice 5b closed sets', () => {
         case 'plan-stale':
         case 'launch-panicked':
         case 'launch-timed-out':
+        case 'input-unavailable':
+        case 'input-not-typeable':
+        case 'input-too-large':
+        case 'input-write-failed':
           return code
         default: {
           const unreachable: never = code
@@ -1748,8 +1826,12 @@ describe('slice 5b closed sets', () => {
       'plan-stale',
       'launch-panicked',
       'launch-timed-out',
+      'input-unavailable',
+      'input-not-typeable',
+      'input-too-large',
+      'input-write-failed',
     ]
-    expect(new Set(codes).size).toBe(49)
+    expect(new Set(codes).size).toBe(53)
     expect(codes.map(codeLabel)).toEqual(codes)
     const kind: ArtifactStateFrame['kind'] = 'artifact-state'
     expect(kind).toBe('artifact-state')
@@ -3740,6 +3822,10 @@ const SHELL_ERROR_CODES = [
   'plan-stale',
   'launch-panicked',
   'launch-timed-out',
+  'input-unavailable',
+  'input-not-typeable',
+  'input-too-large',
+  'input-write-failed',
 ] as const
 /** Every token {@link ApprovalStatus} declares. */
 const APPROVAL_STATUSES = ['active', 'revoked'] as const
@@ -3896,7 +3982,9 @@ const _assertions: [
   CoversExactly<DefinitionCreateApplyOutcomeKind, typeof DEFINITION_CREATE_APPLY_OUTCOME_KINDS>,
   CoversExactly<DefinitionSwitchVerdictKind, typeof DEFINITION_SWITCH_VERDICT_KINDS>,
   CoversExactly<DefinitionSwitchUncertainReason, typeof DEFINITION_SWITCH_UNCERTAIN_REASONS>,
+  CoversExactly<TerminalKey, typeof TERMINAL_KEYS>,
 ] = [
+  true,
   true,
   true,
   true,
@@ -3982,6 +4070,7 @@ const MIRRORED_UNIONS: readonly (readonly [string, readonly string[]])[] = [
   ['DefinitionCreateApplyOutcomeDto', DEFINITION_CREATE_APPLY_OUTCOME_KINDS],
   ['DefinitionSwitchVerdictDto', DEFINITION_SWITCH_VERDICT_KINDS],
   ['SwitchUncertainReasonTag', DEFINITION_SWITCH_UNCERTAIN_REASONS],
+  ['TerminalKeyDto', TERMINAL_KEYS],
 ]
 
 describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103)', () => {
@@ -4013,7 +4102,7 @@ describe('closed sets, read out of the shell (slice 5e; re-review R3-102, R3-103
   it('every union this file mirrors from a dto.rs enum is in the table, and the table names no enum twice', () => {
     const enums = MIRRORED_UNIONS.map(([enumName]) => enumName)
     expect(new Set(enums).size).toBe(enums.length)
-    expect(enums).toHaveLength(38)
+    expect(enums).toHaveLength(39)
   })
 })
 
