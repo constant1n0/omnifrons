@@ -295,13 +295,20 @@ fn a_stopped_pty_child_is_unavailable_and_nothing_is_written() {
         block_on(supervisor.send_input(id, &line("too late"))),
         Err(SendInputError::Unavailable)
     );
-    let texts: Vec<String> = frames
-        .iter()
-        .filter_map(|frame| match frame.payload {
-            FramePayload::Text { text, .. } => Some(text),
-            FramePayload::State(_) => None,
-        })
-        .collect();
+    // Bounded like every other wait here: read up to the State frame, so a
+    // sender kept alive for the run can never hang the test binary.
+    let mut texts = Vec::new();
+    let deadline = Instant::now() + OUTPUT_DEADLINE;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let frame = frames.recv_timeout(remaining).unwrap_or_else(|error| {
+            panic!("no State frame within {OUTPUT_DEADLINE:?} ({error}); got {texts:#?}")
+        });
+        match frame.payload {
+            FramePayload::Text { text, .. } => texts.push(text),
+            FramePayload::State(_) => break,
+        }
+    }
     assert!(typed_lines(&texts).is_empty(), "got {texts:#?}");
 
     let _ = std::fs::remove_dir_all(&dir);

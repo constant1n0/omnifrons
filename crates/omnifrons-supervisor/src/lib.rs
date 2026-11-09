@@ -1743,9 +1743,18 @@ impl TokioProcessSupervisor {
     /// [`SendInputError::WriteFailed`] when the write failed or did not
     /// finish within the bounded wait (2 s, including waiting for the
     /// prompt or another input to finish); on timeout the write is
-    /// abandoned before the error is returned. Dropping the future does
+    /// abandoned before the error is returned, but some of its bytes may
+    /// already sit in the terminal's input queue, where the next input
+    /// joins them: nothing can take them back. Dropping the future does
     /// not cancel the write, which stays bounded by the same wait. No
     /// synthetic "stdin write failed" frame is emitted for these writes.
+    ///
+    /// Inputs to one run never interleave with each other or with the
+    /// typed prompt, and none is written before the prompt. Their order is
+    /// the order in which their write tasks take the run's write lock, not
+    /// the order of the calls: a caller that needs call order awaits each
+    /// send before it starts the next (the Agent panel sends one at a
+    /// time).
     ///
     /// Whether the run is live is read from this supervisor's own
     /// bookkeeping as it stands (no reap check is made here): a child that
