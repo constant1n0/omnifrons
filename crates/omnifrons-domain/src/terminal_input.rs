@@ -77,7 +77,9 @@ impl std::fmt::Display for TypedLineError {
             Self::NotTypeable => {
                 "the line holds a line break or a byte the terminal would interpret"
             }
-            Self::TooLarge => "the line exceeds the 4,095-byte canonical-buffer size",
+            Self::TooLarge => {
+                "the line exceeds 1,023 bytes, the most every supported terminal types with its Enter"
+            }
         };
         f.write_str(message)
     }
@@ -95,11 +97,13 @@ impl std::error::Error for TypedLineError {}
 pub struct TypedLine(String);
 
 impl TypedLine {
-    /// The maximum UTF-8 byte length of a line, inclusive: the Linux
-    /// canonical-buffer size, past which the kernel truncates a typed line
-    /// silently (`docs/spike-log.md`, "Interactive input"). Other kernels
-    /// may hold less in canonical mode.
-    pub const MAX_BYTES: usize = 4095;
+    /// The maximum UTF-8 byte length of a line, inclusive. With its Enter
+    /// (`\r`) the line must fit the smallest canonical input queue of the
+    /// supported kernels: macOS's `MAX_INPUT` is 1,024 bytes, and past it
+    /// Darwin drops typed characters, the Enter included, so the line would
+    /// never be submitted. Linux holds 4,096 and truncates silently past
+    /// that (`docs/spike-log.md`, "Interactive input").
+    pub const MAX_BYTES: usize = 1023;
 
     /// Validate and build a line.
     ///
@@ -238,13 +242,21 @@ mod tests {
         }
     }
 
+    /// The line and its Enter must fit macOS's 1,024-byte canonical input
+    /// queue (`MAX_INPUT`), the smallest of the supported kernels: past it
+    /// Darwin drops typed characters, the Enter included.
     #[test]
-    fn a_line_past_the_canonical_buffer_is_refused() {
+    fn a_line_that_with_its_enter_overflows_the_smallest_canonical_buffer_is_refused() {
+        assert_eq!(
+            TypedLine::new("x".repeat(1024)),
+            Err(TypedLineError::TooLarge)
+        );
         assert_eq!(
             TypedLine::new("x".repeat(TypedLine::MAX_BYTES + 1)),
             Err(TypedLineError::TooLarge)
         );
-        assert_eq!(TypedLine::MAX_BYTES + 1, 4096);
+        let longest = TypedLine::new("x".repeat(1023)).expect("1,023 bytes fit with the Enter");
+        assert_eq!(TerminalInput::Line(longest).to_bytes().len(), 1024);
     }
 
     /// Tab is typed literally, multi-byte UTF-8 never matches the rule, and
