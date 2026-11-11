@@ -517,6 +517,36 @@ mod unix_tests {
         }
     }
 
+    /// #186: a script longer than the head the probe reads still has its
+    /// `#!` line recognized (the head read stops at a full buffer, not at
+    /// the end of the file), and a long script for another interpreter
+    /// keeps its identity, hashed whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_script_longer_than_the_read_head_is_judged_by_its_first_line() {
+        let dir = TempDir::new("long-scripts");
+        let prober = FsExecutableProber::new();
+        let body = "console.log('ok');\n".repeat(64);
+
+        let node = format!("#!/usr/bin/env node\n{body}");
+        let node_path = write_file(dir.path(), "long-node", node.as_bytes(), 0o755);
+        let outcome = prober.probe(&node_path);
+        assert!(
+            matches!(outcome, ProbeOutcome::UnsupportedInterpreter),
+            "a {}-byte node script: expected UnsupportedInterpreter, got {outcome:?}",
+            node.len()
+        );
+
+        let shell = format!("#!/bin/sh\n{}", "echo ok\n".repeat(128));
+        let shell_path = write_file(dir.path(), "long-sh", shell.as_bytes(), 0o755);
+        let executable = expect_identity(prober.probe(&shell_path));
+        assert_eq!(executable.identity.size, shell.len() as u64);
+        assert_eq!(
+            &executable.identity.sha256.0[..],
+            &Sha256::digest(shell.as_bytes())[..]
+        );
+    }
+
     /// #186: off Linux an approved executable is spawned by its path,
     /// where node starts normally, so a node script keeps its identity.
     #[cfg(not(target_os = "linux"))]
