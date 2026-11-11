@@ -106,6 +106,9 @@ pub enum ProbeOutcome {
     Unreadable,
     /// The candidate exceeds the probe's size cap.
     TooLarge,
+    /// The candidate is a `#!` script whose interpreter cannot start from
+    /// the sealed copy launched on Linux (today Node.js, #186).
+    UnsupportedInterpreter,
 }
 
 impl ProbeOutcome {
@@ -125,6 +128,7 @@ impl ProbeOutcome {
             Self::NotExecutable => Some(Domain::NotExecutable),
             Self::Unreadable => Some(Domain::Unreadable),
             Self::TooLarge => Some(Domain::TooLarge),
+            Self::UnsupportedInterpreter => Some(Domain::UnsupportedInterpreter),
         }
     }
 }

@@ -34,7 +34,9 @@ only when it appears in such material. A user-level skill path in a transcript, 
 The `pty-cli` leg was bound to Gemini CLI 0.41.2 until 2026-10-31: Google
 retired that CLI for individual accounts after 2026-06-18, and its Node
 launcher cannot run from the app's sealed memfd, so the binding moved to
-Antigravity CLI, which still reads `AGENTS.md` and `GEMINI.md`.
+Antigravity CLI, which still reads `AGENTS.md` and `GEMINI.md`. Since
+#186 the app refuses such a Node launcher when it is picked, naming the
+reason, instead of failing at Start.
 
 ## 1. Prepare
 

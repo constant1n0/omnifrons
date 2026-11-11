@@ -25,6 +25,8 @@ use omnifrons_app::{ExecHandle, ExecutableProber, ProbeOutcome, ProbedExecutable
 use omnifrons_domain::executable::{
     ExecutableIdentity, ExecutablePresence, PlatformEvidence, Sha256Digest,
 };
+#[cfg(target_os = "linux")]
+use omnifrons_domain::executable::{SHEBANG_LINE_BYTES, is_node_script};
 use sha2::{Digest, Sha256};
 
 /// The maximum size this prober will hash. A candidate strictly larger is
@@ -242,9 +244,20 @@ fn build_identity(
 ) -> ProbeOutcome {
     #[cfg(target_os = "linux")]
     {
-        let Ok((sha256, handle)) = hash_into_sealed_memfd(file) else {
+        let Ok((sha256, sealed)) = hash_into_sealed_memfd(file) else {
             return ProbeOutcome::Unreadable;
         };
+        // #186: the supervisor launches this sealed copy through
+        // `/proc/self/fd/<n>`, where node cannot start. Read the head of
+        // the copy itself, so the bytes inspected are exactly the bytes
+        // that would be launched.
+        let Ok(head) = read_sealed_head(&sealed) else {
+            return ProbeOutcome::Unreadable;
+        };
+        if is_node_script(&head) {
+            return ProbeOutcome::UnsupportedInterpreter;
+        }
+        let handle = ExecHandle::SealedMemory(sealed);
         ProbeOutcome::Identity(ProbedExecutable {
             identity: ExecutableIdentity {
                 canonical_path,
@@ -294,7 +307,7 @@ fn hash_file(mut file: &File) -> std::io::Result<Sha256Digest> {
 
 /// Linux only: stream-hash `source`'s content while copying it into a
 /// fresh, sealed `memfd`, returning both the digest and the sealed
-/// handle.
+/// file.
 ///
 /// The `memfd` is created with `MFD_CLOEXEC` (never inherited across an
 /// unrelated `exec` before the supervisor deliberately clears that flag
@@ -310,7 +323,7 @@ fn hash_file(mut file: &File) -> std::io::Result<Sha256Digest> {
 /// Returns any `io::Error` reading `source`, creating the `memfd`,
 /// writing into it, or applying the seal can produce.
 #[cfg(target_os = "linux")]
-fn hash_into_sealed_memfd(mut source: File) -> std::io::Result<(Sha256Digest, ExecHandle)> {
+fn hash_into_sealed_memfd(mut source: File) -> std::io::Result<(Sha256Digest, File)> {
     use std::io::Write as _;
 
     use nix::fcntl::{FcntlArg, SealFlag, fcntl};
@@ -347,7 +360,33 @@ fn hash_into_sealed_memfd(mut source: File) -> std::io::Result<(Sha256Digest, Ex
     .map_err(std::io::Error::from)?;
 
     let digest: [u8; 32] = hasher.finalize().into();
-    Ok((Sha256Digest(digest), ExecHandle::SealedMemory(sealed)))
+    Ok((Sha256Digest(digest), sealed))
+}
+
+/// Linux only: the first [`SHEBANG_LINE_BYTES`] of the sealed copy, or all
+/// of it when it is shorter, read with `pread` from offset 0 so the
+/// copy's own file offset is left as it was.
+///
+/// # Errors
+///
+/// Returns any `io::Error` other than `Interrupted` that reading the
+/// sealed copy produces.
+#[cfg(target_os = "linux")]
+fn read_sealed_head(sealed: &File) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut head = vec![0u8; SHEBANG_LINE_BYTES];
+    let mut filled = 0;
+    while filled < head.len() {
+        match sealed.read_at(&mut head[filled..], filled as u64) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    head.truncate(filled);
+    Ok(head)
 }
 
 /// R3-005: `is_windows_executable_extension` is a pure function with no

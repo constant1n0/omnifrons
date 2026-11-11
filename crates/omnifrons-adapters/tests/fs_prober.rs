@@ -491,6 +491,79 @@ mod unix_tests {
         }
     }
 
+    /// #186: on Linux the app launches the sealed copy through
+    /// `/proc/self/fd/<n>`, and node cannot start from it (it resolves its
+    /// entry file's real path and finds `/memfd:… (deleted)`), so a node
+    /// script is refused before it can be approved or started.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_node_script_is_refused_as_an_unsupported_interpreter_on_linux() {
+        let dir = TempDir::new("node-script");
+        let prober = FsExecutableProber::new();
+        let scripts: [(&str, &[u8]); 2] = [
+            ("env-node", b"#!/usr/bin/env node\nconsole.log('ok')\n"),
+            ("direct-node", b"#!/usr/bin/node\nconsole.log('ok')\n"),
+        ];
+
+        for (name, contents) in scripts {
+            let path = write_file(dir.path(), name, contents, 0o755);
+
+            let outcome = prober.probe(&path);
+
+            assert!(
+                matches!(outcome, ProbeOutcome::UnsupportedInterpreter),
+                "{name}: expected UnsupportedInterpreter, got {outcome:?}"
+            );
+        }
+    }
+
+    /// #186: off Linux an approved executable is spawned by its path,
+    /// where node starts normally, so a node script keeps its identity.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_node_script_keeps_its_identity_off_linux() {
+        let dir = TempDir::new("node-script-off-linux");
+        let contents = b"#!/usr/bin/env node\nconsole.log('ok')\n";
+        let path = write_file(dir.path(), "env-node", contents, 0o755);
+
+        let executable = expect_identity(FsExecutableProber::new().probe(&path));
+
+        assert_eq!(executable.identity.size, contents.len() as u64);
+    }
+
+    /// #186: only node is refused. Scripts for interpreters that start from
+    /// the sealed copy (sh, bash, python3, perl were checked), and a shell
+    /// wrapper that runs node on a later line, keep their identity.
+    #[test]
+    fn scripts_for_other_interpreters_keep_their_identity() {
+        let dir = TempDir::new("other-interpreters");
+        let prober = FsExecutableProber::new();
+        let scripts: [(&str, &[u8]); 5] = [
+            ("sh", b"#!/bin/sh\necho ok\n"),
+            ("bash", b"#!/usr/bin/env bash\necho ok\n"),
+            ("python3", b"#!/usr/bin/env python3\nprint('ok')\n"),
+            ("perl", b"#!/usr/bin/perl\nprint \"ok\\n\";\n"),
+            ("sh-wrapper", b"#!/bin/sh\nexec node \"$0.js\"\n"),
+        ];
+
+        for (name, contents) in scripts {
+            let path = write_file(dir.path(), name, contents, 0o755);
+
+            let executable = expect_identity(prober.probe(&path));
+
+            assert_eq!(
+                executable.identity.size,
+                contents.len() as u64,
+                "{name}: the identity must describe the whole script"
+            );
+            assert_eq!(
+                &executable.identity.sha256.0[..],
+                &Sha256::digest(contents)[..],
+                "{name}: the identity must hash the whole script"
+            );
+        }
+    }
+
     // R1-001(b) (a symlink placed at the canonical path *after*
     // canonicalization is refused) is tested directly against the
     // private `open_checked` helper, not through the public `probe` entry

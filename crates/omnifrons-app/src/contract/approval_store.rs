@@ -149,6 +149,7 @@ impl ExecutableProber for FakeProber {
             ScriptedProbeOutcome::NotExecutable => ProbeOutcome::NotExecutable,
             ScriptedProbeOutcome::Unreadable => ProbeOutcome::Unreadable,
             ScriptedProbeOutcome::TooLarge => ProbeOutcome::TooLarge,
+            ScriptedProbeOutcome::UnsupportedInterpreter => ProbeOutcome::UnsupportedInterpreter,
         }
     }
 }

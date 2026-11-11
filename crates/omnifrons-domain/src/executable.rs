@@ -143,6 +143,91 @@ pub enum ProbeOutcome {
     Unreadable,
     /// The candidate exceeds the probe's size cap.
     TooLarge,
+    /// The candidate is a `#!` script whose interpreter cannot start from
+    /// the sealed copy the app launches on Linux: today Node.js, see
+    /// [`is_node_script`] (#186). Only a Linux probe reports it.
+    UnsupportedInterpreter,
+}
+
+/// How many bytes of a `#!` line the Linux kernel reads
+/// (`BINPRM_BUF_SIZE`): an interpreter or argument past this limit is
+/// never seen.
+pub const SHEBANG_LINE_BYTES: usize = 256;
+
+/// Whether `head`, an executable's leading bytes, is a Node.js script:
+/// its `#!` line names `node` (or Debian's `nodejs`) as the interpreter,
+/// directly or through `env`.
+///
+/// Node cannot start from the sealed copy the app launches on Linux
+/// through `/proc/self/fd/<n>`: it resolves its entry file's real path and
+/// finds `/memfd:… (deleted)` (#186). Scripts for sh, bash, python3 and
+/// perl were checked and start there, so only node is recognized.
+///
+/// The line is read as the kernel reads it: at most
+/// [`SHEBANG_LINE_BYTES`], up to the first line feed; the interpreter is
+/// the first word after `#!` (spaces and tabs skipped), and the rest of
+/// the line is its argument. For `env`, the program is the argument's
+/// first word that is neither an option (with the value of `-u`, `-C`,
+/// `-P`, `-a`, `--unset`, `--chdir` and `--argv0` skipped, also at the end
+/// of a cluster such as `-iu`) nor a `NAME=VALUE` assignment, as `env -S`
+/// splits it.
+#[must_use]
+pub fn is_node_script(head: &[u8]) -> bool {
+    let head = &head[..head.len().min(SHEBANG_LINE_BYTES)];
+    let Some(rest) = head.strip_prefix(b"#!") else {
+        return false;
+    };
+    let line = rest.split(|&byte| byte == b'\n').next().unwrap_or(&[]);
+    let mut words = line
+        .split(|&byte| byte == b' ' || byte == b'\t')
+        .filter(|word| !word.is_empty());
+    let Some(interpreter) = words.next() else {
+        return false;
+    };
+    match file_name(interpreter) {
+        b"env" => env_program(words).is_some_and(|program| is_node_name(file_name(program))),
+        name => is_node_name(name),
+    }
+}
+
+/// The program `env` runs, given the words of its argument: the first word
+/// that is neither an option (nor an option's value) nor a `NAME=VALUE`
+/// assignment.
+fn env_program<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> Option<&'a [u8]> {
+    while let Some(word) = words.next() {
+        if value_is_next_word(word) {
+            words.next();
+        } else if !word.starts_with(b"-") && !word.contains(&b'=') {
+            return Some(word);
+        }
+    }
+    None
+}
+
+/// Whether `word` is an `env` option whose value is the next word:
+/// `--unset`, `--chdir` or `--argv0`, or a cluster of short options whose
+/// first value-taking letter (`u`, `C`, `P`, `a`) ends it, as in `-u` or
+/// `-iu`. When such a letter is not last, the rest of the cluster is its
+/// value (`-uNAME`), and the next word is not consumed.
+fn value_is_next_word(word: &[u8]) -> bool {
+    match word {
+        b"--unset" | b"--chdir" | b"--argv0" => true,
+        [b'-', letters @ ..] if letters.first().is_some_and(|&letter| letter != b'-') => letters
+            .iter()
+            .position(|letter| matches!(letter, b'u' | b'C' | b'P' | b'a'))
+            .is_some_and(|at| at + 1 == letters.len()),
+        _ => false,
+    }
+}
+
+/// The last component of a `/`-separated path.
+fn file_name(path: &[u8]) -> &[u8] {
+    path.rsplit(|&byte| byte == b'/').next().unwrap_or(path)
+}
+
+/// Whether `name` is the file name of the Node.js binary.
+fn is_node_name(name: &[u8]) -> bool {
+    name == b"node" || name == b"nodejs"
 }
 
 /// An approval's opaque identifier, stable across the approval's lifetime
@@ -272,7 +357,8 @@ pub enum PublicToken {
     /// re-probe could not even read it.
     Uncertain,
     /// The re-probe determined the candidate cannot be an executable at
-    /// all (not a regular file, not executable, or over the size cap).
+    /// all (not a regular file, not executable, over the size cap, or a
+    /// script whose interpreter cannot start from the sealed copy).
     Failed,
 }
 
@@ -281,7 +367,8 @@ impl DenialReason {
     /// `docs/spike-log.md` § Slice 2's mapping:
     /// `Unapproved`/`ShadowedPath`/`Revoked`/`ChangedSinceApproval` ->
     /// `Untrusted`; `ProbeFailed(Unreadable)` -> `Uncertain`;
-    /// `ProbeFailed(NotRegularFile|NotExecutable|TooLarge)` -> `Failed`.
+    /// `ProbeFailed(NotRegularFile|NotExecutable|TooLarge|UnsupportedInterpreter)`
+    /// -> `Failed`.
     #[must_use]
     pub fn public_token(&self) -> PublicToken {
         match self {
@@ -300,6 +387,7 @@ impl DenialReason {
                 ProbeOutcome::NotRegularFile
                 | ProbeOutcome::NotExecutable
                 | ProbeOutcome::TooLarge
+                | ProbeOutcome::UnsupportedInterpreter
                 | ProbeOutcome::Identity(_) => PublicToken::Failed,
             },
         }
@@ -429,6 +517,10 @@ mod tests {
                 DenialReason::ProbeFailed(ProbeOutcome::TooLarge),
                 PublicToken::Failed,
             ),
+            (
+                DenialReason::ProbeFailed(ProbeOutcome::UnsupportedInterpreter),
+                PublicToken::Failed,
+            ),
         ];
 
         for (reason, expected) in cases {
@@ -453,5 +545,77 @@ mod tests {
         assert_exhaustive(PublicToken::Untrusted);
         assert_exhaustive(PublicToken::Uncertain);
         assert_exhaustive(PublicToken::Failed);
+    }
+
+    /// #186: a `#!` line whose interpreter is node, named directly or
+    /// through `env` (with its options, assignments and `-S`), is a node
+    /// script.
+    #[test]
+    fn a_shebang_that_runs_node_is_a_node_script() {
+        let heads: [&[u8]; 13] = [
+            b"#!/usr/bin/env node\nconsole.log('ok')\n",
+            b"#!/usr/bin/node\n",
+            b"#! /usr/local/bin/node\n",
+            b"#!\t/usr/bin/env\tnode\n",
+            b"#!/usr/bin/env -S node --no-warnings\n",
+            b"#!/usr/bin/env -S -u NODE_OPTIONS node\n",
+            b"#!/usr/bin/env -S -uNODE_OPTIONS node\n",
+            b"#!/usr/bin/env -S --unset NODE_OPTIONS node\n",
+            b"#!/usr/bin/env -S NODE_ENV=production node\n",
+            b"#!/usr/bin/env -- node\n",
+            b"#!/usr/bin/env node",
+            b"#!/usr/bin/nodejs\n",
+            b"#!/usr/bin/env nodejs\n",
+        ];
+        for head in heads {
+            assert!(
+                is_node_script(head),
+                "{:?} must be a node script",
+                String::from_utf8_lossy(head)
+            );
+        }
+    }
+
+    /// #186: only node is refused. Other interpreters, a shell wrapper
+    /// that runs node on a later line, native binaries and files with no
+    /// `#!` line are not node scripts.
+    #[test]
+    fn other_interpreters_binaries_and_plain_files_are_not_node_scripts() {
+        let heads: [&[u8]; 16] = [
+            b"#!/usr/bin/env -S -iu node sh\n",
+            b"#!/usr/bin/env -S -iC /srv/node sh\n",
+            b"#!/usr/bin/env -S --argv0 node sh\n",
+            b"#!/bin/sh\necho ok\n",
+            b"#!/usr/bin/env bash\n",
+            b"#!/usr/bin/env python3\n",
+            b"#!/usr/bin/perl\n",
+            b"#!/usr/bin/env nodemon\n",
+            b"#!/opt/node/bin/python3\n",
+            b"#!/usr/bin/env -S deno run\n",
+            b"#!/bin/sh\nexec node \"$0.js\"\n",
+            b"\x7fELF\x02\x01\x01\x00",
+            b"console.log('no shebang')\n",
+            b"",
+            b"#!",
+            b"#!/usr/bin/env\n",
+        ];
+        for head in heads {
+            assert!(
+                !is_node_script(head),
+                "{:?} must not be a node script",
+                String::from_utf8_lossy(head)
+            );
+        }
+    }
+
+    /// #186: the kernel reads at most [`SHEBANG_LINE_BYTES`] of the `#!`
+    /// line, so a word past that limit never names the interpreter.
+    #[test]
+    fn a_word_past_the_shebang_line_limit_is_ignored() {
+        let mut head = b"#!/usr/bin/env".to_vec();
+        head.resize(SHEBANG_LINE_BYTES + 10, b' ');
+        head.extend_from_slice(b"node\n");
+
+        assert!(!is_node_script(&head));
     }
 }

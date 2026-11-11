@@ -1988,6 +1988,12 @@ impl ShellError {
                 ShellErrorCode::TooLarge,
                 "the executable exceeds the size limit",
             ),
+            // #186: kept under `not-executable`, so the renderer's code
+            // list is unchanged; the message names the reason.
+            ProbeOutcome::UnsupportedInterpreter => Self::new(
+                ShellErrorCode::NotExecutable,
+                "the target is a Node.js script, which cannot start from the sealed copy this app launches on Linux",
+            ),
             // Never actually produced by a real probe or a real
             // `DenialReason::ProbeFailed` (both only ever wrap a genuine
             // failure outcome) -- folded in defensively so this mapping
@@ -3676,6 +3682,10 @@ mod tests {
             .message,
             ShellError::from_probe_failure(&omnifrons_domain::executable::ProbeOutcome::TooLarge)
                 .message,
+            ShellError::from_probe_failure(
+                &omnifrons_domain::executable::ProbeOutcome::UnsupportedInterpreter,
+            )
+            .message,
             ShellError::new(
                 ShellErrorCode::Unapproved,
                 "this executable has not been approved",
@@ -3704,6 +3714,29 @@ mod tests {
                 "catalogue message must contain no '/', got: {message}"
             );
         }
+    }
+
+    /// #186: a node script keeps the existing `not-executable` code, so the
+    /// renderer's code list is unchanged, and its message names the
+    /// reason; a file that is not executable keeps its own message.
+    #[test]
+    fn an_unsupported_interpreter_is_not_executable_with_its_own_message() {
+        use omnifrons_domain::executable::ProbeOutcome;
+
+        let node = ShellError::from_probe_failure(&ProbeOutcome::UnsupportedInterpreter);
+        assert_eq!(node.code, ShellErrorCode::NotExecutable);
+        assert_eq!(
+            node.message,
+            "the target is a Node.js script, which cannot start from the sealed copy this app launches on Linux"
+        );
+        assert!(node.detail.is_none());
+
+        let plain = ShellError::from_probe_failure(&ProbeOutcome::NotExecutable);
+        assert_eq!(plain.code, ShellErrorCode::NotExecutable);
+        assert_eq!(
+            plain.message,
+            "the target is not a regular, executable file"
+        );
     }
 
     #[test]

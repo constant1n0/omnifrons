@@ -104,6 +104,35 @@ fn shadowed_path_is_denied_with_both_paths() {
     }
 }
 
+/// #186: an executable approved before the probe refused node scripts is
+/// denied at Start, carrying the re-probe's reason.
+#[test]
+fn an_approval_whose_re_probe_finds_a_node_script_is_denied() {
+    let target = identity("/opt/tool/cli.js", 100, 1);
+    let prober = FakeProber::always(ProbeOutcome::UnsupportedInterpreter);
+    let mut gate = LaunchGate::new(
+        prober,
+        InMemoryApprovalStore::new(),
+        FixedClock::new(SystemTime::UNIX_EPOCH),
+    );
+
+    let record = gate
+        .approve_candidate(target)
+        .expect("approving a candidate records it without probing");
+
+    let decision = gate.decide(record.approval_id);
+
+    assert!(
+        matches!(
+            decision,
+            GateDecision::Denied(DenialReason::ProbeFailed(
+                ProbeOutcome::UnsupportedInterpreter
+            ))
+        ),
+        "expected ProbeFailed(UnsupportedInterpreter), got {decision:?}"
+    );
+}
+
 #[test]
 fn revoked_approval_is_denied() {
     let target = identity("/opt/tool/app", 100, 1);
