@@ -404,6 +404,8 @@ struct SelfExitReaper {
     /// Notified by the child's last reader to finish.
     readers_done: Arc<tokio::sync::Notify>,
     id: ProcessId,
+    /// The child's start time, read by `finish_spawn` right after spawn.
+    started: ChildStart,
     /// The claim `finish_spawn` took for this reaper, if it got one.
     claim: Option<output_capture::ClaimToken>,
 }
@@ -681,10 +683,7 @@ impl SelfExitReaper {
                     if let Some(handle) = refresh.take() {
                         census = adopt_refresh(census, handle).await;
                     }
-                    let id = self.id;
-                    // Not running any more: no longer this reaper's to
-                    // reap, and nothing is trusted.
-                    let started = running_start(&self.children, id).flatten();
+                    let (id, started) = (self.id, self.started);
                     tokio::task::spawn_blocking(move || {
                         take_exit_group(id, started, ExitCensus::Exited(Vec::new()))
                     })
@@ -1146,7 +1145,9 @@ fn take_exit_census(id: ProcessId, started: ChildStart) -> ExitCensus {
 type ChildStart = Option<u64>;
 
 /// The start time recorded at spawn for `id`, if it is tracked as running
-/// (`None` otherwise). Takes `children` only for this read.
+/// (`None` otherwise), for `observe`. Takes `children` only for this read;
+/// the self-exit reaper is handed the value at spawn instead, so its
+/// `Exited` branch never waits for the table.
 fn running_start(
     children: &Mutex<HashMap<ProcessId, Tracked>>,
     id: ProcessId,
@@ -2124,7 +2125,7 @@ impl TokioProcessSupervisor {
         // From spawn, not from the readers' end: a descendant that inherited
         // the output can keep the readers running long after the child has
         // exited. Spawned only now, with the entry in `children` to poll.
-        self.spawn_on_runtime(self.reaper(id, readers_done, claim).run());
+        self.spawn_on_runtime(self.reaper(id, readers_done, claim, started).run());
 
         tracing::debug!(program = %program_label, pid, "spawned process");
         Ok(id)
@@ -2137,6 +2138,7 @@ impl TokioProcessSupervisor {
         id: ProcessId,
         readers_done: Arc<tokio::sync::Notify>,
         claim: Option<output_capture::ClaimToken>,
+        started: ChildStart,
     ) -> SelfExitReaper {
         SelfExitReaper {
             children: Arc::clone(&self.inner.children),
@@ -2149,6 +2151,7 @@ impl TokioProcessSupervisor {
             outputs: Arc::clone(&self.inner.outputs),
             readers_done,
             id,
+            started,
             claim,
         }
     }
@@ -3434,6 +3437,11 @@ mod self_exit_tests {
             .expect("the held refresh must walk");
         std::fs::write(&end, b"").expect("the end file must be written");
         wait_until_not_running(id.0, Duration::from_secs(2));
+        // Released only once the reaper has had time to read the exit
+        // (it polls every 5 ms): released earlier, the walk could finish
+        // first and be adopted at the top of the loop, the path that
+        // existed before this fix.
+        std::thread::sleep(Duration::from_millis(200));
         drop(release);
 
         while let Ok(frame) = frames.recv_timeout(Duration::from_secs(10)) {
