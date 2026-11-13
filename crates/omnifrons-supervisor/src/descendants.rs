@@ -52,8 +52,9 @@
 //!   requested, as when each child walked for itself, and the next refresh
 //!   is timed from that request, not from the start of the walk folded, so
 //!   the window above is unchanged; refreshes that queue behind the walk in
-//!   flight share the next one, so the walks do not multiply with the
-//!   children. Measured
+//!   flight share the next one, so the cost grows with the children far
+//!   less than the walks would (a refresh that overlaps no walk still takes
+//!   its own). Measured
 //!   with `tests/census_cost.rs` (#197; release build, about 1,400 host
 //!   processes, one walk about 20 ms): 16 children in their first minute
 //!   cost about 1.5 CPU cores when each walked for itself, and about 0.2

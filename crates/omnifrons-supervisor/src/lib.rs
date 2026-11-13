@@ -3754,53 +3754,80 @@ mod self_exit_tests {
     }
 
     /// #197: the walks of `/proc` are shared by every running child of a
-    /// supervisor, so their number does not grow with the number of
-    /// children. Eight children refreshing every 50 ms for a second would
-    /// make about 160 walks if each walked on its own; shared, a period
-    /// takes at most the walk in flight and the next one, which every
-    /// refresh that queued behind it folds.
+    /// supervisor. A refresh requested while a walk is in flight waits for
+    /// it, does not fold it (it started before the request), and folds the
+    /// next walk, which every refresh queued behind the same walk shares:
+    /// eight children whose refreshes all queue behind one held walk take
+    /// one walk between them once it ends.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_proc_walks_do_not_multiply_with_the_children() {
+    fn the_refreshes_queued_behind_a_walk_share_the_next_one() {
         const CHILDREN: usize = 8;
-        const PERIOD: Duration = Duration::from_millis(50);
-        const WINDOW: Duration = Duration::from_secs(1);
-        let pacing = ReapPacing {
-            census_refresh: PERIOD,
-            ..HELD_WALK_PACING
-        };
-        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        // Held before any child exists: the spawn censuses walk on their own,
+        // and every first refresh (1 s after it) is requested while it is in
+        // flight.
+        let other = omnifrons_app::ProcessId(u32::MAX - 1971);
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: other.0,
+                walked: walked_tx,
+                release: release_rx,
+            },
+        );
+        let mut supervisor = TokioProcessSupervisor::build_with(None, HELD_WALK_PACING);
+        let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        let holder = std::thread::spawn(move || drop(walks.walk(other)));
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other walk must be held");
         let ids: Vec<u32> = (0..CHILDREN)
             .map(|_| {
                 supervisor
-                    .spawn(ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 5"]))
+                    .spawn(ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 10"]))
                     .expect("spawning sh must succeed")
                     .0
             })
             .collect();
-        let walks = || {
-            super::PROC_WALKS
+        let count = |table: &std::sync::Mutex<Vec<u32>>| {
+            table
                 .lock()
-                .expect("walk counter poisoned")
+                .expect("counter poisoned")
                 .iter()
                 .filter(|pid| ids.contains(pid))
                 .count()
         };
-        // Past every spawn census, then one window.
+        // Each child's spawn census and first refresh.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while count(&super::CENSUS_TAKES) < 2 * CHILDREN {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "every child must request its first refresh"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Each refresh is counted just before it asks for a walk: give the
+        // last one time to be waiting.
+        std::thread::sleep(Duration::from_millis(50));
+        let queued = count(&super::PROC_WALKS);
+        drop(release);
+        holder.join().expect("the other walk must end");
+        // Well before any second refresh, due 1 s after the first.
         std::thread::sleep(Duration::from_millis(300));
-        let before = walks();
-        std::thread::sleep(WINDOW);
-        let during = walks() - before;
+        let after = count(&super::PROC_WALKS);
         for id in &ids {
             let _ = supervisor.stop(omnifrons_app::ProcessId(*id), Duration::from_secs(5));
         }
 
-        let periods = usize::try_from(WINDOW.as_millis() / PERIOD.as_millis()).unwrap_or(0);
-        assert!(during > 0, "the children must still be walked for");
-        assert!(
-            during <= 2 * periods + 5,
-            "{during} walks in {WINDOW:?} for {CHILDREN} children: at most about {} expected",
-            2 * periods
+        assert_eq!(
+            queued, 0,
+            "no child may walk while the other walk is in flight"
+        );
+        assert_eq!(
+            after, 1,
+            "the {CHILDREN} refreshes queued behind one walk must share the next one"
         );
     }
 
