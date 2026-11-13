@@ -587,21 +587,26 @@ fn member_still_in_group_in(proc_root: &Path, pgid: Pid, members: &[Identity]) -
 /// and reaps only after this walk. Until then the zombie holds its pid,
 /// which is also its group's id, so no other process can have been given
 /// that id: whatever this walk finds in the group is in the original group.
-/// The walk trusts no one unless it sees the child itself as a zombie --
-/// still running, it has not exited; gone, its pid may already be reused
-/// -- and the zombie itself is never a member.
-pub(crate) fn exit_group_census(child: Pid) -> Vec<Identity> {
-    exit_group_census_in(Path::new(PROC_ROOT), child)
+/// The walk trusts no one unless it sees the child itself as a zombie with
+/// the start time `started` recorded for it at spawn ([`start_time`]) --
+/// still running, it has not exited; gone, its pid may already be reused;
+/// a zombie with another start time is another process, given the pid
+/// after a reap this supervisor did not make (a foreign reaper in the host
+/// process); with no start time recorded, nothing proves which process the
+/// zombie is -- and the zombie itself is never a member.
+pub(crate) fn exit_group_census(child: Pid, started: Option<u64>) -> Vec<Identity> {
+    exit_group_census_in(Path::new(PROC_ROOT), child, started)
 }
 
-fn exit_group_census_in(proc_root: &Path, child: Pid) -> Vec<Identity> {
+fn exit_group_census_in(proc_root: &Path, child: Pid, started: Option<u64>) -> Vec<Identity> {
     let Ok(table) = read_table(proc_root) else {
         return Vec::new();
     };
-    // Not seen as a zombie -- still running, or gone -- proves nothing.
+    // Not seen as the child's own zombie -- still running, gone, or another
+    // process under its pid -- proves nothing.
     if table
         .get(&child)
-        .is_none_or(|stat| stat.state != ZOMBIE_STATE)
+        .is_none_or(|stat| stat.state != ZOMBIE_STATE || Some(stat.starttime) != started)
     {
         return Vec::new();
     }
@@ -615,6 +620,23 @@ fn exit_group_census_in(proc_root: &Path, child: Pid) -> Vec<Identity> {
         .collect();
     members.sort_by_key(|identity| identity.pid.as_raw());
     members
+}
+
+/// The start time (`proc(5)` field 22) of `pid`, if its entry can be read.
+///
+/// Read for the child right after spawn: until this supervisor reaps it,
+/// the child (or its zombie) keeps its pid, so the value read then is the
+/// child's own, and the exit census compares the zombie's against it
+/// ([`exit_group_census`]).
+pub(crate) fn start_time(pid: Pid) -> Option<u64> {
+    start_time_in(Path::new(PROC_ROOT), pid)
+}
+
+fn start_time_in(proc_root: &Path, pid: Pid) -> Option<u64> {
+    read_stat(proc_root, pid)
+        .ok()
+        .flatten()
+        .map(|stat| stat.starttime)
 }
 
 /// The command name (`proc(5)` field 2, `comm`) of `pid`, if it can still
@@ -1235,7 +1257,7 @@ mod tests {
             .entry(102, 'S', 1, 100, 12) // orphaned at once, still in its group
             .entry(103, 'Z', 1, 100, 13) // already terminated
             .entry(200, 'S', 1, 200, 20); // unrelated
-        let trusted = exit_group_census_in(at_exit.path(), pid(100));
+        let trusted = exit_group_census_in(at_exit.path(), pid(100), Some(10));
         assert_eq!(trusted, vec![identity(102, 12)]);
 
         let after_reap = ProcRoot::new("zombie-group-later");
@@ -1262,11 +1284,29 @@ mod tests {
         running
             .entry(100, 'S', 1, 100, 10)
             .entry(102, 'S', 100, 100, 12);
-        assert!(exit_group_census_in(running.path(), pid(100)).is_empty());
+        assert!(exit_group_census_in(running.path(), pid(100), Some(10)).is_empty());
 
         let reaped = ProcRoot::new("exit-census-reaped");
         reaped.entry(102, 'S', 1, 100, 12);
-        assert!(exit_group_census_in(reaped.path(), pid(100)).is_empty());
+        assert!(exit_group_census_in(reaped.path(), pid(100), Some(10)).is_empty());
+    }
+
+    /// #197: the zombie must also carry the start time recorded for the
+    /// child at spawn. A zombie with another one is a different process,
+    /// given the pid after a reap this supervisor did not make (a foreign
+    /// reaper in the host process), and its group is not the run's; with no
+    /// start time recorded, nothing proves which process the zombie is.
+    #[test]
+    fn the_exit_census_trusts_no_one_unless_the_zombie_has_the_childs_start_time() {
+        let root = ProcRoot::new("exit-census-start-time");
+        root.entry(100, 'Z', 1, 100, 10).entry(102, 'S', 1, 100, 12);
+
+        assert_eq!(
+            exit_group_census_in(root.path(), pid(100), Some(10)),
+            vec![identity(102, 12)]
+        );
+        assert!(exit_group_census_in(root.path(), pid(100), Some(99)).is_empty());
+        assert!(exit_group_census_in(root.path(), pid(100), None).is_empty());
     }
 
     #[test]

@@ -674,8 +674,11 @@ impl SelfExitReaper {
             let exit = match peek_exit(self.id) {
                 ExitCensus::Exited(_) => {
                     let id = self.id;
+                    // Not running any more: no longer this reaper's to
+                    // reap, and nothing is trusted.
+                    let started = running_start(&self.children, id).flatten();
                     tokio::task::spawn_blocking(move || {
-                        take_exit_group(id, ExitCensus::Exited(Vec::new()))
+                        take_exit_group(id, started, ExitCensus::Exited(Vec::new()))
                     })
                     .await
                     .unwrap_or(ExitCensus::Exited(Vec::new()))
@@ -858,7 +861,7 @@ impl SelfExitReaper {
             let Some(tracked) = children.get_mut(&self.id) else {
                 return ReapAttempt::Finished;
             };
-            let Tracked::Running(child) = tracked else {
+            let Tracked::Running(child, _) = tracked else {
                 return ReapAttempt::ReapedElsewhere;
             };
             // Checked with `children` held (the only nesting of the two
@@ -1111,18 +1114,52 @@ fn peek_exit(id: ProcessId) -> ExitCensus {
 /// Fill an `Exited` census with the members of the child's process group,
 /// read while the zombie still holds the group's id
 /// (`descendants::exit_group_census`). Blocking: a procfs walk.
-fn take_exit_group(id: ProcessId, census: ExitCensus) -> ExitCensus {
+fn take_exit_group(id: ProcessId, started: ChildStart, census: ExitCensus) -> ExitCensus {
     #[cfg(target_os = "linux")]
     if matches!(census, ExitCensus::Exited(_)) {
-        return ExitCensus::Exited(descendants::exit_group_census(pid_of(id)));
+        return ExitCensus::Exited(descendants::exit_group_census(pid_of(id), started));
     }
-    let _ = id;
+    let _ = (id, started);
     census
 }
 
 /// [`peek_exit`] then [`take_exit_group`], in one blocking call.
-fn take_exit_census(id: ProcessId) -> ExitCensus {
-    take_exit_group(id, peek_exit(id))
+fn take_exit_census(id: ProcessId, started: ChildStart) -> ExitCensus {
+    take_exit_group(id, started, peek_exit(id))
+}
+
+/// The child's start time (`proc(5)` field 22), read right after spawn:
+/// the exit census trusts the group of a zombie only when the zombie has
+/// it (`descendants::exit_group_census`). `None` if it could not be read,
+/// and then the exit census trusts no one; always `None` without `/proc`,
+/// where there is no exit census either.
+type ChildStart = Option<u64>;
+
+/// The start time recorded at spawn for `id`, if it is tracked as running
+/// (`None` otherwise). Takes `children` only for this read.
+fn running_start(
+    children: &Mutex<HashMap<ProcessId, Tracked>>,
+    id: ProcessId,
+) -> Option<ChildStart> {
+    match children
+        .lock()
+        .expect("children mutex poisoned by a prior panic")
+        .get(&id)
+    {
+        Some(Tracked::Running(_, started)) => Some(*started),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_child_start(id: ProcessId) -> ChildStart {
+    descendants::start_time(pid_of(id))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_child_start(id: ProcessId) -> ChildStart {
+    let _ = id;
+    None
 }
 
 /// The one way the self-exit reaper and `observe` reap a child: never
@@ -1429,8 +1466,9 @@ enum Tracked {
     /// significantly larger on Windows than the `Terminal` variant, and
     /// boxing keeps every `Tracked` entry (including the far more common
     /// eventual `Terminal` one) at the smaller size instead of every entry
-    /// paying for the largest variant.
-    Running(Box<Child>),
+    /// paying for the largest variant. With it, the child's start time as
+    /// read right after spawn ([`ChildStart`]).
+    Running(Box<Child>, ChildStart),
     /// Confirmed terminal: the `Child` handle has been dropped, and this
     /// state is returned directly to any later `stop`/`observe` call.
     Terminal(ProcessTerminalState),
@@ -1805,7 +1843,7 @@ impl TokioProcessSupervisor {
         match children.get(&id) {
             None => return Err(SendInputError::UnknownProcess),
             Some(Tracked::Terminal(_)) => return Err(SendInputError::Unavailable),
-            Some(Tracked::Running(_)) => {}
+            Some(Tracked::Running(..)) => {}
         }
         #[cfg(unix)]
         {
@@ -1881,7 +1919,7 @@ impl TokioProcessSupervisor {
             .expect("children mutex poisoned by a prior panic");
         let running_count = children
             .values()
-            .filter(|tracked| matches!(tracked, Tracked::Running(_)))
+            .filter(|tracked| matches!(tracked, Tracked::Running(..)))
             .count();
         if running_count >= MAX_RUNNING_CHILDREN {
             return Err(SupervisorError::TooManyProcesses);
@@ -1986,6 +2024,9 @@ impl TokioProcessSupervisor {
             .id()
             .ok_or_else(|| SupervisorError::Spawn("spawned child reported no pid".to_string()))?;
         let id = ProcessId(pid);
+        // Read before anything else can happen to the child: until this
+        // supervisor reaps it, its pid is its own.
+        let started = read_child_start(id);
 
         let (output_state, handles) = output_capture::new_channel(wiring.reader_count());
         let readers_done = handles.readers_done();
@@ -2021,7 +2062,7 @@ impl TokioProcessSupervisor {
             .children
             .lock()
             .expect("children mutex poisoned by a prior panic")
-            .insert(id, Tracked::Running(Box::new(child)));
+            .insert(id, Tracked::Running(Box::new(child), started));
 
         // From spawn, not from the readers' end: a descendant that inherited
         // the output can keep the readers running long after the child has
@@ -2423,15 +2464,9 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         // its exit-time census, taken before `children` is locked (it may
         // walk `/proc`) and only for a child still running here.
         // Its own statement, so the lock is released before the census.
-        let running = matches!(
-            self.inner
-                .children
-                .lock()
-                .expect("children mutex poisoned by a prior panic")
-                .get(&id),
-            Some(Tracked::Running(_))
-        );
-        let mut exit = (!reaper_active && running).then(|| take_exit_census(id));
+        let mut exit = running_start(&self.inner.children, id)
+            .filter(|_| !reaper_active)
+            .map(|started| take_exit_census(id, started));
         let mut children = self
             .inner
             .children
@@ -2471,9 +2506,9 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                     None => Some(ProcessStatus::Terminal(*state)),
                 }
             }
-            Tracked::Running(_) if reaper_active => Some(ProcessStatus::Running),
+            Tracked::Running(..) if reaper_active => Some(ProcessStatus::Running),
             // Without a census taken above, nothing is reaped.
-            Tracked::Running(child) => {
+            Tracked::Running(child, _) => {
                 match reap_after_exit_census(child, exit.take().unwrap_or(ExitCensus::Running)) {
                     Ok(Some((status, members))) => {
                         let state = ProcessTerminalState::Exited {
@@ -2609,7 +2644,7 @@ impl Drop for Inner {
                 Err(poisoned) => poisoned.into_inner(),
             };
             for (id, tracked) in children.iter_mut() {
-                let Tracked::Running(child) = tracked else {
+                let Tracked::Running(child, _) = tracked else {
                     continue;
                 };
                 let Ok(raw_pid) = i32::try_from(id.0) else {
@@ -2739,7 +2774,7 @@ mod unix {
                         .get(&id)
                         .cloned(),
                 ),
-                Some(Tracked::Running(_)) => (None, None),
+                Some(Tracked::Running(..)) => (None, None),
             }
         };
         // Already confirmed terminal: report the same recorded state again.
@@ -2959,7 +2994,7 @@ mod unix {
                     .lock()
                     .expect("children mutex poisoned by a prior panic");
                 let tracked = guard.get_mut(&id).expect("checked present by the caller");
-                let Tracked::Running(child) = tracked else {
+                let Tracked::Running(child, _) = tracked else {
                     // Reaped and recorded by the self-exit reaper (or an
                     // `observe`) after this call's own `Running` check:
                     // report that same recorded state.
@@ -3156,7 +3191,7 @@ mod windows {
             .expect("children mutex poisoned by a prior panic");
         match guard.get_mut(&id).ok_or(SupervisorError::UnknownProcess)? {
             Tracked::Terminal(state) => Ok(*state),
-            Tracked::Running(child) => {
+            Tracked::Running(child, _) => {
                 // Best-effort direct-child termination; containment of any
                 // descendant it spawned is unproven without a Job Object.
                 let _ = child.start_kill();
@@ -3228,6 +3263,38 @@ mod self_exit_tests {
             }
         };
         assert_eq!(state, Some(ProcessTerminalState::Exited { code: Some(0) }));
+    }
+
+    /// #197: the child's start time is recorded at spawn exactly as `/proc`
+    /// reports it, so the exit census can tell that the zombie it reads is
+    /// this child and not a process given its pid after a foreign reap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_childs_start_time_is_recorded_at_spawn() {
+        let mut supervisor = TokioProcessSupervisor::new();
+        let spec = ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 5"]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", id.0))
+            .expect("the child's stat must be readable");
+        let starttime: u64 = stat[stat.rfind(')').expect("stat has a comm") + 1..]
+            .split_whitespace()
+            .nth(19)
+            .and_then(|field| field.parse().ok())
+            .expect("stat has a start time");
+        let recorded = match supervisor
+            .inner
+            .children
+            .lock()
+            .expect("children mutex poisoned")
+            .get(&id)
+        {
+            Some(super::Tracked::Running(_, started)) => *started,
+            _ => panic!("the child must be tracked as running"),
+        };
+        assert_eq!(recorded, Some(starttime));
+
+        let _ = supervisor.stop(id, Duration::from_secs(5));
     }
 
     /// A pacing whose reaper never polls again after its first attempt.
