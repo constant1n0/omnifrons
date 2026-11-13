@@ -681,7 +681,7 @@ impl SelfExitReaper {
                     // zombie still holds the child's pid (#197). It costs
                     // the rest of one walk, at most `IN_FLIGHT_REFRESH_WAIT`.
                     if let Some(handle) = refresh.take() {
-                        census = adopt_in_flight(census, handle).await;
+                        census = adopt_in_flight(census, handle, self.id).await;
                     }
                     let (id, started) = (self.id, self.started);
                     tokio::task::spawn_blocking(move || {
@@ -1010,13 +1010,14 @@ async fn adopt_refresh(census: Census, refresh: JoinHandle<Census>) -> Census {
 /// [`adopt_refresh`] for a refresh still in flight at the child's exit,
 /// waiting at most [`IN_FLIGHT_REFRESH_WAIT`]; past it the refresh is
 /// dropped (detached) and the census stands as it is.
-async fn adopt_in_flight(census: Census, mut refresh: JoinHandle<Census>) -> Census {
+async fn adopt_in_flight(census: Census, mut refresh: JoinHandle<Census>, id: ProcessId) -> Census {
     if let Ok(joined) = tokio::time::timeout(IN_FLIGHT_REFRESH_WAIT, &mut refresh).await {
         adopt_joined(census, joined)
     } else {
         tracing::warn!(
+            pid = id.0,
             "a census refresh was still running {IN_FLIGHT_REFRESH_WAIT:?} after the child's \
-             exit; reaping without it"
+             exit; reaping without it, so a descendant only that walk saw is not counted"
         );
         census
     }
@@ -3560,9 +3561,10 @@ mod self_exit_tests {
             ..HELD_WALK_PACING
         };
         let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
-        let spawned = std::time::Instant::now();
+        // Lives long enough for a refresh to start after the hold below is
+        // registered (one every 50 ms), however slow the registration.
         let id = supervisor
-            .spawn(ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 0.3; exit 0"]))
+            .spawn(ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 1; exit 0"]))
             .expect("spawning sh must succeed");
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
         let (walked_tx, walked) = std::sync::mpsc::channel();
@@ -3578,11 +3580,14 @@ mod self_exit_tests {
         walked
             .recv_timeout(Duration::from_secs(10))
             .expect("a refresh must walk and be held");
+        let held = std::time::Instant::now();
 
-        // The walk stays held for the whole wait below.
-        let budget = super::IN_FLIGHT_REFRESH_WAIT + Duration::from_secs(3);
+        // The walk stays held for the whole wait below: the child's
+        // remaining second, the bounded wait, and room for a slow host.
+        let budget =
+            Duration::from_secs(1) + super::IN_FLIGHT_REFRESH_WAIT + Duration::from_secs(3);
         let state = loop {
-            let left = budget.saturating_sub(spawned.elapsed());
+            let left = budget.saturating_sub(held.elapsed());
             match frames.recv_timeout(left) {
                 Ok(frame) => {
                     if let FramePayload::State(state) = frame.payload {
