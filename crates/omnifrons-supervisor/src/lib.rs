@@ -679,9 +679,9 @@ impl SelfExitReaper {
                     // sighted a descendant that left the group just before
                     // the exit: it is awaited and adopted now, while the
                     // zombie still holds the child's pid (#197). It costs
-                    // at most the rest of one walk.
+                    // the rest of one walk, at most `IN_FLIGHT_REFRESH_WAIT`.
                     if let Some(handle) = refresh.take() {
-                        census = adopt_refresh(census, handle).await;
+                        census = adopt_in_flight(census, handle).await;
                     }
                     let (id, started) = (self.id, self.started);
                     tokio::task::spawn_blocking(move || {
@@ -993,12 +993,37 @@ fn record_self_exit_verdict(
     output_capture::record_confirmed_state(outputs, id, verdict.state);
 }
 
+/// How long the self-exit reaper waits, at the child's exit, for a census
+/// refresh still in flight before reaping without it: one walk takes tens
+/// of milliseconds (about 20 ms with 1,400 processes), so this bounds only
+/// a walk that is stuck.
+const IN_FLIGHT_REFRESH_WAIT: Duration = Duration::from_secs(1);
+
 /// Adopt a finished census refresh ([`refresh_census`]): it started from a
 /// copy of `census`, which has not changed since, so its result replaces
 /// it. A refresh task that failed (it panicked, or the runtime is shutting
 /// down) changes nothing.
 async fn adopt_refresh(census: Census, refresh: JoinHandle<Census>) -> Census {
-    match refresh.await {
+    adopt_joined(census, refresh.await)
+}
+
+/// [`adopt_refresh`] for a refresh still in flight at the child's exit,
+/// waiting at most [`IN_FLIGHT_REFRESH_WAIT`]; past it the refresh is
+/// dropped (detached) and the census stands as it is.
+async fn adopt_in_flight(census: Census, mut refresh: JoinHandle<Census>) -> Census {
+    if let Ok(joined) = tokio::time::timeout(IN_FLIGHT_REFRESH_WAIT, &mut refresh).await {
+        adopt_joined(census, joined)
+    } else {
+        tracing::warn!(
+            "a census refresh was still running {IN_FLIGHT_REFRESH_WAIT:?} after the child's \
+             exit; reaping without it"
+        );
+        census
+    }
+}
+
+fn adopt_joined(census: Census, joined: Result<Census, tokio::task::JoinError>) -> Census {
+    match joined {
         Ok(refreshed) => refreshed,
         Err(error) => {
             tracing::error!(%error, "census refresh task failed; keeping the earlier census");
@@ -3521,6 +3546,58 @@ mod self_exit_tests {
                 FramePayload::State(_) => None,
             })
             .collect()
+    }
+
+    /// A census walk that is still running when the child exits delays
+    /// the run's end by at most `IN_FLIGHT_REFRESH_WAIT`: past it the reaper
+    /// reaps without the walk, so a stuck `/proc` read cannot hold the final
+    /// `State` frame back (Codex review of #206).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_census_walk_stuck_at_the_exit_delays_the_end_by_at_most_the_wait() {
+        let pacing = ReapPacing {
+            census_refresh: Duration::from_millis(50),
+            ..HELD_WALK_PACING
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        let spawned = std::time::Instant::now();
+        let id = supervisor
+            .spawn(ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 0.3; exit 0"]))
+            .expect("spawning sh must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: id.0,
+                walked: walked_tx,
+                release: release_rx,
+            },
+        );
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a refresh must walk and be held");
+
+        // The walk stays held for the whole wait below.
+        let budget = super::IN_FLIGHT_REFRESH_WAIT + Duration::from_secs(3);
+        let state = loop {
+            let left = budget.saturating_sub(spawned.elapsed());
+            match frames.recv_timeout(left) {
+                Ok(frame) => {
+                    if let FramePayload::State(state) = frame.payload {
+                        break Some(state);
+                    }
+                }
+                Err(_) => break None,
+            }
+        };
+        drop(release);
+        assert_eq!(
+            state,
+            Some(ProcessTerminalState::Exited { code: Some(0) }),
+            "the run must end within {budget:?} while the walk is stuck"
+        );
     }
 
     /// A pacing whose reaper never polls again after its first attempt.
