@@ -621,6 +621,17 @@ fn member_still_in_group_in(proc_root: &Path, pgid: Pid, members: &[Identity]) -
 /// after a reap this supervisor did not make (a foreign reaper in the host
 /// process); with no start time recorded, nothing proves which process the
 /// zombie is -- and the zombie itself is never a member.
+///
+/// Cost (#197): this is one full walk, and it runs before every reap, so it
+/// adds that walk to the end of every run that exits on its own. Measured
+/// with `tests/census_cost.rs` (release build, about 1,400 host processes):
+/// about 20 ms, growing with the host's process count, out of a median of
+/// about 67 ms from spawn to the `State` frame of `sh -c 'echo x'`.
+/// Accepted, with a budget of one walk: a group's members cannot be listed
+/// without reading every process, and the walk is what lets a later Stop
+/// signal a group whose descendant outlived the child. The walk still in
+/// flight that the reaper may adopt first adds at most the rest of one walk
+/// (`IN_FLIGHT_REFRESH_WAIT` caps a stuck one at 1 s).
 pub(crate) fn exit_group_census(child: Pid, started: Option<u64>) -> Vec<Identity> {
     exit_group_census_in(Path::new(PROC_ROOT), child, started)
 }
