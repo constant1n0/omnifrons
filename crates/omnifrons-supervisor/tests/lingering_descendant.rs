@@ -405,6 +405,63 @@ fn an_escaped_descendant_recorded_while_the_child_lived_is_named_in_the_verdict(
     assert!(helper.is_running(), "the verdict signals nothing");
 }
 
+/// A directory under the system temp dir, removed when dropped.
+#[cfg(target_os = "linux")]
+struct ScratchDir(std::path::PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// #197 (R1-001): a process chooses its own `comm`, so an escaped
+/// descendant's name reaches the note with its control characters (C0, DEL
+/// and C1) stripped: the line cannot carry terminal escapes or break in two
+/// while it reads as written by the supervisor. Here the name comes from the
+/// file name `sleep` is executed under.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_escaped_descendants_name_reaches_the_note_without_control_characters() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let scratch = ScratchDir(
+        std::env::temp_dir().join(format!("omnifrons-comm-{}-{nanos}", std::process::id())),
+    );
+    std::fs::create_dir(&scratch.0).expect("the scratch directory must be created");
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .expect("sleep must be installed");
+    let link = scratch.0.join("ev\u{1b}[31m\t\u{7f}\u{85}il");
+    std::os::unix::fs::symlink(sleep, &link).expect("the link must be created");
+
+    let mut supervisor = TokioProcessSupervisor::new();
+    let script = "setsid \"$1\" \"$2\" >/dev/null 2>&1 </dev/null & echo \"$!\"; sleep 1; exit 0";
+    let spec = ProcessSpec::new("/bin/sh").with_args([
+        "-c".to_owned(),
+        script.to_owned(),
+        "sh".to_owned(),
+        link.to_str().expect("the link path is UTF-8").to_owned(),
+        HELPER_SECS.to_string(),
+    ]);
+    let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+    let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+    let mut seen = Vec::new();
+    let helper = helper_from_first_line(&frames, &mut seen);
+
+    let _ = collect_until_closed(&frames, &mut seen, Instant::now(), LINE_DEADLINE);
+
+    assert_eq!(last_state(&seen), ProcessTerminalState::OrphanRiskUncertain);
+    assert_eq!(
+        diagnostic_before_state(&seen),
+        escaped_note(helper.pid(), "ev[31mil")
+    );
+    assert!(helper.is_running(), "the verdict signals nothing");
+}
+
 /// The `State` frame stays the last frame even while a lingering descendant
 /// keeps writing after the grace: its later output is discarded.
 #[test]

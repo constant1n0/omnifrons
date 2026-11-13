@@ -438,12 +438,18 @@ const MAX_NAMED_ESCAPES: usize = 8;
 
 /// The diagnostic lines naming recorded descendants that left the child's
 /// process group and outlived it, by pid and command name (never a path).
+///
+/// A process sets its own `comm`, so the name is printed with its control
+/// characters (C0, DEL and C1) stripped: the note travels on the child's
+/// own text channel, and must not carry terminal escapes or break into a
+/// second line while it reads as written by the supervisor (#197, R1-001).
 #[cfg(target_os = "linux")]
 fn escape_notes(escaped: &[(nix::unistd::Pid, String)]) -> Vec<String> {
     let mut notes: Vec<String> = escaped
         .iter()
         .take(MAX_NAMED_ESCAPES)
         .map(|(pid, comm)| {
+            let comm: String = comm.chars().filter(|c| !c.is_control()).collect();
             format!(
                 "descendant {} ({comm}) left the run's process group and is still running",
                 pid.as_raw()
