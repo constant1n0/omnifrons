@@ -38,11 +38,12 @@
 //! One case bounds that wait. A descendant that inherited the child's
 //! output (`sh -c 'sleep 3600 & exit 0'`) holds it open after the child has
 //! exited, and its reader then never ends. The self-exit reaper (which polls
-//! for the child's exit from spawn, not from the readers' end) gives the
-//! readers a grace of 2 s from the moment it notices that exit -- one poll
-//! after it at most, 250 ms in the child's first minute and 2 s after that
-//! while the output is open, so the run ends at most about 4 s after the
-//! exit; if a reader is still running after the grace, the reaper
+//! for the child's exit from spawn, not from the readers' end) notices that
+//! exit one poll after it at most, 250 ms in the child's first minute and
+//! 2 s after that while the output is open; on Linux it then awaits any
+//! census walk still in flight, for at most 1 s, and gives the readers a
+//! grace of 2 s, so the run ends at most about 5 s after the exit; if a
+//! reader is still running after the grace, the reaper
 //! *abandons* the readers: the run ends with `orphan-risk/uncertain`,
 //! preceded by a diagnostic `stderr` frame saying a descendant still holds
 //! the output open. The same grace applies when `stop` reaped the child.

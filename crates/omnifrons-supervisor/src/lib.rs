@@ -298,15 +298,18 @@ struct ReapPacing {
     census_idle_refresh: Duration,
     /// The most sightings the census keeps ([`CENSUS_SIGHTINGS_BOUND`]).
     census_bound: usize,
-    /// How long, from the moment the reaper notices the child's exit, its
+    /// How long, after the reaper notices the child's exit, its
     /// readers may keep the run open: a descendant that inherited the
     /// output holds it past the exit, and past this grace the run ends
     /// without it (`output_capture`'s own doc comment). The exit is noticed
     /// at the next poll, which while the output is open comes within
     /// `slow_poll` (250 ms) in the child's first minute and within
-    /// `idle_poll` (2 s) after it, so with the defaults the run ends at most
-    /// about 4 s after the exit (measured: 2.07 s for a young child, 2.81 s
-    /// for one older than a minute). Shorter than `settle_wait`, which
+    /// `idle_poll` (2 s) after it, and on Linux a census walk still in
+    /// flight at the exit is awaited first, for at most
+    /// `IN_FLIGHT_REFRESH_WAIT` (1 s), so with the defaults the run ends at
+    /// most about 5 s after the exit (measured: 2.07 s for a young child,
+    /// 2.81 s for one older than a minute, with no walk stuck). Shorter than
+    /// `settle_wait`, which
     /// bounds the whole settle this grace is part of.
     exit_grace: Duration,
     /// How long `observe` keeps deferring to a claimed reaper that has not
@@ -2510,12 +2513,14 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         // holds this child it alone confirms the reap, so that its
         // descendant census decides the terminal state; `observe` reports
         // `Running` meanwhile. After the child exits, that lasts until the
-        // reaper's next poll notices the exit, then while a reader still
-        // holds the output, then for the verdict's census walk. With
-        // `ReapPacing::DEFAULT` (whose values are quoted here) that is at
-        // most `idle_poll`, 2 s (`slow_poll`, 250 ms, or less within a
-        // minute of the spawn or of the output closing), plus `exit_grace`,
-        // 2 s, plus the walk: about 4 s
+        // reaper's next poll notices the exit, then while it awaits a census
+        // walk still in flight (Linux only, at most `IN_FLIGHT_REFRESH_WAIT`),
+        // then while a reader still holds the output, then for the verdict's
+        // census walk. With `ReapPacing::DEFAULT` (whose values are quoted
+        // here) that is at most `idle_poll`, 2 s (`slow_poll`, 250 ms, or less
+        // within a minute of the spawn or of the output closing), plus 1 s for
+        // the walk in flight, plus `exit_grace`, 2 s, plus the verdict's walk:
+        // about 5 s
         // (`observe_turns_terminal_within_a_poll_and_the_grace_of_a_self_exit`).
         // Two caps hold whatever the reaper does. Before the reap the
         // deferral ends once its last poll (its claim, before the first) is
