@@ -673,6 +673,14 @@ impl SelfExitReaper {
             // id, and only then is the child reaped (`try_reap`).
             let exit = match peek_exit(self.id) {
                 ExitCensus::Exited(_) => {
+                    // A walk still in flight may be the only one to have
+                    // sighted a descendant that left the group just before
+                    // the exit: it is awaited and adopted now, while the
+                    // zombie still holds the child's pid (#197). It costs
+                    // at most the rest of one walk.
+                    if let Some(handle) = refresh.take() {
+                        census = adopt_refresh(census, handle).await;
+                    }
                     let id = self.id;
                     // Not running any more: no longer this reaper's to
                     // reap, and nothing is trusted.
@@ -687,12 +695,14 @@ impl SelfExitReaper {
             };
             match self.try_reap(exit) {
                 ReapAttempt::Reaped(state, settling) => {
-                    // A walk still in flight is dropped (detached), never
-                    // adopted: it may read `/proc` after this reap, once the
-                    // child's pid is free for an unrelated process, and only
-                    // sightings taken while the child held its pid may later
-                    // authorize a group signal (`descendants::Leftovers`).
-                    // Every adopted walk finished before this reap.
+                    // A walk still in flight here (the exit could not be read
+                    // without reaping, so none was awaited above) is dropped
+                    // (detached), never adopted: it may read `/proc` after
+                    // this reap, once the child's pid is free for an
+                    // unrelated process, and only sightings taken while the
+                    // child held its pid may later authorize a group signal
+                    // (`descendants::Leftovers`). Every adopted walk
+                    // finished before this reap.
                     drop(refresh.take());
                     self.end_after_reap(census, state).await;
                     #[cfg(test)]
@@ -1283,9 +1293,16 @@ fn refresh_census(census: Census, id: ProcessId, bound: usize) -> Census {
         .lock()
         .expect("census counter poisoned")
         .push(id.0);
+    #[cfg(all(test, target_os = "linux"))]
+    let held = take_held_walk(id);
     #[cfg(target_os = "linux")]
     {
-        census.refresh(pid_of(id), bound)
+        let refreshed = census.refresh(pid_of(id), bound);
+        #[cfg(test)]
+        if let Some(held) = held {
+            held.hold();
+        }
+        refreshed
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1298,6 +1315,46 @@ fn refresh_census(census: Census, id: ProcessId, bound: usize) -> Census {
 /// Every pid a census was taken for, in order; unit tests count their own.
 #[cfg(test)]
 static CENSUS_TAKES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// A unit test's hold on the next census refresh of a child: that walk
+/// reads `/proc` as usual, says so on `walked`, then waits for `release`
+/// (a message, or the test dropping its sender) before it returns, so it
+/// stays in flight for as long as the test needs.
+#[cfg(all(test, target_os = "linux"))]
+struct HeldWalk {
+    pid: u32,
+    walked: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl HeldWalk {
+    fn hold(self) {
+        let _ = self.walked.send(());
+        let _ = self.release.recv();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl HookEntry for HeldWalk {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+/// Holds registered by unit tests; each is taken by the first refresh of
+/// its child that starts after it was registered.
+#[cfg(all(test, target_os = "linux"))]
+static HELD_WALKS: Mutex<Vec<HeldWalk>> = Mutex::new(Vec::new());
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_held_walk(id: ProcessId) -> Option<HeldWalk> {
+    let mut held = HELD_WALKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = held.iter().position(|walk| walk.pid == id.0)?;
+    Some(held.remove(at))
+}
 
 /// Pids whose self-exit settle a unit test holds for the given time, so a
 /// settle can be made to outlast the settle wait without a sweep.
@@ -3295,6 +3352,167 @@ mod self_exit_tests {
         assert_eq!(recorded, Some(starttime));
 
         let _ = supervisor.stop(id, Duration::from_secs(5));
+    }
+
+    /// #197 (R4-001, R3): a census walk still in flight when the child
+    /// exits is awaited and adopted before the reap, while the zombie still
+    /// holds the child's pid. Here it is the only walk to sight a helper
+    /// that left the group with `setsid`: the first census ends before the
+    /// helper exists, and the next walk is held open across the child's
+    /// exit (`HELD_WALKS`). Dropped at the reap, it would leave a clean exit
+    /// that never names the helper.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_census_walk_in_flight_at_the_exit_is_adopted_before_the_reap() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let mut cleanup = HeldWalkCleanup(
+            std::env::temp_dir().join(format!(
+                "omnifrons-held-walk-{}-{nanos}",
+                std::process::id()
+            )),
+            None,
+        );
+        std::fs::create_dir(&cleanup.0).expect("the scratch directory must be created");
+        let (go, end) = (cleanup.0.join("go"), cleanup.0.join("end"));
+        let script = "while [ ! -e \"$1\" ]; do sleep 0.01; done; \
+                      setsid sleep 30 >/dev/null 2>&1 </dev/null & echo \"$!\"; \
+                      while [ ! -e \"$2\" ]; do sleep 0.01; done; exit 0";
+
+        let mut supervisor = TokioProcessSupervisor::build_with(None, HELD_WALK_PACING);
+        let spec = ProcessSpec::new("/bin/sh").with_args([
+            "-c".to_owned(),
+            script.to_owned(),
+            "sh".to_owned(),
+            go.to_str().expect("UTF-8 path").to_owned(),
+            end.to_str().expect("UTF-8 path").to_owned(),
+        ]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: id.0,
+                walked: walked_tx,
+                release: release_rx,
+            },
+        );
+
+        // The helper starts only once the first census has ended.
+        let first = std::time::Instant::now() + Duration::from_secs(10);
+        while !super::CENSUS_TAKES
+            .lock()
+            .expect("census counter poisoned")
+            .contains(&id.0)
+        {
+            assert!(std::time::Instant::now() < first, "no first census");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(&go, b"").expect("the go file must be written");
+        let mut seen = Vec::new();
+        let helper = loop {
+            let frame = frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the child must print the helper's pid");
+            if let FramePayload::Text { text, .. } = &frame.payload
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            seen.push(frame);
+        };
+        cleanup.1 = Some(helper);
+
+        // The held walk has read `/proc` while the child lived; the child
+        // then exits while that walk is still in flight.
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the held refresh must walk");
+        std::fs::write(&end, b"").expect("the end file must be written");
+        wait_until_not_running(id.0, Duration::from_secs(2));
+        drop(release);
+
+        while let Ok(frame) = frames.recv_timeout(Duration::from_secs(10)) {
+            seen.push(frame);
+        }
+        let texts = frame_texts(&seen);
+        assert_eq!(
+            seen.last().map(|frame| &frame.payload),
+            Some(&FramePayload::State(
+                ProcessTerminalState::OrphanRiskUncertain
+            )),
+            "frames: {texts:?}"
+        );
+        let note = format!(
+            "descendant {helper} (sleep) left the run's process group and is still running"
+        );
+        assert!(texts.contains(&note), "frames: {texts:?}");
+    }
+
+    /// Polls every 5 ms; the first refresh starts 1 s after the first
+    /// census, and no other starts while the held one is in flight.
+    #[cfg(target_os = "linux")]
+    const HELD_WALK_PACING: ReapPacing = ReapPacing {
+        fast_poll: Duration::from_millis(5),
+        fast_window: Duration::from_secs(60),
+        slow_poll: Duration::from_millis(5),
+        slow_window: Duration::from_secs(60),
+        idle_poll: Duration::from_millis(5),
+        census_refresh: Duration::from_secs(1),
+        census_idle_refresh: Duration::from_secs(60),
+        census_bound: super::CENSUS_SIGHTINGS_BOUND,
+        exit_grace: Duration::from_secs(2),
+        stall_grace: Duration::from_secs(30),
+        settle_wait: Duration::from_secs(30),
+    };
+
+    /// A scratch directory and, once known, a helper pid: the directory is
+    /// removed and the helper killed when dropped, even on a failed assert.
+    #[cfg(target_os = "linux")]
+    struct HeldWalkCleanup(std::path::PathBuf, Option<i32>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HeldWalkCleanup {
+        fn drop(&mut self) {
+            if let Some(helper) = self.1 {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(helper),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Wait, at most `budget`, until `pid` is a zombie or gone.
+    #[cfg(target_os = "linux")]
+    fn wait_until_not_running(pid: u32, budget: Duration) {
+        let end = std::time::Instant::now() + budget;
+        while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat[stat.rfind(')').map_or(0, |at| at + 1)..]
+                .split_whitespace()
+                .next()
+                != Some("Z")
+        }) && std::time::Instant::now() < end
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The text of every text frame, in order.
+    #[cfg(target_os = "linux")]
+    fn frame_texts(frames: &[omnifrons_app::OutputFrame]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|frame| match &frame.payload {
+                FramePayload::Text { text, .. } => Some(text.clone()),
+                FramePayload::State(_) => None,
+            })
+            .collect()
     }
 
     /// A pacing whose reaper never polls again after its first attempt.

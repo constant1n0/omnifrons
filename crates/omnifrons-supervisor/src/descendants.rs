@@ -56,7 +56,9 @@
 //!   interval before the child exits (at most 250 ms early on, 30 s later)
 //!   and one double-forked through an intermediate that exits at once.
 //!   `sh -c 'setsid sleep 3600 & exit 0'` is the shortest form: the child
-//!   is gone within a millisecond of the fork, before any walk.
+//!   is gone within a millisecond of the fork, before any walk. A walk
+//!   still in flight when the child exits is awaited and adopted before the
+//!   reap, so what it saw counts.
 //!
 //! # What this still cannot prove
 //!
