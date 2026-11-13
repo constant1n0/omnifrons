@@ -46,7 +46,14 @@
 //!   minute, then one every 30 s for as long as the child lives; the
 //!   250 ms cadence restarts for a minute when the child's output closes.
 //!   A full `/proc` walk reads every process's `stat`, which is what bounds
-//!   how often it can run.
+//!   how often it can run. Because a walk reads the whole host, one walk at
+//!   a time serves every child of a supervisor (`crate::SharedWalks`): a
+//!   child reuses the latest walk when it started within the child's own
+//!   interval, so the walks do not multiply with the children. Measured
+//!   with `tests/census_cost.rs` (#197; release build, about 1,400 host
+//!   processes, one walk about 20 ms): 16 children in their first minute
+//!   cost about 1.5 CPU cores when each walked for itself, about 0.1 with
+//!   the shared walk, close to the 0.09 of a single child.
 //! - **Blind spot.** A walk links a descendant to the child only through
 //!   its parent chain, and that chain breaks the moment the child -- or any
 //!   process between them -- exits. A descendant that calls `setsid` (or
@@ -140,6 +147,23 @@ struct Stat {
     pgrp: Pid,
     /// `proc(5)` field 22.
     starttime: u64,
+}
+
+/// One full read of the host's process table, as a census refresh folds it
+/// in ([`Census::refresh`]): every process's `/proc/<pid>/stat`, or why
+/// that could not be read. A walk reads every process on the host, so one
+/// walk serves the census of every child of a supervisor (#197).
+pub(crate) struct Walk(Result<HashMap<Pid, Stat>, Unproven>);
+
+impl Walk {
+    /// Read the whole process table now. Blocking: a procfs walk.
+    pub(crate) fn take() -> Self {
+        Self::take_in(Path::new(PROC_ROOT))
+    }
+
+    fn take_in(proc_root: &Path) -> Self {
+        Self(read_table(proc_root))
+    }
 }
 
 /// Why something about a stopped child's descendants could not be proven.
@@ -271,10 +295,9 @@ impl Census {
         }
     }
 
-    /// Walk again and fold the walk into this census: first forget every
-    /// recorded sighting that is no longer alive, judged by the same walk,
-    /// then merge the walk's own sightings ([`Self::merge`]), keeping at
-    /// most `bound`.
+    /// Fold a later walk into this census: first forget every recorded
+    /// sighting that is no longer alive, judged by the same walk, then merge
+    /// the walk's own sightings ([`Self::merge`]), keeping at most `bound`.
     ///
     /// Forgetting changes no verdict: a sighting that is gone, a zombie, or
     /// a pid now carrying another start time can never count as a
@@ -282,18 +305,20 @@ impl Census {
     /// a process that ended never comes back. What it changes is what the
     /// bound counts: the descendants alive at the same time, not every one
     /// the child ever ran. A walk of the unreaped zombie child still erases
-    /// nothing that is alive.
-    pub(crate) fn refresh(self, child: Pid, bound: usize) -> Self {
-        self.refresh_in(Path::new(PROC_ROOT), child, bound)
+    /// nothing that is alive. One walk can be folded into the census of
+    /// every child of a supervisor ([`Walk`]).
+    pub(crate) fn refresh(self, walk: &Walk, child: Pid, bound: usize) -> Self {
+        match &walk.0 {
+            Err(reason) => self.merge(Self::Unavailable(*reason), bound),
+            Ok(table) => self
+                .without_the_dead(table)
+                .merge(Self::from_table(table, child), bound),
+        }
     }
 
+    #[cfg(test)]
     fn refresh_in(self, proc_root: &Path, child: Pid, bound: usize) -> Self {
-        match read_table(proc_root) {
-            Err(reason) => self.merge(Self::Unavailable(reason), bound),
-            Ok(table) => self
-                .without_the_dead(&table)
-                .merge(Self::from_table(&table, child), bound),
-        }
+        self.refresh(&Walk::take_in(proc_root), child, bound)
     }
 
     /// This census without the sightings `table` shows are no longer alive.
