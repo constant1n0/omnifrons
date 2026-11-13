@@ -49,13 +49,15 @@
 //!   how often it can run. Because a walk reads the whole host, one walk at
 //!   a time serves every child of a supervisor (`crate::SharedWalks`): a
 //!   child's refresh folds only a walk that started at or after it was
-//!   requested, as when each child walked for itself, so the window above
-//!   is unchanged, and refreshes that queue behind the walk in flight share
-//!   the next one, so the walks do not multiply with the children. Measured
+//!   requested, as when each child walked for itself, and the next refresh
+//!   is timed from that request, not from the start of the walk folded, so
+//!   the window above is unchanged; refreshes that queue behind the walk in
+//!   flight share the next one, so the walks do not multiply with the
+//!   children. Measured
 //!   with `tests/census_cost.rs` (#197; release build, about 1,400 host
 //!   processes, one walk about 20 ms): 16 children in their first minute
 //!   cost about 1.5 CPU cores when each walked for itself, and about 0.2
-//!   (0.17 to 0.24 over three runs) with the shared walk, against about
+//!   (0.18 to 0.26 over two runs) with the shared walk, against about
 //!   0.08 for a single child; never more than one walk runs at a time.
 //! - **Blind spot.** A walk links a descendant to the child only through
 //!   its parent chain, and that chain breaks the moment the child -- or any

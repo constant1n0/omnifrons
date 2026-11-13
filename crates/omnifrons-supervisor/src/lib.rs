@@ -655,10 +655,10 @@ impl SelfExitReaper {
             id: self.id,
             token: self.claim,
         };
-        // When the walk folded last started: the spawn census's for now.
+        // When the last refresh was requested: the spawn census for now.
         let mut census_at = std::time::Instant::now();
         let mut census = take_census_blocking(self.id).await;
-        let mut refresh: Option<JoinHandle<Refreshed>> = None;
+        let mut refresh: Option<JoinHandle<Census>> = None;
         // The current cadence phase began at spawn, and begins again when
         // the child's output closes.
         let mut phase_began = std::time::Instant::now();
@@ -671,7 +671,7 @@ impl SelfExitReaper {
             if refresh.as_ref().is_some_and(JoinHandle::is_finished)
                 && let Some(handle) = refresh.take()
             {
-                (census, census_at) = adopt_refresh((census, census_at), handle).await;
+                census = adopt_refresh(census, handle).await;
             }
             output_capture::note_reap_poll(&self.outputs, self.id);
             #[cfg(test)]
@@ -688,8 +688,7 @@ impl SelfExitReaper {
                     // the rest of a walk or two, at most
                     // `IN_FLIGHT_REFRESH_WAIT`.
                     if let Some(handle) = refresh.take() {
-                        (census, census_at) =
-                            adopt_in_flight((census, census_at), handle, self.id).await;
+                        census = adopt_in_flight(census, handle, self.id).await;
                     }
                     let (id, started) = (self.id, self.started);
                     tokio::task::spawn_blocking(move || {
@@ -753,6 +752,11 @@ impl SelfExitReaper {
                 refresh = Some(tokio::task::spawn_blocking(move || {
                     refresh_census(recorded, id, bound, &walks)
                 }));
+                // Timed from the request, not from the walk's start: a
+                // refresh that waits for another child's walk starts its own
+                // later, and timing from that would push the next refresh
+                // past this child's next poll (#197).
+                census_at = std::time::Instant::now();
             }
             // Stamp again so a long sleep is preceded by a fresh poll time.
             output_capture::note_reap_poll(&self.outputs, self.id);
@@ -1009,43 +1013,35 @@ fn record_self_exit_verdict(
 const IN_FLIGHT_REFRESH_WAIT: Duration = Duration::from_secs(1);
 
 /// Adopt a finished census refresh ([`refresh_census`]): it started from a
-/// copy of `current`'s census, which has not changed since, so its result
-/// replaces it. A refresh task that failed (it panicked, or the runtime is
-/// shutting down) changes nothing but the time, so it is not retried before
-/// the next interval.
-async fn adopt_refresh(current: Refreshed, refresh: JoinHandle<Refreshed>) -> Refreshed {
-    adopt_joined(current, refresh.await)
+/// copy of `census`, which has not changed since, so its result replaces
+/// it. A refresh task that failed (it panicked, or the runtime is shutting
+/// down) changes nothing.
+async fn adopt_refresh(census: Census, refresh: JoinHandle<Census>) -> Census {
+    adopt_joined(census, refresh.await)
 }
 
 /// [`adopt_refresh`] for a refresh still in flight at the child's exit,
 /// waiting at most [`IN_FLIGHT_REFRESH_WAIT`]; past it the refresh is
 /// dropped (detached) and the census stands as it is.
-async fn adopt_in_flight(
-    current: Refreshed,
-    mut refresh: JoinHandle<Refreshed>,
-    id: ProcessId,
-) -> Refreshed {
+async fn adopt_in_flight(census: Census, mut refresh: JoinHandle<Census>, id: ProcessId) -> Census {
     if let Ok(joined) = tokio::time::timeout(IN_FLIGHT_REFRESH_WAIT, &mut refresh).await {
-        adopt_joined(current, joined)
+        adopt_joined(census, joined)
     } else {
         tracing::warn!(
             pid = id.0,
             "a census refresh was still running {IN_FLIGHT_REFRESH_WAIT:?} after the child's \
              exit; reaping without it, so a descendant only that walk saw is not counted"
         );
-        current
+        census
     }
 }
 
-fn adopt_joined(
-    current: Refreshed,
-    joined: Result<Refreshed, tokio::task::JoinError>,
-) -> Refreshed {
+fn adopt_joined(census: Census, joined: Result<Census, tokio::task::JoinError>) -> Census {
     match joined {
         Ok(refreshed) => refreshed,
         Err(error) => {
             tracing::error!(%error, "census refresh task failed; keeping the earlier census");
-            (current.0, std::time::Instant::now())
+            census
         }
     }
 }
@@ -1328,17 +1324,13 @@ fn census_task_failed() -> Census {
     Census
 }
 
-/// A finished census refresh: the census with a walk folded in, and when
-/// that walk started.
-type Refreshed = (Census, std::time::Instant);
-
 /// Fold a walk of `/proc` into `census` for `id`, keeping at most `bound`
 /// sightings (`descendants::Census::refresh`: sightings no longer alive are
 /// forgotten, everything alive is kept). The walk is shared with the
 /// supervisor's other children ([`SharedWalks::walk`]), and started no
 /// earlier than this call. Blocking: it may wait for a walk in flight, or
 /// walk.
-fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWalks) -> Refreshed {
+fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWalks) -> Census {
     #[cfg(test)]
     CENSUS_TAKES
         .lock()
@@ -1346,14 +1338,13 @@ fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWal
         .push(id.0);
     #[cfg(target_os = "linux")]
     {
-        let walk = walks.walk(id);
-        (census.refresh(&walk.walk, pid_of(id), bound), walk.started)
+        census.refresh(&walks.walk(id).walk, pid_of(id), bound)
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Nothing to walk: the stub census records nothing.
         let _ = (id, bound, walks);
-        (census, std::time::Instant::now())
+        census
     }
 }
 
@@ -3829,6 +3820,77 @@ mod self_exit_tests {
         assert!(
             second.started > first.started,
             "a walk that finished before the request was folded again"
+        );
+    }
+
+    /// #197 (native review of the shared walk): a refresh that waited for
+    /// another child's walk keeps this child's cadence. The next refresh is
+    /// timed from when this one was requested, not from when its own walk
+    /// could start: timed from the walk, it came later by the wait, and
+    /// with a poll as long as the refresh interval the child refreshed only
+    /// every other poll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refresh_that_waited_for_another_walk_keeps_the_childs_cadence() {
+        const PERIOD: Duration = Duration::from_millis(400);
+        const WAIT: Duration = Duration::from_millis(200);
+        let pacing = ReapPacing {
+            census_refresh: PERIOD,
+            ..HELD_WALK_PACING
+        };
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        let id = supervisor
+            .spawn(ProcessSpec::new("/bin/sh").with_args(["-c", "sleep 10"]))
+            .expect("spawning sh must succeed");
+        let takes = || {
+            super::CENSUS_TAKES
+                .lock()
+                .expect("census counter poisoned")
+                .iter()
+                .filter(|pid| **pid == id.0)
+                .count()
+        };
+        // Wait for more than `after` censuses of this child, and return
+        // when the last one began.
+        let next_take = |after: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while takes() <= after {
+                assert!(std::time::Instant::now() < deadline, "no census refresh");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::time::Instant::now()
+        };
+        // The spawn census, then the first refresh: the walk below starts
+        // just after it, so the next refresh is requested while it is held.
+        next_take(1);
+        let other = omnifrons_app::ProcessId(u32::MAX - 1970);
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: other.0,
+                walked: walked_tx,
+                release: release_rx,
+            },
+        );
+        let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        let holder = std::thread::spawn(move || drop(walks.walk(other)));
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other walk must be held");
+        let requested = next_take(2);
+        std::thread::sleep(WAIT);
+        drop(release);
+        holder.join().expect("the other walk must end");
+        let again = next_take(3);
+        let _ = supervisor.stop(id, Duration::from_secs(5));
+
+        let gap = again - requested;
+        assert!(
+            gap < PERIOD + WAIT / 2,
+            "the refresh after one that waited {WAIT:?} for another walk came \
+             {gap:?} after it, not one period ({PERIOD:?}) after"
         );
     }
 
