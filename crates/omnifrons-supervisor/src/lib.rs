@@ -685,7 +685,8 @@ impl SelfExitReaper {
                     // sighted a descendant that left the group just before
                     // the exit: it is awaited and adopted now, while the
                     // zombie still holds the child's pid (#197). It costs
-                    // the rest of one walk, at most `IN_FLIGHT_REFRESH_WAIT`.
+                    // the rest of a walk or two, at most
+                    // `IN_FLIGHT_REFRESH_WAIT`.
                     if let Some(handle) = refresh.take() {
                         (census, census_at) =
                             adopt_in_flight((census, census_at), handle, self.id).await;
@@ -748,9 +749,9 @@ impl SelfExitReaper {
             let interval = self.pacing.census_interval(elapsed);
             if refresh.is_none() && census_at.elapsed() >= interval {
                 let (id, bound, recorded) = (self.id, self.pacing.census_bound, census.clone());
-                let (walks, after) = (Arc::clone(&self.walks), census_at);
+                let walks = Arc::clone(&self.walks);
                 refresh = Some(tokio::task::spawn_blocking(move || {
-                    refresh_census(recorded, id, bound, &walks, after, interval)
+                    refresh_census(recorded, id, bound, &walks)
                 }));
             }
             // Stamp again so a long sleep is preceded by a fresh poll time.
@@ -1334,17 +1335,10 @@ type Refreshed = (Census, std::time::Instant);
 /// Fold a walk of `/proc` into `census` for `id`, keeping at most `bound`
 /// sightings (`descendants::Census::refresh`: sightings no longer alive are
 /// forgotten, everything alive is kept). The walk is shared with the
-/// supervisor's other children ([`SharedWalks::walk`]): one that started
-/// after `after` (the walk last folded) and within `interval` of now.
-/// Blocking: it may wait for a walk in flight, or walk.
-fn refresh_census(
-    census: Census,
-    id: ProcessId,
-    bound: usize,
-    walks: &SharedWalks,
-    after: std::time::Instant,
-    interval: Duration,
-) -> Refreshed {
+/// supervisor's other children ([`SharedWalks::walk`]), and started no
+/// earlier than this call. Blocking: it may wait for a walk in flight, or
+/// walk.
+fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWalks) -> Refreshed {
     #[cfg(test)]
     CENSUS_TAKES
         .lock()
@@ -1352,13 +1346,13 @@ fn refresh_census(
         .push(id.0);
     #[cfg(target_os = "linux")]
     {
-        let walk = walks.walk(id, after, interval);
+        let walk = walks.walk(id);
         (census.refresh(&walk.walk, pid_of(id), bound), walk.started)
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Nothing to walk: the stub census records nothing.
-        let _ = (id, bound, walks, after, interval);
+        let _ = (id, bound, walks);
         (census, std::time::Instant::now())
     }
 }
@@ -1366,11 +1360,14 @@ fn refresh_census(
 /// One `/proc` walk at a time per supervisor, shared by every running
 /// child's census refresh (#197). A walk reads every process on the host,
 /// so walking once per child made the cost grow with the number of
-/// children; a refresh now reuses the latest walk when that walk started
-/// after the one it folded last and within its own interval, waits for the
-/// walk in flight, or else walks itself. With every child refreshing at
-/// the same interval, the walks fall into one cadence for all of them, and
-/// no child's census is ever older than its interval plus one walk.
+/// children. A refresh now folds only a walk that started at or after it
+/// was requested, exactly as when each child walked for itself, so sharing
+/// never makes a child's census older and its detection window is
+/// unchanged: it reuses a walk another child's refresh took meanwhile,
+/// waits for the walk in flight and takes the next one with every other
+/// refresh that queued behind it, or else walks. Reusing any walk started
+/// within the child's interval instead let the newest walk be nearly two
+/// intervals old at the child's exit (independent verification of #197).
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct SharedWalks {
@@ -1402,15 +1399,12 @@ struct TimedWalk {
 
 #[cfg(target_os = "linux")]
 impl SharedWalks {
-    /// A walk for `id`'s census that started after `after` and no more than
-    /// `interval` ago: the latest finished walk if it qualifies, else the
-    /// one in flight once it finishes if that one does, else a new walk
-    /// taken here. Blocking.
-    fn walk(&self, id: ProcessId, after: std::time::Instant, interval: Duration) -> Arc<TimedWalk> {
-        let not_before = std::time::Instant::now()
-            .checked_sub(interval)
-            .unwrap_or(after);
-        let qualifies = |walk: &TimedWalk| walk.started > after && walk.started >= not_before;
+    /// A walk for `id`'s census that started at or after this call: the
+    /// latest finished walk if it did, else the one in flight once it
+    /// finishes if that one did, else a new walk taken here. Blocking.
+    fn walk(&self, id: ProcessId) -> Arc<TimedWalk> {
+        let requested = std::time::Instant::now();
+        let qualifies = |walk: &TimedWalk| walk.started >= requested;
         let mut state = self
             .state
             .lock()
@@ -3768,13 +3762,15 @@ mod self_exit_tests {
         );
     }
 
-    /// #197: one walk of `/proc` per period serves every running child of
-    /// a supervisor, so the number of walks does not grow with the number
-    /// of children. Eight children refreshing every 50 ms for a second
-    /// would make about 160 walks if each walked on its own.
+    /// #197: the walks of `/proc` are shared by every running child of a
+    /// supervisor, so their number does not grow with the number of
+    /// children. Eight children refreshing every 50 ms for a second would
+    /// make about 160 walks if each walked on its own; shared, a period
+    /// takes at most the walk in flight and the next one, which every
+    /// refresh that queued behind it folds.
     #[cfg(target_os = "linux")]
     #[test]
-    fn one_proc_walk_per_period_serves_every_running_child() {
+    fn the_proc_walks_do_not_multiply_with_the_children() {
         const CHILDREN: usize = 8;
         const PERIOD: Duration = Duration::from_millis(50);
         const WINDOW: Duration = Duration::from_secs(1);
@@ -3811,8 +3807,28 @@ mod self_exit_tests {
         let periods = usize::try_from(WINDOW.as_millis() / PERIOD.as_millis()).unwrap_or(0);
         assert!(during > 0, "the children must still be walked for");
         assert!(
-            during <= periods + 5,
-            "{during} walks in {WINDOW:?} for {CHILDREN} children: at most about {periods} expected"
+            during <= 2 * periods + 5,
+            "{during} walks in {WINDOW:?} for {CHILDREN} children: at most about {} expected",
+            2 * periods
+        );
+    }
+
+    /// #197 (verification B1): a refresh folds only a walk that started at
+    /// or after the refresh was requested. A walk that finished just before,
+    /// however recent, is taken again: reusing one up to an interval old
+    /// let a child's newest walk be nearly two intervals old at its exit,
+    /// and a descendant that left the group in that time went unseen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refresh_never_folds_a_walk_that_started_before_it_was_requested() {
+        let walks = super::SharedWalks::default();
+        let id = omnifrons_app::ProcessId(u32::MAX - 197);
+        let first = walks.walk(id);
+        std::thread::sleep(Duration::from_millis(10));
+        let second = walks.walk(id);
+        assert!(
+            second.started > first.started,
+            "a walk that finished before the request was folded again"
         );
     }
 

@@ -48,12 +48,15 @@
 //!   A full `/proc` walk reads every process's `stat`, which is what bounds
 //!   how often it can run. Because a walk reads the whole host, one walk at
 //!   a time serves every child of a supervisor (`crate::SharedWalks`): a
-//!   child reuses the latest walk when it started within the child's own
-//!   interval, so the walks do not multiply with the children. Measured
+//!   child's refresh folds only a walk that started at or after it was
+//!   requested, as when each child walked for itself, so the window above
+//!   is unchanged, and refreshes that queue behind the walk in flight share
+//!   the next one, so the walks do not multiply with the children. Measured
 //!   with `tests/census_cost.rs` (#197; release build, about 1,400 host
 //!   processes, one walk about 20 ms): 16 children in their first minute
-//!   cost about 1.5 CPU cores when each walked for itself, about 0.1 with
-//!   the shared walk, close to the 0.09 of a single child.
+//!   cost about 1.5 CPU cores when each walked for itself, and about 0.2
+//!   (0.17 to 0.24 over three runs) with the shared walk, against about
+//!   0.08 for a single child; never more than one walk runs at a time.
 //! - **Blind spot.** A walk links a descendant to the child only through
 //!   its parent chain, and that chain breaks the moment the child -- or any
 //!   process between them -- exits. A descendant that calls `setsid` (or
@@ -629,9 +632,10 @@ fn member_still_in_group_in(proc_root: &Path, pgid: Pid, members: &[Identity]) -
 /// about 67 ms from spawn to the `State` frame of `sh -c 'echo x'`.
 /// Accepted, with a budget of one walk: a group's members cannot be listed
 /// without reading every process, and the walk is what lets a later Stop
-/// signal a group whose descendant outlived the child. The walk still in
-/// flight that the reaper may adopt first adds at most the rest of one walk
-/// (`IN_FLIGHT_REFRESH_WAIT` caps a stuck one at 1 s).
+/// signal a group whose descendant outlived the child. The refresh still in
+/// flight that the reaper may adopt first adds the rest of its walk, and
+/// one more walk when the walk in flight started before that refresh was
+/// requested (`IN_FLIGHT_REFRESH_WAIT` caps the wait at 1 s).
 pub(crate) fn exit_group_census(child: Pid, started: Option<u64>) -> Vec<Identity> {
     exit_group_census_in(Path::new(PROC_ROOT), child, started)
 }
