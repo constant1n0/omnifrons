@@ -420,7 +420,9 @@ impl Drop for ScratchDir {
 /// descendant's name reaches the note with its control characters (C0, DEL
 /// and C1) stripped: the line cannot carry terminal escapes or break in two
 /// while it reads as written by the supervisor. Here the name comes from the
-/// file name `sleep` is executed under.
+/// file name the `fake-agent` fixture is executed under (a single-purpose
+/// binary, so the odd name cannot change what it runs, as it would for a
+/// multi-call `sleep`), and `--setsid-sleep` takes it out of the group.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_escaped_descendants_name_reaches_the_note_without_control_characters() {
@@ -431,21 +433,17 @@ fn an_escaped_descendants_name_reaches_the_note_without_control_characters() {
         std::env::temp_dir().join(format!("omnifrons-comm-{}-{nanos}", std::process::id())),
     );
     std::fs::create_dir(&scratch.0).expect("the scratch directory must be created");
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-        .into_iter()
-        .find(|path| std::path::Path::new(path).exists())
-        .expect("sleep must be installed");
     let link = scratch.0.join("ev\u{1b}[31m\t\u{7f}\u{85}il");
-    std::os::unix::fs::symlink(sleep, &link).expect("the link must be created");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fake-agent"), &link)
+        .expect("the link must be created");
 
     let mut supervisor = TokioProcessSupervisor::new();
-    let script = "setsid \"$1\" \"$2\" >/dev/null 2>&1 </dev/null & echo \"$!\"; sleep 1; exit 0";
+    let script = "\"$1\" --setsid-sleep >/dev/null 2>&1 </dev/null & echo \"$!\"; sleep 1; exit 0";
     let spec = ProcessSpec::new("/bin/sh").with_args([
         "-c".to_owned(),
         script.to_owned(),
         "sh".to_owned(),
         link.to_str().expect("the link path is UTF-8").to_owned(),
-        HELPER_SECS.to_string(),
     ]);
     let id = supervisor.spawn(spec).expect("spawning sh must succeed");
     let frames = supervisor.subscribe(id).expect("subscribe must succeed");
