@@ -43,23 +43,25 @@
 //! longer alive, so its bound counts the descendants alive at once):
 //!
 //! - **Interval.** One walk at spawn, then one every 250 ms for the first
-//!   minute, then one every 30 s for as long as the child lives; the
-//!   250 ms cadence restarts for a minute when the child's output closes.
-//!   A full `/proc` walk reads every process's `stat`, which is what bounds
-//!   how often it can run. Because a walk reads the whole host, one walk at
-//!   a time serves every child of a supervisor (`crate::SharedWalks`): a
-//!   child's refresh folds only a walk that started at or after it was
-//!   requested, as when each child walked for itself, and the next refresh
-//!   is timed from that request, not from the start of the walk folded, so
-//!   the window above is unchanged; refreshes that queue behind the walk in
-//!   flight share the next one, so the cost grows with the children far
-//!   less than the walks would (a refresh that overlaps no walk still takes
-//!   its own). Measured
-//!   with `tests/census_cost.rs` (#197; release build, about 1,400 host
+//!   minute, then one every 30 s for as long as the child lives; the 250 ms
+//!   cadence restarts for a minute when the child's output closes. A full
+//!   `/proc` walk reads every process's `stat`, which is what bounds how
+//!   often it can run. Because a walk reads the whole host, one walk at a
+//!   time serves the census refreshes of every child of a supervisor
+//!   (`crate::SharedWalks`): a child's refresh folds only a walk that
+//!   started at or after it was requested, as when each child walked for
+//!   itself, and the next refresh is timed from that request, not from the
+//!   start of the walk folded, so the window above is unchanged; refreshes
+//!   that queue behind the walk in flight share the next one, so the cost
+//!   grows with the children far less than the walks would (a refresh that
+//!   overlaps no walk still takes its own). Measured with
+//!   `tests/census_cost.rs` (#197; release build, about 1,400 host
 //!   processes, one walk about 20 ms): 16 children in their first minute
 //!   cost about 1.5 CPU cores when each walked for itself, and about 0.2
-//!   (0.18 to 0.26 over two runs) with the shared walk, against about
-//!   0.08 for a single child; never more than one walk runs at a time.
+//!   (0.18 to 0.26 over two runs) with the shared walk, against about 0.08
+//!   for a single child; never more than one refresh walk runs at a time,
+//!   though the census taken at a child's spawn and the one at its exit
+//!   still walk on their own.
 //! - **Blind spot.** A walk links a descendant to the child only through
 //!   its parent chain, and that chain breaks the moment the child -- or any
 //!   process between them -- exits. A descendant that calls `setsid` (or
