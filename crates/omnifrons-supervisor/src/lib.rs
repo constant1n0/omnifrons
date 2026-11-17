@@ -3816,6 +3816,8 @@ mod self_exit_tests {
             end.to_str().expect("UTF-8 path").to_owned(),
         ]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        // Its child exits only once this test lets it.
+        forget_exit_waits(id.0);
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         // The helper starts only once the first census has ended.
@@ -4303,16 +4305,32 @@ mod self_exit_tests {
         );
     }
 
+    /// Forget every exit wait recorded for `pid`, which an earlier test's
+    /// child may have held: called before this test's child can exit.
+    #[cfg(target_os = "linux")]
+    fn forget_exit_waits(pid: u32) {
+        super::EXIT_WAITS
+            .lock()
+            .expect("exit wait counter poisoned")
+            .retain(|waited| *waited != pid);
+    }
+
     /// Wait, at most 10 s, until the reaper of `pid` has raised `exiting`
-    /// at the child's exit and waits for its refresh in flight.
+    /// at the child's exit and waits for its refresh in flight, and consume
+    /// that record.
     #[cfg(target_os = "linux")]
     fn wait_for_exit_wait(pid: u32) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !super::EXIT_WAITS
-            .lock()
-            .expect("exit wait counter poisoned")
-            .contains(&pid)
-        {
+        loop {
+            {
+                let mut waits = super::EXIT_WAITS
+                    .lock()
+                    .expect("exit wait counter poisoned");
+                if let Some(at) = waits.iter().position(|waited| *waited == pid) {
+                    waits.remove(at);
+                    return;
+                }
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "the reaper must wait for the refresh in flight at the exit"
@@ -4582,6 +4600,8 @@ mod self_exit_tests {
             end.to_str().expect("UTF-8 path").to_owned(),
         ]);
         let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        // Its child exits only once this test lets it.
+        forget_exit_waits(id.0);
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
 
         // The first refresh, 1 s after the spawn census, walks for itself
