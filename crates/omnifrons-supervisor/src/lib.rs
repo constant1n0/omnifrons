@@ -1480,15 +1480,18 @@ impl SharedWalks {
             #[cfg(not(test))]
             let stuck_after = STUCK_WALK;
             if age >= stuck_after {
-                if state.warned_stuck != Some(started) {
-                    state.warned_stuck = Some(started);
+                let first = state.warned_stuck != Some(started);
+                state.warned_stuck = Some(started);
+                // Logged without the lock: a slow subscriber must not hold
+                // up every other refresh.
+                drop(state);
+                if first {
                     tracing::warn!(
                         pid = walker,
                         "a census walk of /proc has been running for {age:?}; \
                          census refreshes walk on their own until it ends"
                     );
                 }
-                drop(state);
                 break (self.take_own(id), How::PastStuck);
             }
             #[cfg(test)]
@@ -1506,6 +1509,8 @@ impl SharedWalks {
             }
             waited = true;
         };
+        // `took` runs from the request until the walk is in hand: the wait,
+        // and the walk itself when this refresh took it.
         tracing::trace!(
             pid = id.0,
             ?how,
@@ -3992,16 +3997,19 @@ mod self_exit_tests {
     }
 
     /// The advisories of #207: a walk whose walker unwinds still ends
-    /// (`Walking`'s drop): it clears the walk in flight and wakes every
-    /// refresh waiting for it at once, and a woken refresh then takes its
-    /// own walk, since the unwound one recorded none. No refresh waits for
-    /// a walk that will never finish.
+    /// (`Walking`'s drop): it clears the walk in flight, records no walk,
+    /// and wakes every refresh waiting for it at once, and the woken
+    /// refreshes share one walk of their own. No refresh waits for a walk
+    /// that will never finish. Three waiters, each timed when it returns,
+    /// tell waking all of them from waking one: a refresh nobody wakes
+    /// would walk only once the unwound walk is `STUCK_WALK` old
+    /// (independent verification of the advisories).
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_walk_that_unwinds_wakes_the_refreshes_waiting_for_it() {
+    fn a_walk_that_unwinds_wakes_every_refresh_waiting_for_it() {
         let walks = std::sync::Arc::new(super::SharedWalks::default());
-        let other = omnifrons_app::ProcessId(u32::MAX - 1972);
-        let waiter = omnifrons_app::ProcessId(u32::MAX - 1973);
+        let other = omnifrons_app::ProcessId(u32::MAX - 1982);
+        let waiters: Vec<u32> = (1983..1986).map(|n| u32::MAX - n).collect();
         let (walked_tx, walked) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
         let _hold = super::register_hook(
@@ -4021,35 +4029,40 @@ mod self_exit_tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the other walk must be held");
         let (got_tx, got) = std::sync::mpsc::channel();
-        {
-            let walks = std::sync::Arc::clone(&walks);
+        for pid in &waiters {
+            let (walks, got_tx, pid) = (std::sync::Arc::clone(&walks), got_tx.clone(), *pid);
             std::thread::spawn(move || {
-                let _ = got_tx.send(walks.walk(waiter).started);
+                drop(walks.walk(omnifrons_app::ProcessId(pid)));
+                let _ = got_tx.send(std::time::Instant::now());
             });
         }
-        wait_for_queue(&walks, (1, true), "the refresh must wait for the held walk");
+        wait_for_queue(
+            &walks,
+            (waiters.len(), true),
+            "every refresh must wait for the held walk",
+        );
         let released = std::time::Instant::now();
         drop(release);
         assert!(holder.join().is_err(), "the held walk must unwind");
 
-        let started = got
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the waiting refresh must be woken and get a walk");
-        // Woken by the unwind itself: a refresh nobody wakes would walk
-        // only once the unwound walk is `STUCK_WALK` old.
-        assert!(
-            started.saturating_duration_since(released) < super::STUCK_WALK / 2,
-            "the waiting refresh walked {:?} after the unwind",
-            started.saturating_duration_since(released)
-        );
+        for _ in &waiters {
+            let at = got
+                .recv_timeout(Duration::from_secs(10))
+                .expect("every waiting refresh must be woken and get a walk");
+            let late = at.saturating_duration_since(released);
+            assert!(
+                late < super::STUCK_WALK / 2,
+                "a waiting refresh got its walk {late:?} after the unwind"
+            );
+        }
         assert_eq!(walks.queue(), (0, false), "nothing may be left in flight");
-        assert!(
-            super::PROC_WALKS
-                .lock()
-                .expect("walk counter poisoned")
-                .contains(&waiter.0),
-            "the woken refresh must take its own walk"
-        );
+        let taken = super::PROC_WALKS
+            .lock()
+            .expect("walk counter poisoned")
+            .iter()
+            .filter(|pid| waiters.contains(pid))
+            .count();
+        assert_eq!(taken, 1, "the woken refreshes must share one walk");
     }
 
     /// Everything a unit test's `tracing` subscriber wrote.
