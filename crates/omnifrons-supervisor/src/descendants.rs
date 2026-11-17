@@ -59,9 +59,11 @@
 //!   processes, one walk about 20 ms): 16 children in their first minute
 //!   cost about 1.5 CPU cores when each walked for itself, and about 0.2
 //!   (0.18 to 0.26 over two runs) with the shared walk, against about 0.08
-//!   for a single child; never more than one refresh walk runs at a time,
-//!   though the census taken at a child's spawn and the one at its exit
-//!   still walk on their own.
+//!   for a single child; never more than one refresh walk runs at a time
+//!   while none is stuck (one still running after 1 s is taken for stuck,
+//!   and refreshes walk on their own until it ends), though the census
+//!   taken at a child's spawn and the one at its exit still walk on their
+//!   own.
 //! - **Blind spot.** A walk links a descendant to the child only through
 //!   its parent chain, and that chain breaks the moment the child -- or any
 //!   process between them -- exits. A descendant that calls `setsid` (or

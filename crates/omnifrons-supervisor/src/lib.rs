@@ -1359,6 +1359,9 @@ fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWal
 /// refresh that queued behind it, or else walks. Reusing any walk started
 /// within the child's interval instead let the newest walk be nearly two
 /// intervals old at the child's exit (independent verification of #197).
+/// A walk in flight for [`STUCK_WALK`] is taken for stuck: until it ends,
+/// refreshes stop waiting for it and walk on their own, as when each child
+/// walked for itself, so a stuck walk stalls only its own refresh.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct SharedWalks {
@@ -1366,6 +1369,13 @@ struct SharedWalks {
     /// Notified whenever a walk finishes (or its walker unwinds).
     finished: std::sync::Condvar,
 }
+
+/// How old another child's walk may grow while a refresh waits for it:
+/// past this it is taken for stuck, and the refreshes walk on their own.
+/// One walk takes tens of milliseconds (about 20 ms with 1,400 processes),
+/// so this bounds only a walk that is stuck.
+#[cfg(target_os = "linux")]
+const STUCK_WALK: Duration = Duration::from_secs(1);
 
 /// Without `/proc` there is nothing to walk or share.
 #[cfg(not(target_os = "linux"))]
@@ -1377,12 +1387,36 @@ struct SharedWalks;
 struct WalkState {
     /// The latest finished walk.
     latest: Option<Arc<TimedWalk>>,
-    /// Whether a walk is being taken right now.
-    in_flight: bool,
+    /// The shared walk being taken right now, if one is: when it started,
+    /// and the pid of the child whose refresh takes it.
+    in_flight: Option<(std::time::Instant, u32)>,
+    /// When the stuck walk last warned about started: each stuck walk is
+    /// warned about once.
+    warned_stuck: Option<std::time::Instant>,
     /// How many refreshes are waiting for a walk to finish; unit tests
     /// wait on it instead of sleeping ([`SharedWalks::queue`]).
     #[cfg(test)]
     waiting: usize,
+    /// A unit test's own stuck bound, longer than [`STUCK_WALK`] for a
+    /// test that holds a walk for longer while refreshes wait for it.
+    #[cfg(test)]
+    stuck_after: Option<Duration>,
+}
+
+#[cfg(target_os = "linux")]
+impl WalkState {
+    /// Record `walk` as the latest finished walk, unless a newer one
+    /// already is: a stuck walk that ends late must not replace the walks
+    /// taken past it.
+    fn publish(&mut self, walk: Arc<TimedWalk>) {
+        if self
+            .latest
+            .as_ref()
+            .is_none_or(|latest| latest.started < walk.started)
+        {
+            self.latest = Some(walk);
+        }
+    }
 }
 
 /// A finished walk and when it started.
@@ -1392,24 +1426,70 @@ struct TimedWalk {
     walk: descendants::Walk,
 }
 
+/// How a refresh got its walk ([`SharedWalks::walk_how`]), for its trace.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum How {
+    /// A walk another refresh took after this one asked, already finished.
+    Reused,
+    /// The walk in flight, or the one after it, once waited for.
+    Waited,
+    /// A shared walk taken here.
+    Walked,
+    /// A walk of its own, the walk in flight being stuck.
+    PastStuck,
+}
+
 #[cfg(target_os = "linux")]
 impl SharedWalks {
-    /// A walk for `id`'s census that started at or after this call: the
-    /// latest finished walk if it did, else the one in flight once it
-    /// finishes if that one did, else a new walk taken here. Blocking.
+    /// [`Self::walk_how`] without how the walk was got.
     fn walk(&self, id: ProcessId) -> Arc<TimedWalk> {
+        self.walk_how(id).0
+    }
+
+    /// A walk for `id`'s census that started at or after this call, and
+    /// how it was got: the latest finished walk if it did, else the one in
+    /// flight once it finishes if that one did, else a new walk taken here
+    /// and shared with the refreshes that queue behind it, or, while the
+    /// walk in flight is stuck ([`STUCK_WALK`]), one of `id`'s own.
+    /// Blocking.
+    fn walk_how(&self, id: ProcessId) -> (Arc<TimedWalk>, How) {
         let requested = std::time::Instant::now();
-        let qualifies = |walk: &TimedWalk| walk.started >= requested;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if let Some(latest) = state.latest.as_ref().filter(|walk| qualifies(walk)) {
-                return Arc::clone(latest);
+        let mut state = self.lock();
+        let mut waited = false;
+        let (walk, how) = loop {
+            if let Some(latest) = state
+                .latest
+                .as_ref()
+                .filter(|walk| walk.started >= requested)
+            {
+                break (
+                    Arc::clone(latest),
+                    if waited { How::Waited } else { How::Reused },
+                );
             }
-            if !state.in_flight {
-                break;
+            let Some((started, walker)) = state.in_flight else {
+                let started = std::time::Instant::now();
+                state.in_flight = Some((started, id.0));
+                drop(state);
+                break (self.take_shared(id, started), How::Walked);
+            };
+            let age = started.elapsed();
+            #[cfg(test)]
+            let stuck_after = state.stuck_after.unwrap_or(STUCK_WALK);
+            #[cfg(not(test))]
+            let stuck_after = STUCK_WALK;
+            if age >= stuck_after {
+                if state.warned_stuck != Some(started) {
+                    state.warned_stuck = Some(started);
+                    tracing::warn!(
+                        pid = walker,
+                        "a census walk of /proc has been running for {age:?}; \
+                         census refreshes walk on their own until it ends"
+                    );
+                }
+                drop(state);
+                break (self.take_own(id), How::PastStuck);
             }
             #[cfg(test)]
             {
@@ -1417,42 +1497,79 @@ impl SharedWalks {
             }
             state = self
                 .finished
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(state, stuck_after.saturating_sub(age))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
             #[cfg(test)]
             {
                 state.waiting -= 1;
             }
-        }
-        state.in_flight = true;
-        drop(state);
+            waited = true;
+        };
+        tracing::trace!(
+            pid = id.0,
+            ?how,
+            took = ?requested.elapsed(),
+            walk_age = ?walk.started.elapsed(),
+            "census refresh got its walk of /proc"
+        );
+        (walk, how)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, WalkState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The shared walk, marked in flight at `started`: it ends, records
+    /// itself and wakes the refreshes queued behind it through [`Walking`],
+    /// even if the walker unwinds.
+    fn take_shared(&self, id: ProcessId, started: std::time::Instant) -> Arc<TimedWalk> {
         let mut walking = Walking {
             walks: self,
             done: None,
         };
-        let started = std::time::Instant::now();
-        #[cfg(test)]
-        PROC_WALKS.lock().expect("walk counter poisoned").push(id.0);
-        #[cfg(test)]
-        let held = take_held_walk(id);
-        #[cfg(not(test))]
-        let _ = id;
-        let walk = Arc::new(TimedWalk {
-            started,
-            walk: descendants::Walk::take(),
-        });
-        #[cfg(test)]
-        if let Some(held) = held {
-            held.hold();
-        }
+        let walk = Arc::new(take_timed(id, started));
         walking.done = Some(Arc::clone(&walk));
+        walk
+    }
+
+    /// A walk of `id`'s own past a stuck one, outside the shared walk. It
+    /// becomes the latest walk unless a newer one already is, and wakes the
+    /// refreshes waiting, which fold it if it started after they asked.
+    fn take_own(&self, id: ProcessId) -> Arc<TimedWalk> {
+        let walk = Arc::new(take_timed(id, std::time::Instant::now()));
+        self.lock().publish(Arc::clone(&walk));
+        self.finished.notify_all();
         walk
     }
 }
 
-/// The walk in flight: when dropped (once it finished, or if the walker
-/// unwinds) it records the walk, if any, clears `in_flight` and wakes
-/// every refresh waiting for it, so no refresh can wait forever.
+/// Read the whole process table for `id`'s census refresh, as a walk that
+/// started at `started`. Blocking.
+#[cfg(target_os = "linux")]
+fn take_timed(id: ProcessId, started: std::time::Instant) -> TimedWalk {
+    #[cfg(test)]
+    PROC_WALKS.lock().expect("walk counter poisoned").push(id.0);
+    #[cfg(test)]
+    let held = take_held_walk(id);
+    #[cfg(not(test))]
+    let _ = id;
+    let walk = TimedWalk {
+        started,
+        walk: descendants::Walk::take(),
+    };
+    #[cfg(test)]
+    if let Some(held) = held {
+        held.hold();
+    }
+    walk
+}
+
+/// The shared walk in flight: when dropped (once it finished, or if the
+/// walker unwinds) it records the walk, if any, clears the walk in flight
+/// and wakes every refresh waiting for it, so no refresh can wait forever.
 #[cfg(target_os = "linux")]
 struct Walking<'a> {
     walks: &'a SharedWalks,
@@ -1462,15 +1579,11 @@ struct Walking<'a> {
 #[cfg(target_os = "linux")]
 impl Drop for Walking<'_> {
     fn drop(&mut self) {
-        let mut state = self
-            .walks
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.walks.lock();
         if let Some(walk) = self.done.take() {
-            state.latest = Some(walk);
+            state.publish(walk);
         }
-        state.in_flight = false;
+        state.in_flight = None;
         drop(state);
         self.walks.finished.notify_all();
     }
@@ -1512,11 +1625,18 @@ impl SharedWalks {
     /// How many refreshes are waiting for a walk, and whether a walk is in
     /// flight.
     fn queue(&self) -> (usize, bool) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (state.waiting, state.in_flight)
+        let state = self.lock();
+        (state.waiting, state.in_flight.is_some())
+    }
+
+    /// When the latest finished walk started, if there is one.
+    fn latest_started(&self) -> Option<std::time::Instant> {
+        self.lock().latest.as_ref().map(|walk| walk.started)
+    }
+
+    /// Take a walk for stuck only once it is `bound` old.
+    fn set_stuck_bound(&self, bound: Duration) {
+        self.lock().stuck_after = Some(bound);
     }
 }
 
@@ -3810,6 +3930,8 @@ mod self_exit_tests {
         );
         let mut supervisor = TokioProcessSupervisor::build_with(None, HELD_WALK_PACING);
         let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        // Held for over `STUCK_WALK` before the refreshes queue behind it.
+        walks.set_stuck_bound(Duration::from_secs(60));
         let holder = std::thread::spawn(move || drop(walks.walk(other)));
         walked
             .recv_timeout(Duration::from_secs(10))
@@ -3871,9 +3993,9 @@ mod self_exit_tests {
 
     /// The advisories of #207: a walk whose walker unwinds still ends
     /// (`Walking`'s drop): it clears the walk in flight and wakes every
-    /// refresh waiting for it, and a woken refresh then takes its own walk,
-    /// since the unwound one recorded none. No refresh waits for a walk
-    /// that will never finish.
+    /// refresh waiting for it at once, and a woken refresh then takes its
+    /// own walk, since the unwound one recorded none. No refresh waits for
+    /// a walk that will never finish.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_walk_that_unwinds_wakes_the_refreshes_waiting_for_it() {
@@ -3906,11 +4028,20 @@ mod self_exit_tests {
             });
         }
         wait_for_queue(&walks, (1, true), "the refresh must wait for the held walk");
+        let released = std::time::Instant::now();
         drop(release);
         assert!(holder.join().is_err(), "the held walk must unwind");
 
-        got.recv_timeout(Duration::from_secs(10))
+        let started = got
+            .recv_timeout(Duration::from_secs(10))
             .expect("the waiting refresh must be woken and get a walk");
+        // Woken by the unwind itself: a refresh nobody wakes would walk
+        // only once the unwound walk is `STUCK_WALK` old.
+        assert!(
+            started.saturating_duration_since(released) < super::STUCK_WALK / 2,
+            "the waiting refresh walked {:?} after the unwind",
+            started.saturating_duration_since(released)
+        );
         assert_eq!(walks.queue(), (0, false), "nothing may be left in flight");
         assert!(
             super::PROC_WALKS
@@ -3918,6 +4049,135 @@ mod self_exit_tests {
                 .expect("walk counter poisoned")
                 .contains(&waiter.0),
             "the woken refresh must take its own walk"
+        );
+    }
+
+    /// Everything a unit test's `tracing` subscriber wrote.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(target_os = "linux")]
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CapturedLog {
+        /// A dispatcher that writes every event here, `trace` included.
+        fn dispatch(&self) -> tracing::Dispatch {
+            let log = self.clone();
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(move || log.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log poisoned")).into_owned()
+        }
+    }
+
+    /// Run `f` on this thread with `dispatch` as its subscriber. A callsite
+    /// is cached as uninteresting when first hit on a thread with no
+    /// subscriber, as other tests' refreshes do, and with a single
+    /// dispatcher registered `tracing` rebuilds that cache from the current
+    /// thread's default: rebuilt here, every callsite logs to `dispatch`.
+    #[cfg(target_os = "linux")]
+    fn logged<T>(dispatch: &tracing::Dispatch, f: impl FnOnce() -> T) -> T {
+        tracing::dispatcher::with_default(dispatch, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        })
+    }
+
+    /// The advisories of #207: a stuck walk no longer stalls every child's
+    /// refresh. A refresh waits for another child's walk only until that
+    /// walk is `STUCK_WALK` old, then walks on its own, as when each child
+    /// walked for itself, so one stuck walk again stalls only its own
+    /// refresh. The stuck walk is warned about once, each refresh reports
+    /// how it got its walk (which it traces), and the stuck walk, once it
+    /// ends, does not replace the newer walk the refreshes took meanwhile.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refresh_walks_on_its_own_past_a_stuck_walk() {
+        let walks = std::sync::Arc::new(super::SharedWalks::default());
+        let other = omnifrons_app::ProcessId(u32::MAX - 1974);
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1975);
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: other.0,
+                walked: walked_tx,
+                release: release_rx,
+                unwind: false,
+            },
+        );
+        let holder = {
+            let walks = std::sync::Arc::clone(&walks);
+            std::thread::spawn(move || drop(walks.walk(other)))
+        };
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other walk must be held");
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let mut last = None;
+        for refresh in 1..=2 {
+            let (got_tx, got) = std::sync::mpsc::channel();
+            let (walks, dispatch) = (std::sync::Arc::clone(&walks), dispatch.clone());
+            std::thread::spawn(move || {
+                let (walk, how) = logged(&dispatch, || walks.walk_how(waiter));
+                let _ = got_tx.send((walk.started, how));
+            });
+            let (started, how) = got
+                .recv_timeout(super::STUCK_WALK + Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("refresh {refresh} must not wait for a stuck walk"));
+            assert_eq!(how, super::How::PastStuck, "refresh {refresh}");
+            last = Some(started);
+        }
+        let stuck = walks.queue();
+        drop(release);
+        holder
+            .join()
+            .expect("the stuck walk must end once released");
+
+        assert_eq!(
+            stuck,
+            (0, true),
+            "the stuck walk must still be in flight, with no refresh waiting for it"
+        );
+        let own = super::PROC_WALKS
+            .lock()
+            .expect("walk counter poisoned")
+            .iter()
+            .filter(|pid| **pid == waiter.0)
+            .count();
+        assert_eq!(own, 2, "each refresh must take a walk of its own");
+        assert_eq!(
+            walks.latest_started(),
+            last,
+            "the stuck walk, older, must not replace the latest walk"
+        );
+        let text = log.text();
+        assert_eq!(
+            text.matches("census refreshes walk on their own").count(),
+            1,
+            "the stuck walk must be warned about once: {text}"
         );
     }
 
@@ -3996,6 +4256,8 @@ mod self_exit_tests {
             },
         );
         let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        // About one period old when the next refresh is requested.
+        walks.set_stuck_bound(Duration::from_secs(60));
         let holder = std::thread::spawn(move || drop(walks.walk(other)));
         walked
             .recv_timeout(Duration::from_secs(10))
