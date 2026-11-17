@@ -1379,6 +1379,10 @@ struct WalkState {
     latest: Option<Arc<TimedWalk>>,
     /// Whether a walk is being taken right now.
     in_flight: bool,
+    /// How many refreshes are waiting for a walk to finish; unit tests
+    /// wait on it instead of sleeping ([`SharedWalks::queue`]).
+    #[cfg(test)]
+    waiting: usize,
 }
 
 /// A finished walk and when it started.
@@ -1407,10 +1411,18 @@ impl SharedWalks {
             if !state.in_flight {
                 break;
             }
+            #[cfg(test)]
+            {
+                state.waiting += 1;
+            }
             state = self
                 .finished
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                state.waiting -= 1;
+            }
         }
         state.in_flight = true;
         drop(state);
@@ -1476,12 +1488,14 @@ static PROC_WALKS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// A unit test's hold on the next census refresh of a child: that walk
 /// reads `/proc` as usual, says so on `walked`, then waits for `release`
 /// (a message, or the test dropping its sender) before it returns, so it
-/// stays in flight for as long as the test needs.
+/// stays in flight for as long as the test needs. With `unwind`, the
+/// walker panics once released instead of returning.
 #[cfg(all(test, target_os = "linux"))]
 struct HeldWalk {
     pid: u32,
     walked: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
+    unwind: bool,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1489,6 +1503,20 @@ impl HeldWalk {
     fn hold(self) {
         let _ = self.walked.send(());
         let _ = self.release.recv();
+        assert!(!self.unwind, "a held walk unwinds, as its unit test asked");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl SharedWalks {
+    /// How many refreshes are waiting for a walk, and whether a walk is in
+    /// flight.
+    fn queue(&self) -> (usize, bool) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.waiting, state.in_flight)
     }
 }
 
@@ -3601,6 +3629,7 @@ mod self_exit_tests {
                 pid: id.0,
                 walked: walked_tx,
                 release: release_rx,
+                unwind: false,
             },
         );
 
@@ -3723,6 +3752,7 @@ mod self_exit_tests {
                 pid: id.0,
                 walked: walked_tx,
                 release: release_rx,
+                unwind: false,
             },
         );
         walked
@@ -3775,6 +3805,7 @@ mod self_exit_tests {
                 pid: other.0,
                 walked: walked_tx,
                 release: release_rx,
+                unwind: false,
             },
         );
         let mut supervisor = TokioProcessSupervisor::build_with(None, HELD_WALK_PACING);
@@ -3791,6 +3822,7 @@ mod self_exit_tests {
                     .0
             })
             .collect();
+        let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
         let count = |table: &std::sync::Mutex<Vec<u32>>| {
             table
                 .lock()
@@ -3799,23 +3831,14 @@ mod self_exit_tests {
                 .filter(|pid| ids.contains(pid))
                 .count()
         };
-        // Each child's spawn census and first refresh.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while count(&super::CENSUS_TAKES) < 2 * CHILDREN {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "every child must request its first refresh"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // Each refresh is counted just before it asks for a walk: give the
-        // last one time to be waiting.
-        std::thread::sleep(Duration::from_millis(50));
+        // Every child's first refresh waits for the held walk.
+        wait_for_queue(&walks, (CHILDREN, true), "every refresh must wait");
         let queued = count(&super::PROC_WALKS);
         drop(release);
         holder.join().expect("the other walk must end");
-        // Well before any second refresh, due 1 s after the first.
-        std::thread::sleep(Duration::from_millis(300));
+        // Every refresh got its walk, well before any second refresh (due
+        // 1 s after the first).
+        wait_for_queue(&walks, (0, false), "every refresh must get a walk");
         let after = count(&super::PROC_WALKS);
         for id in &ids {
             let _ = supervisor.stop(omnifrons_app::ProcessId(*id), Duration::from_secs(5));
@@ -3828,6 +3851,73 @@ mod self_exit_tests {
         assert_eq!(
             after, 1,
             "the {CHILDREN} refreshes queued behind one walk must share the next one"
+        );
+    }
+
+    /// Wait, at most 10 s, until `walks` has `expected` refreshes waiting
+    /// and a walk in flight or not.
+    #[cfg(target_os = "linux")]
+    fn wait_for_queue(walks: &super::SharedWalks, expected: (usize, bool), what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while walks.queue() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: waiting and in flight are {:?}, not {expected:?}",
+                walks.queue()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The advisories of #207: a walk whose walker unwinds still ends
+    /// (`Walking`'s drop): it clears the walk in flight and wakes every
+    /// refresh waiting for it, and a woken refresh then takes its own walk,
+    /// since the unwound one recorded none. No refresh waits for a walk
+    /// that will never finish.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_walk_that_unwinds_wakes_the_refreshes_waiting_for_it() {
+        let walks = std::sync::Arc::new(super::SharedWalks::default());
+        let other = omnifrons_app::ProcessId(u32::MAX - 1972);
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1973);
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: other.0,
+                walked: walked_tx,
+                release: release_rx,
+                unwind: true,
+            },
+        );
+        let holder = {
+            let walks = std::sync::Arc::clone(&walks);
+            std::thread::spawn(move || drop(walks.walk(other)))
+        };
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other walk must be held");
+        let (got_tx, got) = std::sync::mpsc::channel();
+        {
+            let walks = std::sync::Arc::clone(&walks);
+            std::thread::spawn(move || {
+                let _ = got_tx.send(walks.walk(waiter).started);
+            });
+        }
+        wait_for_queue(&walks, (1, true), "the refresh must wait for the held walk");
+        drop(release);
+        assert!(holder.join().is_err(), "the held walk must unwind");
+
+        got.recv_timeout(Duration::from_secs(10))
+            .expect("the waiting refresh must be woken and get a walk");
+        assert_eq!(walks.queue(), (0, false), "nothing may be left in flight");
+        assert!(
+            super::PROC_WALKS
+                .lock()
+                .expect("walk counter poisoned")
+                .contains(&waiter.0),
+            "the woken refresh must take its own walk"
         );
     }
 
@@ -3859,8 +3949,11 @@ mod self_exit_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_refresh_that_waited_for_another_walk_keeps_the_childs_cadence() {
-        const PERIOD: Duration = Duration::from_millis(400);
-        const WAIT: Duration = Duration::from_millis(200);
+        // The wait is shorter than the period, so the refresh that waited
+        // ends before the next is due; the bound below leaves half the wait
+        // on each side, 300 ms, for a loaded host.
+        const PERIOD: Duration = Duration::from_secs(1);
+        const WAIT: Duration = Duration::from_millis(600);
         let pacing = ReapPacing {
             census_refresh: PERIOD,
             ..HELD_WALK_PACING
@@ -3899,6 +3992,7 @@ mod self_exit_tests {
                 pid: other.0,
                 walked: walked_tx,
                 release: release_rx,
+                unwind: false,
             },
         );
         let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
