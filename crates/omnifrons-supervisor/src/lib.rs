@@ -657,7 +657,12 @@ impl SelfExitReaper {
         };
         // When the last refresh was requested: the spawn census for now.
         let mut census_at = std::time::Instant::now();
+        // Raised at the child's exit for a refresh still in flight.
+        let exiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut census = take_census_blocking(self.id).await;
+        // No walk that started before this may be folded into `census` at
+        // the exit: it may predate the census, or the child (`walk_how`).
+        let mut census_from = std::time::Instant::now();
         let mut refresh: Option<JoinHandle<Census>> = None;
         // The current cadence phase began at spawn, and begins again when
         // the child's output closes.
@@ -684,10 +689,18 @@ impl SelfExitReaper {
                     // A walk still in flight may be the only one to have
                     // sighted a descendant that left the group just before
                     // the exit: it is awaited and adopted now, while the
-                    // zombie still holds the child's pid (#197). It costs
-                    // the rest of a walk or two, at most
+                    // zombie still holds the child's pid (#197). A refresh
+                    // still waiting for another child's walk folds that walk
+                    // once it ends instead of taking its own (`exiting`), so
+                    // this costs the rest of one walk, at most
                     // `IN_FLIGHT_REFRESH_WAIT`.
                     if let Some(handle) = refresh.take() {
+                        self.walks.raise_exiting(&exiting);
+                        #[cfg(test)]
+                        EXIT_WAITS
+                            .lock()
+                            .expect("exit wait counter poisoned")
+                            .push(self.id.0);
                         census = adopt_in_flight(census, handle, self.id).await;
                     }
                     let (id, started) = (self.id, self.started);
@@ -748,15 +761,19 @@ impl SelfExitReaper {
             let interval = self.pacing.census_interval(elapsed);
             if refresh.is_none() && census_at.elapsed() >= interval {
                 let (id, bound, recorded) = (self.id, self.pacing.census_bound, census.clone());
-                let walks = Arc::clone(&self.walks);
+                let (walks, exiting) = (Arc::clone(&self.walks), Arc::clone(&exiting));
+                let not_before = census_from;
                 refresh = Some(tokio::task::spawn_blocking(move || {
-                    refresh_census(recorded, id, bound, &walks)
+                    refresh_census(recorded, id, bound, &walks, &exiting, not_before)
                 }));
                 // Timed from the request, not from the walk's start: a
                 // refresh that waits for another child's walk starts its own
                 // later, and timing from that would push the next refresh
                 // past this child's next poll (#197).
                 census_at = std::time::Instant::now();
+                // Once adopted, the census holds a walk that started at or
+                // after this request.
+                census_from = census_at;
             }
             // Stamp again so a long sleep is preceded by a fresh poll time.
             output_capture::note_reap_poll(&self.outputs, self.id);
@@ -1327,10 +1344,19 @@ fn census_task_failed() -> Census {
 /// Fold a walk of `/proc` into `census` for `id`, keeping at most `bound`
 /// sightings (`descendants::Census::refresh`: sightings no longer alive are
 /// forgotten, everything alive is kept). The walk is shared with the
-/// supervisor's other children ([`SharedWalks::walk`]), and started no
-/// earlier than this call. Blocking: it may wait for a walk in flight, or
-/// walk.
-fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWalks) -> Census {
+/// supervisor's other children ([`SharedWalks::walk_how`]), and started no
+/// earlier than this call, unless `exiting` is raised (the child exited)
+/// while it waits for the walk in flight: that walk is folded if it
+/// started at or after `not_before`, when `census` was taken at the latest,
+/// and none otherwise. Blocking: it may wait for a walk in flight, or walk.
+fn refresh_census(
+    census: Census,
+    id: ProcessId,
+    bound: usize,
+    walks: &SharedWalks,
+    exiting: &std::sync::atomic::AtomicBool,
+    not_before: std::time::Instant,
+) -> Census {
     #[cfg(test)]
     CENSUS_TAKES
         .lock()
@@ -1338,12 +1364,15 @@ fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWal
         .push(id.0);
     #[cfg(target_os = "linux")]
     {
-        census.refresh(&walks.walk(id).walk, pid_of(id), bound)
+        match walks.walk_how(id, exiting, not_before).0 {
+            Some(walk) => census.refresh(&walk.walk, pid_of(id), bound),
+            None => census,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Nothing to walk: the stub census records nothing.
-        let _ = (id, bound, walks);
+        let _ = (id, bound, walks, exiting, not_before);
         census
     }
 }
@@ -1361,7 +1390,10 @@ fn refresh_census(census: Census, id: ProcessId, bound: usize, walks: &SharedWal
 /// intervals old at the child's exit (independent verification of #197).
 /// A walk in flight for [`STUCK_WALK`] is taken for stuck: until it ends,
 /// refreshes stop waiting for it and walk on their own, as when each child
-/// walked for itself, so a stuck walk stalls only its own refresh.
+/// walked for itself, so a stuck walk stalls only its own refresh. Once a
+/// child's exit is noticed its refresh starts no walk: it folds the walk
+/// in flight it waits for, if that walk started after the census it folds
+/// into, so the exit waits for the rest of one walk, not two.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct SharedWalks {
@@ -1381,6 +1413,18 @@ const STUCK_WALK: Duration = Duration::from_secs(1);
 #[cfg(not(target_os = "linux"))]
 #[derive(Default)]
 struct SharedWalks;
+
+#[cfg(not(target_os = "linux"))]
+impl SharedWalks {
+    /// Raise `exiting`: no refresh walks here anyway.
+    #[expect(
+        clippy::unused_self,
+        reason = "the Linux counterpart takes the walks' lock"
+    )]
+    fn raise_exiting(&self, exiting: &std::sync::atomic::AtomicBool) {
+        exiting.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Default)]
@@ -1438,13 +1482,23 @@ enum How {
     Walked,
     /// A walk of its own, the walk in flight being stuck.
     PastStuck,
+    /// At the child's exit, the walk in flight it waited for.
+    InFlightAtExit,
+    /// At the child's exit, none: a walk started after the exit cannot
+    /// link a descendant to the child.
+    NoneAtExit,
 }
 
 #[cfg(target_os = "linux")]
 impl SharedWalks {
-    /// [`Self::walk_how`] without how the walk was got.
+    /// [`Self::walk_how`] for a child that is not exiting, without how
+    /// the walk was got.
+    #[cfg(test)]
     fn walk(&self, id: ProcessId) -> Arc<TimedWalk> {
-        self.walk_how(id).0
+        let not_exiting = std::sync::atomic::AtomicBool::new(false);
+        self.walk_how(id, &not_exiting, std::time::Instant::now())
+            .0
+            .expect("a child that is not exiting always gets a walk")
     }
 
     /// A walk for `id`'s census that started at or after this call, and
@@ -1453,10 +1507,27 @@ impl SharedWalks {
     /// and shared with the refreshes that queue behind it, or, while the
     /// walk in flight is stuck ([`STUCK_WALK`]), one of `id`'s own.
     /// Blocking.
-    fn walk_how(&self, id: ProcessId) -> (Arc<TimedWalk>, How) {
+    ///
+    /// Once `exiting` is raised ([`Self::raise_exiting`], when the reaper
+    /// notices the child's exit) no walk is started: the child's
+    /// descendants are already reparented, so a later walk cannot link one
+    /// to the child. The walk in flight this refresh waits for is folded
+    /// once it ends, though it started before the request, if it started
+    /// at or after `not_before` (when the census this refresh folds into
+    /// was taken, at the latest): an earlier walk would drop, as no longer
+    /// alive, what that census sighted since. Otherwise there is no walk to
+    /// fold.
+    fn walk_how(
+        &self,
+        id: ProcessId,
+        exiting: &std::sync::atomic::AtomicBool,
+        not_before: std::time::Instant,
+    ) -> (Option<Arc<TimedWalk>>, How) {
         let requested = std::time::Instant::now();
         let mut state = self.lock();
         let mut waited = false;
+        // The walk in flight this refresh last chose to wait for.
+        let mut awaited = None;
         let (walk, how) = loop {
             if let Some(latest) = state
                 .latest
@@ -1464,21 +1535,36 @@ impl SharedWalks {
                 .filter(|walk| walk.started >= requested)
             {
                 break (
-                    Arc::clone(latest),
+                    Some(Arc::clone(latest)),
                     if waited { How::Waited } else { How::Reused },
                 );
+            }
+            #[cfg(test)]
+            let stuck_after = state.stuck_after.unwrap_or(STUCK_WALK);
+            #[cfg(not(test))]
+            let stuck_after = STUCK_WALK;
+            if exiting.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(latest) = state
+                    .latest
+                    .as_ref()
+                    .filter(|walk| Some(walk.started) == awaited && walk.started >= not_before)
+                {
+                    break (Some(Arc::clone(latest)), How::InFlightAtExit);
+                }
+                let still_awaited = state.in_flight.is_some_and(|(started, _)| {
+                    Some(started) == awaited && started.elapsed() < stuck_after
+                });
+                if !still_awaited {
+                    break (None, How::NoneAtExit);
+                }
             }
             let Some((started, walker)) = state.in_flight else {
                 let started = std::time::Instant::now();
                 state.in_flight = Some((started, id.0));
                 drop(state);
-                break (self.take_shared(id, started), How::Walked);
+                break (Some(self.take_shared(id, started)), How::Walked);
             };
             let age = started.elapsed();
-            #[cfg(test)]
-            let stuck_after = state.stuck_after.unwrap_or(STUCK_WALK);
-            #[cfg(not(test))]
-            let stuck_after = STUCK_WALK;
             if age >= stuck_after {
                 let first = state.warned_stuck != Some(started);
                 state.warned_stuck = Some(started);
@@ -1492,8 +1578,9 @@ impl SharedWalks {
                          census refreshes walk on their own until it ends"
                     );
                 }
-                break (self.take_own(id), How::PastStuck);
+                break (Some(self.take_own(id)), How::PastStuck);
             }
+            awaited = Some(started);
             #[cfg(test)]
             {
                 state.waiting += 1;
@@ -1515,10 +1602,18 @@ impl SharedWalks {
             pid = id.0,
             ?how,
             took = ?requested.elapsed(),
-            walk_age = ?walk.started.elapsed(),
+            walk_age = ?walk.as_ref().map(|walk| walk.started.elapsed()),
             "census refresh got its walk of /proc"
         );
         (walk, how)
+    }
+
+    /// Raise `exiting` under the walks' lock, which [`Self::walk_how`] holds
+    /// while it reads the flag and decides to walk: no refresh can read it
+    /// unset and then start a walk after this.
+    fn raise_exiting(&self, exiting: &std::sync::atomic::AtomicBool) {
+        let _state = self.lock();
+        exiting.store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, WalkState> {
@@ -1597,6 +1692,12 @@ impl Drop for Walking<'_> {
 /// Every pid a census was taken for, in order; unit tests count their own.
 #[cfg(test)]
 static CENSUS_TAKES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// The pid of every child whose reaper, at the child's exit, raised
+/// `exiting` and is about to wait for its refresh in flight; unit tests
+/// wait on it instead of sleeping.
+#[cfg(test)]
+static EXIT_WAITS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// The pid of the child whose census refresh read the whole process table,
 /// once per full `/proc` walk; unit tests count their own children's.
@@ -3765,11 +3866,11 @@ mod self_exit_tests {
             .expect("the held refresh must walk");
         std::fs::write(&end, b"").expect("the end file must be written");
         wait_until_not_running(id.0, Duration::from_secs(2));
-        // Released only once the reaper has had time to read the exit
-        // (it polls every 5 ms): released earlier, the walk could finish
-        // first and be adopted at the top of the loop, the path that
-        // existed before this fix.
-        std::thread::sleep(Duration::from_millis(200));
+        // Released only once the reaper has read the exit and waits for the
+        // walk: released earlier, the walk could finish first and be
+        // adopted at the top of the loop, the path that existed before this
+        // fix.
+        wait_for_exit_wait(id.0);
         drop(release);
 
         while let Ok(frame) = frames.recv_timeout(Duration::from_secs(10)) {
@@ -4158,7 +4259,11 @@ mod self_exit_tests {
             let (got_tx, got) = std::sync::mpsc::channel();
             let (walks, dispatch) = (std::sync::Arc::clone(&walks), dispatch.clone());
             std::thread::spawn(move || {
-                let (walk, how) = logged(&dispatch, || walks.walk_how(waiter));
+                let not_exiting = std::sync::atomic::AtomicBool::new(false);
+                let (walk, how) = logged(&dispatch, || {
+                    walks.walk_how(waiter, &not_exiting, std::time::Instant::now())
+                });
+                let walk = walk.expect("a child that is not exiting always gets a walk");
                 let _ = got_tx.send((walk.started, how));
             });
             let (started, how) = got
@@ -4196,6 +4301,334 @@ mod self_exit_tests {
             1,
             "the stuck walk must be warned about once: {text}"
         );
+    }
+
+    /// Wait, at most 10 s, until the reaper of `pid` has raised `exiting`
+    /// at the child's exit and waits for its refresh in flight.
+    #[cfg(target_os = "linux")]
+    fn wait_for_exit_wait(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !super::EXIT_WAITS
+            .lock()
+            .expect("exit wait counter poisoned")
+            .contains(&pid)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reaper must wait for the refresh in flight at the exit"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Hold the next walk taken for `other` on `walks`, from a thread of
+    /// its own, once that walk has read `/proc`. Returns the thread, the
+    /// sender that releases the walk (as does dropping it), and the hold.
+    #[cfg(target_os = "linux")]
+    fn hold_a_walk(
+        walks: &std::sync::Arc<super::SharedWalks>,
+        other: omnifrons_app::ProcessId,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Sender<()>,
+        super::HookRegistration<super::HeldWalk>,
+    ) {
+        let (walked_tx, walked) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: other.0,
+                walked: walked_tx,
+                release: release_rx,
+                unwind: false,
+            },
+        );
+        let holder = {
+            let walks = std::sync::Arc::clone(walks);
+            std::thread::spawn(move || drop(walks.walk(other)))
+        };
+        walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other walk must be held");
+        (holder, release, hold)
+    }
+
+    /// How many `/proc` walks the refreshes of `pid` took.
+    #[cfg(target_os = "linux")]
+    fn walks_taken_for(pid: u32) -> usize {
+        super::PROC_WALKS
+            .lock()
+            .expect("walk counter poisoned")
+            .iter()
+            .filter(|walker| **walker == pid)
+            .count()
+    }
+
+    /// A refresh for `waiter` on its own thread, whose child exits (its
+    /// `exiting` is raised) once the refresh waits for the walk in flight,
+    /// which is then released. Returns the walk's start and how it was got.
+    #[cfg(target_os = "linux")]
+    fn refresh_across_the_exit(
+        walks: &std::sync::Arc<super::SharedWalks>,
+        waiter: omnifrons_app::ProcessId,
+        not_before: std::time::Instant,
+        release: std::sync::mpsc::Sender<()>,
+        holder: std::thread::JoinHandle<()>,
+    ) -> (Option<std::time::Instant>, super::How) {
+        let exiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (got_tx, got) = std::sync::mpsc::channel();
+        {
+            let (walks, exiting) = (
+                std::sync::Arc::clone(walks),
+                std::sync::Arc::clone(&exiting),
+            );
+            std::thread::spawn(move || {
+                let (walk, how) = walks.walk_how(waiter, &exiting, not_before);
+                let _ = got_tx.send((walk.map(|walk| walk.started), how));
+            });
+        }
+        wait_for_queue(walks, (1, true), "the refresh must wait for the held walk");
+        walks.raise_exiting(&exiting);
+        drop(release);
+        holder.join().expect("the held walk must end");
+        got.recv_timeout(Duration::from_secs(10))
+            .expect("the refresh must end once the walk it waited for ends")
+    }
+
+    /// The advisories of #207: at the child's exit, a refresh still waiting
+    /// for another child's walk folds that walk once it ends, though it
+    /// started before the refresh was requested, and takes no walk of its
+    /// own after it: a walk started after the exit cannot link a
+    /// descendant to the child, so waiting for one only delayed the exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refresh_waiting_at_the_exit_folds_the_walk_in_flight() {
+        let walks = std::sync::Arc::new(super::SharedWalks::default());
+        let other = omnifrons_app::ProcessId(u32::MAX - 1976);
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1977);
+        let not_before = std::time::Instant::now();
+        let (holder, release, _hold) = hold_a_walk(&walks, other);
+
+        let (started, how) = refresh_across_the_exit(&walks, waiter, not_before, release, holder);
+        assert_eq!(how, super::How::InFlightAtExit);
+        assert_eq!(started, walks.latest_started(), "the walk it waited for");
+        assert_eq!(walks_taken_for(waiter.0), 0, "no walk of its own");
+    }
+
+    /// The advisories of #207: at the child's exit, the walk in flight is
+    /// not folded if it started before the census the refresh folds into
+    /// was taken: it may not even contain the child, and it would drop
+    /// what that census sighted since. The refresh then folds nothing, and
+    /// still takes no walk of its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refresh_at_the_exit_never_folds_a_walk_older_than_its_census() {
+        let walks = std::sync::Arc::new(super::SharedWalks::default());
+        let other = omnifrons_app::ProcessId(u32::MAX - 1978);
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1979);
+        let (holder, release, _hold) = hold_a_walk(&walks, other);
+        let not_before = std::time::Instant::now();
+
+        let (started, how) = refresh_across_the_exit(&walks, waiter, not_before, release, holder);
+        assert_eq!((started, how), (None, super::How::NoneAtExit));
+        assert_eq!(walks_taken_for(waiter.0), 0, "no walk of its own");
+    }
+
+    /// The advisories of #207: a refresh that starts after the child's exit
+    /// was noticed takes no walk at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refresh_that_starts_after_the_exit_takes_no_walk() {
+        let walks = super::SharedWalks::default();
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1980);
+        let exiting = std::sync::atomic::AtomicBool::new(true);
+        let (walk, how) = walks.walk_how(waiter, &exiting, std::time::Instant::now());
+        assert_eq!((walk.is_none(), how), (true, super::How::NoneAtExit));
+        assert_eq!(walks_taken_for(waiter.0), 0, "no walk at all");
+    }
+
+    /// The advisories of #207: at the exit, a refresh does not wait for
+    /// the walk that a refresh of a child still running starts once the
+    /// awaited walk ends; it folds the awaited walk while the next one is
+    /// still in flight (independent verification of T3).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exiting_refresh_never_waits_for_the_next_walker() {
+        let walks = std::sync::Arc::new(super::SharedWalks::default());
+        walks.set_stuck_bound(Duration::from_secs(30));
+        let other = omnifrons_app::ProcessId(u32::MAX - 1992);
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1993);
+        let next = omnifrons_app::ProcessId(u32::MAX - 1994);
+        let not_before = std::time::Instant::now();
+        let (holder, release, _hold) = hold_a_walk(&walks, other);
+        let held = walks.lock().in_flight.map(|(started, _)| started);
+        let (next_walked_tx, next_walked) = std::sync::mpsc::channel();
+        let (next_release, next_release_rx) = std::sync::mpsc::channel::<()>();
+        let _next_hold = super::register_hook(
+            &super::HELD_WALKS,
+            super::HeldWalk {
+                pid: next.0,
+                walked: next_walked_tx,
+                release: next_release_rx,
+                unwind: false,
+            },
+        );
+        let exiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (got_tx, got) = std::sync::mpsc::channel();
+        for (pid, flag) in [
+            (waiter, std::sync::Arc::clone(&exiting)),
+            (next, std::sync::Arc::default()),
+        ] {
+            let (walks, got_tx) = (std::sync::Arc::clone(&walks), got_tx.clone());
+            let since = if pid == waiter {
+                not_before
+            } else {
+                std::time::Instant::now()
+            };
+            std::thread::spawn(move || {
+                let (walk, how) = walks.walk_how(pid, &flag, since);
+                let _ = got_tx.send((pid, walk.map(|walk| walk.started), how));
+            });
+        }
+        wait_for_queue(
+            &walks,
+            (2, true),
+            "both refreshes must wait for the held walk",
+        );
+        walks.raise_exiting(&exiting);
+        drop(release);
+        holder.join().expect("the held walk must end");
+        next_walked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other refresh must take the next walk");
+        let first = got
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the exiting refresh must end while the next walk is held");
+        drop(next_release);
+
+        assert_eq!(first, (waiter, held, super::How::InFlightAtExit));
+        assert_eq!(walks_taken_for(waiter.0), 0, "no walk of its own");
+    }
+
+    /// The advisories of #207: at the exit, an awaited walk that turns
+    /// stuck yields no walk, and the refresh does not walk on its own past
+    /// it as it would before the exit (independent verification of T3).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_awaited_walk_stuck_at_the_exit_yields_no_walk() {
+        let walks = std::sync::Arc::new(super::SharedWalks::default());
+        walks.set_stuck_bound(Duration::from_millis(400));
+        let other = omnifrons_app::ProcessId(u32::MAX - 1996);
+        let waiter = omnifrons_app::ProcessId(u32::MAX - 1997);
+        let not_before = std::time::Instant::now();
+        let (holder, release, _hold) = hold_a_walk(&walks, other);
+        let exiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (got_tx, got) = std::sync::mpsc::channel();
+        {
+            let (walks, exiting) = (
+                std::sync::Arc::clone(&walks),
+                std::sync::Arc::clone(&exiting),
+            );
+            std::thread::spawn(move || {
+                let (walk, how) = walks.walk_how(waiter, &exiting, not_before);
+                let _ = got_tx.send((walk.is_some(), how));
+            });
+        }
+        wait_for_queue(&walks, (1, true), "the refresh must wait for the held walk");
+        walks.raise_exiting(&exiting);
+        // The held walk is released only after: the refresh ends at the
+        // stuck bound, not when the walk does.
+        let outcome = got
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the refresh must end at the stuck bound");
+        drop(release);
+        holder.join().expect("the held walk must end");
+
+        assert_eq!(outcome, (false, super::How::NoneAtExit));
+        assert_eq!(walks_taken_for(waiter.0), 0, "no walk past the stuck walk");
+    }
+
+    /// The advisories of #207, end to end: a helper that left the group
+    /// with `setsid` is sighted only by another child's walk, held across
+    /// this child's exit while this child's refresh waits for it. Folded
+    /// at the exit, that walk names the helper; a walk of the refresh's
+    /// own, after the exit, could not have linked it to the child.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_childs_walk_in_flight_at_the_exit_names_an_escaped_helper() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let mut cleanup = HeldWalkCleanup(
+            std::env::temp_dir().join(format!(
+                "omnifrons-shared-walk-{}-{nanos}",
+                std::process::id()
+            )),
+            None,
+        );
+        std::fs::create_dir(&cleanup.0).expect("the scratch directory must be created");
+        let (go, end) = (cleanup.0.join("go"), cleanup.0.join("end"));
+        let script = "while [ ! -e \"$1\" ]; do sleep 0.01; done; \
+                      setsid sleep 30 >/dev/null 2>&1 </dev/null & echo \"$!\"; \
+                      while [ ! -e \"$2\" ]; do sleep 0.01; done; exit 0";
+        let mut supervisor = TokioProcessSupervisor::build_with(None, HELD_WALK_PACING);
+        let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        let spec = ProcessSpec::new("/bin/sh").with_args([
+            "-c".to_owned(),
+            script.to_owned(),
+            "sh".to_owned(),
+            go.to_str().expect("UTF-8 path").to_owned(),
+            end.to_str().expect("UTF-8 path").to_owned(),
+        ]);
+        let id = supervisor.spawn(spec).expect("spawning sh must succeed");
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+
+        // The first refresh, 1 s after the spawn census, walks for itself
+        // and ends before the helper exists.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while walks_taken_for(id.0) < 1 || walks.queue() != (0, false) {
+            assert!(std::time::Instant::now() < deadline, "no first refresh");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::write(&go, b"").expect("the go file must be written");
+        let mut seen = Vec::new();
+        let helper = loop {
+            let frame = frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the helper's pid must be printed");
+            if let FramePayload::Text { text, .. } = &frame.payload
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            seen.push(frame);
+        };
+        cleanup.1 = Some(helper);
+        // Another child's walk sights the helper and is held; the next
+        // refresh, 1 s after the first, waits for it.
+        let other = omnifrons_app::ProcessId(u32::MAX - 1981);
+        let (holder, release, _hold) = hold_a_walk(&walks, other);
+        wait_for_queue(
+            &walks,
+            (1, true),
+            "the next refresh must wait for the held walk",
+        );
+        std::fs::write(&end, b"").expect("the end file must be written");
+        wait_until_not_running(id.0, Duration::from_secs(2));
+        wait_for_exit_wait(id.0);
+        drop(release);
+        holder.join().expect("the held walk must end");
+
+        while let Ok(frame) = frames.recv_timeout(Duration::from_secs(10)) {
+            seen.push(frame);
+        }
+        let texts = frame_texts(&seen);
+        let note = format!(
+            "descendant {helper} (sleep) left the run's process group and is still running"
+        );
+        assert!(texts.contains(&note), "frames: {texts:?}");
+        assert_eq!(walks_taken_for(id.0), 1, "no walk of its own at the exit");
     }
 
     /// #197 (verification B1): a refresh folds only a walk that started at
