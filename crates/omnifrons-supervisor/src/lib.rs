@@ -4001,13 +4001,17 @@ mod self_exit_tests {
     /// and wakes every refresh waiting for it at once, and the woken
     /// refreshes share one walk of their own. No refresh waits for a walk
     /// that will never finish. Three waiters, each timed when it returns,
-    /// tell waking all of them from waking one: a refresh nobody wakes
-    /// would walk only once the unwound walk is `STUCK_WALK` old
-    /// (independent verification of the advisories).
+    /// tell waking all of them from waking one (independent verification
+    /// of the advisories). The stuck bound is raised, so a refresh nobody
+    /// wakes stays waiting, and a loaded host cannot make the held walk
+    /// look stuck before the refreshes queue (native review).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_walk_that_unwinds_wakes_every_refresh_waiting_for_it() {
+        // Far longer than waking a refresh and taking one walk.
+        const PROMPT: Duration = Duration::from_millis(500);
         let walks = std::sync::Arc::new(super::SharedWalks::default());
+        walks.set_stuck_bound(Duration::from_secs(60));
         let other = omnifrons_app::ProcessId(u32::MAX - 1982);
         let waiters: Vec<u32> = (1983..1986).map(|n| u32::MAX - n).collect();
         let (walked_tx, walked) = std::sync::mpsc::channel();
@@ -4051,7 +4055,7 @@ mod self_exit_tests {
                 .expect("every waiting refresh must be woken and get a walk");
             let late = at.saturating_duration_since(released);
             assert!(
-                late < super::STUCK_WALK / 2,
+                late < PROMPT,
                 "a waiting refresh got its walk {late:?} after the unwind"
             );
         }
