@@ -4947,6 +4947,9 @@ mod self_exit_tests {
             .lock()
             .expect("walk counter poisoned")
             .retain(|walker| *walker != id.0);
+        // Should the reaper's next poll still come between the exit and the
+        // Stop, it waits at the exit, so it is the Stop that reaps.
+        let hold = HeldExit::new(id.0);
         let frames = supervisor.subscribe(id).expect("subscribe must succeed");
         // The helper is forked only once a walk has ended, so the walks
         // the reaper adopts at its next poll cannot have sighted it.
@@ -4984,6 +4987,7 @@ mod self_exit_tests {
         let state = supervisor
             .stop(id, Duration::from_secs(2))
             .expect("stop must return a result");
+        drop(hold);
 
         let helper_pid = u32::try_from(helper).expect("a pid is positive");
         wait_until_not_running(helper_pid, Duration::from_millis(500));
