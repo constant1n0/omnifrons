@@ -15,7 +15,10 @@
 //!
 //! 1. **Census** ([`Census::take`]), taken while the child is still alive:
 //!    walk `/proc` by parent chain and record every descendant as
-//!    `(pid, starttime)`.
+//!    `(pid, starttime)`. A child that already exited and only awaits its
+//!    reap has no descendant left to walk to, so Stop then folds in the
+//!    census its self-exit reaper kept while it lived
+//!    ([`Census::take_at_stop`], #199).
 //! 2. **Verify and sweep** ([`Census::settle`]), after the child is
 //!    reaped: re-read every recorded `(pid, starttime)`, terminate the
 //!    ones still running (`SIGTERM`, bounded wait, `SIGKILL`), and check
@@ -294,6 +297,41 @@ impl Census {
         match read_table(proc_root) {
             Err(reason) => Self::Unavailable(reason),
             Ok(table) => Self::from_table(&table, child),
+        }
+    }
+
+    /// [`Self::take`] for a Stop. A walk that finds `child` already exited
+    /// (an unreaped zombie) links no descendant to it, since the kernel
+    /// reparented them at the exit, so the census the self-exit reaper kept
+    /// while the child lived, read through `recorded` only once this walk
+    /// has found the exit, is folded into that walk ([`Self::refresh`]) and
+    /// the Stop sweeps what it sighted (#199). A recorded census that proves
+    /// nothing stays that way. While the child is alive, the Stop keeps the
+    /// census of its own walk, as before, and `recorded` is not read.
+    pub(crate) fn take_at_stop(
+        child: Pid,
+        recorded: impl FnOnce() -> Option<Self>,
+        bound: usize,
+    ) -> Self {
+        Self::take_at_stop_in(Path::new(PROC_ROOT), child, recorded, bound)
+    }
+
+    fn take_at_stop_in(
+        proc_root: &Path,
+        child: Pid,
+        recorded: impl FnOnce() -> Option<Self>,
+        bound: usize,
+    ) -> Self {
+        let table = match read_table(proc_root) {
+            Ok(table) => table,
+            Err(reason) => return Self::Unavailable(reason),
+        };
+        let exited = table
+            .get(&child)
+            .is_some_and(|stat| stat.state == ZOMBIE_STATE);
+        match exited.then(recorded).flatten() {
+            Some(recorded) => recorded.refresh(&Walk(Ok(table)), child, bound),
+            None => Self::from_table(&table, child),
         }
     }
 
@@ -1180,6 +1218,70 @@ mod tests {
             panic!("two readable walks must merge into a snapshot")
         };
         assert_eq!(recorded, vec![identity(101, 11)]);
+    }
+
+    /// #199: a Stop whose walk finds the child already exited folds in the
+    /// census recorded while it lived: the helper that left the group and
+    /// was reparented is kept for the sweep, a sighting no longer alive is
+    /// forgotten, and the zombie's own walk adds nothing.
+    #[test]
+    fn a_stop_census_of_the_zombie_child_folds_the_recorded_census() {
+        let root = ProcRoot::new("stop-zombie");
+        root.entry(100, 'Z', 1, 100, 10)
+            .entry(101, 'S', 1, 101, 11)
+            .entry(200, 'S', 1, 200, 20);
+        let recorded = Census::Snapshot(vec![identity(101, 11), identity(102, 12)]);
+
+        let Census::Snapshot(census) =
+            Census::take_at_stop_in(root.path(), pid(100), move || Some(recorded), BOUND)
+        else {
+            panic!("a readable walk of the zombie child must yield a snapshot")
+        };
+        assert_eq!(census, vec![identity(101, 11)]);
+
+        let Census::Snapshot(unrecorded) =
+            Census::take_at_stop_in(root.path(), pid(100), || None, BOUND)
+        else {
+            panic!("a readable walk of the zombie child must yield a snapshot")
+        };
+        assert!(unrecorded.is_empty(), "nothing links to the zombie child");
+    }
+
+    /// #199: a recorded census that proves nothing makes the Stop's census
+    /// prove nothing too once the child has exited, as the self-exit
+    /// verdict would.
+    #[test]
+    fn a_stop_census_of_the_zombie_child_keeps_a_recorded_census_that_proves_nothing() {
+        let root = ProcRoot::new("stop-zombie-unproven");
+        root.entry(100, 'Z', 1, 100, 10).entry(101, 'S', 1, 101, 11);
+        let recorded = Census::Unavailable(Unproven::TooManySightings);
+
+        let census = Census::take_at_stop_in(root.path(), pid(100), move || Some(recorded), BOUND);
+
+        assert!(matches!(
+            census,
+            Census::Unavailable(Unproven::TooManySightings)
+        ));
+    }
+
+    /// #199: while the child is alive, a Stop keeps the census of its own
+    /// walk, as before, and never reads the recorded census.
+    #[test]
+    fn a_stop_census_of_a_live_child_keeps_its_own_walk() {
+        let root = ProcRoot::new("stop-alive");
+        root.entry(100, 'S', 1, 100, 10)
+            .entry(101, 'S', 1, 101, 11)
+            .entry(102, 'S', 100, 100, 12);
+
+        let Census::Snapshot(census) = Census::take_at_stop_in(
+            root.path(),
+            pid(100),
+            || panic!("a Stop on a live child must not read the recorded census"),
+            BOUND,
+        ) else {
+            panic!("a readable walk of the live child must yield a snapshot")
+        };
+        assert_eq!(census, vec![identity(102, 12)]);
     }
 
     /// A refresh forgets every recorded sighting that is no longer alive --

@@ -413,6 +413,9 @@ struct SelfExitReaper {
     walks: Arc<SharedWalks>,
     /// The claim `finish_spawn` took for this reaper, if it got one.
     claim: Option<output_capture::ClaimToken>,
+    /// Where this reaper shares its census with `stop`
+    /// ([`RecordedCensus`]): the same slot the child's entry holds.
+    recorded: RecordedCensus,
 }
 
 /// A recorded member of a self-exited child's process group -- always a
@@ -660,6 +663,8 @@ impl SelfExitReaper {
         // Raised at the child's exit for a refresh still in flight.
         let exiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut census = take_census_blocking(self.id).await;
+        // Each refresh shares the census it folds itself (`refresh_census`).
+        record_census(&self.recorded, &census);
         // No walk that started before this may be folded into `census` at
         // the exit: it may predate the census, or the child (`walk_how`).
         let mut census_from = std::time::Instant::now();
@@ -686,29 +691,9 @@ impl SelfExitReaper {
             // id, and only then is the child reaped (`try_reap`).
             let exit = match peek_exit(self.id) {
                 ExitCensus::Exited(_) => {
-                    // A walk still in flight may be the only one to have
-                    // sighted a descendant that left the group just before
-                    // the exit: it is awaited and adopted now, while the
-                    // zombie still holds the child's pid (#197). A refresh
-                    // still waiting for another child's walk folds that walk
-                    // once it ends instead of taking its own (`exiting`), so
-                    // this costs the rest of one walk, at most
-                    // `IN_FLIGHT_REFRESH_WAIT`.
-                    if let Some(handle) = refresh.take() {
-                        self.walks.raise_exiting(&exiting);
-                        #[cfg(test)]
-                        EXIT_WAITS
-                            .lock()
-                            .expect("exit wait counter poisoned")
-                            .push(self.id.0);
-                        census = adopt_in_flight(census, handle, self.id).await;
-                    }
-                    let (id, started) = (self.id, self.started);
-                    tokio::task::spawn_blocking(move || {
-                        take_exit_group(id, started, ExitCensus::Exited(Vec::new()))
-                    })
-                    .await
-                    .unwrap_or(ExitCensus::Exited(Vec::new()))
+                    let (adopted, exit) = self.at_exit(census, refresh.take(), &exiting).await;
+                    census = adopted;
+                    exit
                 }
                 other => other,
             };
@@ -762,9 +747,9 @@ impl SelfExitReaper {
             if refresh.is_none() && census_at.elapsed() >= interval {
                 let (id, bound, recorded) = (self.id, self.pacing.census_bound, census.clone());
                 let (walks, exiting) = (Arc::clone(&self.walks), Arc::clone(&exiting));
-                let not_before = census_from;
+                let (not_before, shared) = (census_from, Arc::clone(&self.recorded));
                 refresh = Some(tokio::task::spawn_blocking(move || {
-                    refresh_census(recorded, id, bound, &walks, &exiting, not_before)
+                    refresh_census(recorded, id, bound, &walks, &exiting, not_before, &shared)
                 }));
                 // Timed from the request, not from the walk's start: a
                 // refresh that waits for another child's walk starts its own
@@ -789,6 +774,44 @@ impl SelfExitReaper {
                 .await;
             }
         }
+    }
+
+    /// The child has exited and is not reaped yet: complete `census` and
+    /// read the child's group, while the zombie still holds its pid.
+    ///
+    /// A walk still in flight (`refresh`) may be the only one to have
+    /// sighted a descendant that left the group just before the exit: it is
+    /// awaited and adopted now (#197). A refresh still waiting for another
+    /// child's walk folds that walk once it ends instead of taking its own
+    /// (`exiting`), so this costs the rest of one walk, at most
+    /// `IN_FLIGHT_REFRESH_WAIT`.
+    async fn at_exit(
+        &self,
+        census: Census,
+        refresh: Option<JoinHandle<Census>>,
+        exiting: &std::sync::atomic::AtomicBool,
+    ) -> (Census, ExitCensus) {
+        let census = match refresh {
+            Some(handle) => {
+                self.walks.raise_exiting(exiting);
+                #[cfg(test)]
+                EXIT_WAITS
+                    .lock()
+                    .expect("exit wait counter poisoned")
+                    .push(self.id.0);
+                adopt_in_flight(census, handle, self.id).await
+            }
+            None => census,
+        };
+        let (id, started) = (self.id, self.started);
+        let exit = tokio::task::spawn_blocking(move || {
+            take_exit_group(id, started, ExitCensus::Exited(Vec::new()))
+        })
+        .await
+        .unwrap_or(ExitCensus::Exited(Vec::new()));
+        #[cfg(test)]
+        hold_reaper_at_exit(self.id).await;
+        (census, exit)
     }
 
     /// Give the readers the exit grace, counted from now: `true` when one
@@ -900,7 +923,7 @@ impl SelfExitReaper {
             let Some(tracked) = children.get_mut(&self.id) else {
                 return ReapAttempt::Finished;
             };
-            let Tracked::Running(child, _) = tracked else {
+            let Tracked::Running(child, ..) = tracked else {
                 return ReapAttempt::ReapedElsewhere;
             };
             // Checked with `children` held (the only nesting of the two
@@ -1096,6 +1119,13 @@ impl Census {
         Self
     }
 
+    // Without `/proc` the reaper records nothing, so there is nothing for
+    // a Stop to fold in; only `unix::stop` calls this.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn take_at_stop<P, R>(_child: P, _recorded: R, _bound: usize) -> Self {
+        Self
+    }
+
     // Takes `&self` it does not read, so this stub keeps the exact shape
     // the Linux census has and `stop` stays one platform-independent call
     // site (`clippy::unused_self` would have it an associated function).
@@ -1213,7 +1243,7 @@ fn running_start(
         .expect("children mutex poisoned by a prior panic")
         .get(&id)
     {
-        Some(Tracked::Running(_, started)) => Some(*started),
+        Some(Tracked::Running(_, started, _)) => Some(*started),
         _ => None,
     }
 }
@@ -1349,6 +1379,13 @@ fn census_task_failed() -> Census {
 /// while it waits for the walk in flight: that walk is folded if it
 /// started at or after `not_before`, when `census` was taken at the latest,
 /// and none otherwise. Blocking: it may wait for a walk in flight, or walk.
+///
+/// A census that folded a walk is shared with Stop (`recorded`) the moment
+/// it is folded, not when the reaper adopts it at its next poll, up to a
+/// poll interval later (#199): the reaper's census does not change while a
+/// refresh runs, so this is the census it will adopt. One that folded none
+/// is not shared: it is the census already shared, and a refresh at the
+/// exit must not replace the one a detached walk shared meanwhile.
 fn refresh_census(
     census: Census,
     id: ProcessId,
@@ -1356,6 +1393,7 @@ fn refresh_census(
     walks: &SharedWalks,
     exiting: &std::sync::atomic::AtomicBool,
     not_before: std::time::Instant,
+    recorded: &RecordedCensus,
 ) -> Census {
     #[cfg(test)]
     CENSUS_TAKES
@@ -1365,16 +1403,28 @@ fn refresh_census(
     #[cfg(target_os = "linux")]
     {
         match walks.walk_how(id, exiting, not_before).0 {
-            Some(walk) => census.refresh(&walk.walk, pid_of(id), bound),
+            Some(walk) => {
+                let refreshed = census.refresh(&walk.walk, pid_of(id), bound);
+                record_census(recorded, &refreshed);
+                refreshed
+            }
             None => census,
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Nothing to walk: the stub census records nothing.
-        let _ = (id, bound, walks, exiting, not_before);
+        let _ = (id, bound, walks, exiting, not_before, recorded);
         census
     }
+}
+
+/// Share `census` with a Stop that lands before the child's reap
+/// ([`RecordedCensus`]).
+fn record_census(recorded: &RecordedCensus, census: &Census) {
+    *recorded
+        .lock()
+        .expect("recorded census mutex poisoned by a prior panic") = Some(census.clone());
 }
 
 /// One `/proc` walk at a time per supervisor, shared by every running
@@ -1820,6 +1870,37 @@ async fn hold_reaper_end(id: ProcessId) {
     }
 }
 
+/// Pids whose reaper a unit test holds once it has read the child's exit,
+/// before it tries to reap, for as long as the pid stays here; each hold is
+/// recorded in [`REACHED_EXITS`] as it begins.
+#[cfg(test)]
+static HELD_EXITS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Pids whose reaper has begun a hold of [`HELD_EXITS`].
+#[cfg(test)]
+static REACHED_EXITS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Hold `id`'s reaper while a unit test keeps `id` in [`HELD_EXITS`].
+#[cfg(test)]
+async fn hold_reaper_at_exit(id: ProcessId) {
+    let held = || {
+        HELD_EXITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id.0)
+    };
+    if !held() {
+        return;
+    }
+    REACHED_EXITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(id.0);
+    while held() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Pids whose census walk a unit test makes panic, so a failed census task
 /// can be exercised.
 #[cfg(test)]
@@ -1935,12 +2016,30 @@ enum Tracked {
     /// boxing keeps every `Tracked` entry (including the far more common
     /// eventual `Terminal` one) at the smaller size instead of every entry
     /// paying for the largest variant. With it, the child's start time as
-    /// read right after spawn ([`ChildStart`]).
-    Running(Box<Child>, ChildStart),
+    /// read right after spawn ([`ChildStart`]), and the census its self-exit
+    /// reaper keeps ([`RecordedCensus`]).
+    Running(
+        Box<Child>,
+        ChildStart,
+        #[cfg_attr(
+            not(unix),
+            expect(dead_code, reason = "only `unix::stop` reads the recorded census")
+        )]
+        RecordedCensus,
+    ),
     /// Confirmed terminal: the `Child` handle has been dropped, and this
     /// state is returned directly to any later `stop`/`observe` call.
     Terminal(ProcessTerminalState),
 }
+
+/// The census of a running child's descendants as of the last walk its
+/// self-exit reaper folded in, shared with `stop` as soon as that walk is
+/// folded (`refresh_census`): a Stop that lands after the child exited,
+/// before the reaper reaped it, folds it in, since its own walk of the
+/// zombie child can link no descendant (#199). `None` until the spawn
+/// census. Held by the child's entry in `children`, so a pid recycled for a
+/// later child never reads an earlier child's census.
+type RecordedCensus = Arc<Mutex<Option<Census>>>;
 
 /// Why [`TokioProcessSupervisor::send_input`] wrote nothing, or not all of
 /// it. Its own type rather than a [`SupervisorError`] variant: only this
@@ -2537,16 +2636,23 @@ impl TokioProcessSupervisor {
         // a no-op.
         drop(command);
 
+        let recorded = RecordedCensus::default();
         self.inner
             .children
             .lock()
             .expect("children mutex poisoned by a prior panic")
-            .insert(id, Tracked::Running(Box::new(child), started));
+            .insert(
+                id,
+                Tracked::Running(Box::new(child), started, Arc::clone(&recorded)),
+            );
 
         // From spawn, not from the readers' end: a descendant that inherited
         // the output can keep the readers running long after the child has
         // exited. Spawned only now, with the entry in `children` to poll.
-        self.spawn_on_runtime(self.reaper(id, readers_done, claim, started).run());
+        self.spawn_on_runtime(
+            self.reaper(id, readers_done, claim, started, recorded)
+                .run(),
+        );
 
         tracing::debug!(program = %program_label, pid, "spawned process");
         Ok(id)
@@ -2560,6 +2666,7 @@ impl TokioProcessSupervisor {
         readers_done: Arc<tokio::sync::Notify>,
         claim: Option<output_capture::ClaimToken>,
         started: ChildStart,
+        recorded: RecordedCensus,
     ) -> SelfExitReaper {
         SelfExitReaper {
             children: Arc::clone(&self.inner.children),
@@ -2575,6 +2682,7 @@ impl TokioProcessSupervisor {
             started,
             walks: Arc::clone(&self.inner.census_walks),
             claim,
+            recorded,
         }
     }
 
@@ -2892,6 +3000,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                 &self.inner.outputs,
                 id,
                 deadline,
+                self.inner.reap_pacing.census_bound,
             )
         }
         #[cfg(windows)]
@@ -2992,7 +3101,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             }
             Tracked::Running(..) if reaper_active => Some(ProcessStatus::Running),
             // Without a census taken above, nothing is reaped.
-            Tracked::Running(child, _) => {
+            Tracked::Running(child, ..) => {
                 match reap_after_exit_census(child, exit.take().unwrap_or(ExitCensus::Running)) {
                     Ok(Some((status, members))) => {
                         let state = ProcessTerminalState::Exited {
@@ -3128,7 +3237,7 @@ impl Drop for Inner {
                 Err(poisoned) => poisoned.into_inner(),
             };
             for (id, tracked) in children.iter_mut() {
-                let Tracked::Running(child, _) = tracked else {
+                let Tracked::Running(child, ..) = tracked else {
                     continue;
                 };
                 let Ok(raw_pid) = i32::try_from(id.0) else {
@@ -3195,7 +3304,7 @@ impl Drop for Inner {
 #[cfg(unix)]
 mod unix {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use nix::errno::Errno;
@@ -3243,8 +3352,9 @@ mod unix {
         outputs: &OutputTable,
         id: ProcessId,
         deadline: Duration,
+        census_bound: usize,
     ) -> Result<ProcessTerminalState, SupervisorError> {
-        let (recorded, members) = {
+        let (recorded, members, kept) = {
             let guard = children
                 .lock()
                 .expect("children mutex poisoned by a prior panic");
@@ -3257,8 +3367,9 @@ mod unix {
                         .expect("lingering mutex poisoned by a prior panic")
                         .get(&id)
                         .cloned(),
+                    None,
                 ),
-                Some(Tracked::Running(..)) => (None, None),
+                Some(Tracked::Running(_, _, kept)) => (None, None, Some(Arc::clone(kept))),
             }
         };
         // Already confirmed terminal: report the same recorded state again.
@@ -3286,8 +3397,22 @@ mod unix {
         // been reparented away and the chain that identifies them as its
         // descendants is gone for good. A descendant that leaves the
         // process group (`setsid`) is invisible to every `killpg` below but
-        // is in this census, which is the whole point of taking one.
-        let census = Census::take(pgid);
+        // is in this census, which is the whole point of taking one. If the
+        // child has already exited on its own and only awaits its reap, the
+        // walk links none of them to it, so the census its self-exit reaper
+        // kept while it lived is folded in (#199), read only after the walk
+        // found the exit, so it holds every walk finished by then.
+        let census = Census::take_at_stop(
+            pgid,
+            || {
+                kept.and_then(|kept| {
+                    kept.lock()
+                        .expect("recorded census mutex poisoned by a prior panic")
+                        .clone()
+                })
+            },
+            census_bound,
+        );
 
         // Best-effort: a group that has already exited yields ESRCH here,
         // which is not itself a failure -- the loop below confirms the
@@ -3478,7 +3603,7 @@ mod unix {
                     .lock()
                     .expect("children mutex poisoned by a prior panic");
                 let tracked = guard.get_mut(&id).expect("checked present by the caller");
-                let Tracked::Running(child, _) = tracked else {
+                let Tracked::Running(child, ..) = tracked else {
                     // Reaped and recorded by the self-exit reaper (or an
                     // `observe`) after this call's own `Running` check:
                     // report that same recorded state.
@@ -3675,7 +3800,7 @@ mod windows {
             .expect("children mutex poisoned by a prior panic");
         match guard.get_mut(&id).ok_or(SupervisorError::UnknownProcess)? {
             Tracked::Terminal(state) => Ok(*state),
-            Tracked::Running(child, _) => {
+            Tracked::Running(child, ..) => {
                 // Best-effort direct-child termination; containment of any
                 // descendant it spawned is unproven without a Job Object.
                 let _ = child.start_kill();
@@ -3773,7 +3898,7 @@ mod self_exit_tests {
             .expect("children mutex poisoned")
             .get(&id)
         {
-            Some(super::Tracked::Running(_, started)) => *started,
+            Some(super::Tracked::Running(_, started, _)) => *started,
             _ => panic!("the child must be tracked as running"),
         };
         assert_eq!(recorded, Some(starttime));
@@ -3927,17 +4052,22 @@ mod self_exit_tests {
         }
     }
 
-    /// Wait, at most `budget`, until `pid` is a zombie or gone.
+    /// Whether `pid` is running: present, and not a zombie.
     #[cfg(target_os = "linux")]
-    fn wait_until_not_running(pid: u32, budget: Duration) {
-        let end = std::time::Instant::now() + budget;
-        while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+    fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
             stat[stat.rfind(')').map_or(0, |at| at + 1)..]
                 .split_whitespace()
                 .next()
                 != Some("Z")
-        }) && std::time::Instant::now() < end
-        {
+        })
+    }
+
+    /// Wait, at most `budget`, until `pid` is a zombie or gone.
+    #[cfg(target_os = "linux")]
+    fn wait_until_not_running(pid: u32, budget: Duration) {
+        let end = std::time::Instant::now() + budget;
+        while running(pid) && std::time::Instant::now() < end {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -4649,6 +4779,219 @@ mod self_exit_tests {
         );
         assert!(texts.contains(&note), "frames: {texts:?}");
         assert_eq!(walks_taken_for(id.0), 1, "no walk of its own at the exit");
+    }
+
+    /// Holds `pid`'s reaper at the child's exit ([`super::HELD_EXITS`])
+    /// until dropped, even on a failed assert.
+    #[cfg(target_os = "linux")]
+    struct HeldExit(u32);
+
+    #[cfg(target_os = "linux")]
+    impl HeldExit {
+        /// Called before the child can exit: forgets any hold an earlier
+        /// test's child with the same pid began.
+        fn new(pid: u32) -> Self {
+            super::REACHED_EXITS
+                .lock()
+                .expect("reached exits poisoned")
+                .retain(|reached| *reached != pid);
+            super::HELD_EXITS
+                .lock()
+                .expect("held exits poisoned")
+                .push(pid);
+            Self(pid)
+        }
+
+        /// Wait, at most 10 s, until the reaper is held at the exit.
+        fn wait_until_reached(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !super::REACHED_EXITS
+                .lock()
+                .expect("reached exits poisoned")
+                .contains(&self.0)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the reaper must reach the child's exit"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HeldExit {
+        fn drop(&mut self) {
+            super::HELD_EXITS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|held| *held != self.0);
+        }
+    }
+
+    /// #199: a Stop that lands after the child exited on its own, before
+    /// the self-exit reaper reaped it, sweeps a helper that left the group
+    /// with `setsid` and that the reaper's census sighted while the child
+    /// lived. Stop's own census, of the zombie child, can link no
+    /// descendant to it: the kernel reparented them at the exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_between_a_self_exit_and_its_reap_sweeps_an_escaped_helper() {
+        /// The helper, killed when dropped, even on a failed assert.
+        struct KillOnDrop(Option<i32>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if let Some(helper) = self.0 {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(helper),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
+        }
+        let mut supervisor = TokioProcessSupervisor::new();
+        let id = supervisor
+            .spawn(ProcessSpec::new("/bin/sh").with_args([
+                "-c",
+                "setsid sleep 30 >/dev/null 2>&1 </dev/null & echo \"$!\"; sleep 1; exit 0",
+            ]))
+            .expect("spawning sh must succeed");
+        // The child exits 1 s after its spawn, past several census refreshes.
+        let hold = HeldExit::new(id.0);
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        let mut cleanup = KillOnDrop(None);
+        let mut seen = Vec::new();
+        let helper = loop {
+            let frame = frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the helper's pid must be printed");
+            if let FramePayload::Text { text, .. } = &frame.payload
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            seen.push(frame);
+        };
+        cleanup.0 = Some(helper);
+        hold.wait_until_reached();
+
+        let state = supervisor
+            .stop(id, Duration::from_secs(2))
+            .expect("stop must return a result");
+        drop(hold);
+
+        let helper_pid = u32::try_from(helper).expect("a pid is positive");
+        wait_until_not_running(helper_pid, Duration::from_millis(500));
+        assert!(
+            !running(helper_pid),
+            "stop reported {state:?} while the escaped helper {helper} kept running"
+        );
+        assert_eq!(state, ProcessTerminalState::Exited { code: Some(0) });
+        assert_eq!(supervisor.observe(id), Some(ProcessStatus::Terminal(state)));
+        while let Ok(frame) = frames.recv_timeout(Duration::from_secs(10)) {
+            seen.push(frame);
+        }
+        assert_eq!(
+            seen.last().map(|frame| &frame.payload),
+            Some(&FramePayload::State(state)),
+            "the final frame must carry the state stop returned"
+        );
+    }
+
+    /// #199 (verification B1): the census a Stop folds in holds every walk
+    /// that ended before the Stop read it, one the reaper has not adopted
+    /// yet included. The reaper adopts a walk at its next poll, up to a
+    /// poll interval after the walk ended (250 ms in the child's first
+    /// minute while the output is open, 2 s after), and a Stop that landed
+    /// in between missed a helper only that walk sighted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_right_after_the_exit_sweeps_a_helper_only_an_unadopted_walk_sighted() {
+        // One poll a second while the output is open, each with a refresh:
+        // the walk that sights the helper ends long before the next poll.
+        let pacing = ReapPacing {
+            slow_poll: Duration::from_secs(1),
+            census_refresh: Duration::ZERO,
+            ..HELD_WALK_PACING
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let mut cleanup = HeldWalkCleanup(
+            std::env::temp_dir().join(format!(
+                "omnifrons-unadopted-walk-{}-{nanos}",
+                std::process::id()
+            )),
+            None,
+        );
+        std::fs::create_dir(&cleanup.0).expect("the scratch directory must be created");
+        let (go, end) = (cleanup.0.join("go"), cleanup.0.join("end"));
+        // `sleep 5` keeps the output open past the exit, so the readers'
+        // end does not wake the reaper before its next poll.
+        let script = "while [ ! -e \"$1\" ]; do sleep 0.01; done; \
+                      setsid sleep 30 >/dev/null 2>&1 </dev/null & echo \"$!\"; \
+                      sleep 5 </dev/null & \
+                      while [ ! -e \"$2\" ]; do sleep 0.01; done; exit 0";
+        let mut supervisor = TokioProcessSupervisor::build_with(None, pacing);
+        let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        let id = supervisor
+            .spawn(ProcessSpec::new("/bin/sh").with_args([
+                "-c".to_owned(),
+                script.to_owned(),
+                "sh".to_owned(),
+                go.to_str().expect("UTF-8 path").to_owned(),
+                end.to_str().expect("UTF-8 path").to_owned(),
+            ]))
+            .expect("spawning sh must succeed");
+        super::PROC_WALKS
+            .lock()
+            .expect("walk counter poisoned")
+            .retain(|walker| *walker != id.0);
+        let frames = supervisor.subscribe(id).expect("subscribe must succeed");
+        // The helper is forked only once a walk has ended, so the walks
+        // the reaper adopts at its next poll cannot have sighted it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while walks_taken_for(id.0) < 1 || walks.queue() != (0, false) {
+            assert!(std::time::Instant::now() < deadline, "no first refresh");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::write(&go, b"").expect("the go file must be written");
+        let helper = loop {
+            let frame = frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the helper's pid must be printed");
+            if let FramePayload::Text { text, .. } = &frame.payload
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+        };
+        cleanup.1 = Some(helper);
+
+        // A walk taken from now on started after the helper existed; wait
+        // until one has ended, then let the child exit and stop it at once.
+        let before = walks_taken_for(id.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while walks_taken_for(id.0) <= before || walks.queue() != (0, false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a walk must sight the helper"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::write(&end, b"").expect("the end file must be written");
+        wait_until_not_running(id.0, Duration::from_secs(2));
+        let state = supervisor
+            .stop(id, Duration::from_secs(2))
+            .expect("stop must return a result");
+
+        let helper_pid = u32::try_from(helper).expect("a pid is positive");
+        wait_until_not_running(helper_pid, Duration::from_millis(500));
+        assert!(
+            !running(helper_pid),
+            "stop reported {state:?} while the escaped helper {helper} kept running"
+        );
+        assert_eq!(state, ProcessTerminalState::Exited { code: Some(0) });
     }
 
     /// #197 (verification B1): a refresh folds only a walk that started at
