@@ -28,20 +28,69 @@ const claudeBase = (extra) => lines(
   ...extra,
 );
 
-test('claude-code passes with loaded-file evidence and only the indexed skill path', () => {
+test('claude-code stays uncertain with reads of CLAUDE.md and AGENTS.md and the indexed skill path: it emits no loaded-file notice', () => {
   const result = observeLeg({
     adapter: 'claude-code',
-    transcript: claudeBase([tool('Read', { file_path: '/work/definition/skills/release-notes/SKILL.md' })]),
+    transcript: claudeBase([
+      tool('Read', { file_path: '/work/definition/CLAUDE.md' }),
+      tool('Read', { file_path: '/work/definition/skills/release-notes/SKILL.md' }),
+    ]),
     versionText: CLAUDE_VERSION,
     ...OPTIONS,
   });
-  assert.equal(result.result, 'pass');
+  assert.equal(result.result, 'uncertain');
   assert.equal(result.harness.name, 'Claude Code');
   assert.equal(result.harness.version, '2.1.316');
   assert.equal(result.harness.versionMatchesBinding, true);
-  assert.equal(result.loadedFileEvidence.found, true);
+  assert.equal(result.loadedFileEvidence.found, false);
+  assert.deepEqual(result.loadedFileEvidence.excerpts, []);
   assert.equal(result.skillPaths.indexed, true);
   assert.equal(result.skillPaths.userLevel, false);
+  assert.ok(result.reasons.some((reason) => /emits no notice naming the memory file it loaded/.test(reason)));
+});
+
+// Claude Code's `system/commands_changed` line: the operator's command catalogue.
+const commandsChanged = (...commands) => json({
+  type: 'system', subtype: 'commands_changed', commands: commands.map(([name, description]) => ({ name, description, argumentHint: '' })),
+});
+
+test('a catalogue entry naming CLAUDE.md is not loaded-file evidence for claude-code (#188)', () => {
+  const result = observeLeg({
+    adapter: 'claude-code',
+    transcript: lines(
+      init,
+      commandsChanged(['init', 'Initialize a new CLAUDE.md file with codebase documentation']),
+      say('I am Orbit Scribe.'),
+      tool('Read', { file_path: 'skills/release-notes/SKILL.md' }),
+    ),
+    versionText: CLAUDE_VERSION,
+    ...OPTIONS,
+  });
+  assert.equal(result.result, 'uncertain');
+  assert.equal(result.loadedFileEvidence.found, false);
+  assert.deepEqual(result.loadedFileEvidence.excerpts, []);
+  assert.equal(result.skillPaths.indexed, true);
+});
+
+test('the catalogue is not material: init arrays and commands_changed name neither the loaded file nor the indexed skill path (#188)', () => {
+  const catalogueInit = json({
+    type: 'system', subtype: 'init', cwd: '/work/definition', model: 'm', session_id: 's',
+    tools: ['Read'], skills: ['release-notes: skills/release-notes/SKILL.md'], slash_commands: ['release-notes'],
+  });
+  const catalogue = commandsChanged(['release-notes', 'Drafts release notes from skills/release-notes/SKILL.md after reading AGENTS.md']);
+  const claude = observeLeg({
+    adapter: 'claude-code', transcript: lines(catalogueInit, catalogue, say('I am Orbit Scribe.')), versionText: CLAUDE_VERSION, ...OPTIONS,
+  });
+  assert.equal(claude.result, 'uncertain');
+  assert.equal(claude.skillPaths.indexed, false);
+  assert.deepEqual(claude.skillPaths.excerpts, []);
+  assert.ok(claude.reasons.some((reason) => /names no skill path/.test(reason)));
+  const codex = observeLeg({
+    adapter: 'stream-json-cli', transcript: lines(catalogueInit, bridge, catalogue, say('Orbit Scribe here.')), versionText: CODEX_VERSION, ...OPTIONS,
+  });
+  assert.equal(codex.result, 'uncertain');
+  assert.equal(codex.loadedFileEvidence.found, false);
+  assert.equal(codex.skillPaths.indexed, false);
 });
 
 test('a user-level skill path in the transcript fails the leg', () => {
@@ -259,7 +308,7 @@ test('formatRecord omits both digest rows when none is given and cites the named
   assert.match(text, /retained redacted file docs\/evidence\/VP-001\/artifacts\/vp-s29\/run-2\/bundle\.txt/);
 });
 
-test('an assistant text mention of AGENTS.md is not loaded-file evidence; a tool_use read is', () => {
+test('an assistant text mention of AGENTS.md is not loaded-file evidence; a bridge command reading it is', () => {
   const textOnly = observeLeg({
     adapter: 'claude-code',
     transcript: lines(init, say('I read AGENTS.md at startup.'), tool('Read', { file_path: 'skills/release-notes/SKILL.md' })),
@@ -269,12 +318,15 @@ test('an assistant text mention of AGENTS.md is not loaded-file evidence; a tool
   assert.equal(textOnly.result, 'uncertain');
   assert.equal(textOnly.loadedFileEvidence.found, false);
   const read = observeLeg({
-    adapter: 'claude-code',
-    transcript: lines(init, tool('Read', { file_path: 'AGENTS.md' }), tool('Read', { file_path: 'skills/release-notes/SKILL.md' })),
-    versionText: CLAUDE_VERSION,
+    adapter: 'stream-json-cli',
+    transcript: lines(
+      init, bridge, tool('command_execution', { command: 'cat AGENTS.md' }), tool('command_execution', { command: 'cat skills/release-notes/SKILL.md' }),
+    ),
+    versionText: CODEX_VERSION,
     ...OPTIONS,
   });
   assert.equal(read.result, 'pass');
+  assert.equal(read.loadedFileEvidence.found, true);
 });
 
 test('the same rule holds for the bridge, and for the indexed skill path named only in prose', () => {
@@ -286,11 +338,12 @@ test('the same rule holds for the bridge, and for the indexed skill path named o
   });
   assert.equal(textOnly.result, 'uncertain');
   const proseSkill = observeLeg({
-    adapter: 'claude-code',
-    transcript: lines(init, tool('Read', { file_path: 'AGENTS.md' }), say('I used skills/release-notes/SKILL.md')),
-    versionText: CLAUDE_VERSION,
+    adapter: 'stream-json-cli',
+    transcript: lines(init, bridge, tool('command_execution', { command: 'cat AGENTS.md' }), say('I used skills/release-notes/SKILL.md')),
+    versionText: CODEX_VERSION,
     ...OPTIONS,
   });
+  assert.equal(proseSkill.loadedFileEvidence.found, true);
   assert.equal(proseSkill.skillPaths.indexed, false);
   assert.equal(proseSkill.result, 'uncertain');
   const proseUser = observeLeg({
@@ -358,9 +411,11 @@ const out = (text, continued = false, droppedBefore = 0) => record({ kind: 'stdo
 const err = (text) => record({ kind: 'stderr', text, continued: false, droppedBefore: 0 });
 const state = (code = 0) => record({ kind: 'state', state: 'exited', code });
 const log = (...parts) => `${parts.join('\n')}\n`;
-const claudeLog = (...extra) => log(
-  header('claude-code'), out(init), out(tool('Read', { file_path: 'AGENTS.md' })),
-  out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })), ...extra, state(),
+// A complete bridge log passes; a claude-code log never does (no loaded-file notice).
+const codexRead = (file) => tool('command_execution', { command: `cat ${file}` });
+const codexLog = (...extra) => log(
+  header('stream-json-cli'), out(init), out(bridge), out(codexRead('AGENTS.md')),
+  out(codexRead('skills/release-notes/SKILL.md')), ...extra, state(),
 );
 
 test('parseHarnessLog reassembles continued fragments and keeps stderr, state and drops apart', () => {
@@ -386,8 +441,8 @@ test('parseHarnessLog flushes a fragment left open at the end and rejects bad lo
   assert.throws(() => parseHarnessLog(log(record({ kind: 'header', schema: 'other/9', runId: 'r', adapter: 'a', startedAt: 't' }))), /schema/);
 });
 
-test('observeHarnessLogs passes a complete claude-code log and carries the log summary', () => {
-  const result = observeHarnessLogs({ adapter: 'claude-code', logs: [claudeLog()], versionText: CLAUDE_VERSION, ...OPTIONS });
+test('observeHarnessLogs passes a complete bridge log and carries the log summary', () => {
+  const result = observeHarnessLogs({ adapter: 'stream-json-cli', logs: [codexLog()], versionText: CODEX_VERSION, ...OPTIONS });
   assert.equal(result.result, 'pass');
   assert.equal(result.log.logs.length, 1);
   assert.deepEqual(result.log.logs[0].state, { kind: 'state', state: 'exited', code: 0 });
@@ -397,7 +452,7 @@ test('observeHarnessLogs passes a complete claude-code log and carries the log s
 
 test('a log whose header names another adapter fails the leg', () => {
   const result = observeHarnessLogs({
-    adapter: 'claude-code', logs: [claudeLog().replace('"adapter":"claude-code"', '"adapter":"pty-cli"')], versionText: CLAUDE_VERSION, ...OPTIONS,
+    adapter: 'stream-json-cli', logs: [codexLog().replace('"adapter":"stream-json-cli"', '"adapter":"pty-cli"')], versionText: CODEX_VERSION, ...OPTIONS,
   });
   assert.equal(result.result, 'fail');
   assert.ok(result.reasons.some((reason) => /adapter/.test(reason)));
@@ -405,15 +460,15 @@ test('a log whose header names another adapter fails the leg', () => {
 
 test('a truncated marker or any dropped frame makes the leg at most uncertain', () => {
   const truncated = observeHarnessLogs({
-    adapter: 'claude-code', logs: [claudeLog(record({ kind: 'truncated', framesDropped: 4 }))], versionText: CLAUDE_VERSION, ...OPTIONS,
+    adapter: 'stream-json-cli', logs: [codexLog(record({ kind: 'truncated', framesDropped: 4 }))], versionText: CODEX_VERSION, ...OPTIONS,
   });
   assert.equal(truncated.result, 'uncertain');
   assert.equal(truncated.log.incomplete, true);
   assert.ok(truncated.reasons.some((reason) => /incomplete log/.test(reason)));
   const dropped = observeHarnessLogs({
-    adapter: 'claude-code',
-    logs: [log(header(), out(init), out(tool('Read', { file_path: 'AGENTS.md' }), false, 2), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })), state())],
-    versionText: CLAUDE_VERSION,
+    adapter: 'stream-json-cli',
+    logs: [log(header('stream-json-cli'), out(init), out(bridge), out(codexRead('AGENTS.md'), false, 2), out(codexRead('skills/release-notes/SKILL.md')), state())],
+    versionText: CODEX_VERSION,
     ...OPTIONS,
   });
   assert.equal(dropped.result, 'uncertain');
@@ -422,18 +477,18 @@ test('a truncated marker or any dropped frame makes the leg at most uncertain', 
 
 test('a user-level skill path still fails even in an incomplete log', () => {
   const result = observeHarnessLogs({
-    adapter: 'claude-code',
-    logs: [claudeLog(out(tool('Read', { file_path: '/home/op/.claude/skills/release-notes/SKILL.md' })), record({ kind: 'truncated', framesDropped: 1 }))],
-    versionText: CLAUDE_VERSION,
+    adapter: 'stream-json-cli',
+    logs: [codexLog(out(codexRead('/home/op/.agents/skills/release-notes/SKILL.md')), record({ kind: 'truncated', framesDropped: 1 }))],
+    versionText: CODEX_VERSION,
     ...OPTIONS,
   });
   assert.equal(result.result, 'fail');
 });
 
 test('the two runs of a leg combine; a pty-cli log uses its text frames', () => {
-  const first = log(header('claude-code', 'run-1'), out(init), out(tool('Read', { file_path: 'AGENTS.md' })), state());
-  const second = log(header('claude-code', 'run-2'), out(init), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })), state());
-  const both = observeHarnessLogs({ adapter: 'claude-code', logs: [first, second], versionText: CLAUDE_VERSION, ...OPTIONS });
+  const first = log(header('stream-json-cli', 'run-1'), out(init), out(bridge), out(codexRead('AGENTS.md')), state());
+  const second = log(header('stream-json-cli', 'run-2'), out(init), out(bridge), out(codexRead('skills/release-notes/SKILL.md')), state());
+  const both = observeHarnessLogs({ adapter: 'stream-json-cli', logs: [first, second], versionText: CODEX_VERSION, ...OPTIONS });
   assert.equal(both.result, 'pass');
   assert.deepEqual(both.log.logs.map((entry) => entry.runId), ['run-1', 'run-2']);
   const pty = observeHarnessLogs({
@@ -447,9 +502,9 @@ test('the two runs of a leg combine; a pty-cli log uses its text frames', () => 
 });
 
 test('a log with no final state line is incomplete, and says so', () => {
-  const noState = log(header(), out(init), out(tool('Read', { file_path: 'AGENTS.md' })), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })));
+  const noState = log(header('stream-json-cli'), out(init), out(bridge), out(codexRead('AGENTS.md')), out(codexRead('skills/release-notes/SKILL.md')));
   assert.equal(parseHarnessLog(noState).state, null);
-  const result = observeHarnessLogs({ adapter: 'claude-code', logs: [noState], versionText: CLAUDE_VERSION, ...OPTIONS });
+  const result = observeHarnessLogs({ adapter: 'stream-json-cli', logs: [noState], versionText: CODEX_VERSION, ...OPTIONS });
   assert.equal(result.result, 'uncertain');
   assert.equal(result.log.incomplete, true);
   assert.ok(result.reasons.some((reason) => /log has no final state/.test(reason)));
@@ -460,7 +515,7 @@ test('a log ending in a continued fragment is incomplete: the log ends mid-line'
   assert.equal(parsed.endsMidLine, true);
   assert.equal(parseHarnessLog(log(header(), out('whole'), state())).endsMidLine, false);
   const result = observeHarnessLogs({
-    adapter: 'claude-code', logs: [claudeLog(out('{"type":"assi', true))], versionText: CLAUDE_VERSION, ...OPTIONS,
+    adapter: 'stream-json-cli', logs: [codexLog(out('{"type":"assi', true))], versionText: CODEX_VERSION, ...OPTIONS,
   });
   assert.equal(result.result, 'uncertain');
   assert.ok(result.reasons.some((reason) => /log ends mid-line/.test(reason)));
@@ -468,11 +523,11 @@ test('a log ending in a continued fragment is incomplete: the log ends mid-line'
 
 test('drops recorded on the state line count towards the dropped total', () => {
   const lossy = log(
-    header(), out(init), out(tool('Read', { file_path: 'AGENTS.md' })), out(tool('Read', { file_path: 'skills/release-notes/SKILL.md' })),
+    header('stream-json-cli'), out(init), out(bridge), out(codexRead('AGENTS.md')), out(codexRead('skills/release-notes/SKILL.md')),
     record({ kind: 'state', droppedBefore: 2, state: 'exited', code: 0 }),
   );
   assert.equal(parseHarnessLog(lossy).droppedBefore, 2);
-  const result = observeHarnessLogs({ adapter: 'claude-code', logs: [lossy], versionText: CLAUDE_VERSION, ...OPTIONS });
+  const result = observeHarnessLogs({ adapter: 'stream-json-cli', logs: [lossy], versionText: CODEX_VERSION, ...OPTIONS });
   assert.equal(result.result, 'uncertain');
   assert.equal(result.log.droppedBefore, 2);
 });

@@ -144,15 +144,21 @@ test('observe writes observation-<adapter>.json and redacts HOME', LINUX_ONLY, (
 const ADAPTERS = ['claude-code', 'stream-json-cli', 'pty-cli'];
 const AFTER_LABELS = ADAPTERS.flatMap((adapter) => [1, 2].map((index) => `after-${adapter}-${index}`));
 
-function observedClaude(dir, env) {
-  const transcript = join(dir, 'claude.jsonl');
-  const version = join(dir, 'claude-version.txt');
-  writeLog(transcript, 'claude-code', [
-    '{"type":"system","subtype":"init"}',
-    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}},{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}',
-  ]);
-  writeFileSync(version, '2.1.316 (Claude Code)\n');
-  assert.equal(sh(['observe', 'claude-code', transcript, version], env).status, 0);
+// Stream-json lines of a bridge run that reads AGENTS.md and/or the indexed skill.
+const BRIDGE_INIT = '{"type":"system","subtype":"init"}';
+const BRIDGE_VERSION = '{"type":"system","subtype":"bridge","codex_version":"codex-cli 0.163.0","bridge_version":"0.1.0"}';
+const bridgeReads = (...files) => JSON.stringify({
+  type: 'assistant',
+  message: { content: files.map((file) => ({ type: 'tool_use', name: 'command_execution', input: { command: `cat ${file}` } })) },
+});
+
+// A bridge leg passes; a claude-code leg never does (Claude Code emits no loaded-file notice).
+function observedCodex(dir, env) {
+  const transcript = join(dir, 'codex.jsonl');
+  const version = join(dir, 'codex-version.txt');
+  writeLog(transcript, 'stream-json-cli', [BRIDGE_INIT, BRIDGE_VERSION, bridgeReads('AGENTS.md', 'skills/release-notes/SKILL.md')]);
+  writeFileSync(version, 'codex-cli 0.163.0\n');
+  assert.equal(sh(['observe', 'stream-json-cli', transcript, version], env).status, 0);
 }
 
 test('record assembles record.md and evidence-summary.txt from six per-invocation digests', LINUX_ONLY, () => {
@@ -161,14 +167,14 @@ test('record assembles record.md and evidence-summary.txt from six per-invocatio
     writeFileSync(join(root, 'AGENTS.md'), 'canonical\n');
     sh(['digests', 'before'], env);
     for (const label of AFTER_LABELS) assert.equal(sh(['digests', label], env).status, 0);
-    observedClaude(dir, env);
+    observedCodex(dir, env);
 
     const args = ['record', '--baseline-id', 'VP-001-BASE-01', '--run-date', '2026-11-01'];
     const ok = sh(args, env);
     assert.equal(ok.status, 0, ok.stderr);
     const record = readFileSync(join(runDir, 'record.md'), 'utf8');
     assert.match(record, /\| `result` \| uncertain \|/);
-    assert.match(record, /\| `claude_code_leg` \| pass --/);
+    assert.match(record, /\| `codex_leg` \| pass --/);
     assert.match(record, /\| `digests_unchanged` \| true \|/);
     for (const label of AFTER_LABELS) assert.match(record, new RegExp(`${label} true`));
     assert.match(record, /\| `baseline_id` \| VP-001-BASE-01 \|/);
@@ -188,7 +194,7 @@ test('a changed intermediate digest makes the record fail even when the last one
       if (label === 'after-stream-json-cli-2') writeFileSync(join(root, 'AGENTS.md'), 'canonical\n');
       sh(['digests', label], env);
     }
-    observedClaude(dir, env);
+    observedCodex(dir, env);
     assert.equal(sh(['record', '--run-date', '2026-11-01'], env).status, 0);
     const record = readFileSync(join(runDir, 'record.md'), 'utf8');
     assert.match(record, /\| `result` \| fail \|/);
@@ -371,21 +377,21 @@ test('a symlinked SKILL.md records its target and the target content, and a dang
 test('observe takes the two logs of a leg and a log that is not a harness log is refused', LINUX_ONLY, () => {
   withDir((dir) => {
     const { runDir, env } = prepared(dir);
-    const first = join(dir, 'log-claude-code-1.jsonl');
-    const second = join(dir, 'log-claude-code-2.jsonl');
-    const version = join(dir, 'claude-version.txt');
-    writeFileSync(version, '2.1.316 (Claude Code)\n');
-    writeLog(first, 'claude-code', ['{"type":"system","subtype":"init"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"AGENTS.md"}}]}}']);
-    writeLog(second, 'claude-code', ['{"type":"system","subtype":"init"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"skills/release-notes/SKILL.md"}}]}}']);
-    const both = sh(['observe', 'claude-code', first, second, version], env);
+    const first = join(dir, 'log-stream-json-cli-1.jsonl');
+    const second = join(dir, 'log-stream-json-cli-2.jsonl');
+    const version = join(dir, 'codex-version.txt');
+    writeFileSync(version, 'codex-cli 0.163.0\n');
+    writeLog(first, 'stream-json-cli', [BRIDGE_INIT, BRIDGE_VERSION, bridgeReads('AGENTS.md')]);
+    writeLog(second, 'stream-json-cli', [BRIDGE_INIT, BRIDGE_VERSION, bridgeReads('skills/release-notes/SKILL.md')]);
+    const both = sh(['observe', 'stream-json-cli', first, second, version], env);
     assert.equal(both.status, 0, both.stderr);
-    assert.equal(JSON.parse(readFileSync(join(runDir, 'observation-claude-code.json'), 'utf8')).result, 'pass');
-    assert.equal(JSON.parse(readFileSync(join(runDir, 'log-summary-claude-code.json'), 'utf8')).logs.length, 2);
+    assert.equal(JSON.parse(readFileSync(join(runDir, 'observation-stream-json-cli.json'), 'utf8')).result, 'pass');
+    assert.equal(JSON.parse(readFileSync(join(runDir, 'log-summary-stream-json-cli.json'), 'utf8')).logs.length, 2);
     const plain = join(dir, 'plain.txt');
     writeFileSync(plain, 'just text\n');
-    const refused = sh(['observe', 'claude-code', plain, version], env);
+    const refused = sh(['observe', 'stream-json-cli', plain, version], env);
     assert.equal(refused.status, 1);
-    assert.equal(existsSync(join(runDir, 'observation-claude-code.json')), false);
-    assert.equal(existsSync(join(runDir, 'log-summary-claude-code.json')), false);
+    assert.equal(existsSync(join(runDir, 'observation-stream-json-cli.json')), false);
+    assert.equal(existsSync(join(runDir, 'log-summary-stream-json-cli.json')), false);
   });
 });

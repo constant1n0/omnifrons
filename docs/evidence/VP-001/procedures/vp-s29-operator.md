@@ -15,12 +15,20 @@ transcript cannot distinguish the CLI's own output from the model's prose, and
 Antigravity CLI documents no loaded-context notice, so the leg records
 `uncertain` on that count. The model saying
 who it is, or mentioning the file, never counts; without the notice the leg is
-`uncertain` even when the indexed skill path appears. For `claude-code` and the
-bridge, loaded-file evidence is
-non-assistant material only: a `system` line naming `CLAUDE.md`/`AGENTS.md`, or
+`uncertain` even when the indexed skill path appears. For `claude-code`, no
+line counts either: Claude Code's stream-json output emits no notice naming the
+memory file (`CLAUDE.md`, `AGENTS.md`) it loaded, and the model reading the file
+through a tool is its own access, not the harness loading the definition, so the
+leg records `uncertain` on that count until Claude Code emits such a notice. For
+the bridge, loaded-file evidence is
+non-assistant material only: a `system` line naming `AGENTS.md`, or
 a `tool_use` block whose input names the file (a read). An assistant text block
-that merely mentions the file never counts, and the indexed skill path counts
-only when it appears in such material. A user-level skill path in a transcript, or a changed digest, is
+that merely mentions the file never counts, and for both stream-json adapters
+the indexed skill path counts only when it appears in such material. The
+harness's catalogue never counts: the arrays of a `system/init` line (tools, MCP
+servers, slash commands, skills, agents, plugins) and every
+`system/commands_changed` line list what the operator has installed, not what
+the run loaded or read. A user-level skill path in a transcript, or a changed digest, is
 `fail`.
 
 ## 0. Bindings
