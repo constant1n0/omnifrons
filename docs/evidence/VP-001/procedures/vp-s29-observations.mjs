@@ -11,11 +11,18 @@
 //     indexed skill path in the transcript AND the bound harness version;
 //   - anything else is `uncertain`, never `pass`.
 // Loaded-file evidence per adapter:
-//   claude-code     the `system/init` line plus a line naming CLAUDE.md or AGENTS.md
+//   claude-code     none: Claude Code's stream-json output emits no notice naming the
+//                   memory file (CLAUDE.md, AGENTS.md) it loaded, and the model reading
+//                   the file through a tool is its own access, not the harness loading
+//                   it, so the leg stays `uncertain` on that count until Claude Code
+//                   emits such a notice (#188)
 //   stream-json-cli the bridge's `system/init` line plus a line naming AGENTS.md
 //   pty-cli         none: a PTY transcript cannot tell the CLI's output from the model's
 //                   prose and the bound CLI documents no loaded-context notice, so the
 //                   leg stays `uncertain` on that count
+// The harness's catalogue (the arrays of a `system/init` line and every
+// `system/commands_changed` line) lists what the operator has installed, not
+// what the run loaded or read, so it is never evidence (#188).
 //
 // CLI: node vp-s29-observations.mjs <adapter> <version-file> <harness-log>...
 //        [--manifest <file>] [--skill <name>] [--home <dir>] [--redacted-out <file>] [--summary-out <file>]
@@ -130,13 +137,24 @@ function isFailedExecution(line) {
   return false;
 }
 
+/** A `system/init` line without its arrays (tools, MCP servers, slash
+ * commands, skills, agents, plugins): the operator's catalogue. */
+const withoutCatalogue = (value) => Object.fromEntries(Object.entries(value).filter(([, field]) => !Array.isArray(field)));
+
 /** The `system` lines and `tool_use` blocks of a stream-json transcript, as
- * strings; every other line (assistant text, results, plain text) is left out. */
+ * strings; every other line (assistant text, results, plain text) is left out.
+ * The harness's catalogue is left out too: every `system/commands_changed` line
+ * and the arrays of a `system/init` line. It lists what the operator has
+ * installed, not what this run loaded or read, and its descriptions name files
+ * such as CLAUDE.md (#188). */
 function harnessMaterial(lines, parsed) {
   const out = [];
   parsed.forEach((value, index) => {
     if (!value) return;
-    if (value.type === 'system') out.push(lines[index]);
+    if (value.type === 'system') {
+      if (value.subtype === 'init') out.push(JSON.stringify(withoutCatalogue(value)));
+      else if (value.subtype !== 'commands_changed') out.push(lines[index]);
+    }
     const content = value.message?.content;
     if (Array.isArray(content)) {
       for (const block of content) {
@@ -191,16 +209,21 @@ export function observeLeg({
   }
 
   // Material that comes from the harness, not the model's prose: `system`
-  // lines and `tool_use` blocks (a read names its file in its input). An
-  // assistant `text` block never counts. A PTY capture has no such structure.
+  // lines and `tool_use` blocks (a read names its file in its input), without
+  // the operator's catalogue. An assistant `text` block never counts. A PTY
+  // capture has no such structure.
   const jsonAdapter = adapter !== 'pty-cli';
   const material = jsonAdapter ? harnessMaterial(lines, parsed) : lines;
 
   // Loaded-file evidence.
   let evidenceLines = [];
   if (adapter === 'claude-code') {
-    evidenceLines = findLines(material, /(?:CLAUDE|AGENTS)\.md/);
-    if (!hasSystem('init')) evidenceLines = [];
+    // Claude Code's stream-json output names no memory file it loaded, and a
+    // `tool_use` read of CLAUDE.md or AGENTS.md is the model's own access, not
+    // the harness loading the definition, so no line counts: the leg stays
+    // `uncertain` on loaded-file evidence until Claude Code emits a notice that
+    // names the loaded file (#188).
+    evidenceLines = [];
   } else if (adapter === 'stream-json-cli') {
     evidenceLines = findLines(material, /AGENTS\.md/);
     if (!hasSystem('init')) evidenceLines = [];
@@ -215,7 +238,7 @@ export function observeLeg({
   const loadedFound = evidenceLines.length > 0;
   if (!loadedFound && lines.length > 0) {
     reasons.push({
-      'claude-code': 'no system/init line together with a line naming CLAUDE.md or AGENTS.md',
+      'claude-code': 'Claude Code emits no notice naming the memory file it loaded (CLAUDE.md or AGENTS.md); a read of the file is the model\'s own access',
       'stream-json-cli': 'no system/init line together with a line naming AGENTS.md',
       'pty-cli': 'the bound CLI documents no loaded-context notice and PTY text cannot be authenticated as CLI output',
     }[adapter]);
