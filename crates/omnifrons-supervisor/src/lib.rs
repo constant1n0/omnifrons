@@ -4701,7 +4701,11 @@ mod self_exit_tests {
     /// with `setsid` is sighted only by another child's walk, held across
     /// this child's exit while this child's refresh waits for it. Folded
     /// at the exit, that walk names the helper; a walk of the refresh's
-    /// own, after the exit, could not have linked it to the child.
+    /// own, after the exit, could not have linked it to the child. The
+    /// stuck bound is raised so that the held walk cannot look stuck
+    /// before the exit: on a loaded host the exit can come more than the
+    /// default 1 s after the walk is held, and the waiting refresh would
+    /// then walk on its own after it.
     #[cfg(target_os = "linux")]
     #[test]
     fn another_childs_walk_in_flight_at_the_exit_names_an_escaped_helper() {
@@ -4722,6 +4726,8 @@ mod self_exit_tests {
                       while [ ! -e \"$2\" ]; do sleep 0.01; done; exit 0";
         let mut supervisor = TokioProcessSupervisor::build_with(None, HELD_WALK_PACING);
         let walks = std::sync::Arc::clone(&supervisor.inner.census_walks);
+        // The held walk below must outlast this child's exit.
+        walks.set_stuck_bound(Duration::from_secs(60));
         let spec = ProcessSpec::new("/bin/sh").with_args([
             "-c".to_owned(),
             script.to_owned(),
