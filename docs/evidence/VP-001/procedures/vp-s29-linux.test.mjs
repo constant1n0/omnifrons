@@ -174,7 +174,9 @@ test('record assembles record.md and evidence-summary.txt from six per-invocatio
     assert.equal(ok.status, 0, ok.stderr);
     const record = readFileSync(join(runDir, 'record.md'), 'utf8');
     assert.match(record, /\| `result` \| uncertain \|/);
-    assert.match(record, /\| `codex_leg` \| pass --/);
+    // The bridge emits no loaded-file notice, and the model reading AGENTS.md is
+    // its own access (#213), so the leg is `uncertain` even with both reads.
+    assert.match(record, /\| `codex_leg` \| uncertain -- .*the bridge emits no notice naming the file Codex loaded/);
     assert.match(record, /\| `digests_unchanged` \| true \|/);
     for (const label of AFTER_LABELS) assert.match(record, new RegExp(`${label} true`));
     assert.match(record, /\| `baseline_id` \| VP-001-BASE-01 \|/);
@@ -385,7 +387,12 @@ test('observe takes the two logs of a leg and a log that is not a harness log is
     writeLog(second, 'stream-json-cli', [BRIDGE_INIT, BRIDGE_VERSION, bridgeReads('skills/release-notes/SKILL.md')]);
     const both = sh(['observe', 'stream-json-cli', first, second, version], env);
     assert.equal(both.status, 0, both.stderr);
-    assert.equal(JSON.parse(readFileSync(join(runDir, 'observation-stream-json-cli.json'), 'utf8')).result, 'pass');
+    const observation = JSON.parse(readFileSync(join(runDir, 'observation-stream-json-cli.json'), 'utf8'));
+    // The indexed skill path comes from the second log only; the model's read of
+    // AGENTS.md in the first is not loaded-file evidence (#213).
+    assert.equal(observation.skillPaths.indexed, true);
+    assert.equal(observation.loadedFileEvidence.found, false);
+    assert.equal(observation.result, 'uncertain');
     assert.equal(JSON.parse(readFileSync(join(runDir, 'log-summary-stream-json-cli.json'), 'utf8')).logs.length, 2);
     const plain = join(dir, 'plain.txt');
     writeFileSync(plain, 'just text\n');

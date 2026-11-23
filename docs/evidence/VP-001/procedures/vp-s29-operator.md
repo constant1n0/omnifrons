@@ -19,12 +19,14 @@ who it is, or mentioning the file, never counts; without the notice the leg is
 line counts either: Claude Code's stream-json output emits no notice naming the
 memory file (`CLAUDE.md`, `AGENTS.md`) it loaded, and the model reading the file
 through a tool is its own access, not the harness loading the definition, so the
-leg records `uncertain` on that count until Claude Code emits such a notice. For
-the bridge, loaded-file evidence is
-non-assistant material only: a `system` line naming `AGENTS.md`, or
-a `tool_use` block whose input names the file (a read). An assistant text block
-that merely mentions the file never counts, and for both stream-json adapters
-the indexed skill path counts only when it appears in such material. The
+leg records `uncertain` on that count until Claude Code emits such a notice. The
+same holds for the bridge (`stream-json-cli`): it emits no notice naming the
+file Codex loaded (`AGENTS.md`), and a `command_execution` or any other
+`tool_use` block that reads the file is the model's own access, so the leg
+records `uncertain` on that count until the harness emits such a notice. An
+assistant text block that merely mentions the file never counts, and for both
+stream-json adapters the indexed skill path counts only when it appears in
+non-assistant material: a `system` line or a `tool_use` block. The
 harness's catalogue never counts: the arrays of a `system/init` line (tools, MCP
 servers, slash commands, skills, agents, plugins) and every
 `system/commands_changed` line list what the operator has installed, not what
