@@ -21,7 +21,9 @@ This draft does not redefine work already owned elsewhere:
 - **AEC-001** owns the wire event `handoff.state` and the producer identity/signing primitive. HTP-001 defines which values are valid in that event and adopts the producer identity primitive at device level (see Authenticity and replay).
 - **[TM-001](threat-model.md)** owns the attacker model. Until it is accepted, automatic claim stays blocked and manual claim shows the device fingerprint.
 - **MRP-001** owns migration, backup, and restore. **UTA-001** owns update trust. **[context-orb.md](context-orb.md)** owns presentation.
-- The same-device model/harness switch described in the target architecture's Model and harness switching section is the degenerate case of this protocol — source and receiver are one device, transport is local. HTP-001 does not change that flow; it frames it.
+- The same-device model/harness switch described in the target architecture's Model and harness switching section is the degenerate case of this protocol — source and receiver are one device, transport is local. HTP-001 does not change that flow; it frames it. The switch proves the target architecture's four conditions: quiescence, shutdown, checkpoint integrity and workspace consistency.
+  - **Planes that do not move.** On one device the memory and Git planes are not transferred: the new harness reads the same memory store and the same working tree in place. HTP-001-R2's composite quiescence gates the step from `prepared` to `publication-pending`, which only a cross-device handoff takes, so it does not govern the switch.
+  - **States.** The switch uses only HTP-001-R1's states, on the degenerate path `prepared` -> `claimed`. It is `prepared` once its checkpoint is written with all four conditions proven, and `claimed` once the target harness has started with the startup brief. It is `uncertain` when any condition is unproven, and `aborted` when the user cancels. It has no publication step, because transport is local.
 
 ## Purpose and scope
 

@@ -130,6 +130,8 @@ A model change is a checkpoint-and-restart handoff, not a transparent transfer o
 
 If quiescence, shutdown, checkpoint integrity, or workspace consistency cannot be proven, the switch is `uncertain` and requires human review.
 
+A switch proves those four conditions and no other plane. On one device the memory store and the Git working tree are read in place by the new harness rather than transferred, so the composite quiescence that the handoff protocol requires before publication does not apply. The switch takes that protocol's degenerate path, `prepared` -> `claimed`, or ends `uncertain` or `aborted` ([handoff-transaction-protocol.md](handoff-transaction-protocol.md#document-authority)).
+
 ## Workspace and artifact access
 
 Portable references use logical artifact IDs and workspace-relative identity where possible. A receiving device must resolve the project unambiguously before launch.

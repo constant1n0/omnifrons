@@ -33,6 +33,7 @@ pub mod quarantine;
 pub mod run_outbox;
 pub mod snapshot_store;
 pub mod switch_check;
+pub mod switch_checkpoint;
 pub mod terminal_normalizer;
 pub mod work_area;
 pub mod wrong_root;
