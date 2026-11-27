@@ -45,3 +45,15 @@ fn scrubbing_is_idempotent() {
     let once = scrub_secrets(text);
     assert_eq!(scrub_secrets(&once), once);
 }
+
+#[test]
+fn a_prefixed_token_after_punctuation_is_redacted() {
+    for (text, expected) in [
+        ("flag --sk-ant-abcdefgh1234 end", "flag --<redacted> end"),
+        ("x_ghp_abcdefgh1", "x_<redacted>"),
+        ("name-sk-short", "name-sk-short"),
+        ("keys/sk-ant-abcdefgh1234.txt", "keys/<redacted>.txt"),
+    ] {
+        assert_eq!(scrub_secrets(text), expected, "{text}");
+    }
+}

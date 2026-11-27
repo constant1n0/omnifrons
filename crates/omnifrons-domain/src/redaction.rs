@@ -7,7 +7,8 @@
 //! agree on what a secret looks like:
 //! - the rest of a line after `authorization:` (any case);
 //! - the token after `bearer` and spaces (any case);
-//! - a token that starts with a known key prefix and has at least eight
+//! - a token that starts with a known key prefix, at a run start or right
+//!   after `-` or `_`, and has at least eight
 //!   more characters;
 //! - any run of 40 or more token characters that is not exactly a
 //!   lowercase SHA-256 digest.
@@ -31,9 +32,9 @@ const LONG_RUN_MIN: usize = 40;
 pub fn scrub_secrets(text: &str) -> String {
     let text = redact_authorization(text);
     let text = redact_bearer(&text);
-    let text = redact_runs(&text, is_prefix_class, is_prefixed_token);
+    let text = redact_runs(&text, is_prefix_class, prefixed_token_start);
     redact_runs(&text, is_long_class, |run| {
-        run.len() >= LONG_RUN_MIN && !is_sha256_hex(run)
+        (run.len() >= LONG_RUN_MIN && !is_sha256_hex(run)).then_some(0)
     })
 }
 
@@ -49,11 +50,19 @@ const fn is_bearer_class(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
 }
 
-fn is_prefixed_token(run: &str) -> bool {
-    PREFIXES.iter().any(|prefix| {
-        run.strip_prefix(prefix)
-            .is_some_and(|tail| tail.len() >= PREFIX_MIN_TAIL)
-    })
+/// Where in `run` a prefixed token starts: at the run's start or right
+/// after a `-` or `_`, so `--sk-...` and `x_ghp_...` are caught too.
+fn prefixed_token_start(run: &str) -> Option<usize> {
+    let bytes = run.as_bytes();
+    (0..bytes.len())
+        .filter(|&at| at == 0 || matches!(bytes[at - 1], b'-' | b'_'))
+        .find(|&at| {
+            PREFIXES.iter().any(|prefix| {
+                run[at..]
+                    .strip_prefix(prefix)
+                    .is_some_and(|tail| tail.len() >= PREFIX_MIN_TAIL)
+            })
+        })
 }
 
 fn is_sha256_hex(run: &str) -> bool {
@@ -111,9 +120,14 @@ fn redact_bearer(text: &str) -> String {
     out
 }
 
-/// Replace every maximal run of `class` bytes for which `secret` holds.
-/// The class is ASCII-only, so every cut is a character boundary.
-fn redact_runs(text: &str, class: fn(u8) -> bool, secret: impl Fn(&str) -> bool) -> String {
+/// Replace every maximal run of `class` bytes from the offset
+/// `secret_from` returns to the run's end; a run it returns `None` for is
+/// kept. The class is ASCII-only, so every cut is a character boundary.
+fn redact_runs(
+    text: &str,
+    class: fn(u8) -> bool,
+    secret_from: impl Fn(&str) -> Option<usize>,
+) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let (mut index, mut copied) = (0, 0);
@@ -126,8 +140,8 @@ fn redact_runs(text: &str, class: fn(u8) -> bool, secret: impl Fn(&str) -> bool)
         while index < bytes.len() && class(bytes[index]) {
             index += 1;
         }
-        if secret(&text[start..index]) {
-            out.push_str(&text[copied..start]);
+        if let Some(keep) = secret_from(&text[start..index]) {
+            out.push_str(&text[copied..start + keep]);
             out.push_str(REDACTED);
             copied = index;
         }
