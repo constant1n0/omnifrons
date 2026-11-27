@@ -22,6 +22,7 @@ pub mod scope;
 pub mod skills_index;
 pub mod skills_safety;
 pub mod switch_check;
+pub mod switch_checkpoint;
 pub mod terminal;
 pub mod terminal_input;
 pub mod warnings;
