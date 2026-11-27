@@ -337,6 +337,11 @@ pub enum CheckpointError {
     /// The definition reference's path is not root-relative.
     #[error("the definition path is not root-relative")]
     DefinitionPathNotRelative,
+    /// A path has a secret-shaped part ([`scrub_secrets`] would change
+    /// it). The caller replaces such a path with an opaque name before it
+    /// builds the checkpoint (TM-001-R6).
+    #[error("a path has a secret-shaped part")]
+    SecretShapedPath,
     /// The first record is not `schema`.
     #[error("the first record is not the schema")]
     SchemaNotFirst,
@@ -389,7 +394,9 @@ impl SwitchCheckpoint {
     ///
     /// [`CheckpointError::TerminalWithoutRun`] for a terminal state with no
     /// run, [`CheckpointError::DefinitionPathNotRelative`] for a definition
-    /// path that could name a raw location.
+    /// path that could name a raw location,
+    /// [`CheckpointError::SecretShapedPath`] for a definition or inventory
+    /// path with a secret-shaped part.
     pub fn new(mut facts: CheckpointFacts) -> Result<Self, CheckpointError> {
         if facts.outgoing.run.is_none() && facts.outgoing.terminal.is_some() {
             return Err(CheckpointError::TerminalWithoutRun);
@@ -397,6 +404,19 @@ impl SwitchCheckpoint {
         if let Some(definition) = &facts.definition {
             RootRelativePath::new(definition.path())
                 .map_err(|_| CheckpointError::DefinitionPathNotRelative)?;
+        }
+        let definition_path = facts.definition.as_ref().map(DefinitionReference::path);
+        let paths = facts
+            .inventory
+            .entries()
+            .iter()
+            .map(|entry| entry.path.as_str());
+        if definition_path
+            .into_iter()
+            .chain(paths)
+            .any(|path| scrub_secrets(path) != path)
+        {
+            return Err(CheckpointError::SecretShapedPath);
         }
         facts.goal = facts.goal.and_then(|goal| scrubbed_goal(&goal));
         Ok(Self {

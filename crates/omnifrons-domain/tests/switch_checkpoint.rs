@@ -342,3 +342,22 @@ fn a_secret_in_the_goal_is_redacted_before_it_is_stored() {
     );
     assert!(!checkpoint.encode_body().contains("abc123XYZ"));
 }
+
+#[test]
+fn a_secret_shaped_path_is_refused() {
+    let mut named = facts(EXITED);
+    named.inventory = inventory(vec![entry("keys/sk-ant-abcdefgh1234.txt", 1, 10)]);
+    assert_eq!(
+        SwitchCheckpoint::new(named).map(|_| ()),
+        Err(CheckpointError::SecretShapedPath)
+    );
+    let mut definition = facts(EXITED);
+    definition.definition = Some(
+        DefinitionReference::new("ghp_abcdefgh12345/AGENTS.md", "ab".repeat(32))
+            .expect("reference"),
+    );
+    assert_eq!(
+        SwitchCheckpoint::new(definition).map(|_| ()),
+        Err(CheckpointError::SecretShapedPath)
+    );
+}
