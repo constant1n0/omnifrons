@@ -16,9 +16,11 @@
 //! keeps 64-hex SHA-256 digests.
 //!
 //! It never exceeds [`BRIEF_MAX_BYTES`]. The goal is cut at
-//! [`BRIEF_GOAL_MAX_BYTES`], and the changed paths listed shrink until the
-//! text fits. A text that still does not fit, which takes a definition path
-//! of several KiB, is cut at a line break and marked `[brief truncated]`.
+//! [`BRIEF_GOAL_MAX_BYTES`], a definition path is shown whole only up to
+//! 128 bytes, and the changed paths listed shrink until the text fits, so
+//! every section, the unresolved risks included, always reaches the
+//! harness. The final cut at a line break, marked `[brief truncated]`, is
+//! a safety net those bounds leave unreachable.
 
 use std::fmt::Write as _;
 
@@ -45,6 +47,8 @@ const NOT_RECORDED: &str = "Changed files during the outgoing run: not recorded 
                             Summary from the outgoing harness: none; this version does not request one.\n";
 const FOOTER: &str = "[End of startup brief]\n";
 const TRUNCATED: &str = "[brief truncated]\n";
+/// The longest definition path the brief shows whole.
+const DEFINITION_PATH_SHOWN_MAX: usize = 128;
 const WORKSPACE_CHANGED: &str = "workspace-changed";
 
 /// The startup brief for `checkpoint`, opened and verified with digest `sealed_digest`, given the workspace `consistency` re-checked just before the restart.
@@ -107,7 +111,7 @@ fn render(
             let _ = writeln!(
                 out,
                 "Agent definition: {}, sha256 {}.",
-                definition.path(),
+                shown_path(definition.path()),
                 definition.digest()
             );
         }
@@ -124,13 +128,31 @@ fn render(
         }
         Consistency::Changed(changes) => push_changes(&mut out, changes, listed),
         Consistency::Unproven => {
-            out.push_str("Workspace: consistency unproven: the inventory is capped.\n");
+            out.push_str("Workspace: consistency unproven: the inventory is incomplete (a bound was reached or an entry could not be read).\n");
         }
     }
     out.push_str(NOT_RECORDED);
     push_risks(&mut out, &state, consistency);
     out.push_str(FOOTER);
     out
+}
+
+/// The definition path as the brief shows it: whole up to
+/// [`DEFINITION_PATH_SHOWN_MAX`] bytes, else cut at a character boundary
+/// and marked. With the goal capped too, every section, the unresolved
+/// risks included, then fits in [`BRIEF_MAX_BYTES`].
+fn shown_path(path: &str) -> String {
+    if path.len() <= DEFINITION_PATH_SHOWN_MAX {
+        return path.to_string();
+    }
+    let mut end = DEFINITION_PATH_SHOWN_MAX;
+    while !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... (path cut at {DEFINITION_PATH_SHOWN_MAX} bytes)",
+        &path[..end]
+    )
 }
 
 fn push_provenance(out: &mut String, outgoing: &OutgoingRun, sealed_digest: &Sha256Digest) {
@@ -250,7 +272,7 @@ fn risk_sentence(reason: Unproven) -> &'static str {
             "the supervisor could not prove that every process the outgoing run started has stopped."
         }
         Unproven::InventoryIncomplete => {
-            "the workspace inventory is capped, so its consistency cannot be proven."
+            "the workspace inventory is incomplete (a bound was reached or an entry could not be read), so its consistency cannot be proven."
         }
     }
 }

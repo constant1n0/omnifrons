@@ -145,7 +145,7 @@ fn an_unproven_checkpoint_is_uncertain_and_lists_every_risk() {
         risks(&brief),
         "Unresolved risks:\n\
          - run-not-terminal: the outgoing run was not seen to end, so it may still change the workspace.\n\
-         - inventory-incomplete: the workspace inventory is capped, so its consistency cannot be proven.\n\
+         - inventory-incomplete: the workspace inventory is incomplete (a bound was reached or an entry could not be read), so its consistency cannot be proven.\n\
          - workspace-changed: files changed between the stop and the restart; review them before relying on them.\n"
     );
 
@@ -161,7 +161,7 @@ fn an_unproven_checkpoint_is_uncertain_and_lists_every_risk() {
         risks(&brief),
         "Unresolved risks:\n\
          - descendants-unproven: the supervisor could not prove that every process the outgoing run started has stopped.\n\
-         - inventory-incomplete: the workspace inventory is capped, so its consistency cannot be proven.\n"
+         - inventory-incomplete: the workspace inventory is incomplete (a bound was reached or an entry could not be read), so its consistency cannot be proven.\n"
     );
     assert_eq!(brief.matches("inventory-incomplete").count(), 1);
 }
@@ -274,12 +274,12 @@ fn an_unproven_workspace_is_uncertain_with_one_inventory_risk() {
     assert_eq!(line(&brief, "Switch state:"), "Switch state: uncertain\n");
     assert_eq!(
         line(&brief, "Workspace:"),
-        "Workspace: consistency unproven: the inventory is capped.\n"
+        "Workspace: consistency unproven: the inventory is incomplete (a bound was reached or an entry could not be read).\n"
     );
     assert_eq!(
         risks(&brief),
         "Unresolved risks:\n\
-         - inventory-incomplete: the workspace inventory is capped, so its consistency cannot be proven.\n"
+         - inventory-incomplete: the workspace inventory is incomplete (a bound was reached or an entry could not be read), so its consistency cannot be proven.\n"
     );
 }
 
@@ -342,15 +342,35 @@ fn the_brief_never_exceeds_its_byte_bound() {
         assert!(brief.ends_with("[End of startup brief]\n"));
     }
 
-    let mut deep = facts(EXITED);
+    // The worst case for size: a definition path of 8 KiB and a goal of
+    // newlines only, on an uncertain checkpoint over a changed workspace.
+    // The path is cut, and every risk still reaches the brief.
+    let mut deep = facts(None);
+    deep.inventory = inventory(false);
     let deep_path = format!("{}AGENTS.md", "deep/".repeat(1600));
     deep.definition =
         Some(DefinitionReference::new(deep_path, "ab".repeat(32)).expect("reference"));
     deep.goal = Some(AgentPrompt::new("\n".repeat(AgentPrompt::MAX_BYTES)).expect("prompt"));
-    let brief = render(deep, &Consistency::Consistent);
+    let brief = render(deep, &changed(&["notes/draft.md"], &[], &[]));
     assert!(brief.len() <= BRIEF_MAX_BYTES, "{} bytes", brief.len());
     assert!(brief.starts_with("[Omnifrons startup brief: untrusted context]\n"));
-    assert!(brief.ends_with("\n[brief truncated]\n[End of startup brief]\n"));
+    assert!(!brief.contains("[brief truncated]"), "nothing is cut away");
+    assert!(brief.contains(&format!(
+        "Agent definition: {}... (path cut at 128 bytes), sha256 ",
+        "deep/".repeat(26).get(..128).expect("128 bytes")
+    )));
+    let risks = risks(&brief);
+    for token in [
+        "run-not-terminal",
+        "inventory-incomplete",
+        "workspace-changed",
+    ] {
+        assert!(
+            risks.contains(&format!("- {token}:")),
+            "{token} kept: {risks}"
+        );
+    }
+    assert!(brief.ends_with("[End of startup brief]\n"));
 }
 
 #[test]
