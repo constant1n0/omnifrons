@@ -21,6 +21,7 @@ pub mod redaction;
 pub mod scope;
 pub mod skills_index;
 pub mod skills_safety;
+pub mod switch_brief;
 pub mod switch_check;
 pub mod switch_checkpoint;
 pub mod terminal;
