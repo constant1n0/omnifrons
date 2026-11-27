@@ -17,6 +17,7 @@ pub mod nesting;
 pub mod outbox;
 pub mod output;
 pub mod publication;
+pub mod redaction;
 pub mod scope;
 pub mod skills_index;
 pub mod skills_safety;
